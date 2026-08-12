@@ -435,7 +435,7 @@ impl SoulseekClient for RealClient {
         let queue_client = client.clone();
         let queue_filename = filename.clone();
         let queue_username = username_owned.clone();
-        let (_, crate_rx) = tokio::task::spawn_blocking(move || {
+        let (download_handle, crate_rx) = tokio::task::spawn_blocking(move || {
             queue_client.download(queue_filename, queue_username, size, download_dir)
         })
         .await
@@ -460,10 +460,18 @@ impl SoulseekClient for RealClient {
         let bridge_client = client.clone();
         let bridge_username = username_owned.clone();
         let bridge_filename = filename.clone();
+        // Keep the Download handle alive — it holds the internal Sender that
+        // the crate uses to push status updates. Dropping it closes the channel
+        // and silently kills the transfer.
+        let _download_handle = download_handle;
         tokio::task::spawn_blocking(move || {
+            // Keep _download_handle alive for the entire bridge lifetime.
+            let _keep = &_download_handle;
+            tracing::info!("Bridge started for {bridge_filename} from {bridge_username}");
             loop {
                 match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
                     Ok(status) => {
+                        tracing::info!("Bridge status for {bridge_filename}: {status:?}");
                         if forward_cancelled.load(Ordering::SeqCst) {
                             break;
                         }
@@ -483,7 +491,10 @@ impl SoulseekClient for RealClient {
                     // The consumer enforces its own overall timeout and
                     // cancels via `cancel_tx`.
                     Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        tracing::info!("Bridge disconnected for {bridge_filename}");
+                        break;
+                    }
                 }
             }
             let _ = bridge_client.remove_download(&bridge_username, &bridge_filename);

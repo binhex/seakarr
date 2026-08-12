@@ -10,11 +10,14 @@ use crate::filter;
 /// (the crate already strips directory components), reject path-traversal
 /// patterns, and return a safe filename suitable for path construction.
 fn safe_basename(remote_name: &str) -> Result<&str> {
-    // The crate's download peer strips everything up to the last '/' or '\',
-    // so our local path must use the same basename.
-    let basename = remote_name.rsplit('/').next().unwrap_or(remote_name);
-    if basename.is_empty() || basename == "." || basename.contains("..") || basename.contains('\\')
-    {
+    // Soulseek filenames may use either / or \\ as path separators
+    // (many peers share from Windows machines).  Split on both and
+    // take the last component.
+    let basename = remote_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(remote_name);
+    if basename.is_empty() || basename == "." || basename.contains("..") {
         return Err(SeakarrError::Download(format!(
             "unsafe or empty remote filename: {remote_name:?}"
         )));
@@ -36,6 +39,7 @@ pub async fn download_file(
         ..file.clone()
     };
     let mut handle = client.download(&safe_file, username, dir).await?;
+    tracing::info!("Download queued: {basename} from {username}");
     let mut transfer_start: Option<tokio::time::Instant> = None;
 
     loop {
@@ -75,20 +79,25 @@ pub async fn download_file(
             }
             Ok(Some(DownloadStatus::Completed)) => {
                 let dest = dir.join(basename);
+                tracing::info!("Download completed: {basename}");
                 return Ok(dest);
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
+                tracing::warn!("Download of {basename} failed: {reason}");
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
             }
-            Ok(Some(DownloadStatus::Queued { .. })) => {
-                // Still queued — keep waiting.
-            }
+            Ok(Some(DownloadStatus::Queued { .. })) => {}
             Ok(None) => {
+                tracing::warn!("Download channel closed for {basename}");
                 return Err(SeakarrError::Download(
                     "download channel closed unexpectedly".into(),
                 ));
             }
             Err(_elapsed) => {
+                tracing::warn!(
+                    "Download of {basename} timed out after {}s",
+                    config.timeout_secs
+                );
                 let _ = handle.cancel_tx.send(()).await;
                 return Err(SeakarrError::Download("download timed out".into()));
             }
@@ -115,7 +124,6 @@ pub async fn download_album(
             .iter()
             .filter(|f| safe_basename(&f.name).is_ok() && filter::file_passes_filters(f, filters))
             .count();
-        let total = candidate.files.len();
         if all_passed == 0 {
             // Show a sample of what we're rejecting to help debug
             for f in candidate.files.iter().take(3) {

@@ -137,8 +137,7 @@ async fn run() -> Result<()> {
 
     // Connect to Soulseek
     // Suppress the crate's internal logger (it uses LOG_LEVEL / RUST_LOG
-    // env vars, not the tracing ecosystem).  Set to ERROR to silence
-    // "No handler found for message code" diagnostics.
+    // env vars, not the tracing ecosystem).  Set to INFO for debugging.
     std::env::set_var("LOG_LEVEL", "ERROR");
     tracing::info!(
         "Connecting to Soulseek server {}...",
