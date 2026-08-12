@@ -51,18 +51,49 @@ pub async fn process_album(
     }
 
     // Filter + rank
+    let total_results: usize = results.iter().map(|r| r.files.len()).sum();
+    let total_users = results.len();
     let filtered = filter::filter_results(&results, &config.filters);
+    if filtered.is_empty() {
+        tracing::info!(
+            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot)",
+            album.unwrap_or("(all)"),
+            config.filters.allowed_extensions,
+        );
+        if let Some(a) = album {
+            db.mark_album_processed(artist, a, "skipped")?;
+        }
+        return Ok(());
+    }
     let ranked = filter::rank_candidates(&filtered, &config.filters);
+    tracing::info!(
+        "{artist} — {}: {total_results} files from {total_users} users, {} users passed filters, best: {} (speed={})",
+        album.unwrap_or("(all)"),
+        filtered.len(),
+        ranked.first().map(|r| r.username.as_str()).unwrap_or("?"),
+        ranked.first().map(|r| r.speed).unwrap_or(0),
+    );
 
     // Download
-    let downloaded = download::download_album(
+    let downloaded = match download::download_album(
         client,
         &ranked,
         &album_staging,
         &config.download,
         &config.filters,
     )
-    .await?;
+    .await
+    {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(
+                "{artist} — {}: download failed ({e}); {} candidates exhausted",
+                album.unwrap_or("(all)"),
+                ranked.len(),
+            );
+            return Err(e);
+        }
+    };
 
     // Organize (if enabled)
     let mut organize_ok = true;
