@@ -110,6 +110,25 @@ pub async fn download_album(
     let mut last_err: Option<SeakarrError> = None;
 
     for candidate in candidates {
+        let all_passed = candidate
+            .files
+            .iter()
+            .filter(|f| safe_basename(&f.name).is_ok() && filter::file_passes_filters(f, filters))
+            .count();
+        let total = candidate.files.len();
+        if all_passed == 0 {
+            // Show a sample of what we're rejecting to help debug
+            for f in candidate.files.iter().take(3) {
+                let ext = f.name.rsplit('.').next().unwrap_or("<none>");
+                let safe = safe_basename(&f.name).is_ok();
+                let passes = filter::file_passes_filters(f, filters);
+                tracing::warn!(
+                    "reject: {:?} ext={ext} safe={safe} passes={passes} bitrate={bitrate:?}",
+                    f.name,
+                    bitrate = f.attribs.get(&0),
+                );
+            }
+        }
         let filtered_files: Vec<&FileInfo> = candidate
             .files
             .iter()
