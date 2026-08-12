@@ -190,7 +190,7 @@ impl Database {
 
     pub fn is_album_processed(&self, artist: &str, album: &str) -> Result<bool> {
         let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM processed_albums WHERE artist = ?1 AND album = ?2 AND status IN ('success', 'skipped')",
+            "SELECT COUNT(*) FROM processed_albums WHERE artist = ?1 AND album = ?2 AND status = 'success'",
             params![artist, album],
             |row| row.get(0),
         )?;
