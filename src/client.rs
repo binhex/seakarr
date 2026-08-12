@@ -474,10 +474,27 @@ impl SoulseekClient for RealClient {
             // Keep _download_handle alive for the entire bridge lifetime.
             let _keep = &_download_handle;
             tracing::info!("Bridge started for {bridge_filename} from {bridge_username}");
+            // Throttle per-status progress logs: the crate emits InProgress
+            // updates several times a second, which floods the console. Log
+            // state transitions immediately, but progress at most once per
+            // 5 seconds.
+            let mut last_progress_log = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(6))
+                .unwrap();
             loop {
                 match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
                     Ok(status) => {
-                        tracing::info!("Bridge status for {bridge_filename}: {status:?}");
+                        if matches!(
+                            &status,
+                            SsDownloadStatus::InProgress { .. } | SsDownloadStatus::Paused { .. }
+                        ) {
+                            if last_progress_log.elapsed() >= std::time::Duration::from_secs(5) {
+                                tracing::info!("Bridge progress for {bridge_filename}: {status:?}");
+                                last_progress_log = std::time::Instant::now();
+                            }
+                        } else {
+                            tracing::info!("Bridge status for {bridge_filename}: {status:?}");
+                        }
                         if forward_cancelled.load(Ordering::SeqCst) {
                             break;
                         }
