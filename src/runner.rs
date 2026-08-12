@@ -141,8 +141,19 @@ pub async fn run_auto_mode(
 
     // Scan library
     tracing::info!("Scanning library...");
-    let albums = scanner::scan_library(&config.library.paths, &config.filters.allowed_extensions)?;
+    let albums = scanner::scan_library(&config.library.paths)?;
     let targets = scanner::find_albums_to_upgrade(&albums, &config.filters);
+    for album in &albums {
+        let fmt_str: Vec<&str> = album.formats.iter().map(|f| f.as_str()).collect();
+        tracing::info!(
+            "  {artist} — {album} ({tracks} tracks, formats: {formats}, bitrate: {bitrate:?})",
+            artist = album.artist,
+            album = album.album,
+            tracks = album.track_count,
+            formats = fmt_str.join(","),
+            bitrate = album.min_bitrate,
+        );
+    }
     tracing::info!(
         "Found {} albums to upgrade out of {} total",
         targets.len(),

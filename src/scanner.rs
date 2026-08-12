@@ -19,17 +19,20 @@ pub struct ScannedAlbum {
     pub formats: Vec<String>,
 }
 
+/// Recognised audio file extensions that the scanner should pick up.
+/// This is broader than `filters.allowed_extensions` — the scanner needs to
+/// see *all* audio files so it can detect albums that contain formats outside
+/// the user's quality target.
+const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "wma", "ape", "mpc", "wv", "aiff", "aif",
+    "dsf", "dff", "spx",
+];
+
 /// Walk library directories, group audio files by artist/album, collect format+bitrate info.
-pub fn scan_library(
-    library_paths: &[String],
-    allowed_extensions: &[String],
-) -> Result<Vec<ScannedAlbum>> {
+pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
     let mut albums: std::collections::BTreeMap<(String, String), ScannedAlbum> =
         std::collections::BTreeMap::new();
-    let ext_set: HashSet<String> = allowed_extensions
-        .iter()
-        .map(|e| e.to_lowercase())
-        .collect();
+    let ext_set: HashSet<&str> = KNOWN_AUDIO_EXTENSIONS.iter().copied().collect();
 
     for lib_path_str in library_paths {
         let lib_path = Path::new(lib_path_str);
@@ -53,7 +56,7 @@ pub fn scan_library(
                 .unwrap_or("")
                 .to_lowercase();
 
-            if !ext_set.contains(&ext) {
+            if !ext_set.contains(ext.as_str()) {
                 continue;
             }
 
@@ -178,7 +181,7 @@ mod tests {
     #[test]
     fn test_scan_empty_directory() {
         let dir = TempDir::new().unwrap();
-        let albums = scan_library(&library_paths(dir.path()), &["flac".to_string()]).unwrap();
+        let albums = scan_library(&library_paths(dir.path())).unwrap();
         assert!(albums.is_empty());
     }
 
@@ -191,20 +194,18 @@ mod tests {
         fs::write(album_dir.join("01 - Song One.flac"), b"fake flac data").unwrap();
         fs::write(album_dir.join("02 - Song Two.flac"), b"fake flac data").unwrap();
 
-        // Another artist with MP3 (should be skipped if only flac is configured)
+        // Another artist with MP3 — now discovered because the scanner picks
+        // up all known audio formats (upgrade detection handles the filter).
         let mp3_dir = dir.path().join("Other Artist").join("Other Album");
         fs::create_dir_all(&mp3_dir).unwrap();
         fs::write(mp3_dir.join("track.mp3"), b"fake mp3 data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &["flac".to_string()]).unwrap();
-        assert_eq!(albums.len(), 1);
-        assert_eq!(albums[0].artist, "Test Artist");
-        assert_eq!(albums[0].album, "Test Album");
-        assert_eq!(albums[0].track_count, 2);
-
-        // MP3 album should not appear since only flac is configured
-        let mp3_count = albums.iter().filter(|a| a.artist == "Other Artist").count();
-        assert_eq!(mp3_count, 0);
+        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        assert_eq!(albums.len(), 2);
+        // Both albums should be present
+        let artists: Vec<&str> = albums.iter().map(|a| a.artist.as_str()).collect();
+        assert!(artists.contains(&"Test Artist"));
+        assert!(artists.contains(&"Other Artist"));
     }
 
     #[test]
