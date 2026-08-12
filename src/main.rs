@@ -224,6 +224,9 @@ fn validate_for_test(config: &Config) -> Result<()> {
             config.logging.level
         )));
     }
+    // Same numeric bounds as Config::validate() so `--test` does not report
+    // "valid" for a config that would fail at real startup.
+    Config::validate_concurrent_bounds(config.download.concurrent)?;
     for path in &config.library.paths {
         if !Path::new(path).exists() {
             tracing::warn!("library path does not exist: {path}");

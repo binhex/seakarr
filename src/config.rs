@@ -234,7 +234,12 @@ fn default_extensions() -> Vec<String> {
     vec!["flac".into()]
 }
 fn default_concurrent() -> usize {
-    5
+    // 1: auto mode searches albums concurrently, and each search makes the
+    // Soulseek server push ConnectToPeer for every result peer (the crate
+    // spawns a peer-actor thread per connection). The vendored crate's
+    // peer-registry cap (16) bounds the thread count, but keeping seakarr's
+    // own concurrency at 1 further reduces search-driven peer churn.
+    1
 }
 fn default_max_start_time() -> u64 {
     120
@@ -416,6 +421,23 @@ impl Config {
         }
     }
 
+    /// Shared concurrent bounds used by both `validate()` (real startup) and
+    /// `--test` mode, so a config that would fail at startup never reports
+    /// "valid" under `--test`.
+    pub fn validate_concurrent_bounds(concurrent: usize) -> Result<()> {
+        if concurrent == 0 {
+            return Err(SeakarrError::Config(
+                "download.concurrent must be at least 1 (0 blocks all downloads)".into(),
+            ));
+        }
+        if concurrent > 8 {
+            return Err(SeakarrError::Config(format!(
+                "download.concurrent must be at most 8, got {concurrent}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate required fields. Returns Ok(()) or the first error.
     pub fn validate(&self) -> Result<()> {
         if self.soulseek.username.is_empty() {
@@ -431,6 +453,7 @@ impl Config {
                 valid_levels, self.logging.level
             )));
         }
+        Self::validate_concurrent_bounds(self.download.concurrent)?;
         Ok(())
     }
 }
@@ -589,6 +612,48 @@ daemon:
     }
 
     #[test]
+    fn test_validate_rejects_zero_and_high_concurrency() {
+        // concurrent == 0: blocks all downloads forever.
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.download.concurrent = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("at least 1"), "got: {err}");
+
+        // concurrent > 8: multiplies search-driven peer churn.
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.download.concurrent = 9;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("at most 8"), "got: {err}");
+
+        // The shared helper agrees with validate() at the boundary.
+        assert!(Config::validate_concurrent_bounds(1).is_ok());
+        assert!(Config::validate_concurrent_bounds(8).is_ok());
+        assert!(Config::validate_concurrent_bounds(9).is_err());
+        assert!(Config::validate_concurrent_bounds(0).is_err());
+    }
+
+    // Regression guard for the thread-explosion bug: with the default
+    // concurrency, auto mode fires N concurrent album searches, each of which
+    // makes the Soulseek server push ConnectToPeer for every result peer;
+    // soulseek-rs-lib spawns a peer-actor thread per connection. At
+    // concurrent=5 this blew past the container's pids limit (~1200-1600
+    // threads) and downloads never progressed. The vendored crate adds a
+    // peer-registry cap as a second line of defence, but the seakarr-side
+    // default must stay at 1.
+    #[test]
+    fn test_default_concurrency_is_thread_safe() {
+        let config = Config::default();
+        assert_eq!(
+            config.download.concurrent, 1,
+            "default concurrency must stay at 1 — see the thread-explosion regression notes"
+        );
+    }
+
+    #[test]
     fn test_load_config_from_yaml() {
         let dir = TempDir::new().unwrap();
         let yaml_path = dir.path().join("seakarr.yml");
@@ -615,7 +680,7 @@ daemon:
         // Default values
         assert_eq!(config.soulseek.server, "server.slsknet.org:2242");
         assert_eq!(config.search.timeout_secs, 15);
-        assert_eq!(config.download.concurrent, 5);
+        assert_eq!(config.download.concurrent, 1);
     }
 
     #[test]

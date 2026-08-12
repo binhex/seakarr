@@ -1882,9 +1882,10 @@ dependencies = [
 
 [[package]]
 name = "soulseek-rs-lib"
-version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c75f3363ab7284314b54dd0271bea29a0a35c3a34c00faa768247adae9bcad"
+version = "14.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "stable_deref_trait"

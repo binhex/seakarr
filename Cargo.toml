@@ -3,12 +3,19 @@ name = "seakarr"
 version = "0.2.0"
 edition = "2021"
 
+# The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
+# root runs its behavioral regression tests (peer cap, FIFO eviction, zombie
+# eviction) — a patch-only dependency would build it but never test it.
+[workspace]
+members = [".", "vendor/soulseek-rs-lib"]
+default-members = [".", "vendor/soulseek-rs-lib"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 config = "0.14"
-soulseek-rs-lib = "8"
+soulseek-rs-lib = { path = "vendor/soulseek-rs-lib" }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 lofty = "0.21"

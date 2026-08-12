@@ -1,0 +1,2288 @@
+//! End-to-end integration tests against a real Soulseek server (soulfind).
+//!
+//! These tests are SERVER-OPTIONAL so `cargo test` stays green everywhere:
+//!   * If `SOULSEEK_TEST_SERVER=host:port` is set, they connect to it.
+//!   * Else if a soulfind binary is found (via `SOULFIND_BIN`, or a sibling
+//!     `../soulfind/bin/soulfind` checkout), they spawn it on an ephemeral port
+//!     with a throwaway database.
+//!   * Else they SKIP with a printed notice (the test still passes).
+//!
+//! To run them against a locally built soulfind:
+//! ```sh
+//! SOULFIND_BIN=/path/to/soulfind \
+//!   cargo test -p soulseek-rs-lib --test e2e -- --nocapture
+//! ```
+//!
+//! No external crates are used — the library forbids dependencies, so the
+//! harness sticks to `std` and the library's own public API.
+
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
+
+use soulseek_rs::message::Message;
+use soulseek_rs::message::server::MessageFactory;
+use soulseek_rs::peer::ConnectionType;
+use soulseek_rs::{
+    Client, ClientSettings, ClientVersion, DownloadStatus, PeerAddress, SessionLoss, UploadStatus,
+};
+
+/// Only one test at a time may drive a server.
+///
+/// Each of these tests runs its own soulfind plus real clients and, for the
+/// queue tests, peer sockets held open on purpose. Letting the harness start a
+/// handful of those at once starves them, and a login that goes unanswered
+/// fails a test for a reason that has nothing to do with the code under test:
+/// seen on CI as `login: Timeout` in two download tests that the change under
+/// test never went near. The CLI suite already carries this gate for the same
+/// reason.
+static SERVER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A Soulseek server to test against: either a child soulfind process we
+/// spawned, or an external server referenced by `SOULSEEK_TEST_SERVER`.
+struct TestServer {
+    host: String,
+    port: u16,
+    child: Option<Child>,
+    db: Option<PathBuf>,
+    _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+impl TestServer {
+    /// Resolve a server to test against, or `None` if the suite should skip.
+    fn resolve() -> Option<Self> {
+        // A test that panicked while holding the gate poisoned it; the lock
+        // guards nothing but scheduling, so take it back and carry on.
+        let gate = SERVER_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Ok(addr) = std::env::var("SOULSEEK_TEST_SERVER") {
+            let (host, port) = addr.rsplit_once(':')?;
+            let port = port.parse().ok()?;
+            wait_until_listening(host, port, Duration::from_secs(2))?;
+            return Some(Self {
+                host: host.to_string(),
+                port,
+                child: None,
+                db: None,
+                _gate: gate,
+            });
+        }
+        Self::spawn(gate)
+    }
+
+    /// Spawn a local soulfind on an ephemeral port with a throwaway database.
+    fn spawn(gate: std::sync::MutexGuard<'static, ()>) -> Option<Self> {
+        let bin = soulfind_binary()?;
+        let port = free_port()?;
+        let db = std::env::temp_dir().join(format!("soulfind-e2e-{port}.db"));
+        let _ = std::fs::remove_file(&db);
+
+        let mut child = Command::new(&bin)
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-d")
+            .arg(&db)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        if wait_until_listening("127.0.0.1", port, Duration::from_secs(5)).is_none() {
+            // Server never came up (e.g. a toolchain/SQLite issue); skip.
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        Some(Self {
+            host: "127.0.0.1".to_string(),
+            port,
+            child: Some(child),
+            db: Some(db),
+            _gate: gate,
+        })
+    }
+
+    fn settings(&self, username: &str, password: &str) -> ClientSettings {
+        ClientSettings {
+            username: username.to_string(),
+            password: password.to_string(),
+            server_address: PeerAddress::new(self.host.clone(), self.port),
+            enable_listen: false,
+            listen_port: 0,
+            shared_directories: Vec::new(),
+            version: ClientVersion::default(),
+        }
+    }
+
+    /// Settings with the peer listener enabled on `port`, exercising the
+    /// `SetWaitPort` step of the post-login handshake.
+    fn listening_settings(&self, username: &str, password: &str, port: u16) -> ClientSettings {
+        ClientSettings {
+            enable_listen: true,
+            listen_port: port,
+            ..self.settings(username, password)
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(db) = self.db.as_ref() {
+            let _ = std::fs::remove_file(db);
+        }
+    }
+}
+
+fn soulfind_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SOULFIND_BIN") {
+        let p = PathBuf::from(p);
+        return p.exists().then_some(p);
+    }
+    // Fall back to a `soulfind/bin/soulfind` checkout somewhere above this
+    // workspace (the workspace may be nested, e.g. under `.../src/rust/`).
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .map(|dir| dir.join("soulfind/bin/soulfind"))
+        .find(|candidate| candidate.exists())
+}
+
+fn free_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    listener.local_addr().ok().map(|addr| addr.port())
+}
+
+fn wait_until_listening(host: &str, port: u16, timeout: Duration) -> Option<()> {
+    let addr = format!("{host}:{port}");
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(mut addrs) = addr.to_socket_addrs()
+            && let Some(sa) = addrs.next()
+            && TcpStream::connect_timeout(&sa, Duration::from_millis(200)).is_ok()
+        {
+            return Some(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// Resolve a test server or return early with a skip notice.
+///
+/// Set `SOULSEEK_E2E_REQUIRED=1` (as CI does) to turn a missing server into a
+/// hard failure instead of a silent skip, so the suite genuinely runs there.
+macro_rules! server_or_skip {
+    () => {
+        match TestServer::resolve() {
+            Some(server) => server,
+            None => {
+                let required =
+                    std::env::var("SOULSEEK_E2E_REQUIRED").is_ok_and(|v| v != "0" && !v.is_empty());
+                assert!(
+                    !required,
+                    "SOULSEEK_E2E_REQUIRED is set but no soulfind server could \
+                     be started (set SOULFIND_BIN or SOULSEEK_TEST_SERVER)"
+                );
+                println!(
+                    "e2e skipped: no soulfind server (set SOULFIND_BIN or \
+                     SOULSEEK_TEST_SERVER to run)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+#[test]
+fn connect_and_login_succeed() {
+    let server = server_or_skip!();
+    let mut client = Client::with_settings(server.settings("e2e_user", "e2e_pw"));
+    client.connect().expect("connect to soulfind");
+    let logged_in = client.login().expect("login to soulfind");
+    assert!(logged_in, "login should succeed (soulfind auto-registers)");
+}
+
+#[test]
+fn search_round_trips_without_error() {
+    let server = server_or_skip!();
+    let mut client = Client::with_settings(server.settings("e2e_search", "e2e_pw"));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    // A fresh server has no shared files, so the search simply has to
+    // round-trip without error and leave an (empty) queryable result set.
+    let query = "nonexistent query xyzzy";
+    let _ = client.search(query, Duration::from_secs(2));
+    assert!(client.get_search_results(query).is_empty());
+
+    // The search must also be tracked in client state under its key, proving
+    // the request was actually registered and not silently dropped.
+    assert!(
+        client.get_all_searches().contains_key(query),
+        "the issued search should be registered under its query key"
+    );
+}
+
+#[test]
+fn a_search_is_forwarded_to_a_connected_peer() {
+    let server = server_or_skip!();
+
+    // The server distributes each search to other connected users, so a second
+    // client exercises the *incoming* FileSearch handler. We can't observe that
+    // handler's state directly, but if it mishandled the forwarded bytes it
+    // would take the receiver's session down — so we prove the receiver is
+    // still alive afterwards by round-tripping its own search.
+    let mut searcher = Client::with_settings(server.settings("e2e_searcher", "pw"));
+    let mut receiver = Client::with_settings(server.settings("e2e_receiver", "pw"));
+    searcher.connect().expect("searcher connect");
+    receiver.connect().expect("receiver connect");
+    assert!(searcher.login().expect("searcher login"));
+    assert!(receiver.login().expect("receiver login"));
+
+    let _ = searcher.search("some shared song", Duration::from_secs(2));
+
+    // Receiver stays functional after handling the forwarded search.
+    let probe = "receiver still alive";
+    let _ = receiver.search(probe, Duration::from_secs(2));
+    assert!(receiver.get_all_searches().contains_key(probe));
+}
+
+#[test]
+fn a_private_message_is_delivered_between_users() {
+    let server = server_or_skip!();
+
+    // Two logged-in users, one messages the other through the server.
+    let mut alice = Client::with_settings(server.settings("e2e_alice_pm", "pw"));
+    let mut bob = Client::with_settings(server.settings("e2e_bob_pm", "pw"));
+    alice.connect().expect("alice connect");
+    bob.connect().expect("bob connect");
+    assert!(alice.login().expect("alice login"));
+    assert!(bob.login().expect("bob login"));
+
+    let body = "hello bob, this is alice";
+    alice
+        .send_private_message("e2e_bob_pm", body)
+        .expect("send private message");
+
+    // Delivery is asynchronous; poll Bob's inbox until the message arrives.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut received = Vec::new();
+    while Instant::now() < deadline {
+        received.extend(bob.take_private_messages());
+        if !received.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let message = received
+        .iter()
+        .find(|m| m.message() == body)
+        .expect("bob should receive alice's message");
+    assert_eq!(message.username(), "e2e_alice_pm");
+}
+
+#[test]
+fn a_chat_room_message_is_delivered_between_users() {
+    use soulseek_rs::types::RoomEvent;
+    let server = server_or_skip!();
+
+    let room = "e2e_room_chat";
+    let mut alice = Client::with_settings(server.settings("e2e_alice_room", "pw"));
+    let mut bob = Client::with_settings(server.settings("e2e_bob_room", "pw"));
+    alice.connect().expect("alice connect");
+    bob.connect().expect("bob connect");
+    assert!(alice.login().expect("alice login"));
+    assert!(bob.login().expect("bob login"));
+
+    alice.join_room(room).expect("alice joins room");
+    bob.join_room(room).expect("bob joins room");
+
+    // Give both joins time to register on the server before speaking.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = alice.take_room_events();
+    let _ = bob.take_room_events();
+
+    let body = "hello room, this is alice";
+    alice.say_in_room(room, body).expect("alice says in room");
+
+    // Delivery is asynchronous; poll Bob's room events until the message lands.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = None;
+    while Instant::now() < deadline {
+        for event in bob.take_room_events() {
+            if let RoomEvent::Message {
+                room: r,
+                username,
+                message,
+            } = event
+                && r == room
+                && message == body
+            {
+                got = Some(username);
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert_eq!(
+        got.as_deref(),
+        Some("e2e_alice_room"),
+        "bob should receive alice's room message"
+    );
+}
+
+#[test]
+fn the_room_list_includes_a_joined_room() {
+    let server = server_or_skip!();
+
+    let room = "e2e_room_listed";
+    let mut alice = Client::with_settings(server.settings("e2e_alice_list", "pw"));
+    alice.connect().expect("alice connect");
+    assert!(alice.login().expect("alice login"));
+    alice.join_room(room).expect("alice joins room");
+
+    // Once a user is in the room the server should advertise it in RoomList.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut listed = false;
+    while Instant::now() < deadline {
+        alice.request_room_list().expect("request room list");
+        std::thread::sleep(Duration::from_millis(250));
+        if alice.room_list().iter().any(|r| r.name == room) {
+            listed = true;
+            break;
+        }
+    }
+    assert!(listed, "the joined room should appear in the room list");
+}
+
+#[test]
+fn login_succeeds_with_listener_enabled() {
+    let server = server_or_skip!();
+
+    // With the listener enabled the client also sends SetWaitPort during the
+    // post-login handshake; the server must accept it and keep the session.
+    let port = free_port().expect("free listener port");
+    let mut client = Client::with_settings(server.listening_settings("e2e_listener", "pw", port));
+    client.connect().expect("connect with listener");
+    assert!(
+        client.login().expect("login with listener enabled"),
+        "the handshake including SetWaitPort should still log in"
+    );
+}
+
+#[test]
+fn wrong_password_is_rejected() {
+    let server = server_or_skip!();
+
+    // soulfind auto-registers a username on first login and binds it to that
+    // password, so a second login with a different password must be rejected.
+    let user = "e2e_pw_user";
+    let mut first = Client::with_settings(server.settings(user, "correct-horse"));
+    first.connect().expect("connect (registering login)");
+    assert!(
+        first.login().expect("first login"),
+        "registration should log in"
+    );
+    drop(first);
+
+    let mut second = Client::with_settings(server.settings(user, "wrong-password"));
+    second.connect().expect("connect (wrong password)");
+    // The server may signal rejection either as a non-success status or as an
+    // authentication error; both mean "not logged in", only `Ok(true)` accepts.
+    assert!(
+        !matches!(second.login(), Ok(true)),
+        "a mismatched password must not be accepted"
+    );
+}
+
+#[test]
+fn registered_username_can_relogin_with_same_password() {
+    let server = server_or_skip!();
+
+    // The TUI's stored-credentials flow depends on this pair of server
+    // behaviors: a fresh username is registered by simply logging in, and a
+    // later session (a "restart") with the same credentials is accepted.
+    let user = "e2e_relogin_user";
+    let mut first = Client::with_settings(server.settings(user, "pw-123"));
+    first.connect().expect("connect (registering login)");
+    assert!(
+        first.login().expect("registering login"),
+        "a fresh username should be auto-registered"
+    );
+    drop(first);
+
+    let mut second = Client::with_settings(server.settings(user, "pw-123"));
+    second.connect().expect("connect (relogin)");
+    assert!(
+        second.login().expect("relogin"),
+        "the same credentials must log in again after a restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Peer-to-peer download coverage.
+//
+// The client cannot serve files (the upload side is not implemented), so a real
+// download is exercised with a minimal in-process "mock uploader" that speaks
+// the peer protocol using the library's own public `Message` wire format. It
+// drives the same path a real peer would after a search: a `P` control
+// connection to our listener, a `QueueUpload` → `TransferRequest` →
+// `TransferResponse` negotiation, then an `F` connection that streams the bytes.
+// ---------------------------------------------------------------------------
+
+/// Configuration for a one-shot mock uploader.
+struct MockUpload {
+    listen_addr: String,
+    peer_username: String,
+    filename: String,
+    content: Vec<u8>,
+    token: u32,
+    ready: Sender<()>,
+}
+
+/// Build a `PeerInit` (peer code 1) frame: `[len][1][username][conn_type][token]`.
+fn peer_init_bytes(username: &str, conn_type: &str, token: u32) -> Vec<u8> {
+    let mut m = Message::new();
+    m.write_int8(1)
+        .write_string(username)
+        .write_string(conn_type)
+        .write_int32(token);
+    m.get_buffer()
+}
+
+/// Read one length-prefixed peer message (`[len:4 LE][payload]`) from a blocking
+/// stream. The returned `Message` keeps the length prefix, so `get_message_code`
+/// and `set_pointer(8)` behave exactly as they do inside the library.
+fn read_framed(stream: &mut TcpStream) -> std::io::Result<Message> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    let mut data = len_buf.to_vec();
+    data.extend_from_slice(&payload);
+    Ok(Message::new_with_data(data))
+}
+
+fn connect_retry(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn run_mock_uploader(cfg: &MockUpload) -> std::io::Result<u64> {
+    // 1. P (control) connection: register ourselves with the downloader.
+    let mut p = connect_retry(&cfg.listen_addr, Duration::from_secs(5))?;
+    p.set_read_timeout(Some(Duration::from_secs(10)))?;
+    p.write_all(&peer_init_bytes(&cfg.peer_username, "P", 0))?;
+    p.flush()?;
+    let _ = cfg.ready.send(());
+
+    // 2. Wait for the downloader's QueueUpload (peer code 43).
+    loop {
+        let mut msg = read_framed(&mut p)?;
+        if msg.get_message_code() == 43 {
+            msg.set_pointer(8);
+            let _requested = msg.read_string();
+            break;
+        }
+    }
+
+    // 3. Offer the transfer with a TransferRequest (peer code 40). The size here
+    //    becomes the download's expected size, so it must match the content.
+    let mut tr = Message::new();
+    tr.write_int32(40)
+        .write_int32(1) // direction: upload
+        .write_int32(cfg.token)
+        .write_string(&cfg.filename)
+        .write_int64(cfg.content.len() as u64);
+    p.write_all(&tr.get_buffer())?;
+    p.flush()?;
+
+    // 4. Wait for the downloader to allow it (TransferResponse, peer code 41).
+    loop {
+        let msg = read_framed(&mut p)?;
+        if msg.get_message_code() == 41 {
+            break;
+        }
+    }
+
+    // 5. Open the F (file) connection to the downloader's listener and stream.
+    serve_file_over_f(
+        &cfg.listen_addr,
+        &cfg.peer_username,
+        cfg.token,
+        &cfg.content,
+    )
+}
+
+/// Open an F (file transfer) connection to `downloader_addr` and stream
+/// `content`. PeerInit(F) and the 4-byte transfer token are written together so
+/// the token lands in the listener's read buffer, where the download is looked
+/// up by token; the downloader then sends an 8-byte START_DOWNLOAD offset before
+/// we send the bytes.
+///
+/// Like a real peer, only the bytes past that offset are sent. Returns the
+/// offset the downloader asked for.
+fn serve_file_over_f(
+    downloader_addr: &str,
+    username: &str,
+    token: u32,
+    content: &[u8],
+) -> std::io::Result<u64> {
+    let mut f = connect_retry(downloader_addr, Duration::from_secs(5))?;
+    f.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut init = peer_init_bytes(username, "F", token);
+    init.extend_from_slice(&token.to_le_bytes());
+    f.write_all(&init)?;
+    f.flush()?;
+
+    let mut start = [0u8; 8];
+    f.read_exact(&mut start)?;
+    let offset = u64::from_le_bytes(start);
+    f.write_all(&content[offset as usize..])?;
+    f.flush()?;
+
+    // Keep the connection open briefly so the reader drains everything.
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(offset)
+}
+
+/// Log a raw socket in to the server and drain up to the login response,
+/// returning the still-open stream (the user stays online while it lives).
+fn login_raw(server_addr: &str, username: &str, password: &str) -> std::io::Result<TcpStream> {
+    let mut srv = connect_retry(server_addr, Duration::from_secs(5))?;
+    srv.set_read_timeout(Some(Duration::from_secs(10)))?;
+    srv.write_all(
+        &MessageFactory::build_login_message(username, password, ClientVersion::default())
+            .get_buffer(),
+    )?;
+    srv.flush()?;
+    loop {
+        let msg = read_framed(&mut srv)?;
+        if msg.get_message_code() == 1 {
+            break;
+        }
+    }
+    Ok(srv)
+}
+
+/// Read framed messages from `stream` until one has `code`, or the deadline
+/// passes. Returns the matching message.
+fn read_until_code(stream: &mut TcpStream, code: u8, timeout: Duration) -> Option<Message> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match read_framed(stream) {
+            Ok(msg) if msg.get_message_code() == code => return Some(msg),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Like [`read_until_code`] but turns a miss into an `io::Error` for `?`.
+fn expect_code(stream: &mut TcpStream, code: u8, timeout: Duration) -> std::io::Result<Message> {
+    read_until_code(stream, code, timeout).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out waiting for message code {code}"),
+        )
+    })
+}
+
+/// Wait for a download to reach `Completed`, watching both its status channel
+/// and the client's download list (whichever reports first). Returns false if it
+/// fails, times out, or the deadline passes.
+fn wait_for_completion(
+    client: &Client,
+    status_rx: &Receiver<DownloadStatus>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match status_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(DownloadStatus::Completed) => return true,
+            Ok(DownloadStatus::Failed(_) | DownloadStatus::TimedOut) => {
+                return false;
+            }
+            _ => {}
+        }
+        if client
+            .get_all_downloads()
+            .iter()
+            .any(|d| matches!(d.status, DownloadStatus::Completed))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn unique_download_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "soulseek-e2e-dl-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn a_file_downloads_from_a_peer_over_p_and_f_connections() {
+    let server = server_or_skip!();
+
+    // Downloader: connected to the server with its peer listener enabled.
+    let listen_port = free_port().expect("free listen port");
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_downloader", "pw", listen_port));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    let filename = "mock_song.mp3";
+    let content: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let size = content.len() as u64;
+    let token = 424_242_u32;
+    let download_dir = unique_download_dir();
+
+    // Start the mock uploader; it signals once its P connection is established.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let cfg = MockUpload {
+        listen_addr: format!("127.0.0.1:{listen_port}"),
+        peer_username: "e2e_mockpeer".to_string(),
+        filename: filename.to_string(),
+        content: content.clone(),
+        token,
+        ready: ready_tx,
+    };
+    let uploader = std::thread::spawn(move || {
+        if let Err(e) = run_mock_uploader(&cfg) {
+            eprintln!("[mock uploader] {e}");
+        }
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mock uploader P connection");
+
+    // The listener registers an incoming peer under its plain username; give
+    // that registration a moment to complete before queuing the download.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (_download, status_rx) = client
+        .download(
+            filename.to_string(),
+            "e2e_mockpeer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&client, &status_rx, Duration::from_secs(20));
+    let _ = uploader.join();
+
+    assert!(completed, "the download should reach Completed");
+
+    let written = std::fs::read(download_dir.join(filename)).expect("downloaded file should exist");
+    assert_eq!(written, content, "downloaded bytes should match the source");
+
+    let _ = std::fs::remove_dir_all(&download_dir);
+}
+
+#[test]
+fn an_interrupted_download_resumes_from_its_partial_file() {
+    let server = server_or_skip!();
+
+    let listen_port = free_port().expect("free listen port");
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_resume_dl", "pw", listen_port));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    let filename = "resumed_song.mp3";
+    let content: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let size = content.len() as u64;
+    let already_have = 800usize;
+    let download_dir = unique_download_dir();
+
+    // Stand in for a transfer that died after 800 of 2000 bytes.
+    std::fs::write(
+        download_dir.join(format!("{filename}.part")),
+        &content[..already_have],
+    )
+    .expect("seed the partial file");
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let cfg = MockUpload {
+        listen_addr: format!("127.0.0.1:{listen_port}"),
+        peer_username: "e2e_resume_peer".to_string(),
+        filename: filename.to_string(),
+        content: content.clone(),
+        token: 424_243_u32,
+        ready: ready_tx,
+    };
+    let (offset_tx, offset_rx) = std::sync::mpsc::channel();
+    let uploader = std::thread::spawn(move || match run_mock_uploader(&cfg) {
+        Ok(offset) => {
+            let _ = offset_tx.send(offset);
+        }
+        Err(e) => eprintln!("[mock uploader] {e}"),
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mock uploader P connection");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (_download, status_rx) = client
+        .download(
+            filename.to_string(),
+            "e2e_resume_peer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&client, &status_rx, Duration::from_secs(20));
+    let _ = uploader.join();
+
+    assert!(completed, "the resumed download should reach Completed");
+    assert_eq!(
+        offset_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(already_have as u64),
+        "the peer should be asked to start past the bytes we already had"
+    );
+    assert_eq!(
+        std::fs::read(download_dir.join(filename)).expect("downloaded file should exist"),
+        content,
+        "the resumed prefix and the fetched tail should form the whole file"
+    );
+    assert!(
+        !download_dir.join(format!("{filename}.part")).exists(),
+        "the .part should be renamed away once complete"
+    );
+
+    let _ = std::fs::remove_dir_all(&download_dir);
+}
+
+#[test]
+fn soulfind_brokers_connect_to_peer_between_users() {
+    // The firewalled download mode relies on the server forwarding a
+    // ConnectToPeer request to the target user. Confirm soulfind does this: a
+    // requester (with a wait port so the server knows its address) asks the
+    // server to broker a connection to an online target, and the target must
+    // receive a forwarded ConnectToPeer (server code 18) naming the requester.
+    let server = server_or_skip!();
+    let addr = format!("{}:{}", server.host, server.port);
+
+    let mut target = login_raw(&addr, "e2e_broker_target", "pw").expect("target login");
+
+    let mut requester = login_raw(&addr, "e2e_broker_req", "pw").expect("requester login");
+    let req_port = free_port().expect("free port");
+    requester
+        .write_all(&MessageFactory::build_set_wait_port_message(req_port).get_buffer())
+        .expect("set wait port");
+    requester.flush().expect("flush wait port");
+
+    let token = 987_654_u32;
+    requester
+        .write_all(
+            &MessageFactory::build_connect_to_peer(token, "e2e_broker_target", ConnectionType::P)
+                .get_buffer(),
+        )
+        .expect("send ConnectToPeer");
+    requester.flush().expect("flush ConnectToPeer");
+
+    let mut brokered = read_until_code(&mut target, 18, Duration::from_secs(5))
+        .expect("target should receive a brokered ConnectToPeer");
+    brokered.set_pointer(8);
+    assert_eq!(
+        brokered.read_string(),
+        "e2e_broker_req",
+        "the brokered message should name the requester"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct-connection download: the client initiates the peer connection.
+//
+// Here the mock is a server-registered peer. It logs in to soulfind and
+// advertises a listen port (SetWaitPort), so when our client asks the server
+// for the peer's address (GetPeerAddress) and dials it directly, the mock
+// accepts that inbound P connection and then serves the file. This exercises
+// the outbound PeerInit handshake and the auto-connecting download() path.
+// ---------------------------------------------------------------------------
+
+struct MockDirectUpload {
+    server_addr: String,
+    username: String,
+    password: String,
+    listen_port: u16,
+    downloader_listen_addr: String,
+    downloader_username: String,
+    filename: String,
+    content: Vec<u8>,
+    token: u32,
+    ready: Sender<()>,
+    /// Hang up the control connection before streaming, the way clients that
+    /// drop idle peer sockets do while a transfer runs on its own connection.
+    close_control_first: bool,
+}
+
+fn run_mock_direct_peer(cfg: &MockDirectUpload) -> std::io::Result<()> {
+    // 1. Log in to the server so it knows this user is online.
+    let mut srv = connect_retry(&cfg.server_addr, Duration::from_secs(5))?;
+    srv.set_read_timeout(Some(Duration::from_secs(10)))?;
+    srv.write_all(
+        &MessageFactory::build_login_message(
+            &cfg.username,
+            &cfg.password,
+            ClientVersion::default(),
+        )
+        .get_buffer(),
+    )?;
+    srv.flush()?;
+    loop {
+        let msg = read_framed(&mut srv)?;
+        if msg.get_message_code() == 1 {
+            break; // login response
+        }
+    }
+
+    // 2. Bind the peer listener, then advertise its port so the server can hand
+    //    our address to the downloader. Bind all interfaces: soulfind reports
+    //    the host's LAN address (not 127.0.0.1), and the downloader dials that.
+    let listener = std::net::TcpListener::bind(("0.0.0.0", cfg.listen_port))?;
+    srv.write_all(&MessageFactory::build_set_wait_port_message(cfg.listen_port).get_buffer())?;
+    srv.flush()?;
+    let _ = cfg.ready.send(());
+
+    // 3. Accept the downloader's inbound P (control) connection and validate its
+    //    PeerInit (peer code 1, int8 code so the fields start at offset 5). The
+    //    accept is bounded so a misrouted connection fails the test instead of
+    //    hanging it.
+    listener.set_nonblocking(true)?;
+    let accept_deadline = Instant::now() + Duration::from_secs(15);
+    let (mut p, _addr) = loop {
+        match listener.accept() {
+            Ok(pair) => break pair,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= accept_deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "no inbound P connection from the downloader",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    p.set_nonblocking(false)?;
+    p.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut init = read_framed(&mut p)?;
+    assert_eq!(init.get_message_code(), 1, "expected inbound PeerInit");
+    init.set_pointer(5);
+    assert_eq!(init.read_string(), cfg.downloader_username, "PeerInit user");
+    assert_eq!(init.read_string(), "P", "PeerInit connection type");
+
+    // 4. Negotiate the transfer exactly as in the passive path.
+    loop {
+        let mut msg = read_framed(&mut p)?;
+        if msg.get_message_code() == 43 {
+            msg.set_pointer(8);
+            let _requested = msg.read_string();
+            break;
+        }
+    }
+    let mut tr = Message::new();
+    tr.write_int32(40)
+        .write_int32(1)
+        .write_int32(cfg.token)
+        .write_string(&cfg.filename)
+        .write_int64(cfg.content.len() as u64);
+    p.write_all(&tr.get_buffer())?;
+    p.flush()?;
+    loop {
+        let msg = read_framed(&mut p)?;
+        if msg.get_message_code() == 41 {
+            break; // TransferResponse
+        }
+    }
+
+    if cfg.close_control_first {
+        drop(p);
+        // Give the downloader time to notice the hangup before the bytes move,
+        // so the test measures what it does about it rather than outrunning it.
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    // 5. Stream the bytes over an F connection to the downloader's listener.
+    //    `srv` stays in scope so the peer remains online for the whole transfer.
+    serve_file_over_f(
+        &cfg.downloader_listen_addr,
+        &cfg.username,
+        cfg.token,
+        &cfg.content,
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn a_file_downloads_from_a_peer_via_direct_connection() {
+    let server = server_or_skip!();
+
+    // Downloader with a listener enabled (needed for the F leg).
+    let client_port = free_port().expect("free client listen port");
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_direct_dl", "pw", client_port));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    let mock_port = free_port().expect("free mock listen port");
+    let filename = "direct_song.mp3";
+    let content: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let size = content.len() as u64;
+    let token = 515_151_u32;
+    let download_dir = unique_download_dir();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let cfg = MockDirectUpload {
+        server_addr: format!("{}:{}", server.host, server.port),
+        username: "e2e_directpeer".to_string(),
+        password: "pw".to_string(),
+        listen_port: mock_port,
+        downloader_listen_addr: format!("127.0.0.1:{client_port}"),
+        downloader_username: "e2e_direct_dl".to_string(),
+        filename: filename.to_string(),
+        content: content.clone(),
+        token,
+        ready: ready_tx,
+        close_control_first: false,
+    };
+    let uploader = std::thread::spawn(move || {
+        if let Err(e) = run_mock_direct_peer(&cfg) {
+            eprintln!("[mock direct peer] {e}");
+        }
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("mock direct peer ready");
+    // Let the server finish processing SetWaitPort before we resolve the address.
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Target the plain username so download() takes the direct-connect path.
+    let (_download, status_rx) = client
+        .download(
+            filename.to_string(),
+            "e2e_directpeer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&client, &status_rx, Duration::from_secs(20));
+    let _ = uploader.join();
+
+    assert!(completed, "the direct download should reach Completed");
+
+    let written = std::fs::read(download_dir.join(filename)).expect("downloaded file should exist");
+    assert_eq!(written, content, "downloaded bytes should match the source");
+
+    let _ = std::fs::remove_dir_all(&download_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Firewalled download: the peer is unreachable directly, so the connection is
+// brokered through the server.
+//
+// The mock advertises a port nobody listens on, so the downloader's direct
+// connection fails. The client then asks the server to broker the connection
+// (ConnectToPeer); the mock, reading its server stream, sees the forwarded
+// request and connects back to the downloader with a PierceFirewall. That
+// pierced connection becomes the P control channel, and the file is served.
+// ---------------------------------------------------------------------------
+
+struct MockFirewalledUpload {
+    server_addr: String,
+    username: String,
+    password: String,
+    bogus_port: u16,
+    downloader_listen_addr: String,
+    filename: String,
+    content: Vec<u8>,
+    token: u32,
+    ready: Sender<()>,
+}
+
+fn run_mock_firewalled_peer(cfg: &MockFirewalledUpload) -> std::io::Result<()> {
+    // 1. Log in and advertise a port that nobody listens on, so the downloader's
+    //    direct connection is refused and it falls back to server brokering.
+    let mut srv = login_raw(&cfg.server_addr, &cfg.username, &cfg.password)?;
+    srv.write_all(&MessageFactory::build_set_wait_port_message(cfg.bogus_port).get_buffer())?;
+    srv.flush()?;
+    let _ = cfg.ready.send(());
+
+    // 2. Wait for the server-brokered ConnectToPeer (server code 18) and read
+    //    the correlation token (after username, type, ip and port).
+    let mut ctp = expect_code(&mut srv, 18, Duration::from_secs(15))?;
+    ctp.set_pointer(8);
+    let _who = ctp.read_string();
+    let _conn_type = ctp.read_string();
+    let _ip = ctp.read_int32();
+    let _port = ctp.read_int32();
+    let connect_token = ctp.read_int32();
+
+    // 3. Connect back to the downloader with a PierceFirewall (peer code 0);
+    //    this becomes the P control connection.
+    let mut p = connect_retry(&cfg.downloader_listen_addr, Duration::from_secs(5))?;
+    p.set_read_timeout(Some(Duration::from_secs(10)))?;
+    p.write_all(&MessageFactory::build_pierce_firewall_message(connect_token).get_buffer())?;
+    p.flush()?;
+
+    // 4. Negotiate the transfer over the pierced connection.
+    let _queue = expect_code(&mut p, 43, Duration::from_secs(10))?;
+    let mut tr = Message::new();
+    tr.write_int32(40)
+        .write_int32(1)
+        .write_int32(cfg.token)
+        .write_string(&cfg.filename)
+        .write_int64(cfg.content.len() as u64);
+    p.write_all(&tr.get_buffer())?;
+    p.flush()?;
+    let _response = expect_code(&mut p, 41, Duration::from_secs(10))?;
+
+    // 5. Serve the bytes over an F connection to the downloader's listener.
+    serve_file_over_f(
+        &cfg.downloader_listen_addr,
+        &cfg.username,
+        cfg.token,
+        &cfg.content,
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn a_file_downloads_from_a_firewalled_peer_via_server_broker() {
+    let server = server_or_skip!();
+
+    let client_port = free_port().expect("free client listen port");
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_fw_dl", "pw", client_port));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    let bogus_port = free_port().expect("bogus port"); // advertised, unlistened
+    let filename = "firewalled_song.mp3";
+    let content: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let size = content.len() as u64;
+    let token = 606_060_u32;
+    let download_dir = unique_download_dir();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let cfg = MockFirewalledUpload {
+        server_addr: format!("{}:{}", server.host, server.port),
+        username: "e2e_fw_peer".to_string(),
+        password: "pw".to_string(),
+        bogus_port,
+        downloader_listen_addr: format!("127.0.0.1:{client_port}"),
+        filename: filename.to_string(),
+        content: content.clone(),
+        token,
+        ready: ready_tx,
+    };
+    let uploader = std::thread::spawn(move || {
+        if let Err(e) = run_mock_firewalled_peer(&cfg) {
+            eprintln!("[mock firewalled peer] {e}");
+        }
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("mock firewalled peer ready");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let (_download, status_rx) = client
+        .download(
+            filename.to_string(),
+            "e2e_fw_peer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&client, &status_rx, Duration::from_secs(25));
+    let _ = uploader.join();
+
+    assert!(completed, "the firewalled download should reach Completed");
+
+    let written = std::fs::read(download_dir.join(filename)).expect("downloaded file should exist");
+    assert_eq!(written, content, "downloaded bytes should match the source");
+
+    let _ = std::fs::remove_dir_all(&download_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Two real clients: one shares a file, the other searches for it and downloads
+// it — the entire search + connect + upload/download stack, no mock peer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_real_clients_search_and_download() {
+    let server = server_or_skip!();
+
+    // Sharer with one distinctively named file.
+    let share_dir = unique_download_dir();
+    let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let filename = "e2e_probe_xyzzy.bin";
+    std::fs::write(share_dir.join(filename), &content).unwrap();
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_sharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    let leecher_port = free_port().expect("leecher port");
+    let mut leecher =
+        Client::with_settings(server.listening_settings("e2e_leecher", "pw", leecher_port));
+    leecher.connect().expect("leecher connect");
+    assert!(leecher.login().expect("leecher login"));
+
+    // Let soulfind register both SetWaitPorts before the search resolves peers.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let query = "xyzzy";
+    let _ = leecher.search(query, Duration::from_secs(3));
+
+    // Poll until the sharer's response for our file arrives.
+    let mut hit: Option<(String, u64)> = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && hit.is_none() {
+        for result in leecher.get_search_results(query) {
+            if result.username == "e2e_sharer" {
+                for file in &result.files {
+                    if file.name.contains("e2e_probe_xyzzy") {
+                        hit = Some((file.name.clone(), file.size));
+                    }
+                }
+            }
+        }
+        if hit.is_none() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let (result_path, size) = hit.expect("leecher should find the sharer's file");
+    assert_eq!(size, content.len() as u64);
+
+    // Download it from the sharer.
+    let download_dir = unique_download_dir();
+    let (_download, status_rx) = leecher
+        .download(
+            result_path.clone(),
+            "e2e_sharer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&leecher, &status_rx, Duration::from_secs(25));
+    assert!(completed, "the download should complete");
+
+    // The virtual path is backslash-separated; the saved file uses the basename.
+    let basename = result_path.rsplit(['\\', '/']).next().unwrap();
+    let written = std::fs::read(download_dir.join(basename)).expect("downloaded file should exist");
+    assert_eq!(written, content, "downloaded bytes should match the source");
+
+    // The uploader side tracked the transfer and saw it complete.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut uploads = sharer.uploads();
+    while Instant::now() < deadline
+        && !uploads
+            .iter()
+            .any(|u| u.status == soulseek_rs::types::UploadStatus::Completed)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+        uploads = sharer.uploads();
+    }
+    let upload = uploads
+        .iter()
+        .find(|u| u.status == soulseek_rs::types::UploadStatus::Completed)
+        .expect("uploader should record a completed upload");
+    assert_eq!(upload.username, "e2e_leecher");
+    assert_eq!(upload.bytes_sent, size);
+
+    let _ = std::fs::remove_dir_all(share_dir);
+    let _ = std::fs::remove_dir_all(download_dir);
+}
+
+#[test]
+fn a_runtime_share_update_is_visible_to_browsers() {
+    let server = server_or_skip!();
+
+    // The sharer starts sharing NOTHING, then adds a directory at runtime
+    // (what the TUI settings screen does).
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer =
+        Client::with_settings(server.listening_settings("e2e_reshare", "pw", sharer_port));
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+    assert!(sharer.shared_directories().is_empty());
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("new")).unwrap();
+    std::fs::write(share_dir.join("new").join("late.mp3"), b"yyyy").unwrap();
+    sharer
+        .set_shared_directories(vec![share_dir.display().to_string()])
+        .expect("runtime share update");
+    assert_eq!(sharer.shared_directories().len(), 1);
+
+    let browser_port = free_port().expect("browser port");
+    let mut browser =
+        Client::with_settings(server.listening_settings("e2e_reshare_browser", "pw", browser_port));
+    browser.connect().expect("browser connect");
+    assert!(browser.login().expect("browser login"));
+
+    std::thread::sleep(Duration::from_secs(1));
+    browser.browse_user("e2e_reshare").expect("browse request");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut listing = None;
+    while Instant::now() < deadline {
+        if let Some(result) = browser.take_browse_result("e2e_reshare") {
+            listing = Some(result);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let directories = listing.expect("browser should receive the listing");
+    assert!(
+        directories
+            .iter()
+            .any(|d| d.files.iter().any(|(name, _)| name == "late.mp3")),
+        "the listing should include the file shared at runtime"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+#[test]
+fn browse_a_peers_shared_files() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    std::fs::write(share_dir.join("album").join("track.flac"), b"xxxx").unwrap();
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_browsee", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    let browser_port = free_port().expect("browser port");
+    let mut browser =
+        Client::with_settings(server.listening_settings("e2e_browser", "pw", browser_port));
+    browser.connect().expect("browser connect");
+    assert!(browser.login().expect("browser login"));
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    browser.browse_user("e2e_browsee").expect("browse request");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut listing = None;
+    while Instant::now() < deadline {
+        if let Some(result) = browser.take_browse_result("e2e_browsee") {
+            listing = Some(result);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let directories = listing.expect("browser should receive the listing");
+    assert!(
+        directories
+            .iter()
+            .any(|d| { d.files.iter().any(|(name, _)| name == "track.flac") }),
+        "the listing should include the shared file"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+// Browsing a peer that is NOT listening exercises the server-brokered
+// (firewalled) path: the direct dial fails, the client asks the server to
+// broker, and the peer connects back to our listener. This is the path that
+// matters on the real network, where most peers are firewalled. The browser
+// MUST be listening so the peer can connect back.
+#[test]
+fn browse_a_firewalled_peer_via_broker() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    std::fs::write(share_dir.join("album").join("hidden.flac"), b"xxxx").unwrap();
+
+    // Sharer does NOT listen (firewalled): the browser's direct dial will fail,
+    // forcing the server-brokered connect-back.
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.settings("e2e_fw_sharer", "pw")
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    // Browser listens so the firewalled peer can connect back to it.
+    let browser_port = free_port().expect("browser port");
+    let mut browser =
+        Client::with_settings(server.listening_settings("e2e_fw_browser", "pw", browser_port));
+    browser.connect().expect("browser connect");
+    assert!(browser.login().expect("browser login"));
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    browser
+        .browse_user("e2e_fw_sharer")
+        .expect("browse request");
+
+    // The brokered round-trip has more hops; give it a generous deadline.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut listing = None;
+    while Instant::now() < deadline {
+        if let Some(result) = browser.take_browse_result("e2e_fw_sharer") {
+            listing = Some(result);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let directories = listing.expect("browser should receive the firewalled peer's listing");
+    assert!(
+        directories
+            .iter()
+            .any(|d| d.files.iter().any(|(name, _)| name == "hidden.flac")),
+        "the brokered listing should include the shared file"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+/// Browse `sharer_addr` exactly the way a third-party client (SoulseekQt,
+/// Nicotine+) does: dial the peer's listener directly, announce with a
+/// `PeerInit(P)`, ask for the share list (peer code 4) and read the
+/// `SharedFileListResponse` (peer code 5) back off the same socket.
+fn third_party_browse(
+    sharer_addr: &str,
+    username: &str,
+    read_delay: Duration,
+    timeout: Duration,
+) -> std::io::Result<Vec<soulseek_rs::SharedDirectory>> {
+    let mut p = connect_retry(sharer_addr, Duration::from_secs(5))?;
+    p.set_read_timeout(Some(timeout))?;
+    p.write_all(&peer_init_bytes(username, "P", 0))?;
+    p.write_all(&MessageFactory::build_get_share_file_list().get_buffer())?;
+    p.flush()?;
+
+    // A real peer is not always ready to drain the socket the instant the
+    // response starts arriving; a slow reader must not cost us the listing.
+    std::thread::sleep(read_delay);
+
+    let mut response = expect_code(&mut p, 5, timeout)?;
+    response.set_pointer(8);
+    Ok(soulseek_rs::message::peer::parse_shared_file_list(
+        &mut response,
+    ))
+}
+
+// A third-party client browsing us over a direct connection — the scenario of
+// running soulseek-rs and SoulseekQt side by side. The other two browse tests
+// only prove soulseek-rs can talk to itself.
+#[test]
+fn a_third_party_client_browses_our_shares_directly() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    std::fs::write(share_dir.join("album").join("track.flac"), b"xxxx").unwrap();
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_qt_sharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    // The browsing client is a real logged-in user, as SoulseekQt would be.
+    let server_addr = format!("{}:{}", server.host, server.port);
+    let _qt = login_raw(&server_addr, "e2e_qt_browser", "pw").expect("third-party client logs in");
+
+    let directories = third_party_browse(
+        &format!("127.0.0.1:{sharer_port}"),
+        "e2e_qt_browser",
+        Duration::ZERO,
+        Duration::from_secs(15),
+    )
+    .expect("third-party client should receive a SharedFileListResponse");
+
+    assert!(
+        directories
+            .iter()
+            .any(|d| d.files.iter().any(|(name, _)| name == "track.flac")),
+        "the listing should include the shared file, got {directories:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+// A third-party client that cannot dial us directly browses us through the
+// server broker: it asks the server to broker, we connect back with a
+// PierceFirewall, and it browses over that connection. This is the path a
+// second client on the same machine takes whenever the direct dial to our
+// advertised (public) address does not come back to us.
+#[test]
+fn a_third_party_client_browses_our_shares_via_the_server_broker() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    std::fs::write(share_dir.join("album").join("brokered.flac"), b"xxxx").unwrap();
+
+    // The sharer does not listen at all, so the browse can only be brokered.
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.settings("e2e_qt_brok_sharer", "pw")
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    // The third-party client listens and advertises its port, then asks the
+    // server to broker a P connection from the sharer.
+    //
+    // Bind every interface, not just loopback: the server brokers back the
+    // address it observed for this client, which is the host's routable IP
+    // (172.17.0.2 under Docker, 10.x on a CI runner), not 127.0.0.1. A
+    // loopback-only listener refuses that dial and the browse never arrives.
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("browser listener");
+    let browser_port = listener.local_addr().unwrap().port();
+    let server_addr = format!("{}:{}", server.host, server.port);
+    let mut srv =
+        login_raw(&server_addr, "e2e_qt_brok_browser", "pw").expect("third-party client logs in");
+    srv.write_all(&MessageFactory::build_set_wait_port_message(browser_port).get_buffer())
+        .expect("set wait port");
+    srv.flush().expect("flush wait port");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let token = 424_242_u32;
+    srv.write_all(
+        &MessageFactory::build_connect_to_peer(token, "e2e_qt_brok_sharer", ConnectionType::P)
+            .get_buffer(),
+    )
+    .expect("ask the server to broker");
+    srv.flush().expect("flush ConnectToPeer");
+
+    // The sharer must dial us back, quoting our correlation token.
+    listener.set_nonblocking(true).expect("non-blocking accept");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut accepted = None;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                accepted = Some(stream);
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    }
+    let mut p = accepted.expect("the sharer should connect back to us");
+    p.set_nonblocking(false).expect("blocking peer socket");
+    p.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("read timeout");
+
+    let mut pierce = read_framed(&mut p).expect("a PierceFirewall frame");
+    assert_eq!(
+        pierce.get_message_code(),
+        0,
+        "the brokered connect-back must start with a PierceFirewall"
+    );
+    pierce.set_pointer(5); // length prefix (4) + int8 code (1)
+    assert_eq!(
+        pierce.read_int32(),
+        token,
+        "the PierceFirewall must quote the token we brokered with"
+    );
+
+    p.write_all(&MessageFactory::build_get_share_file_list().get_buffer())
+        .expect("request the share list");
+    p.flush().expect("flush share list request");
+
+    let mut response = expect_code(&mut p, 5, Duration::from_secs(20))
+        .expect("a SharedFileListResponse over the brokered connection");
+    response.set_pointer(8);
+    let directories = soulseek_rs::message::peer::parse_shared_file_list(&mut response);
+
+    assert!(
+        directories
+            .iter()
+            .any(|d| d.files.iter().any(|(name, _)| name == "brokered.flac")),
+        "the brokered listing should include the shared file, got {directories:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+// Real peers connect to our listener and go away again (a dropped dial, a port
+// scan, a client that gave up). None of that may cost us the listener: the next
+// client to come along must still be able to browse.
+#[test]
+fn a_stalled_peer_connection_does_not_wedge_the_listener() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    std::fs::write(share_dir.join("album").join("still.flac"), b"xxxx").unwrap();
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_wedge_sharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    let sharer_addr = format!("127.0.0.1:{sharer_port}");
+
+    // A peer that connects and hangs up without ever sending a PeerInit.
+    drop(connect_retry(&sharer_addr, Duration::from_secs(5)).expect("dial the listener"));
+    // A peer that connects and then just sits there, saying nothing.
+    let _silent = connect_retry(&sharer_addr, Duration::from_secs(5)).expect("dial the listener");
+
+    let server_addr = format!("{}:{}", server.host, server.port);
+    let _qt =
+        login_raw(&server_addr, "e2e_wedge_browser", "pw").expect("third-party client logs in");
+
+    let directories = third_party_browse(
+        &sharer_addr,
+        "e2e_wedge_browser",
+        Duration::ZERO,
+        Duration::from_secs(15),
+    )
+    .expect("the listener must still serve browse requests");
+
+    assert!(
+        directories
+            .iter()
+            .any(|d| d.files.iter().any(|(name, _)| name == "still.flac")),
+        "the listing should include the shared file, got {directories:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+// The same direct browse against a share big enough that the response cannot
+// fit in one socket buffer. This is the realistic case: a shared music library
+// serialises to hundreds of KB, and the payload is zlib-STORED (not actually
+// compressed), so the listing goes out at full size.
+#[test]
+fn a_third_party_client_browses_a_large_share() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir().join("big");
+    let _ = std::fs::remove_dir_all(&share_dir);
+    std::fs::create_dir_all(&share_dir).unwrap();
+    // ~4000 entries with long names: well over any socket buffer once framed.
+    let padding = "x".repeat(150);
+    for i in 0..4000 {
+        std::fs::write(share_dir.join(format!("{padding}-{i:05}.flac")), b"z").unwrap();
+    }
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_qt_big_sharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    let server_addr = format!("{}:{}", server.host, server.port);
+    let _qt =
+        login_raw(&server_addr, "e2e_qt_big_browser", "pw").expect("third-party client logs in");
+
+    let directories = third_party_browse(
+        &format!("127.0.0.1:{sharer_port}"),
+        "e2e_qt_big_browser",
+        Duration::from_secs(1),
+        Duration::from_secs(20),
+    )
+    .expect("third-party client should receive the full large listing");
+
+    let file_count: usize = directories.iter().map(|d| d.files.len()).sum();
+    assert_eq!(
+        file_count, 4000,
+        "the whole listing must arrive, not just what fit in one socket buffer"
+    );
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+#[test]
+fn the_server_reports_another_users_status_and_share_counts() {
+    let server = server_or_skip!();
+
+    // A sharer with a known number of files, so the statistics are checkable.
+    let share_dir = unique_download_dir();
+    std::fs::create_dir_all(share_dir.join("album")).unwrap();
+    for name in ["one.flac", "two.flac"] {
+        std::fs::write(share_dir.join("album").join(name), b"xxxx").unwrap();
+    }
+    let mut subject = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.settings("e2e_info_subject", "pw")
+    });
+    subject.connect().expect("subject connect");
+    assert!(subject.login().expect("subject login"));
+
+    let mut asker = Client::with_settings(server.settings("e2e_info_asker", "pw"));
+    asker.connect().expect("asker connect");
+    assert!(asker.login().expect("asker login"));
+
+    asker
+        .request_user_info("e2e_info_subject")
+        .expect("ask about the subject");
+
+    // Status and statistics arrive as two separate replies.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut info = None;
+    while Instant::now() < deadline {
+        match asker.user_info("e2e_info_subject") {
+            Some(found) if found.is_complete() => {
+                info = Some(found);
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let info = info.expect("the server should answer with status and stats");
+
+    assert_eq!(info.username, "e2e_info_subject");
+    let presence = info.presence.expect("presence should have arrived");
+    assert!(
+        presence.status.is_reachable(),
+        "a logged-in user should not read as offline, got {}",
+        presence.status
+    );
+    let stats = info.stats.expect("stats should have arrived");
+    assert_eq!(stats.shared_files, 2, "the subject shares two files");
+    assert!(stats.shared_folders >= 1, "and at least one folder");
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+// --- upload slots and privilege recognition --------------------------------
+//
+// Soulseek's rules ask an alternative client to *recognise* privileges. That is
+// only observable if there is a queue to jump, so these tests hold the single
+// upload slot open with a peer that queues a file and then never answers the
+// TransferRequest — the same thing a stalled client does, and deterministic in
+// a way that racing real 4 KB transfers is not.
+
+/// A raw peer that logs in, dials our listener, queues `filename`, and then
+/// goes quiet. Returned so the caller can keep it alive: dropping the streams
+/// would release the slot it is holding.
+struct QueueingPeer {
+    _server: TcpStream,
+    peer: TcpStream,
+}
+
+impl QueueingPeer {
+    /// Wait for the upload offer (peer code 40) and deliberately not answer it.
+    ///
+    /// Receiving the offer is the only positive proof that this peer was given a
+    /// slot — an unaccepted offer never reaches `Client::uploads()`, and "has no
+    /// place in the queue" is also true of a peer that never asked, so polling
+    /// for that would pass against a completely broken pump.
+    fn takes_a_slot(&mut self) -> bool {
+        read_until_code(&mut self.peer, 40, Duration::from_secs(10)).is_some()
+    }
+}
+
+fn queue_as(
+    server_addr: &str,
+    listen_addr: &str,
+    username: &str,
+    filename: &str,
+) -> std::io::Result<QueueingPeer> {
+    let server = login_raw(server_addr, username, "pw")?;
+    let mut peer = connect_retry(listen_addr, Duration::from_secs(5))?;
+    peer.set_read_timeout(Some(Duration::from_secs(10)))?;
+    peer.write_all(&peer_init_bytes(username, "P", 0))?;
+    let mut queue = Message::new();
+    queue.write_int32(43).write_string(filename);
+    peer.write_all(&queue.get_buffer())?;
+    peer.flush()?;
+    Ok(QueueingPeer {
+        _server: server,
+        peer,
+    })
+}
+
+/// Wait for `check` to hold, polling the client's view of its own queue.
+fn wait_for(mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Where `username` sits in `sharer`'s upload queue, read the way the CLI reads
+/// it — through `uploads()` — rather than through a point query kept alive only
+/// for tests.
+fn place_of(sharer: &Client, username: &str, filename: &str) -> Option<u32> {
+    sharer.uploads().into_iter().find_map(|upload| {
+        match (upload.status, upload.username == username) {
+            (UploadStatus::Queued(place), true) if upload.filename == filename => Some(place),
+            _ => None,
+        }
+    })
+}
+
+/// Give `username` privileges in soulfind's own database.
+///
+/// `false` means it could not be done — an external server, or no `sqlite3` on
+/// this machine — which the caller treats as a skip rather than a failure.
+fn grant_privileges(server: &TestServer, username: &str) -> bool {
+    let Some(db) = server.db.as_ref() else {
+        return false;
+    };
+    // soulfind stores privileges as the unix timestamp they expire at.
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() + 86_400);
+    Command::new("sqlite3")
+        .arg(db)
+        .arg(format!(
+            "UPDATE users SET privileges = {expiry} WHERE username = \
+             '{username}';"
+        ))
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A share directory of its own, so the virtual paths a peer has to name are
+/// predictable: soulfind-facing paths are `<folder name>\<file>`.
+fn queue_share(label: &str, files: &[&str]) -> (PathBuf, String) {
+    // Keyed on the thread as well as the process, matching
+    // `unique_download_dir`: two tests are two threads, and a shared folder
+    // name would make their virtual paths collide.
+    let dir = std::env::temp_dir().join(format!(
+        "soulseek-e2e-queue-{label}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("share dir");
+    for name in files {
+        std::fs::write(dir.join(name), vec![9u8; 4096]).expect("share file");
+    }
+    let folder = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("utf-8 folder")
+        .to_string();
+    (dir, folder)
+}
+
+#[test]
+fn a_second_request_waits_when_the_only_upload_slot_is_taken() {
+    let server = server_or_skip!();
+    let (share, folder) = queue_share("slots", &["blocker.mp3", "waiter.mp3", "third.mp3"]);
+    let server_addr = format!("{}:{}", server.host, server.port);
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share.display().to_string()],
+        ..server.listening_settings("e2e_q_sharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+    sharer.set_upload_slots(1);
+    let listen_addr = format!("127.0.0.1:{sharer_port}");
+
+    let blocker_file = format!("{folder}\\blocker.mp3");
+    let mut blocker = queue_as(&server_addr, &listen_addr, "e2e_q_blocker", &blocker_file)
+        .expect("blocker queues");
+    assert!(
+        blocker.takes_a_slot(),
+        "the first request should be offered the free slot"
+    );
+
+    let waiter_file = format!("{folder}\\waiter.mp3");
+    let _waiter =
+        queue_as(&server_addr, &listen_addr, "e2e_q_waiter", &waiter_file).expect("waiter queues");
+    assert!(
+        wait_for(|| place_of(&sharer, "e2e_q_waiter", &waiter_file) == Some(1)),
+        "with the slot held, the next request must wait at place 1, got {:?}",
+        place_of(&sharer, "e2e_q_waiter", &waiter_file)
+    );
+
+    let third_file = format!("{folder}\\third.mp3");
+    let _third =
+        queue_as(&server_addr, &listen_addr, "e2e_q_third", &third_file).expect("third queues");
+    assert!(
+        wait_for(|| place_of(&sharer, "e2e_q_third", &third_file) == Some(2)),
+        "and the one after that at place 2, got {:?}",
+        place_of(&sharer, "e2e_q_third", &third_file)
+    );
+
+    // Both waiters show up as queued uploads with their places, which is what
+    // `serve` reports to an operator.
+    let queued: Vec<(String, u32)> = sharer
+        .uploads()
+        .into_iter()
+        .filter_map(|upload| match upload.status {
+            UploadStatus::Queued(place) => Some((upload.username, place)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            ("e2e_q_waiter".to_string(), 1),
+            ("e2e_q_third".to_string(), 2)
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(share);
+}
+
+#[test]
+fn a_privileged_peer_overtakes_one_already_waiting_for_a_slot() {
+    let server = server_or_skip!();
+    let server_addr = format!("{}:{}", server.host, server.port);
+
+    // The account has to exist before it can be given privileges, and the
+    // privileges have to exist before we log in: the server sends the
+    // privileged-user list once, at login.
+    drop(login_raw(&server_addr, "e2e_q_donor", "pw").expect("the donor registers"));
+    if !grant_privileges(&server, "e2e_q_donor") {
+        eprintln!(
+            "privilege e2e skipped: cannot write soulfind's database (needs a \
+             locally spawned server and sqlite3)"
+        );
+        return;
+    }
+
+    let (share, folder) = queue_share("privileged", &["blocker.mp3", "plain.mp3", "donor.mp3"]);
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share.display().to_string()],
+        ..server.listening_settings("e2e_q_psharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+    sharer.set_upload_slots(1);
+    let listen_addr = format!("127.0.0.1:{sharer_port}");
+
+    // Not every soulfind build answers login with a populated code-69 list, so
+    // a server that names nobody is a skip rather than a failure — the
+    // re-ranking itself is covered by `client::upload_queue::context_tests`.
+    if !wait_for(|| sharer.is_privileged("e2e_q_donor")) {
+        eprintln!(
+            "privilege ordering e2e skipped: this server declared no \
+             privileged users even after granting them in its database"
+        );
+        let _ = std::fs::remove_dir_all(share);
+        return;
+    }
+    assert!(!sharer.is_privileged("e2e_q_plain"), "and nobody else");
+
+    let blocker_file = format!("{folder}\\blocker.mp3");
+    let mut blocker = queue_as(&server_addr, &listen_addr, "e2e_q_pblocker", &blocker_file)
+        .expect("blocker queues");
+    assert!(
+        blocker.takes_a_slot(),
+        "the blocker should be offered the only slot"
+    );
+
+    // A plain user asks first and is alone in the queue…
+    let plain_file = format!("{folder}\\plain.mp3");
+    let _plain =
+        queue_as(&server_addr, &listen_addr, "e2e_q_plain", &plain_file).expect("plain queues");
+    assert!(
+        wait_for(|| place_of(&sharer, "e2e_q_plain", &plain_file) == Some(1)),
+        "got {:?}",
+        place_of(&sharer, "e2e_q_plain", &plain_file)
+    );
+
+    // …and then the donor asks, and goes ahead of them.
+    let donor_file = format!("{folder}\\donor.mp3");
+    let _donor =
+        queue_as(&server_addr, &listen_addr, "e2e_q_donor", &donor_file).expect("donor queues");
+    assert!(
+        wait_for(|| place_of(&sharer, "e2e_q_donor", &donor_file) == Some(1)),
+        "the privileged peer should take place 1, got {:?}",
+        place_of(&sharer, "e2e_q_donor", &donor_file)
+    );
+    assert_eq!(
+        place_of(&sharer, "e2e_q_plain", &plain_file),
+        Some(2),
+        "and the plain user should be told they were overtaken"
+    );
+
+    let _ = std::fs::remove_dir_all(share);
+}
+
+#[test]
+fn a_peer_asking_where_it_sits_is_answered_with_its_place() {
+    let server = server_or_skip!();
+    let (share, folder) = queue_share("place", &["blocker.mp3", "asker.mp3"]);
+    let server_addr = format!("{}:{}", server.host, server.port);
+
+    let sharer_port = free_port().expect("sharer port");
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share.display().to_string()],
+        ..server.listening_settings("e2e_q_asharer", "pw", sharer_port)
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+    sharer.set_upload_slots(1);
+    let listen_addr = format!("127.0.0.1:{sharer_port}");
+
+    let blocker_file = format!("{folder}\\blocker.mp3");
+    let mut blocker = queue_as(&server_addr, &listen_addr, "e2e_q_ablocker", &blocker_file)
+        .expect("blocker queues");
+    assert!(
+        blocker.takes_a_slot(),
+        "the blocker should be offered the only slot"
+    );
+
+    // The asker keeps its own connection so it can read the answer back.
+    let asker_file = format!("{folder}\\asker.mp3");
+    let mut asker =
+        queue_as(&server_addr, &listen_addr, "e2e_q_asker", &asker_file).expect("asker queues");
+
+    assert!(
+        wait_for(|| place_of(&sharer, "e2e_q_asker", &asker_file) == Some(1)),
+        "the asker should be waiting at place 1 first"
+    );
+
+    let mut request = Message::new();
+    request.write_int32(51).write_string(&asker_file);
+    asker.peer.write_all(&request.get_buffer()).expect("ask");
+    asker.peer.flush().expect("flush");
+
+    let mut answer = expect_code(&mut asker.peer, 44, Duration::from_secs(10))
+        .expect("a PlaceInQueueResponse should come back");
+    answer.set_pointer(8);
+    assert_eq!(answer.read_string(), asker_file);
+    assert_eq!(answer.read_int32(), 1, "and it should carry the real place");
+
+    let _ = std::fs::remove_dir_all(share);
+}
+
+#[test]
+fn the_server_answers_how_much_privilege_time_we_have() {
+    let server = server_or_skip!();
+    let mut client = Client::with_settings(server.settings("e2e_priv_asker", "pw"));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    client.check_privileges().expect("ask");
+    assert!(
+        wait_for(|| client.own_privilege_seconds().is_some()),
+        "the server should answer code 92"
+    );
+    assert_eq!(
+        client.own_privilege_seconds(),
+        Some(0),
+        "a fresh account has no privileges, which is zero rather than unknown"
+    );
+}
+
+#[test]
+fn a_user_who_never_logged_in_reads_as_offline() {
+    let server = server_or_skip!();
+    let mut asker = Client::with_settings(server.settings("e2e_info_asker_b", "pw"));
+    asker.connect().expect("asker connect");
+    assert!(asker.login().expect("asker login"));
+
+    asker.request_user_info("nobody_by_this_name").expect("ask");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut info = None;
+    while Instant::now() < deadline && info.is_none() {
+        info = asker
+            .user_info("nobody_by_this_name")
+            .filter(|found| found.presence.is_some());
+        if info.is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let presence = info
+        .expect("the server should answer for an unknown user")
+        .presence
+        .expect("with a presence");
+    assert!(!presence.status.is_reachable(), "got {}", presence.status);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent sessions: several one-shot invocations running at once.
+// ---------------------------------------------------------------------------
+
+/// Ask the server what address it hands out for `username`.
+fn advertised_port(server_addr: &str, asker: &str, username: &str) -> u32 {
+    let mut peer = login_raw(server_addr, asker, "pw").expect("asker login");
+    peer.write_all(&MessageFactory::build_get_peer_address(username).get_buffer())
+        .expect("ask for the address");
+    peer.flush().expect("flush");
+    let mut reply = expect_code(&mut peer, 3, Duration::from_secs(5))
+        .expect("the server should answer with an address");
+    reply.set_pointer(8);
+    let _name = reply.read_string();
+    for _ in 0..4 {
+        let _ = reply.read_int8();
+    }
+    reply.read_int32()
+}
+
+#[test]
+fn a_taken_listen_port_does_not_cost_us_the_listener() {
+    let server = server_or_skip!();
+    let addr = format!("{}:{}", server.host, server.port);
+
+    // A sibling process already holds the configured port: the ordinary case
+    // when several invocations run at once with one config file between them.
+    let taken = free_port().expect("port to occupy");
+    let _squatter = std::net::TcpListener::bind(("0.0.0.0", taken)).expect("occupy");
+
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_port_clash", "pw", taken));
+    client.connect().expect("connect despite the taken port");
+    assert!(client.login().expect("login"));
+
+    let bound = client.listen_port().expect("a listener was still bound");
+    assert_ne!(bound, taken, "a port someone else holds cannot be ours");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Whatever port we ended up on, the server must hand peers that one:
+    // advertising a port held by someone else sends our search responses to a
+    // stranger, and we wait out the search seeing nothing.
+    let advertised = advertised_port(&addr, "e2e_port_asker", "e2e_port_clash");
+    assert_eq!(
+        advertised,
+        u32::from(bound),
+        "the server must advertise the port we really bound"
+    );
+}
+
+#[test]
+fn a_listening_client_reports_the_port_it_bound() {
+    let server = server_or_skip!();
+    let port = free_port().expect("free port");
+    let mut client = Client::with_settings(server.listening_settings("e2e_port_ok", "pw", port));
+    client.connect().expect("connect");
+    assert_eq!(client.listen_port(), Some(port));
+
+    let mut quiet = Client::with_settings(server.settings("e2e_port_none", "pw"));
+    quiet.connect().expect("connect");
+    assert_eq!(
+        quiet.listen_port(),
+        None,
+        "a client that does not listen has no port to report"
+    );
+}
+
+#[test]
+fn a_second_login_under_one_name_reports_the_first_session_as_lost() {
+    let server = server_or_skip!();
+
+    let mut first = Client::with_settings(server.settings("e2e_displaced", "pw"));
+    first.connect().expect("first connect");
+    assert!(first.login().expect("first login"));
+    assert_eq!(first.session_loss(), None, "a fresh session is alive");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The server allows one session per account, so this login evicts the one
+    // above. Silently seeing nothing from then on is what made concurrent runs
+    // report files as unavailable when they were not.
+    let mut second = Client::with_settings(server.settings("e2e_displaced", "pw"));
+    second.connect().expect("second connect");
+    assert!(second.login().expect("second login"));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while first.session_loss().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        first.session_loss(),
+        Some(SessionLoss::Displaced),
+        "the evicted session must say why it went quiet"
+    );
+    assert_eq!(second.session_loss(), None, "the winner keeps its session");
+}
+
+#[test]
+fn clients_with_distinct_names_search_the_same_sharer_at_once() {
+    let server = server_or_skip!();
+
+    let share_dir = unique_download_dir();
+    let content: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(share_dir.join("e2e_probe_parallel.bin"), &content).unwrap();
+    let mut sharer = Client::with_settings(ClientSettings {
+        shared_directories: vec![share_dir.display().to_string()],
+        ..server.listening_settings("e2e_par_sharer", "pw", free_port().expect("sharer port"))
+    });
+    sharer.connect().expect("sharer connect");
+    assert!(sharer.login().expect("sharer login"));
+
+    // Three sessions on one machine, all configured with the same listen port:
+    // exactly what several agents running the CLI at once look like.
+    let shared_port = free_port().expect("shared port");
+    let seekers: Vec<Client> = (0..3)
+        .map(|i| {
+            let mut client = Client::with_settings(server.listening_settings(
+                &format!("e2e_par_seeker_{i}"),
+                "pw",
+                shared_port,
+            ));
+            client.connect().expect("seeker connect");
+            assert!(client.login().expect("seeker login"));
+            client
+        })
+        .collect();
+
+    let ports: Vec<u16> = seekers.iter().filter_map(Client::listen_port).collect();
+    assert_eq!(ports.len(), 3, "every seeker keeps a listener");
+    let mut unique = ports.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "each seeker holds its own port: {ports:?}");
+    std::thread::sleep(Duration::from_secs(1));
+
+    std::thread::scope(|scope| {
+        for client in &seekers {
+            scope.spawn(move || {
+                let _ = client.search("parallel", Duration::from_secs(5));
+            });
+        }
+    });
+
+    for (i, client) in seekers.iter().enumerate() {
+        assert_eq!(
+            client.session_loss(),
+            None,
+            "seeker {i} should still hold its session"
+        );
+        let hit = client
+            .get_search_results("parallel")
+            .into_iter()
+            .flat_map(|result| result.files)
+            .find(|file| file.name.contains("e2e_probe_parallel"));
+        assert!(hit.is_some(), "seeker {i} found nothing");
+    }
+
+    let _ = std::fs::remove_dir_all(share_dir);
+}
+
+#[test]
+fn a_peer_that_hangs_up_its_control_connection_still_delivers_the_file() {
+    let server = server_or_skip!();
+
+    // The bytes travel over their own F connection, so a peer is free to close
+    // the control connection first — other clients drop idle peer sockets as a
+    // matter of course. Treating that hangup as a failure used to fail every
+    // download queued with that peer, the one streaming included.
+    let client_port = free_port().expect("free client listen port");
+    let mut client =
+        Client::with_settings(server.listening_settings("e2e_fin_dl", "pw", client_port));
+    client.connect().expect("connect");
+    assert!(client.login().expect("login"));
+
+    let mock_port = free_port().expect("free mock listen port");
+    let filename = "hangup_song.mp3";
+    let content: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+    let size = content.len() as u64;
+    let download_dir = unique_download_dir();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let cfg = MockDirectUpload {
+        server_addr: format!("{}:{}", server.host, server.port),
+        username: "e2e_finpeer".to_string(),
+        password: "pw".to_string(),
+        listen_port: mock_port,
+        downloader_listen_addr: format!("127.0.0.1:{client_port}"),
+        downloader_username: "e2e_fin_dl".to_string(),
+        filename: filename.to_string(),
+        content: content.clone(),
+        token: 616_161_u32,
+        ready: ready_tx,
+        close_control_first: true,
+    };
+    let uploader = std::thread::spawn(move || {
+        if let Err(e) = run_mock_direct_peer(&cfg) {
+            eprintln!("[mock hangup peer] {e}");
+        }
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("mock peer ready");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let (_download, status_rx) = client
+        .download(
+            filename.to_string(),
+            "e2e_finpeer".to_string(),
+            size,
+            download_dir.display().to_string(),
+        )
+        .expect("start download");
+
+    let completed = wait_for_completion(&client, &status_rx, Duration::from_secs(20));
+    let _ = uploader.join();
+
+    assert!(
+        completed,
+        "a closed control connection must not fail the transfer"
+    );
+    let written = std::fs::read(download_dir.join(filename)).expect("downloaded file should exist");
+    assert_eq!(written, content, "downloaded bytes should match the source");
+
+    let _ = std::fs::remove_dir_all(&download_dir);
+}

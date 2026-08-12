@@ -170,7 +170,7 @@ Controls which Soulseek search results pass the quality gate.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `concurrent` | Maximum simultaneous album downloads. | `5` |
+| `concurrent` | Maximum simultaneous album downloads. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
 | `max_queue_length` | Maximum acceptable upload queue length. `0` = free-slot only. | `0` |
 | `max_start_time_secs` | Maximum seconds to wait at the front of a remote queue before the transfer starts. | `120` |
 | `max_queue_time_secs` | Maximum total seconds to wait from enqueue before any file starts. `0` disables. | `1800` |

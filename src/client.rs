@@ -184,8 +184,8 @@ impl SoulseekClient for MockClient {
 
 // ── Real client (soulseek-rs-lib wrapper) ──
 //
-// Verified against soulseek-rs-lib v8.0.0 (vendored in the cargo registry).
-// The crate's API is synchronous: `Client::connect()`/`login()` block on the
+// Vendored soulseek-rs-lib v14.0.0 (workspace member at vendor/soulseek-rs-lib) with
+// a local peer-registry cap. The crate's API is synchronous: `Client::connect()`/`login()` block on the
 // server, `Client::search()` blocks for the whole timeout window, and
 // `Client::download()` returns `(Download, std::sync::mpsc::Receiver<DownloadStatus>)`.
 // All blocking calls are therefore wrapped in `spawn_blocking`.
@@ -571,6 +571,95 @@ mod real_client_tests {
     fn real_client_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RealClient>();
+    }
+
+    // Regression guard for the peer-connection bug: soulseek-rs-lib v8.0.0
+    // never processes GetPeerAddress responses, so downloads hang forever.
+    // Verified live that v14.0.0 works (official CLI resolved a peer and
+    // requested a file). The fix for "concurrent invocations silently seeing
+    // nothing" landed in v11.0.0. This test pins the dependency to a version
+    // with the fix, AND asserts the vendored peer cap survives — upstream
+    // 14.0.0 alone would satisfy the version check while reintroducing the
+    // thread explosion.
+    #[test]
+    fn soulseek_lib_version_has_peer_connection_fix() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("Cargo.toml readable");
+
+        // 1. The dependency must be the vendored copy, declared as a path
+        // dependency (workspace member) so `cargo test` exercises its tests.
+        assert!(
+            manifest
+                .lines()
+                .any(|l| l.trim() == "soulseek-rs-lib = { path = \"vendor/soulseek-rs-lib\" }"),
+            "soulseek-rs-lib must be a path dependency on the vendored copy"
+        );
+
+        // 1b. The vendored crate must be a workspace member in BOTH lists,
+        // or plain `cargo test` at the root silently stops running its
+        // regression tests.
+        let members_line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("members"))
+            .expect("[workspace] members present");
+        let default_members_line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default-members"))
+            .expect("[workspace] default-members present");
+        assert!(
+            members_line.contains("vendor/soulseek-rs-lib")
+                && default_members_line.contains("vendor/soulseek-rs-lib"),
+            "vendored crate must be in both workspace members and default-members"
+        );
+
+        // 2. The vendored crate's own version must be >= 11 (the release
+        // with the GetPeerAddress / concurrent-invocations fix). Parse only
+        // inside the [package] section so a stray dependency `version` line
+        // can never confuse the parse.
+        let vendor_manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/soulseek-rs-lib/Cargo.toml"
+        ))
+        .expect("vendored Cargo.toml readable");
+        let mut in_package = false;
+        let mut package_version: Option<String> = None;
+        for line in vendor_manifest.lines() {
+            let t = line.trim();
+            if t == "[package]" {
+                in_package = true;
+                continue;
+            }
+            if t.starts_with('[') {
+                in_package = false;
+            }
+            if in_package && t.starts_with("version") {
+                package_version = t.split('"').nth(1).map(str::to_string);
+                break;
+            }
+        }
+        let version = package_version.expect("vendored [package] version present");
+        let major: u32 = version
+            .split('.')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            major >= 11,
+            "vendored soulseek-rs-lib {version} lacks the GetPeerAddress fix — upgrade to >=11 (v14 verified working)"
+        );
+
+        // 3. The vendored registry must carry the peer cap. Deleting the
+        // vendor directory or reverting the registry changes would otherwise
+        // build and pass while reintroducing the thread explosion.
+        let registry_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/vendor/soulseek-rs-lib/src/actor/peer_registry.rs"
+        ))
+        .expect("vendored peer_registry.rs readable");
+        assert!(
+            registry_src.contains("DEFAULT_MAX_PEERS"),
+            "vendored peer registry must contain the peer cap"
+        );
     }
 
     #[test]

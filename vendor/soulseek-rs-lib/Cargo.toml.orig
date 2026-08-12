@@ -1,0 +1,23 @@
+[package]
+name = "soulseek-rs-lib"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Library for Soulseek protocol implementation in Rust"
+keywords = ["soulseek", "p2p", "protocol", "file-sharing"]
+categories = ["network-programming"]
+
+[lib]
+name = "soulseek_rs"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
