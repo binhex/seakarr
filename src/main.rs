@@ -107,8 +107,10 @@ async fn run() -> Result<()> {
     let log_dir = PathBuf::from(&config.logging.path);
     std::fs::create_dir_all(&log_dir)?;
     let file_appender = tracing_appender::rolling::never(&log_dir, &config.logging.file);
-    let env_filter =
-        EnvFilter::try_new(&config.logging.level).unwrap_or_else(|_| EnvFilter::new("INFO"));
+    // Suppress noisy library logs: lofty emits a WARN per MP3 file
+    // about bitrate estimation, which drowns out the scanner output.
+    let filter_str = format!("{},lofty=error,soulseek_rs=error", config.logging.level);
+    let env_filter = EnvFilter::try_new(&filter_str).unwrap_or_else(|_| EnvFilter::new("INFO"));
 
     tracing_subscriber::registry()
         .with(env_filter)
