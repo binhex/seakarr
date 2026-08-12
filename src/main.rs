@@ -136,6 +136,10 @@ async fn run() -> Result<()> {
     let db = Database::open(&db_dir, &config.database)?;
 
     // Connect to Soulseek
+    // Suppress the crate's internal logger (it uses LOG_LEVEL / RUST_LOG
+    // env vars, not the tracing ecosystem).  Set to ERROR to silence
+    // "No handler found for message code" diagnostics.
+    std::env::set_var("LOG_LEVEL", "ERROR");
     tracing::info!(
         "Connecting to Soulseek server {}...",
         config.soulseek.server
