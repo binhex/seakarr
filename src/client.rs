@@ -74,6 +74,10 @@ pub struct MockClient {
     pub search_results: Mutex<Vec<SearchResult>>,
     pub download_speed: Mutex<u64>,
     pub login_should_fail: Mutex<bool>,
+    /// Records the last filename passed to `download()` so tests can assert
+    /// the wire filename is the full share-relative path (regression guard
+    /// for the UploadDenied-everywhere bug).
+    pub last_download_filename: Mutex<Option<String>>,
 }
 
 impl MockClient {
@@ -82,6 +86,7 @@ impl MockClient {
             search_results: Mutex::new(vec![]),
             download_speed: Mutex::new(1_000_000), // 1 MB/s
             login_should_fail: Mutex::new(false),
+            last_download_filename: Mutex::new(None),
         }
     }
 
@@ -136,10 +141,11 @@ impl SoulseekClient for MockClient {
 
     async fn download(
         &self,
-        _file: &FileInfo,
+        file: &FileInfo,
         _username: &str,
         _dir: &Path,
     ) -> Result<DownloadHandle> {
+        *self.last_download_filename.lock().unwrap() = Some(file.name.clone());
         let (status_tx, status_rx) = mpsc::channel(32);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let speed = *self.download_speed.lock().unwrap();

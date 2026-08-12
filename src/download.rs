@@ -33,12 +33,16 @@ pub async fn download_file(
     dir: &Path,
     config: &DownloadConfig,
 ) -> Result<PathBuf> {
+    // Validate the remote name for traversal safety, but pass the FULL
+    // share-relative path to the crate: the Soulseek QueueUpload wire
+    // message must quote the path exactly as the peer shared it (e.g.
+    // "Music\Artist\Album\01 - Track.flac"). Sending only the basename
+    // makes every peer respond UploadDenied because it cannot find a
+    // basename-only entry in its share list. The crate strips the path
+    // itself when writing the local file, so the local destination is
+    // still dir/<basename>.
     let basename = safe_basename(&file.name)?;
-    let safe_file = FileInfo {
-        name: basename.to_string(),
-        ..file.clone()
-    };
-    let mut handle = client.download(&safe_file, username, dir).await?;
+    let mut handle = client.download(file, username, dir).await?;
     tracing::info!("Download queued: {basename} from {username}");
     let mut transfer_start: Option<tokio::time::Instant> = None;
 
@@ -227,6 +231,38 @@ mod tests {
             min_filtered_users: 1,
             skip_retry_hours: 24,
         }
+    }
+
+    // Regression guard for the UploadDenied-everywhere bug: the Soulseek
+    // QueueUpload wire message must carry the FULL share-relative path
+    // exactly as the peer shared it ("Music\\Artist\\Album\\01 - Track.flac"),
+    // not a basename. Sending only the basename made every peer respond
+    // UploadDenied because it could not match the request against its share
+    // list.
+    #[tokio::test]
+    async fn test_download_passes_full_share_path_to_client() {
+        let client = MockClient::new();
+        let dir = TempDir::new().unwrap();
+        let file = make_file(
+            "Music\\Amy Winehouse\\Back to Black (2006)\\1-01 - Rehab.flac",
+            900,
+            10_000_000,
+        );
+        let config = default_dl_config();
+
+        let result = download_file(&client, &file, "peer", dir.path(), &config).await;
+        assert!(result.is_ok());
+
+        let wire_name = client
+            .last_download_filename
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("download() recorded a filename");
+        assert_eq!(
+            wire_name, "Music\\Amy Winehouse\\Back to Black (2006)\\1-01 - Rehab.flac",
+            "the wire filename must be the full share-relative path"
+        );
     }
 
     #[tokio::test]
