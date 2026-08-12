@@ -4,7 +4,7 @@ use crate::dispatcher::MessageDispatcher;
 use crate::message::peer::{
     FileSearchResponse, GetShareFileList, PeerInit, PlaceInQueueRequest, PlaceInQueueResponse,
     QueueUploadHandler, SharedDirectory, SharedFileListResponseHandler, TransferRequest,
-    TransferResponse, UploadFailedHandler,
+    TransferResponse, UploadDeniedHandler, UploadFailedHandler,
 };
 use crate::message::server::MessageFactory;
 use crate::message::{Handlers, Message, MessageReader, MessageType};
@@ -25,6 +25,10 @@ pub enum PeerMessage {
     FileSearchResult(SearchResult),
     TransferRequest(Transfer),
     UploadFailed(String, String),
+    /// Peer refused a queued upload (peer code 50) — the file is not
+    /// shared. Carries only the filename; the actor fills in its own
+    /// peer username when forwarding to the client ops loop.
+    UploadDenied(String),
     TransferResponse {
         token: u32,
         allowed: bool,
@@ -177,6 +181,7 @@ impl PeerActor {
         handlers.register_handler(TransferResponse);
         handlers.register_handler(GetShareFileList);
         handlers.register_handler(UploadFailedHandler);
+        handlers.register_handler(UploadDeniedHandler);
         handlers.register_handler(PlaceInQueueRequest);
         handlers.register_handler(PlaceInQueueResponse);
         handlers.register_handler(QueueUploadHandler);
@@ -279,6 +284,12 @@ impl PeerActor {
             }
             PeerMessage::UploadFailed(username, filename) => {
                 self.handle_upload_failed(username, filename);
+            }
+            PeerMessage::UploadDenied(filename) => {
+                // Peer code 50: the file is not shared anymore. Fail the
+                // queued download so the caller falls back to the next
+                // candidate instead of hanging until its own timeout.
+                self.handle_upload_failed(self.peer_username(), filename);
             }
         }
     }

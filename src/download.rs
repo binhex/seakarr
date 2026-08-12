@@ -154,38 +154,39 @@ pub async fn download_album(
         let mut failed = false;
 
         for file in &filtered_files {
-            let mut success = false;
-            for attempt in 0..=config.max_retries {
-                match download_file(client, file, &candidate.username, staging_dir, config).await {
-                    Ok(path) => {
-                        downloaded.push(path);
-                        success = true;
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt < config.max_retries {
-                            tokio::time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
-                        }
-                        last_err = Some(e);
-                    }
+            match download_file(client, file, &candidate.username, staging_dir, config).await {
+                Ok(path) => {
+                    downloaded.push(path);
                 }
-            }
-            if !success {
-                // Clean up files already downloaded from this candidate
-                // before trying the next. Errors during cleanup are logged
-                // but do not prevent fallback.
-                for orphan in &downloaded {
-                    if let Err(e) = std::fs::remove_file(orphan) {
-                        tracing::warn!("Failed to clean up orphan staging file {orphan:?}: {e}");
-                    }
+                Err(e) => {
+                    // Do NOT retry the same user: an unresponsive peer
+                    // (silent transfer handshake) burns timeout_secs per
+                    // attempt, and retrying it N times just delays the
+                    // ranked candidate fallback by N × timeout_secs. The
+                    // candidate list IS the retry mechanism.
+                    tracing::warn!(
+                        "Download of {} from {} failed: {e}",
+                        file.name,
+                        candidate.username
+                    );
+                    last_err = Some(e);
+                    failed = true;
+                    break; // Move to next candidate
                 }
-                failed = true;
-                break; // Move to next candidate
             }
         }
 
         if !failed {
             return Ok(downloaded);
+        }
+
+        // Clean up files already downloaded from this failed candidate
+        // before trying the next. Errors during cleanup are logged but do
+        // not prevent fallback.
+        for orphan in &downloaded {
+            if let Err(e) = std::fs::remove_file(orphan) {
+                tracing::warn!("Failed to clean up orphan staging file {orphan:?}: {e}");
+            }
         }
     }
 

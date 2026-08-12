@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Registered peers keyed by username, each stored with the unique id of the
-/// actor currently occupying the slot.
-type PeerMap = HashMap<String, (u64, ActorHandle<PeerMessage>)>;
+/// actor currently occupying the slot and its registration instant (used to
+/// avoid evicting fresh search-responder connections before they deliver).
+type PeerMap = HashMap<String, (u64, ActorHandle<PeerMessage>, std::time::Instant)>;
 
 /// Registry state guarded by a single mutex: the peer map plus FIFO
 /// registration order used for capacity eviction. Keeping both under one
@@ -27,6 +28,14 @@ struct RegistryState {
     peers: PeerMap,
     order: std::collections::VecDeque<String>,
 }
+
+/// A freshly registered peer is exempt from eviction for this long.
+///
+/// Search responders connect (server-brokered) and need a moment to deliver
+/// their FileSearchResponse before the registry may reap them; evicting on
+/// pure FIFO killed responders ~100 ms after connect and empty searches
+/// returned no results at all.
+pub const EVICTION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct PeerRegistry {
     state: Arc<Mutex<RegistryState>>,
@@ -135,7 +144,7 @@ impl PeerRegistry {
             return state
                 .peers
                 .get(&username)
-                .map(|(_, h)| h.clone())
+                .map(|(_, h, _)| h.clone())
                 .ok_or_else(|| format!("peer {username} vanished from registry"));
         }
 
@@ -151,21 +160,47 @@ impl PeerRegistry {
             .map_err(|e| format!("failed to spawn peer actor thread: {e}"))?;
 
         if !state.peers.contains_key(&username) && state.peers.len() >= self.max_peers {
-            // FIFO eviction: drop the oldest registration to make room.
-            // Search-result flood peers register first (before any download
-            // peer is known), so evicting oldest naturally reaps idle flood
-            // peers while the download peer — registered last — survives.
-            // send_to_peer additionally refreshes FIFO position, so peers
-            // with queued/in-flight transfers age out last.
-            if let Some(oldest) = state.order.pop_front() {
-                debug_assert!(
-                    state.peers.contains_key(&oldest),
-                    "order/peers invariant violated: {oldest} in order but not in peers"
-                );
-                if let Some((_, old_handle)) = state.peers.remove(&oldest) {
-                    let _ = old_handle.stop();
-                    debug!("[peer_registry] evicted oldest peer {oldest} at capacity");
-                }
+            // FIFO eviction with a grace period: drop the oldest
+            // registration that has been around long enough to have
+            // delivered its search response (or whatever it connected
+            // for). Search-result flood peers register first, so they are
+            // the natural eviction candidates — but a responder evicted
+            // milliseconds after connecting never delivers, which made
+            // searches return no results at all.
+            //
+            // If every peer is still inside the grace window, refuse the
+            // new registration instead: slot churn would otherwise kill
+            // responders faster than they can answer.
+            let now = std::time::Instant::now();
+            let oldest_evictable = state
+                .peers
+                .iter()
+                .filter(|(_, (_, _, registered))| {
+                    now.duration_since(*registered) >= EVICTION_GRACE_PERIOD
+                })
+                .map(|(name, _)| name.clone())
+                .min_by_key(|name| {
+                    state
+                        .peers
+                        .get(name)
+                        .map_or(now, |(_, _, registered)| *registered)
+                });
+
+            let Some(oldest) = oldest_evictable else {
+                return Err(format!(
+                    "peer registry at capacity ({}) and all peers inside eviction grace period — refusing {username}",
+                    self.max_peers
+                ));
+            };
+
+            state.order.retain(|u| u != &oldest);
+            debug_assert!(
+                state.peers.contains_key(&oldest),
+                "order/peers invariant violated: {oldest} in order but not in peers"
+            );
+            if let Some((_, old_handle, _)) = state.peers.remove(&oldest) {
+                let _ = old_handle.stop();
+                debug!("[peer_registry] evicted oldest peer {oldest} at capacity");
             }
         }
 
@@ -173,7 +208,10 @@ impl PeerRegistry {
         // become an orphan pinning a pool worker forever. Eviction on the
         // replaced actor's later shutdown is identity-aware (keyed on its id),
         // so stopping it here cannot evict this new connection.
-        if let Some((_, old_handle)) = state.peers.insert(username.clone(), (id, handle.clone())) {
+        if let Some((_, old_handle, _)) = state.peers.insert(
+            username.clone(),
+            (id, handle.clone(), std::time::Instant::now()),
+        ) {
             let _ = old_handle.stop();
             // A replacement is a fresh connection: refresh its FIFO position
             // so it is not evicted as "oldest" on the next capacity-triggering
@@ -194,7 +232,10 @@ impl PeerRegistry {
     #[must_use]
     pub fn get_peer(&self, username: &str) -> Option<ActorHandle<PeerMessage>> {
         match self.state.lock_safe() {
-            Ok(state) => state.peers.get(username).map(|(_, handle)| handle.clone()),
+            Ok(state) => state
+                .peers
+                .get(username)
+                .map(|(_, handle, _)| handle.clone()),
             Err(e) => {
                 error!("[peer_registry] get_peer: {}", e);
                 None
@@ -218,7 +259,7 @@ impl PeerRegistry {
             debug!("[peer_registry] Removed peer actor for {}", username);
         }
 
-        removed.map(|(_, handle)| handle)
+        removed.map(|(_, handle, _)| handle)
     }
 
     /// Remove and return the actor for `username` only if it is still the actor
@@ -236,9 +277,9 @@ impl PeerRegistry {
         if state
             .peers
             .get(username)
-            .is_some_and(|(stored, _)| *stored == id)
+            .is_some_and(|(stored, _, _)| *stored == id)
         {
-            let removed = state.peers.remove(username).map(|(_, handle)| handle);
+            let removed = state.peers.remove(username).map(|(_, handle, _)| handle);
             state.order.retain(|u| u != username);
             debug!("[peer_registry] Removed peer actor {} for {}", id, username);
             return removed;
@@ -308,8 +349,34 @@ mod tests {
     use super::PeerRegistry;
     use crate::actor::ActorSystem;
     use crate::peer::{ConnectionType, Peer};
+    use crate::utils::lock::MutexExt;
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
+
+    /// Test registry with zero eviction grace so FIFO behavior can be
+    /// exercised without waiting out the 30 s production grace period.
+    #[allow(dead_code)]
+    fn zero_grace_registry(max_peers: usize) -> PeerRegistry {
+        let system = Arc::new(ActorSystem::new());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let registry = PeerRegistry::with_max_peers(system, tx, "me".to_string(), max_peers);
+        // Collapse the grace period by backdating every registered entry.
+        // register_peer stores Instant::now() internally, so instead we
+        // simply re-register after a tiny sleep in the eviction test below.
+        registry
+    }
+
+    /// Backdate every entry in the registry past the eviction grace period
+    /// so the next capacity-triggering registration evicts the oldest.
+    fn backdate_all(registry: &PeerRegistry) {
+        let mut state = registry.state.lock_safe().unwrap();
+        let old = std::time::Instant::now()
+            .checked_sub(super::EVICTION_GRACE_PERIOD * 2)
+            .unwrap();
+        for (_, _, registered) in state.peers.values_mut() {
+            *registered = old;
+        }
+    }
 
     #[test]
     fn remove_peer_if_respects_actor_identity() {
@@ -391,6 +458,9 @@ mod tests {
                 .register_peer(peers[1].clone(), Some(peer_stream("p1")), None)
                 .is_ok()
         );
+        // Backdate the entries past the eviction grace period so the FIFO
+        // policy (rather than the grace refusal) decides eviction.
+        backdate_all(&registry);
         // At capacity: peer2 evicts peer0 (FIFO), peer3 evicts peer1.
         assert!(
             registry
