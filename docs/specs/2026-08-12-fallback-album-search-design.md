@@ -37,16 +37,19 @@ runs.
 
 - Normalise the path: lowercase, replace `\` with `/`.
 - Tokenise the artist into alphanumeric words (lowercased).
-- **All** artist words must appear as case-insensitive substrings somewhere in the normalised path.
+- Drop common articles (`the`, `a`, `an`) from the word list.
+- **All** remaining words must appear as case-insensitive substrings somewhere in the normalised
+  path.
+- If no words remain (every word was a stop-word, e.g. artist `The The`), fall back to the full
+  lowercased artist name as a substring match.
 
 Rationale:
 
 - Handles reordered names: `Jackson, Michael` contains both `jackson` and `michael`.
-- Handles dropped articles: `The Beatles` shared as `Beatles` — `the` matches trivially, `beatles`
-  must appear.
+- Handles dropped articles: `The Beatles` shared as `Beatles` — `the` is a stop-word, `beatles` must
+  appear.
 - Handles punctuation: `AC/DC` becomes words `ac` and `dc`.
-- Trivial words (`the`, `a`) always match and therefore never block a match — only the distinctive
-  words carry the decision.
+- Stop-words never block a match — only the distinctive words carry the decision.
 
 Accepted risk: substring-per-word means `Prince` also matches a path containing `Princess`. Downstream
 quality filters (extension, bitrate, exclude-words) still apply, and the wrong-artist window is narrow.
@@ -87,9 +90,11 @@ the normal `filter_results` step.
 
 ### `db.rs` (no schema change)
 
-- The fallback search is recorded in `search_history` as its own row (same `artist`/`album`, with
-  `result_count` = number of artist-matching results), giving visibility into fallback usage via the
-  existing history table. No migration needed — the table already allows multiple rows per album.
+- `search::record_search` (currently defined but never called) is wired into `process_album`: the
+  primary search is recorded with its raw result count, and when the fallback fires it is recorded as
+  its own row (same `artist`/`album`, `result_count` = number of artist-matching results). Fallback
+  usage is visible as additional rows. No migration needed — the table already allows multiple rows
+  per album.
 
 ### `client.rs` (test infrastructure only)
 
@@ -130,7 +135,8 @@ search:
 ## 7. Testing
 
 - **Unit (`search.rs`):** `path_matches_artist` — backslash paths, case-insensitivity, reordered
-  artist names, `The Beatles` vs `Beatles`, punctuation (`AC/DC`), non-matching paths.
+  artist names, `The Beatles` vs `Beatles`, punctuation (`AC/DC`), all-stop-word artist (`The The`),
+  non-matching paths.
 - **Unit (`search.rs`):** `search_album_with_fallback` with `MockClient` —
   - empty primary triggers fallback and artist filtering;
   - non-empty primary issues no second query (assert via `search_queries`);
@@ -138,7 +144,8 @@ search:
   - `album = None` skips the fallback.
 - **Integration (`runner.rs`):** full `process_album` flow where the primary search is empty and the
   fallback yields a matching result → download completes and the album is marked `success`; fallback
-  with zero artist matches → album marked `skipped`.
+  with zero artist matches → album marked `skipped`. Both cases assert `search_history` rows (two rows
+  when the fallback fires: primary with 0 results, fallback with its matched count).
 - **Config:** `fallback_search` defaults to `true` and round-trips YAML.
 
 ## 8. Out of scope
