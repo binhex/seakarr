@@ -210,7 +210,17 @@ impl Client {
                     }
                 };
                 if let Some(ref registry) = context.peer_registry {
-                    match registry.register_peer(peer_clone, stream, None) {
+                    // Peers connecting without a search token are download
+                    // targets: they must get a slot even when the registry is
+                    // full of search responders inside the grace window.
+                    // Search responders (token Some) use the grace-protected
+                    // path so they aren't evicted before delivering results.
+                    let result = if peer_clone.token.is_some() {
+                        registry.register_search_responder(peer_clone, stream, None)
+                    } else {
+                        registry.register_peer(peer_clone, stream, None)
+                    };
+                    match result {
                         Ok(_) => (),
                         Err(e) => {
                             trace!("Failed to spawn peer actor for {:?}: {:?}", username, e);

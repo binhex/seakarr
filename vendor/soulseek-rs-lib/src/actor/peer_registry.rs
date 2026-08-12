@@ -94,6 +94,29 @@ impl PeerRegistry {
         stream: Option<TcpStream>,
         reader: Option<MessageReader>,
     ) -> Result<ActorHandle<PeerMessage>, String> {
+        // A peer connecting without a search token is a download target:
+        // it must get a slot even when the registry is full of search
+        // responders inside the grace window.
+        self.register_peer_inner(peer, stream, reader, true)
+    }
+
+    /// Force-register for server-brokered search responders (token Some).
+    pub(crate) fn register_search_responder(
+        &self,
+        peer: Peer,
+        stream: Option<TcpStream>,
+        reader: Option<MessageReader>,
+    ) -> Result<ActorHandle<PeerMessage>, String> {
+        self.register_peer_inner(peer, stream, reader, false)
+    }
+
+    fn register_peer_inner(
+        &self,
+        peer: Peer,
+        stream: Option<TcpStream>,
+        reader: Option<MessageReader>,
+        is_download_target: bool,
+    ) -> Result<ActorHandle<PeerMessage>, String> {
         let username = peer.username.clone();
         let id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -170,21 +193,33 @@ impl PeerRegistry {
             //
             // If every peer is still inside the grace window, refuse the
             // new registration instead: slot churn would otherwise kill
-            // responders faster than they can answer.
+            // responders faster than they can answer. Download targets
+            // bypass the grace window entirely — a peer we are queued to
+            // download FROM must never be refused while idle search
+            // responders hold the registry.
             let now = std::time::Instant::now();
-            let oldest_evictable = state
-                .peers
-                .iter()
-                .filter(|(_, (_, _, registered))| {
-                    now.duration_since(*registered) >= EVICTION_GRACE_PERIOD
-                })
-                .map(|(name, _)| name.clone())
-                .min_by_key(|name| {
+            let oldest_evictable = if is_download_target {
+                state.peers.keys().cloned().min_by_key(|name| {
                     state
                         .peers
                         .get(name)
                         .map_or(now, |(_, _, registered)| *registered)
-                });
+                })
+            } else {
+                state
+                    .peers
+                    .iter()
+                    .filter(|(_, (_, _, registered))| {
+                        now.duration_since(*registered) >= EVICTION_GRACE_PERIOD
+                    })
+                    .map(|(name, _)| name.clone())
+                    .min_by_key(|name| {
+                        state
+                            .peers
+                            .get(name)
+                            .map_or(now, |(_, _, registered)| *registered)
+                    })
+            };
 
             let Some(oldest) = oldest_evictable else {
                 return Err(format!(

@@ -642,6 +642,11 @@ impl PeerActor {
         debug!("[peer:{}] disconnect: {}", username, error);
 
         self.stream.take();
+        // Clear the connection state so the tick loop's
+        // check_connection_status stops re-firing the timeout error every
+        // tick (previously it stayed Connecting and logged "Connection
+        // timeout after 20 seconds" every 100 ms forever).
+        self.connection_state = ConnectionState::Disconnected;
 
         if self.disconnect_reported {
             return;
