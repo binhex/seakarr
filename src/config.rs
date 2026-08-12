@@ -68,6 +68,8 @@ pub struct SearchConfig {
     pub block_threshold: u32,
     #[serde(default = "default_block_pause")]
     pub block_pause_secs: u64,
+    #[serde(default = "default_true")]
+    pub fallback_search: bool,
     #[serde(default)]
     pub manual: ManualConfig,
     #[serde(default)]
@@ -485,6 +487,7 @@ impl Default for Config {
                 delay_secs: default_search_delay(),
                 block_threshold: default_block_threshold(),
                 block_pause_secs: default_block_pause(),
+                fallback_search: default_true(),
                 manual: ManualConfig::default(),
                 batch: BatchConfig::default(),
             },
@@ -566,6 +569,7 @@ search:
   delay_secs: 5.0
   block_threshold: 5
   block_pause_secs: 300
+  fallback_search: true
 
 filters:
   allowed_extensions: ["flac"]
@@ -666,6 +670,23 @@ daemon:
         assert_eq!(config.download.concurrent, 5);
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.filters.allowed_extensions, vec!["flac"]);
+    }
+
+    #[test]
+    fn test_fallback_search_defaults_true() {
+        let config = Config::default();
+        assert!(config.search.fallback_search);
+    }
+
+    #[test]
+    fn test_fallback_search_from_yaml() {
+        let dir = TempDir::new().unwrap();
+        let yaml_path = dir.path().join("seakarr.yml");
+        fs::write(&yaml_path, sample_yaml()).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert!(config.search.fallback_search);
     }
 
     #[test]

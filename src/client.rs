@@ -72,6 +72,11 @@ pub trait SoulseekClient: Send + Sync {
 
 pub struct MockClient {
     pub search_results: Mutex<Vec<SearchResult>>,
+    /// Per-query override map. When a query has an entry here, `search()`
+    /// returns it instead of the static `search_results`.
+    pub search_results_by_query: Mutex<HashMap<String, Vec<SearchResult>>>,
+    /// Every query string passed to `search()`, in call order.
+    pub search_queries: Mutex<Vec<String>>,
     pub download_speed: Mutex<u64>,
     pub login_should_fail: Mutex<bool>,
     /// Records the last filename passed to `download()` so tests can assert
@@ -84,6 +89,8 @@ impl MockClient {
     pub fn new() -> Self {
         MockClient {
             search_results: Mutex::new(vec![]),
+            search_results_by_query: Mutex::new(HashMap::new()),
+            search_queries: Mutex::new(vec![]),
             download_speed: Mutex::new(1_000_000), // 1 MB/s
             login_should_fail: Mutex::new(false),
             last_download_filename: Mutex::new(None),
@@ -135,7 +142,11 @@ impl SoulseekClient for MockClient {
         Ok(())
     }
 
-    async fn search(&self, _query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
+        self.search_queries.lock().unwrap().push(query.to_string());
+        if let Some(results) = self.search_results_by_query.lock().unwrap().get(query) {
+            return Ok(results.clone());
+        }
         Ok(self.search_results.lock().unwrap().clone())
     }
 
@@ -787,5 +798,46 @@ mod real_client_tests {
         assert!(parse_server_address("host:notaport").is_err());
         assert!(parse_server_address(":2242").is_err());
         assert!(parse_server_address("host:99999").is_err());
+    }
+}
+
+#[cfg(test)]
+mod mock_client_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mock_search_records_queries_and_per_query_results() {
+        let client = MockClient::new();
+        client.search_results_by_query.lock().unwrap().insert(
+            "history".into(),
+            vec![MockClient::mock_search_result(
+                "peer1",
+                500,
+                1,
+                vec![("01 - track.flac", 10_000_000, 900)],
+            )],
+        );
+
+        // Per-query override applies.
+        let by_query = client.search("history", 15).await.unwrap();
+        assert_eq!(by_query.len(), 1);
+        assert_eq!(by_query[0].username, "peer1");
+
+        // No override -> falls back to the static search_results set.
+        *client.search_results.lock().unwrap() = vec![MockClient::mock_search_result(
+            "static_peer",
+            500,
+            1,
+            vec![("02 - track.flac", 10_000_000, 900)],
+        )];
+        let by_fallback = client.search("no override", 15).await.unwrap();
+        assert_eq!(by_fallback[0].username, "static_peer");
+
+        // Every query is recorded, in order.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec!["history".to_string(), "no override".to_string()]
+        );
     }
 }

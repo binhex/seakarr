@@ -81,4 +81,12 @@ async fn test_full_pipeline_auto_mode_no_results() {
 
     // Should succeed even with no results (marks as skipped)
     assert!(result.is_ok());
+
+    // The fallback search fires too (default on): primary + album-only,
+    // both recorded in search_history.
+    let history_count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(history_count, 2);
 }

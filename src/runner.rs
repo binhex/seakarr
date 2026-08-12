@@ -40,8 +40,60 @@ pub async fn process_album(
     let album_staging = staging_dir.join(&album_slug);
     std::fs::create_dir_all(&album_staging)?;
 
-    // Search
-    let results = search::search_album(client, artist, album, config.search.timeout_secs).await?;
+    // Search, with an album-only fallback for banned artist+album criteria.
+    // Both searches are recorded in search_history; when the fallback fires
+    // the primary row gets result_count 0 and the fallback row its matched
+    // count, making fallback usage visible in the history table.
+    let search_start = std::time::Instant::now();
+    let outcome = search::search_album_with_fallback(
+        client,
+        artist,
+        album,
+        config.search.timeout_secs,
+        config.search.fallback_search,
+    )
+    .await?;
+    let duration_ms = search_start.elapsed().as_millis() as u64;
+    // When the fallback ran, the primary row gets only the primary search's
+    // own duration (total minus fallback), so the two history rows don't
+    // double-count the fallback time.
+    let primary_duration_ms = duration_ms.saturating_sub(outcome.fallback_duration_ms.unwrap_or(0));
+    if let Err(e) = search::record_search(
+        artist,
+        album,
+        if outcome.used_fallback {
+            0
+        } else {
+            outcome.results.len()
+        },
+        primary_duration_ms,
+        db,
+    ) {
+        tracing::warn!(
+            "{artist} — {}: failed to record primary search history: {e}",
+            album.unwrap_or("(all)")
+        );
+    }
+    if outcome.used_fallback {
+        tracing::info!(
+            "{artist} — {}: fallback album-only search found {} result(s) matching artist in path",
+            album.unwrap_or("(all)"),
+            outcome.results.len(),
+        );
+        if let Err(e) = search::record_search(
+            artist,
+            album,
+            outcome.results.len(),
+            outcome.fallback_duration_ms.unwrap_or(duration_ms),
+            db,
+        ) {
+            tracing::warn!(
+                "{artist} — {}: failed to record fallback search history: {e}",
+                album.unwrap_or("(all)")
+            );
+        }
+    }
+    let results = outcome.results;
     if results.is_empty() {
         tracing::info!("No results for {artist} — {}", album.unwrap_or("(all)"));
         if let Some(a) = album {
@@ -303,6 +355,161 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_fallback_disabled_by_config_issues_single_search() {
+        let client = Arc::new(MockClient::new());
+        // Even though an album-only query would match, the config disables
+        // the fallback: exactly one (primary) query must be issued.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Album".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Music\Test Artist\Test Album\01 - track.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+
+        let mut config = make_test_config();
+        config.search.fallback_search = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
+
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_download_completes_album_and_records_history() {
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Album".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Music\Test Artist\Test Album\01 - track.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+        // Primary query "Test Artist Test Album" has no map entry -> empty.
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await
+        .unwrap();
+
+        // Fallback fired: primary query then album-only query.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Test Artist Test Album".to_string(),
+                "Test Album".to_string()
+            ]
+        );
+
+        // Album completed successfully.
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "success");
+
+        // Both searches recorded: primary with 0 results, fallback with 1.
+        let history_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(history_count, 2);
+        let fallback_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT result_count FROM search_history WHERE album = 'Test Album' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fallback_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_no_matches_marks_skipped() {
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Album".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Music\Someone Else\Test Album\01 - track.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // The fallback fired: primary query then album-only query.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Test Artist Test Album".to_string(),
+                "Test Album".to_string()
+            ]
+        );
+
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "skipped");
     }
 
     #[tokio::test]
