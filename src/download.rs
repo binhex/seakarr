@@ -341,7 +341,7 @@ pub async fn download_album(
 mod tests {
     use super::*;
     use crate::client::{FileInfo, MockClient, SearchResult};
-    use crate::config::DownloadConfig;
+    use crate::config::{DownloadConfig, FilterConfig};
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -369,6 +369,16 @@ mod tests {
             retry_delay_secs: 0,
             min_filtered_users: 1,
             skip_retry_hours: 24,
+        }
+    }
+
+    /// Filter config with the min_tracks gate disabled — these focused
+    /// download tests use small mock shares and exercise transfer/cleanup
+    /// logic, not share completeness (covered in filter.rs).
+    fn default_filter_config_test() -> FilterConfig {
+        FilterConfig {
+            min_tracks: 0,
+            ..FilterConfig::default()
         }
     }
 
@@ -494,7 +504,7 @@ mod tests {
             &candidates,
             dir.path(),
             &config,
-            &crate::config::FilterConfig::default(),
+            &default_filter_config_test(),
             None,
             None,
         )
@@ -534,7 +544,7 @@ mod tests {
             &candidates,
             dir.path(),
             &config,
-            &crate::config::FilterConfig::default(),
+            &default_filter_config_test(),
             None,
             None,
         )
@@ -553,7 +563,6 @@ mod tests {
         // When the cancellation flag is set (Ctrl+C / SIGINT), download_album
         // must abort and clean the staging directory — including any `.part`
         // files the vendor library would leave behind.
-        use crate::config::FilterConfig;
 
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
@@ -568,7 +577,7 @@ mod tests {
         std::fs::write(dir.path().join("01 - track.flac.part"), b"stale partial").unwrap();
 
         let config = default_dl_config();
-        let filter_config = FilterConfig::default();
+        let filter_config = default_filter_config_test();
 
         // Cancellation is already requested — download_album should abort
         // before queuing the download to the peer.

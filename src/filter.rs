@@ -2,9 +2,10 @@ use crate::client::{FileInfo, SearchResult};
 use crate::config::FilterConfig;
 
 /// Filter search results by extension, bitrate, excluded words, free slots,
-/// and — when `contiguous_tracks` is enabled — contiguous track numbers over
-/// the downloadable set. Returns only results with at least one matching
-/// file.
+/// minimum track count (`min_tracks`), and — when `contiguous_tracks` is
+/// enabled — contiguous track numbers over the downloadable set. Returns
+/// only results with at least `min_tracks` matching files (or at least one
+/// when `min_tracks` is 0).
 pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<SearchResult> {
     results
         .iter()
@@ -21,14 +22,35 @@ pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<Se
             // here and then be dropped at download time, recreating the
             // gap this feature exists to prevent.
             if !config.contiguous_tracks {
-                // Toggle off: exact pre-existing behaviour — at least one
-                // file must pass the quality filters.
-                return r.files.iter().any(|f| file_passes_filters(f, config));
+                // Toggle off: count safe, quality-passing files (mirroring
+                // download_album) and reject incomplete shares below
+                // min_tracks. min_tracks.max(1) keeps the "at least one
+                // usable file" floor when the gate is disabled (0).
+                let safe_and_passing = |f: &FileInfo| {
+                    crate::download::safe_basename(&f.name).is_ok()
+                        && file_passes_filters(f, config)
+                };
+                let passing_count = r.files.iter().filter(|f| safe_and_passing(f)).count();
+                // min_tracks == 0 disables the gate but never accepts a
+                // result with zero usable files.
+                let min = config.min_tracks.max(1) as usize;
+                return passing_count >= min;
             }
             let safe_and_passing = |f: &FileInfo| {
                 crate::download::safe_basename(&f.name).is_ok() && file_passes_filters(f, config)
             };
             let passing: Vec<&FileInfo> = r.files.iter().filter(|f| safe_and_passing(f)).collect();
+            if passing.len() < config.min_tracks as usize {
+                // Incomplete share: fewer tracks than the configured minimum
+                // (e.g. a single track of a 16-track album).
+                tracing::debug!(
+                    "result from {} rejected: {} passing files below min_tracks={}",
+                    r.username,
+                    passing.len(),
+                    config.min_tracks
+                );
+                return false;
+            }
             if passing.is_empty() {
                 return false;
             }
@@ -152,6 +174,10 @@ mod tests {
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
+            // 0 disables the min_tracks gate in these focused tests —
+            // they exercise extension/bitrate/word/slot filtering, not
+            // share completeness. Dedicated tests set min_tracks explicitly.
+            min_tracks: 0,
         }
     }
 
@@ -325,6 +351,109 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_toggle_off_applies_min_tracks() {
+        // Toggle-off must still reject incomplete shares below the
+        // configured minimum — regression: the off branch previously
+        // ignored min_tracks for non-contiguous configs.
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file(
+                "16 - It Was a Very Good Year.flac",
+                900,
+                30_000_000,
+            )],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(
+            filtered.is_empty(),
+            "single-track result must be rejected when min_tracks is 3 (toggle off)"
+        );
+    }
+
+    #[test]
+    fn test_filter_toggle_off_min_tracks_zero_still_needs_a_file() {
+        // Regression: with min_tracks: 0 (gate disabled), a result with
+        // zero files passing the quality filters must still be rejected —
+        // previously 0 >= 0 was always true.
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 0,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            // mp3 is not in allowed_extensions (flac only) — zero passing.
+            vec![make_file("01 - A.mp3", 320, 10_000_000)],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(
+            filtered.is_empty(),
+            "zero-file result must be rejected even with min_tracks: 0"
+        );
+    }
+
+    #[test]
+    fn test_filter_toggle_off_accepts_at_min_tracks() {
+        // Toggle-off with exactly min_tracks passing files must be accepted.
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("02 - B.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "3-track result must pass with min_tracks=3 (toggle off)"
+        );
+    }
+
+    #[test]
+    fn test_filter_min_tracks_one_boundary() {
+        // min_tracks = 1: a single passing file is accepted (EP/single
+        // threshold), but zero passing files is still rejected.
+        let cfg = FilterConfig {
+            min_tracks: 1,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file("01 - Single.flac", 900, 30_000_000)],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "single track must pass with min_tracks=1"
+        );
+    }
+
+    #[test]
     fn test_filter_rejects_unnumbered_result_when_toggle_on() {
         let cfg = FilterConfig {
             contiguous_tracks: true,
@@ -388,5 +517,57 @@ mod tests {
 
         let filtered = filter_results(&results, &cfg);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_rejects_result_below_min_tracks() {
+        // A peer sharing a single track of a multi-track album is an
+        // incomplete share — reject it even though a lone track passes
+        // the contiguity check (vacuous truth on a 1-element set).
+        let cfg = FilterConfig {
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file(
+                "16 - It Was a Very Good Year.flac",
+                900,
+                30_000_000,
+            )],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(
+            filtered.is_empty(),
+            "single-track result must be rejected when min_tracks is 3"
+        );
+    }
+
+    #[test]
+    fn test_filter_accepts_result_at_min_tracks() {
+        let cfg = FilterConfig {
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("02 - B.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "3-track result must pass with min_tracks=3"
+        );
     }
 }

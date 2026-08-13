@@ -38,6 +38,8 @@ async fn test_full_pipeline_manual_mode() {
     config.download.min_upload_speed_kbps = 0;
     config.download.max_retries = 1;
     config.notifications.urls = vec![];
+    // Disable min_tracks gate — this test uses a 2-file mock share.
+    config.filters.min_tracks = 0;
 
     let db = Database::open_in_memory().unwrap();
 

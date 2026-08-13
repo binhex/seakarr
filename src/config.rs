@@ -102,6 +102,8 @@ pub struct FilterConfig {
     pub include_locked: bool,
     #[serde(default = "default_true")]
     pub contiguous_tracks: bool,
+    #[serde(default = "default_min_tracks")]
+    pub min_tracks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +204,9 @@ fn default_login_retry_delay() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_min_tracks() -> u32 {
+    3
 }
 fn default_staging_dir() -> String {
     "downloads/staging".into()
@@ -490,6 +495,7 @@ impl Default for Config {
                 exclude_words: vec![],
                 include_locked: false,
                 contiguous_tracks: default_true(),
+                min_tracks: default_min_tracks(),
             },
             download: DownloadConfig {
                 concurrent: default_concurrent(),
@@ -569,6 +575,7 @@ filters:
   exclude_words: []
   include_locked: false
   contiguous_tracks: true
+  min_tracks: 3
 
 download:
   concurrent: 5
@@ -717,6 +724,10 @@ daemon:
         assert!(
             generated.contains("contiguous_tracks: true"),
             "generated default config must contain contiguous_tracks: true"
+        );
+        assert!(
+            generated.contains("min_tracks: 3"),
+            "generated default config must contain min_tracks: 3"
         );
     }
 

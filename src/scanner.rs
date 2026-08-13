@@ -238,6 +238,7 @@ mod tests {
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
+            min_tracks: 3,
         };
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
@@ -267,6 +268,7 @@ mod tests {
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
+            min_tracks: 3,
         };
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);

@@ -517,6 +517,10 @@ mod tests {
         config.download.max_retries = 1;
         config.download.retry_delay_secs = 0;
         config.notifications.urls = vec![];
+        // Disable the min_tracks gate for these pipeline tests — they
+        // exercise process_album flow with small mock shares, not share
+        // completeness.
+        config.filters.min_tracks = 0;
         config
     }
 
