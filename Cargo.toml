@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 
 # The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
