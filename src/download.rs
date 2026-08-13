@@ -210,16 +210,22 @@ pub async fn download_album(
 ) -> Result<Vec<PathBuf>> {
     let mut last_err: Option<SeakarrError> = None;
 
+    // Try each candidate in ranked order; staging dir is created on demand
+    // only when a candidate has valid files to download.
     for candidate in candidates {
         // Check cancellation between candidates — avoid queuing network
         // requests to the next peer after the user pressed Ctrl+C.
         // Clean the staging dir before returning so no partial downloads
         // are left behind (same cleanup as the post-loop failure path).
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            if let Err(e) = std::fs::remove_dir_all(staging_dir) {
-                tracing::warn!("Failed to clean staging dir on cancel {staging_dir:?}: {e}");
-            } else if let Err(e) = std::fs::create_dir_all(staging_dir) {
-                tracing::warn!("Failed to recreate staging dir on cancel {staging_dir:?}: {e}");
+            // Remove staging dir if it was created; suppress ENOENT
+            // (dir may not exist yet if cancel fires before first download).
+            match std::fs::remove_dir_all(staging_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("Failed to clean staging dir on cancel {staging_dir:?}: {e}")
+                }
             }
             return Err(SeakarrError::Download("download cancelled by user".into()));
         }
@@ -254,6 +260,11 @@ pub async fn download_album(
             ));
             continue;
         }
+
+        // Create the staging directory only when we have valid files to
+        // download — prevents empty dirs for albums where every candidate
+        // fails the safe_basename / file_passes_filters checks.
+        std::fs::create_dir_all(staging_dir)?;
 
         let mut downloaded = Vec::new();
         let mut failed = false;
@@ -302,21 +313,14 @@ pub async fn download_album(
         }
 
         // The album's staging directory is per-album (created by the runner).
-        // A failed candidate must leave it completely clean — the album is
-        // either fully downloaded or has nothing in the download path. This
-        // removes completed tracks from this candidate AND any `.part` files
-        // the vendor library left behind on the failed track (resume from a
-        // different peer's `.part` is useless, and stale partials accumulate
-        // otherwise). Retry once after a brief pause to handle transient
-        // locks from a just-cancelled transfer.
+        // A failed candidate must leave no staging directory at all —
+        // the album is either fully downloaded (directory exists with files)
+        // or absent (failed/never attempted). This removes completed tracks,
+        // `.part` files, and the directory itself. Retry once after a brief
+        // pause to handle transient locks from a just-cancelled transfer.
         for attempt in 0..2 {
             match std::fs::remove_dir_all(staging_dir) {
-                Ok(()) => {
-                    if let Err(e) = std::fs::create_dir_all(staging_dir) {
-                        tracing::warn!("Failed to recreate staging directory {staging_dir:?}: {e}");
-                    }
-                    break;
-                }
+                Ok(()) => break,
                 Err(e) if attempt == 0 => {
                     tracing::warn!(
                         "Failed to clean up staging directory {staging_dir:?} (retrying): {e}"
@@ -537,15 +541,10 @@ mod tests {
         .await;
         assert!(result.is_err());
 
-        // The staging directory must be empty — no partial downloads at all.
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        // The staging directory must be gone — no partial downloads at all.
         assert!(
-            remaining.is_empty(),
-            "staging dir must be clean after failed candidate, found: {:?}",
-            remaining.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            !dir.path().exists(),
+            "staging dir must be removed after failed candidate"
         );
     }
 
@@ -591,15 +590,10 @@ mod tests {
             "error must indicate cancellation"
         );
 
-        // The staging directory must be completely clean.
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        // The staging directory must be gone — no partial downloads at all.
         assert!(
-            remaining.is_empty(),
-            "staging dir must be clean after cancellation, found: {:?}",
-            remaining.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            !dir.path().exists(),
+            "staging dir must be removed after cancellation"
         );
     }
 }

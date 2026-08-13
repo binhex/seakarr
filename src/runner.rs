@@ -44,7 +44,9 @@ pub async fn process_album(
         album.unwrap_or("unknown").replace('/', "-")
     );
     let album_staging = staging_dir.join(&album_slug);
-    std::fs::create_dir_all(&album_staging)?;
+    // Note: album_staging directory is created by download_album, only when
+    // a valid peer with downloadable files is found. This prevents empty
+    // staging directories from accumulating for albums with no results.
 
     // Search, with an album-only fallback for banned artist+album criteria.
     // Both searches are recorded in search_history; when the fallback fires
@@ -243,6 +245,13 @@ pub async fn process_album(
     if organize_ok {
         if let Some(a) = album {
             db.mark_album_processed(artist, a, "success")?;
+        }
+        // Remove the staging directory — files have been organized into the
+        // library. Absence of the staging dir signals a completed download.
+        if config.storage.organize && !config.library.paths.is_empty() {
+            if let Err(e) = std::fs::remove_dir_all(&album_staging) {
+                tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
+            }
         }
     } else if let Some(a) = album {
         db.mark_album_processed(artist, a, "failed")?;

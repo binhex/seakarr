@@ -29,8 +29,11 @@ impl ProgressDisplay {
     /// Create a progress bar for a track download.
     ///
     /// The bar shows: filename | downloaded/total | speed | bar | percentage
-    pub fn create_bar(&self, filename: &str, _total_bytes: u64) -> ProgressBar {
-        let bar = self.multi.add(ProgressBar::new(0));
+    pub fn create_bar(&self, filename: &str, total_bytes: u64) -> ProgressBar {
+        // Initialise with the actual total so the bar starts at 0% — using
+        // length 0 renders as a full 100% bar (0/0 = complete) before any
+        // transfer begins.
+        let bar = self.multi.add(ProgressBar::new(total_bytes));
         let style = ProgressStyle::with_template(
             "  {spinner} {msg}  {bytes}/{total_bytes}  {prefix}  [{bar:20}]  {percent}%",
         )
@@ -92,6 +95,27 @@ mod tests {
         // Message should be just the basename
         // indicatif stores the message — we can't easily read it back,
         // but we can verify no panic occurred.
+        bar.finish();
+        display.clear();
+    }
+
+    #[test]
+    fn test_create_bar_uses_provided_total_length() {
+        // Regression: the bar was created with length 0, which renders as a
+        // full 100% bar immediately (0/0 = complete). The provided total
+        // must be used so the bar starts at 0% with the correct total.
+        let display = ProgressDisplay::new();
+        let bar = display.create_bar("01 - Track.flac", 33_304_229);
+        assert_eq!(
+            bar.length(),
+            Some(33_304_229),
+            "bar must be initialised with the provided total bytes"
+        );
+        assert_eq!(
+            bar.position(),
+            0,
+            "bar must start at position 0 (not complete)"
+        );
         bar.finish();
         display.clear();
     }
