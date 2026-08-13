@@ -3,6 +3,7 @@
 use seakarr::client::{FileInfo, MockClient, SearchResult};
 use seakarr::config::Config;
 use seakarr::db::Database;
+use seakarr::report::AlbumOutcome;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -51,6 +52,7 @@ async fn test_full_pipeline_manual_mode() {
     .await;
 
     assert!(result.is_ok());
+    assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
     // Album should be marked as processed
     assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
@@ -81,6 +83,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
 
     // Should succeed even with no results (marks as skipped)
     assert!(result.is_ok());
+    assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
 
     // The fallback search fires too (default on): primary + album-only,
     // both recorded in search_history.

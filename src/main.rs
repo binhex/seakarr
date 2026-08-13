@@ -372,26 +372,29 @@ async fn run_batch_mode(
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
 
-    let mut succeeded = 0;
-    let mut failed = 0;
+    let mut report = seakarr::report::RunReport::new();
 
     for line in &lines {
         let parts: Vec<&str> = line.splitn(2, " - ").collect();
         let artist = parts[0].trim();
         let album = parts.get(1).map(|a| a.trim()).filter(|a| !a.is_empty());
+        let album_display = album.unwrap_or("(all)");
 
-        match runner::process_album(client, artist, album, config, db, staging_dir).await {
-            Ok(()) => succeeded += 1,
+        match seakarr::runner::process_album(client, artist, album, config, db, staging_dir).await {
+            Ok(outcome) => report.record(artist, album_display, outcome),
             Err(e) => {
-                tracing::error!("Batch: failed {artist} — {album:?}: {e}");
-                failed += 1;
+                tracing::error!("Batch: failed {artist} — {album_display}: {e}");
+                report.record(
+                    artist,
+                    album_display,
+                    seakarr::report::AlbumOutcome::Failed {
+                        reason: e.to_string(),
+                    },
+                );
             }
         }
     }
 
-    tracing::info!(
-        "Batch complete: {succeeded} succeeded, {failed} failed, {} total",
-        lines.len()
-    );
+    report.print_summary();
     Ok(())
 }

@@ -8,6 +8,7 @@ use crate::client::SoulseekClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::{Result, SeakarrError};
+use crate::report::{AlbumOutcome, RunReport};
 use crate::{download, filter, notifier, organizer, scanner, search};
 
 /// Process a single album: search → filter rank → download → organize → notify.
@@ -18,12 +19,12 @@ pub async fn process_album(
     config: &Config,
     db: &Database,
     staging_dir: &Path,
-) -> Result<()> {
+) -> Result<AlbumOutcome> {
     // Skip if already processed
     if let Some(a) = album {
         if db.is_album_processed(artist, a)? {
             tracing::info!("Skipping already-processed: {artist} — {a}");
-            return Ok(());
+            return Ok(AlbumOutcome::Skipped);
         }
     }
 
@@ -102,7 +103,7 @@ pub async fn process_album(
         if let Some(a) = album {
             db.mark_album_processed(artist, a, "skipped")?;
         }
-        return Ok(());
+        return Ok(AlbumOutcome::Skipped);
     }
 
     // Filter + rank
@@ -158,7 +159,7 @@ pub async fn process_album(
         if let Some(a) = album {
             db.mark_album_processed(artist, a, "skipped")?;
         }
-        return Ok(());
+        return Ok(AlbumOutcome::Skipped);
     }
     let ranked = filter::rank_candidates(&filtered, &config.filters);
     tracing::info!(
@@ -186,7 +187,9 @@ pub async fn process_album(
                 album.unwrap_or("(all)"),
                 ranked.len(),
             );
-            return Err(e);
+            return Ok(AlbumOutcome::Failed {
+                reason: format!("all candidates exhausted: {e}"),
+            });
         }
     };
 
@@ -221,8 +224,8 @@ pub async fn process_album(
     }
 
     // Mark processed — only success if organize also succeeded.
-    // When album is None (manual mode without --album), treat organize
-    // failure the same way so the CLI exits with an error.
+    // When album is None (manual mode without --album), mark_album_processed
+    // is skipped (no DB row to update).
     if organize_ok {
         if let Some(a) = album {
             db.mark_album_processed(artist, a, "success")?;
@@ -231,26 +234,34 @@ pub async fn process_album(
         db.mark_album_processed(artist, a, "failed")?;
     }
     if !organize_ok {
-        return Err(SeakarrError::Download(
-            "download succeeded but file organization failed".into(),
-        ));
+        return Ok(AlbumOutcome::Failed {
+            reason: "download succeeded but file organization failed".into(),
+        });
     }
 
-    // Notify
+    // Notify — log failure but don't propagate; the download succeeded
+    // and is already marked success in the DB. Pre-change behaviour:
+    // notify errors were also non-fatal to the album outcome.
     let track_count = downloaded.len();
-    notifier::notify_success(
+    if let Err(e) = notifier::notify_success(
         &config.notifications.urls,
         artist,
         album.unwrap_or("Unknown"),
         track_count,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(
+            "{artist} — {}: notification failed: {e}",
+            album.unwrap_or("(all)")
+        );
+    }
 
     tracing::info!(
         "Completed: {artist} — {} ({track_count} tracks)",
         album.unwrap_or("(all)")
     );
-    Ok(())
+    Ok(AlbumOutcome::Downloaded { track_count })
 }
 
 /// Run in automatic mode: scan library, find upgrades, process each album concurrently.
@@ -304,26 +315,51 @@ pub async fn run_auto_mode(
 
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
-    let futures = targets.into_iter().map(|(artist, album)| {
+    let targets_vec: Vec<(String, String)> = targets;
+    let mut futures_vec = Vec::new();
+
+    for (artist, album) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
-        async move {
-            // Park until a permit is free — this is what bounds concurrency.
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("semaphore is never closed");
-            process_album(client, &artist, Some(&album), config, db, staging_dir).await
-        }
-        .boxed_local()
-    });
+        let artist = artist.clone();
+        let album = album.clone();
+        futures_vec.push(
+            async move {
+                // Park until a permit is free — this is what bounds concurrency.
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is never closed");
+                let result =
+                    process_album(client, &artist, Some(&album), config, db, staging_dir).await;
+                (artist, album, result)
+            }
+            .boxed_local(),
+        );
+    }
 
-    let results = futures::future::join_all(futures).await;
+    let results = futures::future::join_all(futures_vec).await;
 
-    for result in results {
-        if let Err(e) = result {
-            tracing::error!("Album processing failed: {e}");
+    // Collect outcomes into the run report and print the summary once at the
+    // end. Environment errors (DB write, search) from inside process_album
+    // are recorded as Failed entries; staging-dir creation above also
+    // propagates but runs before the report exists (no summary printed).
+    let mut report = RunReport::new();
+    for (artist, album, result) in results {
+        match result {
+            Ok(outcome) => report.record(&artist, &album, outcome),
+            Err(e) => {
+                tracing::error!("Album processing failed: {artist} — {album}: {e}");
+                report.record(
+                    &artist,
+                    &album,
+                    AlbumOutcome::Failed {
+                        reason: e.to_string(),
+                    },
+                );
+            }
         }
     }
+    report.print_summary();
 
     Ok(())
 }
@@ -338,7 +374,32 @@ pub async fn run_manual_mode(
 ) -> Result<()> {
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
-    process_album(client, artist, album, config, db, staging_dir).await
+
+    let album_display = album.unwrap_or("(all)");
+    let mut report = RunReport::new();
+
+    // Environment errors from inside process_album (DB write, search)
+    // are recorded as Failed entries so they appear in the summary,
+    // then still propagated so the CLI exits non-zero.
+    // Staging-dir creation above also propagates, but runs before the
+    // report exists so no summary is printed for that failure.
+    let result = process_album(client, artist, album, config, db, staging_dir).await;
+    match &result {
+        Ok(outcome) => report.record(artist, album_display, outcome.clone()),
+        Err(e) => {
+            tracing::error!("Manual mode: {artist} — {album_display}: {e}");
+            report.record(
+                artist,
+                album_display,
+                AlbumOutcome::Failed {
+                    reason: e.to_string(),
+                },
+            );
+        }
+    }
+
+    report.print_summary();
+    result.map(|_| ())
 }
 
 #[cfg(test)]
@@ -398,6 +459,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
     }
 
     #[tokio::test]
@@ -434,6 +496,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
 
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
@@ -476,7 +539,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let staging = TempDir::new().unwrap();
 
-        process_album(
+        let result = process_album(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
@@ -484,8 +547,9 @@ mod tests {
             &db,
             staging.path(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
 
         // Fallback fired: primary query then album-only query.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -576,7 +640,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let staging = TempDir::new().unwrap();
 
-        process_album(
+        let result = process_album(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
@@ -584,8 +648,9 @@ mod tests {
             &db,
             staging.path(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
         // Both the primary and the second-chance fallback query ran.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -635,6 +700,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
 
         // The fallback fired: primary query then album-only query.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -690,6 +756,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
 
         // Gappy track set rejected at the filter stage -> album skipped,
         // nothing downloaded.
@@ -717,5 +784,85 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_auto_mode_processes_album_and_marks_success() {
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+
+        let mut config = make_test_config();
+        let tmp = TempDir::new().unwrap();
+        // Library layout: <tmp>/Test Artist/Test Album/01 - track.mp3
+        // mp3 is not in allowed_extensions (default [flac]) so the album is
+        // flagged for upgrade; the mock search supplies the flac result.
+        let artist_dir = tmp.path().join("Test Artist").join("Test Album");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        std::fs::write(artist_dir.join("01 - track.mp3"), b"fake mp3 data").unwrap();
+        config.library.paths = vec![tmp.path().to_string_lossy().into()];
+
+        let db = Database::open_in_memory().unwrap();
+
+        let result = run_auto_mode(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            &config,
+            &db,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Album processed successfully through the outcome-collection path.
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "success");
+    }
+
+    #[tokio::test]
+    async fn test_process_album_returns_failed_when_download_exhausted() {
+        let client = Arc::new(MockClient::new());
+        // Slow download speed triggers speed-check failure.
+        *client.download_speed.lock().unwrap() = 100_000; // 100 KB/s
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+
+        let mut config = make_test_config();
+        // Require impossibly fast upload → download fails → candidates exhausted.
+        config.download.min_upload_speed_kbps = 10_000_000;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        match outcome {
+            AlbumOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("all candidates exhausted"),
+                    "Expected 'all candidates exhausted' in reason, got: {reason}"
+                );
+            }
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
     }
 }

@@ -9,6 +9,7 @@ pub mod error;
 pub mod filter;
 pub mod notifier;
 pub mod organizer;
+pub mod report;
 pub mod runner;
 pub mod scanner;
 pub mod search;
