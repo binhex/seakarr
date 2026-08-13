@@ -120,8 +120,6 @@ pub struct DownloadConfig {
     pub speed_check_wait_secs: u64,
     #[serde(default = "default_download_timeout")]
     pub timeout_secs: u64,
-    #[serde(default = "default_browse_timeout")]
-    pub browse_timeout_secs: u64,
     #[serde(default = "default_max_download_time")]
     pub max_download_time_mins: u64,
     #[serde(default = "default_max_retries")]
@@ -138,8 +136,6 @@ pub struct DownloadConfig {
 pub struct DatabaseConfig {
     #[serde(default = "default_db_path")]
     pub path: String,
-    #[serde(default = "default_browse_cache_ttl")]
-    pub browse_cache_ttl_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,9 +256,6 @@ fn default_speed_check_wait() -> u64 {
 fn default_download_timeout() -> u64 {
     180
 }
-fn default_browse_timeout() -> u64 {
-    60
-}
 fn default_max_download_time() -> u64 {
     120
 }
@@ -280,9 +273,6 @@ fn default_skip_retry_hours() -> u32 {
 }
 fn default_db_path() -> String {
     "db".into()
-}
-fn default_browse_cache_ttl() -> u32 {
-    7
 }
 fn default_log_level() -> String {
     "INFO".into()
@@ -509,7 +499,6 @@ impl Default for Config {
                 min_upload_speed_kbps: default_min_upload_speed(),
                 speed_check_wait_secs: default_speed_check_wait(),
                 timeout_secs: default_download_timeout(),
-                browse_timeout_secs: default_browse_timeout(),
                 max_download_time_mins: default_max_download_time(),
                 max_retries: default_max_retries(),
                 retry_delay_secs: default_retry_delay(),
@@ -518,7 +507,6 @@ impl Default for Config {
             },
             database: DatabaseConfig {
                 path: default_db_path(),
-                browse_cache_ttl_days: default_browse_cache_ttl(),
             },
             logging: LoggingConfig {
                 level: default_log_level(),
@@ -590,7 +578,6 @@ download:
   min_upload_speed_kbps: 250
   speed_check_wait_secs: 30
   timeout_secs: 180
-  browse_timeout_secs: 60
   max_download_time_mins: 120
   max_retries: 4
   retry_delay_secs: 30
@@ -599,7 +586,6 @@ download:
 
 database:
   path: "db"
-  browse_cache_ttl_days: 7
 
 logging:
   level: "INFO"

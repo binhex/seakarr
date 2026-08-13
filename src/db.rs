@@ -79,7 +79,9 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS processed_albums (
+            "DROP TABLE IF EXISTS browse_cache;
+
+            CREATE TABLE IF NOT EXISTS processed_albums (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 artist      TEXT NOT NULL,
                 album       TEXT NOT NULL,
@@ -139,14 +141,6 @@ impl Database {
                 retries        INTEGER NOT NULL DEFAULT 0,
                 status         TEXT NOT NULL,
                 downloaded_at  TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS browse_cache (
-                username   TEXT NOT NULL,
-                path       TEXT NOT NULL,
-                data_json  TEXT NOT NULL,
-                cached_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (username, path)
             );
 
             CREATE TABLE IF NOT EXISTS batch_jobs (
@@ -310,11 +304,43 @@ mod tests {
     }
 
     #[test]
+    fn test_browse_cache_dropped_from_existing_db() {
+        // Simulate an existing install whose DB already has the browse_cache
+        // table from before this feature was removed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE browse_cache (
+                username   TEXT NOT NULL,
+                path       TEXT NOT NULL,
+                data_json  TEXT NOT NULL,
+                cached_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (username, path)
+            );",
+        )
+        .unwrap();
+        let db = Database { conn };
+        db.migrate().unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='browse_cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "browse_cache table should be dropped by migrate()"
+        );
+    }
+
+    #[test]
     fn test_create_tables() {
         let db = test_db();
         db.migrate().unwrap();
 
-        // Verify all 8 tables exist by querying sqlite_master
+        // Verify all 7 tables exist by querying sqlite_master
         let tables: Vec<String> = db
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -329,7 +355,6 @@ mod tests {
         assert!(tables.contains(&"peer_reputation".to_string()));
         assert!(tables.contains(&"search_history".to_string()));
         assert!(tables.contains(&"download_stats".to_string()));
-        assert!(tables.contains(&"browse_cache".to_string()));
         assert!(tables.contains(&"batch_jobs".to_string()));
         assert!(tables.contains(&"batch_job_lines".to_string()));
     }

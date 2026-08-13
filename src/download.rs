@@ -224,7 +224,6 @@ mod tests {
             min_upload_speed_kbps: 0, // disabled for test
             speed_check_wait_secs: 0, // immediate for test
             timeout_secs: 180,
-            browse_timeout_secs: 60,
             max_download_time_mins: 120,
             max_retries: 2,
             retry_delay_secs: 0,

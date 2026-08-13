@@ -15,13 +15,12 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
   free upload slots. Reject locked files and path-traversal names.
 - **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
-  stall timeout with cancel, per-file retry with backoff, and candidate fallback (try the next ranked peer on
-  failure).
+  stall timeout with cancel, and candidate fallback (try the next ranked peer on failure).
 - **Post-download organisation** — move completed files from a staging directory into your library using a
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
 - **SQLite persistence** — tracks processed albums, download queue, peer reputation, search history,
-  download stats, browse cache, and batch job progress across restarts and daemon cycles.
+  download stats, and batch job progress across restarts and daemon cycles.
 - **Daemon mode** — run continuously, re-scanning your library on a configurable interval and upgrading
   albums as they become available on Soulseek. Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
@@ -145,11 +144,11 @@ A default config is created automatically on first run. The file is divided into
 | --- | ----------- | ------- |
 | `default_mode` | Default search mode. Choices: `auto`, `manual`, `batch`. | `auto` |
 | `timeout_secs` | How long to wait for Soulseek search responses. | `15` |
-| `response_limit` | Maximum search results to collect. | `1000` |
-| `type` | Filter results by track count. `any` (no restriction), `album` (5+ tracks), `single` (1–4 tracks). | `any` |
-| `delay_secs` | Minimum gap between consecutive network searches to avoid flooding. | `5.0` |
-| `block_threshold` | Consecutive zero-result searches before checking for Soulseek rate-limiting. | `5` |
-| `block_pause_secs` | Pause duration when rate-limiting is detected, in seconds. | `300` |
+| `response_limit` | Maximum search results to collect. *(Reserved for future use — not yet enforced.)* | `1000` |
+| `type` | Filter results by track count. `any` (no restriction), `album` (5+ tracks), `single` (1–4 tracks). *(Reserved for future use — not yet enforced.)* | `any` |
+| `delay_secs` | Minimum gap between consecutive network searches to avoid flooding. *(Reserved for future use — not yet enforced.)* | `5.0` |
+| `block_threshold` | Consecutive zero-result searches before checking for Soulseek rate-limiting. *(Reserved for future use — not yet enforced.)* | `5` |
+| `block_pause_secs` | Pause duration when rate-limiting is detected, in seconds. *(Reserved for future use — not yet enforced.)* | `300` |
 | `fallback_search` | When a combined artist+album search returns zero results, retry with an album-only search and accept results whose share paths match the artist. Soulseek sometimes bans specific artist+album criteria. Each zero-result album adds a second search per retry cycle — keep rate limits in mind. | `true` |
 | `manual.artist` | Artist for manual mode (used when `--artist` is not passed). | `""` |
 | `manual.album` | Album for manual mode (optional, used when `--album` is not passed). | `""` |
@@ -174,24 +173,22 @@ Controls which Soulseek search results pass the quality gate.
 | --- | ----------- | ------- |
 | `concurrent` | Maximum simultaneous album downloads. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
 | `max_queue_length` | Maximum acceptable upload queue length. `0` = free-slot only. | `0` |
-| `max_start_time_secs` | Maximum seconds to wait at the front of a remote queue before the transfer starts. | `120` |
-| `max_queue_time_secs` | Maximum total seconds to wait from enqueue before any file starts. `0` disables. | `1800` |
+| `max_start_time_secs` | Maximum seconds to wait at the front of a remote queue before the transfer starts. *(Reserved for future use — not yet enforced.)* | `120` |
+| `max_queue_time_secs` | Maximum total seconds to wait from enqueue before any file starts. `0` disables. *(Reserved for future use — not yet enforced.)* | `1800` |
 | `min_upload_speed_kbps` | Cancel transfers where measured speed drops below this threshold. `0` disables the speed check. | `250` |
 | `speed_check_wait_secs` | Seconds to wait after a transfer starts before measuring speed. | `30` |
 | `timeout_secs` | Inactivity timeout — cancel the download if no status update arrives within this period. | `180` |
-| `browse_timeout_secs` | Maximum seconds to wait when browsing a user's shared files. `0` disables. | `60` |
-| `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. | `120` |
-| `max_retries` | Per-file retry attempts on transfer error. | `4` |
-| `retry_delay_secs` | Seconds to wait between retry attempts. | `30` |
-| `min_filtered_users` | Minimum number of filtered candidates required to apply the speed check. | `10` |
-| `skip_retry_hours` | Cooldown in hours before re-attempting a transiently-failed album on the next run. | `24` |
+| `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. *(Reserved for future use — not yet enforced.)* | `120` |
+| `max_retries` | Per-file retry attempts on transfer error. *(Reserved for future use — not yet enforced.)* | `4` |
+| `retry_delay_secs` | Seconds to wait between retry attempts. *(Reserved for future use — not yet enforced.)* | `30` |
+| `min_filtered_users` | Minimum number of filtered candidates required to apply the speed check. *(Reserved for future use — not yet enforced.)* | `10` |
+| `skip_retry_hours` | Cooldown in hours before re-attempting a transiently-failed album on the next run. *(Reserved for future use — not yet enforced.)* | `24` |
 
 ### `database`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `path` | Directory for the SQLite database (`seakarr.db` is created inside). Overridden by `--db-path`. | `db` |
-| `browse_cache_ttl_days` | Cache browsed user directory listings for this many days. `0` disables. | `7` |
 
 ### `logging`
 
