@@ -29,8 +29,8 @@ impl ProgressDisplay {
     /// Create a progress bar for a track download.
     ///
     /// The bar shows: filename | downloaded/total | speed | bar | percentage
-    pub fn create_bar(&self, filename: &str, total_bytes: u64) -> ProgressBar {
-        let bar = self.multi.add(ProgressBar::new(total_bytes));
+    pub fn create_bar(&self, filename: &str, _total_bytes: u64) -> ProgressBar {
+        let bar = self.multi.add(ProgressBar::new(0));
         let style = ProgressStyle::with_template(
             "  {spinner} {msg}  {bytes}/{total_bytes}  {prefix}  [{bar:20}]  {percent}%",
         )

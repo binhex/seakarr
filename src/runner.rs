@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -13,6 +14,7 @@ use crate::report::{AlbumOutcome, RunReport};
 use crate::{download, filter, notifier, organizer, scanner, search};
 
 /// Process a single album: search → filter rank → download → organize → notify.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_album(
     client: &dyn SoulseekClient,
     artist: &str,
@@ -21,6 +23,7 @@ pub async fn process_album(
     db: &Database,
     staging_dir: &Path,
     progress: Option<&ProgressDisplay>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<AlbumOutcome> {
     // Skip if already processed
     if let Some(a) = album {
@@ -184,19 +187,23 @@ pub async fn process_album(
         &config.download,
         &config.filters,
         progress,
+        cancel,
     )
     .await
     {
         Ok(files) => files,
         Err(e) => {
+            let reason = if e.to_string().contains("cancelled") {
+                e.to_string()
+            } else {
+                format!("all candidates exhausted: {e}")
+            };
             tracing::warn!(
-                "{artist} — {}: download failed ({e}); {} candidates exhausted",
+                "{artist} — {}: download failed ({reason}); {} candidates exhausted",
                 album.unwrap_or("(all)"),
                 ranked.len(),
             );
-            return Ok(AlbumOutcome::Failed {
-                reason: format!("all candidates exhausted: {e}"),
-            });
+            return Ok(AlbumOutcome::Failed { reason });
         }
     };
 
@@ -326,6 +333,17 @@ pub async fn run_auto_mode(
         None
     };
 
+    // Shared cancellation flag: SIGINT (Ctrl+C) sets it, aborting in-flight
+    // downloads. Each album's staging dir is cleaned by download_album.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_signal = Arc::clone(&cancel);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Received SIGINT — aborting in-flight downloads...");
+            cancel_signal.store(true, Ordering::SeqCst);
+        }
+    });
+
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
     let targets_vec: Vec<(String, String)> = targets;
@@ -334,6 +352,7 @@ pub async fn run_auto_mode(
     for (artist, album) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
+        let cancel = cancel.clone();
         let artist = artist.clone();
         let album = album.clone();
         futures_vec.push(
@@ -351,6 +370,7 @@ pub async fn run_auto_mode(
                     db,
                     staging_dir,
                     progress.as_deref(),
+                    Some(&cancel),
                 )
                 .await;
                 (artist, album, result)
@@ -415,7 +435,27 @@ pub async fn run_manual_mode(
         None
     };
     let progress_ref = progress.as_ref();
-    let result = process_album(client, artist, album, config, db, staging_dir, progress_ref).await;
+    // Cancellation flag: SIGINT aborts the in-flight download; download_album
+    // cleans the album's staging dir.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_signal = Arc::clone(&cancel);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Received SIGINT — aborting download...");
+            cancel_signal.store(true, Ordering::SeqCst);
+        }
+    });
+    let result = process_album(
+        client,
+        artist,
+        album,
+        config,
+        db,
+        staging_dir,
+        progress_ref,
+        Some(&cancel),
+    )
+    .await;
     match &result {
         Ok(outcome) => report.record(artist, album_display, outcome.clone()),
         Err(e) => {
@@ -493,6 +533,7 @@ mod tests {
             &db,
             staging.path(),
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -530,6 +571,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
         )
         .await;
@@ -587,6 +629,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
         )
         .await;
@@ -690,6 +733,7 @@ mod tests {
             &db,
             staging.path(),
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -740,6 +784,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
         )
         .await;
@@ -800,6 +845,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
         )
         .await;
@@ -902,6 +948,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
         )
         .await;

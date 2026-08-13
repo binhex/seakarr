@@ -49,6 +49,7 @@ async fn test_full_pipeline_manual_mode() {
         &db,
         staging.path(),
         None,
+        None,
     )
     .await;
 
@@ -79,6 +80,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         &config,
         &db,
         staging.path(),
+        None,
         None,
     )
     .await;

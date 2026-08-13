@@ -1,5 +1,7 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use seakarr::client::{RealClient, SoulseekClient};
@@ -380,7 +382,25 @@ async fn run_batch_mode(
         None
     };
 
+    // Shared cancellation flag: SIGINT aborts the in-flight album download;
+    // its staging dir is cleaned by download_album.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_signal = Arc::clone(&cancel);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Received SIGINT — aborting download...");
+            cancel_signal.store(true, Ordering::SeqCst);
+        }
+    });
+
     for line in &lines {
+        // Check cancellation between batch lines — stop processing
+        // remaining albums after Ctrl+C.
+        if cancel.load(Ordering::SeqCst) {
+            tracing::info!("Batch mode: cancelled");
+            break;
+        }
+
         let parts: Vec<&str> = line.splitn(2, " - ").collect();
         let artist = parts[0].trim();
         let album = parts.get(1).map(|a| a.trim()).filter(|a| !a.is_empty());
@@ -394,6 +414,7 @@ async fn run_batch_mode(
             db,
             staging_dir,
             progress.as_ref(),
+            Some(&cancel),
         )
         .await
         {

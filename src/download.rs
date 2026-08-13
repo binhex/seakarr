@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
 use indicatif::ProgressBar;
@@ -29,6 +31,21 @@ pub(crate) fn safe_basename(remote_name: &str) -> Result<&str> {
     Ok(basename)
 }
 
+/// Drain the status channel until the transfer terminates (Completed/Failed)
+/// or the channel closes. Prevents `remove_dir_all` from racing the vendor
+/// library's transfer thread after cancellation.
+async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, timeout_secs: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(DownloadStatus::Completed))
+            | Ok(Some(DownloadStatus::Failed { .. }))
+            | Ok(None) => return,
+            _ => continue,
+        }
+    }
+}
+
 /// Download a single file from a specific user, monitoring speed.
 pub async fn download_file(
     client: &dyn SoulseekClient,
@@ -37,6 +54,7 @@ pub async fn download_file(
     dir: &Path,
     config: &DownloadConfig,
     bar: Option<&ProgressBar>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<PathBuf> {
     // Validate the remote name for traversal safety, but pass the FULL
     // share-relative path to the crate: the Soulseek QueueUpload wire
@@ -51,23 +69,40 @@ pub async fn download_file(
         Ok(h) => h,
         Err(e) => {
             if let Some(bar) = bar {
-                bar.abandon();
+                bar.finish_and_clear();
             }
             return Err(e);
         }
     };
     tracing::info!("Download queued: {basename} from {username}");
     let mut transfer_start: Option<tokio::time::Instant> = None;
+    // Wall-clock deadline for the entire transfer — reset on every status
+    // message. With 1-second polling, Err(_elapsed) fires every second;
+    // only trigger timeout when the deadline is truly exceeded.
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
 
     loop {
-        // Guard against transfers that stop sending status updates
-        // (hung peer, network partition) — timeout_secs is the deadline
-        // for ANY message to arrive, not just for completion.
-        let msg = timeout(
-            Duration::from_secs(config.timeout_secs),
-            handle.status_rx.recv(),
-        )
-        .await;
+        // Honour cancellation (Ctrl+C / SIGINT): abort the transfer and
+        // clean up. The caller (download_album) removes the staging dir.
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            let _ = handle.cancel_tx.send(()).await;
+            drain_transfer(&mut handle.status_rx, 5).await;
+            if let Some(bar) = bar {
+                bar.finish_and_clear();
+            }
+            return Err(SeakarrError::Download("download cancelled by user".into()));
+        }
+        // Poll status with a short timeout so the cancel flag is checked
+        // frequently (at least once per second). The wall-clock deadline
+        // for the whole transfer is still config.timeout_secs.
+        let poll_timeout = Duration::from_secs(1);
+        let msg = timeout(poll_timeout, handle.status_rx.recv()).await;
+
+        // Any message from the peer resets the deadline — the transfer
+        // is alive. Only the Err (poll timeout) arm checks the deadline.
+        if msg.is_ok() {
+            deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
+        }
 
         match msg {
             Ok(Some(DownloadStatus::InProgress {
@@ -91,9 +126,12 @@ pub async fn download_file(
                             let speed_kbps = (speed_bytes_per_sec / 1024) as u32;
                             if speed_kbps < config.min_upload_speed_kbps {
                                 if let Some(bar) = bar {
-                                    bar.abandon();
+                                    bar.finish_and_clear();
                                 }
                                 let _ = handle.cancel_tx.send(()).await;
+                                // Wait for the transfer to terminate before
+                                // returning — download_album calls remove_dir_all.
+                                drain_transfer(&mut handle.status_rx, 5).await;
                                 return Err(SeakarrError::Download(format!(
                                     "speed {speed_kbps} KB/s below minimum {} KB/s",
                                     config.min_upload_speed_kbps
@@ -110,7 +148,10 @@ pub async fn download_file(
             }
             Ok(Some(DownloadStatus::Completed)) => {
                 if let Some(bar) = bar {
-                    bar.finish_and_clear();
+                    // Show 100% before clearing — finish() keeps the final
+                    // frame visible, unlike finish_and_clear() which removes
+                    // the bar before the 100% render.
+                    bar.finish();
                 }
                 let dest = dir.join(basename);
                 tracing::info!("Download completed: {basename}");
@@ -118,7 +159,7 @@ pub async fn download_file(
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 if let Some(bar) = bar {
-                    bar.abandon();
+                    bar.finish_and_clear();
                 }
                 tracing::warn!("Download of {basename} failed: {reason}");
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
@@ -126,7 +167,7 @@ pub async fn download_file(
             Ok(Some(DownloadStatus::Queued { .. })) => {}
             Ok(None) => {
                 if let Some(bar) = bar {
-                    bar.abandon();
+                    bar.finish_and_clear();
                 }
                 tracing::warn!("Download channel closed for {basename}");
                 return Err(SeakarrError::Download(
@@ -134,15 +175,21 @@ pub async fn download_file(
                 ));
             }
             Err(_elapsed) => {
-                if let Some(bar) = bar {
-                    bar.abandon();
+                // The 1-second poll timed out — check the wall-clock
+                // deadline before declaring the transfer dead.
+                if tokio::time::Instant::now() >= deadline {
+                    if let Some(bar) = bar {
+                        bar.finish_and_clear();
+                    }
+                    tracing::warn!(
+                        "Download of {basename} timed out after {}s",
+                        config.timeout_secs
+                    );
+                    let _ = handle.cancel_tx.send(()).await;
+                    drain_transfer(&mut handle.status_rx, 5).await;
+                    return Err(SeakarrError::Download("download timed out".into()));
                 }
-                tracing::warn!(
-                    "Download of {basename} timed out after {}s",
-                    config.timeout_secs
-                );
-                let _ = handle.cancel_tx.send(()).await;
-                return Err(SeakarrError::Download("download timed out".into()));
+                // Still within deadline — continue polling.
             }
         }
     }
@@ -159,10 +206,24 @@ pub async fn download_album(
     config: &DownloadConfig,
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<PathBuf>> {
     let mut last_err: Option<SeakarrError> = None;
 
     for candidate in candidates {
+        // Check cancellation between candidates — avoid queuing network
+        // requests to the next peer after the user pressed Ctrl+C.
+        // Clean the staging dir before returning so no partial downloads
+        // are left behind (same cleanup as the post-loop failure path).
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            if let Err(e) = std::fs::remove_dir_all(staging_dir) {
+                tracing::warn!("Failed to clean staging dir on cancel {staging_dir:?}: {e}");
+            } else if let Err(e) = std::fs::create_dir_all(staging_dir) {
+                tracing::warn!("Failed to recreate staging dir on cancel {staging_dir:?}: {e}");
+            }
+            return Err(SeakarrError::Download("download cancelled by user".into()));
+        }
+
         let all_passed = candidate
             .files
             .iter()
@@ -211,6 +272,7 @@ pub async fn download_album(
                 staging_dir,
                 config,
                 bar_ref,
+                cancel,
             )
             .await
             {
@@ -239,12 +301,31 @@ pub async fn download_album(
             return Ok(downloaded);
         }
 
-        // Clean up files already downloaded from this failed candidate
-        // before trying the next. Errors during cleanup are logged but do
-        // not prevent fallback.
-        for orphan in &downloaded {
-            if let Err(e) = std::fs::remove_file(orphan) {
-                tracing::warn!("Failed to clean up orphan staging file {orphan:?}: {e}");
+        // The album's staging directory is per-album (created by the runner).
+        // A failed candidate must leave it completely clean — the album is
+        // either fully downloaded or has nothing in the download path. This
+        // removes completed tracks from this candidate AND any `.part` files
+        // the vendor library left behind on the failed track (resume from a
+        // different peer's `.part` is useless, and stale partials accumulate
+        // otherwise). Retry once after a brief pause to handle transient
+        // locks from a just-cancelled transfer.
+        for attempt in 0..2 {
+            match std::fs::remove_dir_all(staging_dir) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::create_dir_all(staging_dir) {
+                        tracing::warn!("Failed to recreate staging directory {staging_dir:?}: {e}");
+                    }
+                    break;
+                }
+                Err(e) if attempt == 0 => {
+                    tracing::warn!(
+                        "Failed to clean up staging directory {staging_dir:?} (retrying): {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to clean up staging directory {staging_dir:?}: {e}");
+                }
             }
         }
     }
@@ -304,7 +385,7 @@ mod tests {
         );
         let config = default_dl_config();
 
-        let result = download_file(&client, &file, "peer", dir.path(), &config, None).await;
+        let result = download_file(&client, &file, "peer", dir.path(), &config, None, None).await;
         assert!(result.is_ok());
 
         let wire_name = client
@@ -330,8 +411,16 @@ mod tests {
         let config = default_dl_config();
         let bar = ProgressBar::new(10_000_000);
 
-        let result =
-            download_file(&client, &file, "testuser", dir.path(), &config, Some(&bar)).await;
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            Some(&bar),
+            None,
+        )
+        .await;
         assert!(result.is_ok());
         assert!(bar.is_finished());
     }
@@ -343,7 +432,8 @@ mod tests {
         let file = make_file("track.flac", 900, 10_000_000);
         let config = default_dl_config();
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
+        let result =
+            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
         assert!(result.is_ok());
     }
 
@@ -358,7 +448,8 @@ mod tests {
         config.min_upload_speed_kbps = 200; // require >200 KB/s
         config.speed_check_wait_secs = 0;
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
+        let result =
+            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
         // Should detect slow speed and return error
         assert!(result.is_err());
     }
@@ -375,7 +466,8 @@ mod tests {
         config.max_retries = 2;
         config.retry_delay_secs = 0;
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
+        let result =
+            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
         assert!(result.is_err());
     }
 
@@ -400,8 +492,114 @@ mod tests {
             &config,
             &crate::config::FilterConfig::default(),
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_failed_candidate_cleans_up_part_files() {
+        // A candidate whose download fails partway must leave the staging
+        // directory clean — no completed tracks, no stale `.part` files.
+        // Regression: the orphan loop only removed files returned as `Ok`,
+        // leaving `.part` files behind after a failed transfer.
+        let client = MockClient::new();
+        // Slow speed forces the speed-check failure on the first file.
+        *client.download_speed.lock().unwrap() = 100_000; // 100 KB/s
+        let dir = TempDir::new().unwrap();
+
+        // Simulate a leftover `.part` file (as the vendor lib leaves behind
+        // on an interrupted transfer) plus a completed track.
+        std::fs::write(dir.path().join("01 - track.flac.part"), b"partial").unwrap();
+        std::fs::write(dir.path().join("02 - track.flac"), b"complete").unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "user1".into(),
+            speed: 300,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+        let mut config = default_dl_config();
+        // Require impossibly fast upload so the speed check fails.
+        config.min_upload_speed_kbps = 10_000_000;
+        config.speed_check_wait_secs = 0;
+
+        let result = download_album(
+            &client,
+            &candidates,
+            dir.path(),
+            &config,
+            &crate::config::FilterConfig::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+
+        // The staging directory must be empty — no partial downloads at all.
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "staging dir must be clean after failed candidate, found: {:?}",
+            remaining.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_flag_aborts_download_and_cleans_up() {
+        // When the cancellation flag is set (Ctrl+C / SIGINT), download_album
+        // must abort and clean the staging directory — including any `.part`
+        // files the vendor library would leave behind.
+        use crate::config::FilterConfig;
+
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+
+        let dir = TempDir::new().unwrap();
+        // Simulate a leftover .part file from a previous run.
+        std::fs::write(dir.path().join("01 - track.flac.part"), b"stale partial").unwrap();
+
+        let config = default_dl_config();
+        let filter_config = FilterConfig::default();
+
+        // Cancellation is already requested — download_album should abort
+        // before queuing the download to the peer.
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let results = client.search_results.lock().unwrap().clone();
+        let result = download_album(
+            client.as_ref(),
+            &results,
+            dir.path(),
+            &config,
+            &filter_config,
+            None,
+            Some(&cancelled),
+        )
+        .await;
+        assert!(result.is_err(), "download_album must abort when cancelled");
+        assert!(
+            result.unwrap_err().to_string().contains("cancelled"),
+            "error must indicate cancellation"
+        );
+
+        // The staging directory must be completely clean.
+        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "staging dir must be clean after cancellation, found: {:?}",
+            remaining.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
     }
 }
