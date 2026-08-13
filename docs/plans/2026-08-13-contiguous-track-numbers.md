@@ -49,6 +49,7 @@ No other files change. `download.rs` and `search.rs` are untouched.
 ### Task 1: Config — `filters.contiguous_tracks` toggle
 
 **Files:**
+
 - Modify: `src/config.rs` (`FilterConfig` struct, `Default` impl at ~line 494, `sample_yaml()` filters section, tests module)
 - Test: `src/config.rs`
 
@@ -125,6 +126,7 @@ git commit -m "feat: add filters.contiguous_tracks config toggle (default on)"
 ### Task 2: `tracks.rs` — `track_number_from_filename`
 
 **Files:**
+
 - Create: `src/tracks.rs`
 - Modify: `src/lib.rs` (register the module)
 - Test: `src/tracks.rs` (tests module)
@@ -217,7 +219,9 @@ mod tests {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p seakarr track_number_from_filename`
-Expected: FAIL — compile error `cannot find function 'track_number_from_filename'` (plus `unused import FileInfo`). Note: `make_file` in the tests module returns `FileInfo`, so the top-level `use crate::client::FileInfo;` must exist — that part compiles once added in Step 3.
+Expected: FAIL — compile error `cannot find function 'track_number_from_filename'` (plus `unused
+import FileInfo`). Note: `make_file` in the tests module returns `FileInfo`, so the top-level
+`use crate::client::FileInfo;` must exist — that part compiles once added in Step 3.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -275,6 +279,7 @@ git commit -m "feat: add track-number parsing helper (tracks module)"
 ### Task 3: `tracks.rs` — `files_have_contiguous_tracks`
 
 **Files:**
+
 - Modify: `src/tracks.rs`
 - Test: `src/tracks.rs`
 
@@ -393,12 +398,14 @@ git commit -m "feat: add contiguous-track check helper"
 ### Task 4: Wire the contiguity predicate into `filter_results`
 
 **Files:**
+
 - Modify: `src/filter.rs` (`filter_results`)
 - Test: `src/filter.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the tests module of `src/filter.rs` (reusing the existing `make_file`, `make_result`, `default_filter_config` helpers):
+Append to the tests module of `src/filter.rs` (reusing the existing `make_file`, `make_result`,
+`default_filter_config` helpers):
 
 ```rust
     #[test]
@@ -483,7 +490,9 @@ Append to the tests module of `src/filter.rs` (reusing the existing `make_file`,
     }
 ```
 
-Note: `default_filter_config()` (used by these tests) must gain the new field — add `contiguous_tracks: true,` to it in the same step (it currently lists all `FilterConfig` fields explicitly):
+Note: `default_filter_config()` (used by these tests) must gain the new field — add
+`contiguous_tracks: true,` to it in the same step (it currently lists all `FilterConfig` fields
+explicitly):
 
 ```rust
     fn default_filter_config() -> FilterConfig {
@@ -501,11 +510,15 @@ Note: `default_filter_config()` (used by these tests) must gain the new field �
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p seakarr test_filter_rejects_gappy_tracks_when_toggle_on`
-Expected: FAIL — compile error `missing field 'contiguous_tracks' in initializer of 'FilterConfig'` (the `default_filter_config` helper does not yet initialise the new field; the production predicate is also missing, so the behaviour is absent either way). Both halves are fixed in Step 3.
+Expected: FAIL — compile error `missing field 'contiguous_tracks' in initializer of
+'FilterConfig'` (the `default_filter_config` helper does not yet initialise the new field; the
+production predicate is also missing, so the behaviour is absent either way). Both halves are
+fixed in Step 3.
 
 - [ ] **Step 3: Write the implementation**
 
-Add `contiguous_tracks: true,` to `default_filter_config()` in the tests module (exact block shown above), then replace the body of `filter_results` in `src/filter.rs` with:
+Add `contiguous_tracks: true,` to `default_filter_config()` in the tests module (exact block shown
+above), then replace the body of `filter_results` in `src/filter.rs` with:
 
 ```rust
 pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<SearchResult> {
@@ -560,6 +573,7 @@ git commit -m "feat: discount search results with non-contiguous track numbers"
 ### Task 5: Runner — log wording and integration test
 
 **Files:**
+
 - Modify: `src/runner.rs` (log wording, tests module)
 - Test: `src/runner.rs`
 
@@ -654,7 +668,9 @@ with:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p seakarr test_fallback_with_gappy_tracks_marks_skipped`
-Expected: PASS. Then the whole runner module: `cargo test -p seakarr runner::tests` — all pass, including `test_fallback_download_completes_album_and_records_history` (its single track 01 is trivially contiguous, so it still downloads).
+Expected: PASS. Then the whole runner module: `cargo test -p seakarr runner::tests` — all pass,
+including `test_fallback_download_completes_album_and_records_history` (its single track 01 is
+trivially contiguous, so it still downloads).
 
 - [ ] **Step 5: Commit**
 
@@ -669,6 +685,7 @@ git commit -m "feat: skip albums whose fallback results have non-contiguous trac
 ### Task 6: README + full verification + final commit
 
 **Files:**
+
 - Modify: `README.md` (filters table)
 
 - [ ] **Step 1: Add the README row**
@@ -676,7 +693,7 @@ git commit -m "feat: skip albums whose fallback results have non-contiguous trac
 In `README.md`, in the `### filters` table, after the `min_bitdepth` row add:
 
 ```markdown
-| `contiguous_tracks` | Require downloaded track numbers to be contiguous — results with gaps (incomplete albums) are discounted at the search stage. Duplicate track numbers are permitted; set `false` for unnumbered or multi-disc collections. | `true` |
+| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. | `true` |
 ```
 
 - [ ] **Step 2: Verify the README row renders as a table row (pipe-delimited, correct column count)**
@@ -712,6 +729,18 @@ git commit -m "docs: document filters.contiguous_tracks"
 
 ## Self-Review Notes
 
-- **Spec coverage:** §1 behaviour (toggle semantics, duplicates OK, gaps reject, unnumbered reject, filter-passing-only scope) → Tasks 3-4; §2 parsing rule (1-3 digit, first token, 4-digit skip) → Task 2; §2 module (`tracks.rs`, `lib.rs`) → Task 2; §2 filter wiring → Task 4; §2 config → Task 1; §2 README → Task 6; §3 data flow → Task 4 (predicate) + Task 5 (integration); §4 error handling (total parsing, no new errors) → Task 2 implementation + Task 5 (skipped path); §5 config surface → Task 1; §6 testing matrix → Tasks 1-5.
-- **Type consistency:** `track_number_from_filename(&str) -> Option<u32>` and `files_have_contiguous_tracks(&[&FileInfo]) -> bool` are used identically in Task 2/3 definitions, Task 3/4 tests, and the Task 4 `filter_results` implementation. `FilterConfig.contiguous_tracks: bool` is consistent across Tasks 1 and 4. `MockClient.download_filenames` (existing, v0.3.2) is used in Task 5.
-- **Existing tests preserved:** `filter_results` still returns whole results (`.cloned()`), so `download_album` re-filters by quality as before; pre-existing filter tests use contiguous or single-track sets and pass. The runner's existing fallback tests use track `01` (trivially contiguous).
+- **Spec coverage:** §1 behaviour (toggle semantics, duplicates OK, gaps reject, unnumbered
+  reject, filter-passing-only scope) → Tasks 3-4; §2 parsing rule (1-3 digit, first token, 4-digit
+  skip) → Task 2; §2 module (`tracks.rs`, `lib.rs`) → Task 2; §2 filter wiring → Task 4; §2 config
+  → Task 1; §2 README → Task 6; §3 data flow → Task 4 (predicate) + Task 5 (integration); §4
+  error handling (total parsing, no new errors) → Task 2 implementation + Task 5 (skipped path);
+  §5 config surface → Task 1; §6 testing matrix → Tasks 1-5.
+- **Type consistency:** `track_number_from_filename(&str) -> Option<u32>` and
+  `files_have_contiguous_tracks(&[&FileInfo]) -> bool` are used identically in Task 2/3
+  definitions, Task 3/4 tests, and the Task 4 `filter_results` implementation.
+  `FilterConfig.contiguous_tracks: bool` is consistent across Tasks 1 and 4.
+  `MockClient.download_filenames` (existing, v0.3.2) is used in Task 5.
+- **Existing tests preserved:** `filter_results` still returns whole results (`.cloned()`), so
+  `download_album` re-filters by quality as before; pre-existing filter tests use contiguous or
+  single-track sets and pass. The runner's existing fallback tests use track `01` (trivially
+  contiguous).
