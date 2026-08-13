@@ -119,7 +119,7 @@ fn handle_peer_connection(
     stream: TcpStream,
     reader: MessageReader,
     context: &ConnectionContext,
-) {
+) -> bool {
     // The peer actor multiplexes socket reads with its mailbox on a single
     // thread: `tick()` reads the socket, but outgoing messages (e.g. a queued
     // QueueUpload for a download) are delivered through the mailbox between
@@ -128,7 +128,7 @@ fn handle_peer_connection(
     // outbound path and drive this connection non-blocking.
     if let Err(e) = stream.set_nonblocking(true) {
         error!("[listener] failed to set peer stream non-blocking: {}", e);
-        return;
+        return false;
     }
     stream.set_nodelay(true).ok();
 
@@ -136,21 +136,31 @@ fn handle_peer_connection(
         Ok(c) => c,
         Err(e) => {
             error!("[listener] handle_peer_connection lock: {}", e);
-            return;
+            return false;
         }
     };
     if let Some(ref registry) = client_context.peer_registry {
-        match registry.register_peer(peer.clone(), Some(stream), Some(reader)) {
-            Ok(_) => (),
+        // Mirror the outbound classification (connection.rs): a peer with a
+        // token is a search responder and takes the grace-protected path;
+        // token-less peers are download targets that may evict.
+        let result = if peer.token.is_some() {
+            registry.register_search_responder(peer.clone(), Some(stream), Some(reader))
+        } else {
+            registry.register_peer(peer.clone(), Some(stream), Some(reader))
+        };
+        match result {
+            Ok(_) => true,
             Err(e) => {
                 error!(
                     "Failed to spawn peer actor for {:?}: {:?}",
                     peer.username, e
                 );
+                false
             }
         }
     } else {
         error!("PeerRegistry not initialized");
+        false
     }
 }
 
@@ -263,7 +273,17 @@ fn handle_pierce_firewall(
         0,
         0,
     );
-    handle_peer_connection(peer, stream, reader, context);
+    // Consume the token only if registration succeeded: a failed
+    // registration (thread-spawn EAGAIN, skip-at-capacity) must not strand
+    // the queued downloads — the BROKER_CONNECT_TIMEOUT reaper finds the
+    // token missing and never fails them. On failure, restore the pending
+    // mapping so the reaper (or a retry) can still resolve it.
+    if !handle_peer_connection(peer, stream, reader, context)
+        && let Ok(mut ctx) = context.client_context.write_safe()
+    {
+        ctx.add_pending_connect(token, username);
+        return;
+    }
 
     // Inbound peers don't self-announce, so nudge the client to flush any
     // downloads queued for this now-connected peer.
@@ -313,12 +333,20 @@ fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext)
     // twice — two sockets, two threads — and made every "already connected?"
     // check miss, so an inbound searcher still got a second, outbound
     // connection dialled at them.
+    //
+    // Preserve the peer-init token: a non-zero token marks a search
+    // responder, which must take the grace-protected registration path so an
+    // inbound responder at capacity cannot evict a fresh, grace-protected
+    // responder before it delivers (the exact failure the grace period
+    // prevents). Token 0 (plain control connection) stays a download-target
+    // registration that may evict.
+    let peer_token = (init_data.token != 0).then_some(init_data.token);
     let peer = Peer::new(
         init_data.username.clone(),
         init_data.connection_type.clone(),
         peer_ip.clone(),
         peer_port.into(),
-        None,
+        peer_token,
         0,
         0,
         0,
@@ -326,7 +354,11 @@ fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext)
 
     match init_data.connection_type {
         ConnectionType::P => {
-            handle_peer_connection(peer, stream, reader, &context);
+            if !handle_peer_connection(peer, stream, reader, &context) {
+                // Registration refused (capacity + grace): announcing
+                // PeerConnected would flush messages into a dead end.
+                return;
+            }
             // Inbound peers don't self-announce, so nudge the client to flush
             // anything queued for this now-connected peer — same as the
             // PierceFirewall path.

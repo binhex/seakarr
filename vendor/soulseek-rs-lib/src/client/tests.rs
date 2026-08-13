@@ -473,3 +473,104 @@ fn a_clean_disconnect_keeps_queued_uploads_an_error_drops_them() {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+// Regression: a ConnectToPeer flood (the server pushes one per search-result
+// peer) must not spawn an unbounded number of dialing actor threads. The
+// peer registry used to spawn its actor BEFORE the capacity/grace refusal,
+// so every refused registration leaked an orphan actor that dialed its
+// target and lived out its connect window — a single popular search leaked
+// hundreds of threads and the process OOM-aborted ("failed to set up
+// alternative stack guard page: Cannot allocate memory").
+//
+// Observable contract: refused flood registrations must not DIAL. We point
+// the flood peers at a listener we own and count the connections we receive:
+// pre-fix every refused registration's orphan actor connects (~N); post-fix
+// only the at-most-max_peers registered actors connect (<=8).
+#[test]
+fn connect_to_peer_flood_does_not_explode_dialing_actors() {
+    use crate::actor::ActorSystem;
+    use crate::actor::peer_registry::PeerRegistry;
+
+    let client = Client::new("flood-test", "pw");
+    // Inject a bounded registry so the ops loop's connect_to_peer path is
+    // exercised end-to-end.
+    let system = Arc::new(ActorSystem::new());
+    let (reg_tx, _reg_rx) = mpsc::channel();
+    let registry = PeerRegistry::with_max_peers(system, reg_tx, "me".to_string(), 8);
+    client.context.write().unwrap().peer_registry = Some(registry);
+
+    let (ops, ops_rx) = mpsc::channel();
+    Client::listen_to_client_operations(ops_rx, client.context.clone(), "me".to_string());
+
+    // A listener that accepts but never speaks: actors dial it and stay
+    // alive (reading) instead of exiting instantly, so every spawned actor
+    // shows up as a connection on this listener.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let n = 96;
+    for i in 0..n {
+        let peer = Peer::new(
+            format!("flood-{i}"),
+            ConnectionType::P,
+            "127.0.0.1".to_string(),
+            u32::from(addr.port()),
+            Some(1234 + i as u32), // search-responder token
+            0,
+            0,
+            0,
+        );
+        ops.send(ClientOperation::ConnectToPeer(peer)).unwrap();
+    }
+
+    // Drain the flood: the ops loop processes all ConnectToPeer ops before
+    // the fence (OwnPrivileges) — poll until the fence is visible. The
+    // sentinel starts as None (not Some(7)): only the ops loop's processing
+    // of the fence op overwrites it, so the poll genuinely waits for the
+    // ops loop to have consumed all preceding ConnectToPeer ops.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        client.context.write().unwrap().own_privileges = None;
+        ops.send(ClientOperation::OwnPrivileges(7)).unwrap();
+        let drained = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while client.context.read().unwrap().own_privileges != Some(7)
+            && std::time::Instant::now() < drained
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if client.context.read().unwrap().own_privileges == Some(7) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ops loop never drained the flood"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Give dials a moment to complete, then count the connections we
+    // received. Registered actors (<= max_peers = 8) legitimately connect;
+    // anything far beyond that is orphan dials from refused registrations.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let mut connected = 0usize;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                connected += 1;
+                // Keep the peer side from blocking the actor's read loop
+                // teardown; drop the accepted side, the actor sees EOF/reset.
+                drop(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
+    }
+
+    let bound = 8 + 8; // max_peers + drain slack
+    assert!(
+        connected <= bound,
+        "ConnectToPeer flood produced {connected} dialing actors (bound {bound}): \
+         refused registrations are leaking orphan actor threads"
+    );
+}
