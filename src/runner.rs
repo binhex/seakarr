@@ -8,6 +8,7 @@ use crate::client::SoulseekClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::{Result, SeakarrError};
+use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, RunReport};
 use crate::{download, filter, notifier, organizer, scanner, search};
 
@@ -19,6 +20,7 @@ pub async fn process_album(
     config: &Config,
     db: &Database,
     staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
 ) -> Result<AlbumOutcome> {
     // Skip if already processed
     if let Some(a) = album {
@@ -177,6 +179,7 @@ pub async fn process_album(
         &album_staging,
         &config.download,
         &config.filters,
+        progress,
     )
     .await
     {
@@ -313,6 +316,12 @@ pub async fn run_auto_mode(
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
 
+    let progress = if is_interactive() {
+        Some(Arc::new(ProgressDisplay::new()))
+    } else {
+        None
+    };
+
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
     let targets_vec: Vec<(String, String)> = targets;
@@ -320,6 +329,7 @@ pub async fn run_auto_mode(
 
     for (artist, album) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
+        let progress = progress.clone();
         let artist = artist.clone();
         let album = album.clone();
         futures_vec.push(
@@ -329,8 +339,16 @@ pub async fn run_auto_mode(
                     .acquire_owned()
                     .await
                     .expect("semaphore is never closed");
-                let result =
-                    process_album(client, &artist, Some(&album), config, db, staging_dir).await;
+                let result = process_album(
+                    client,
+                    &artist,
+                    Some(&album),
+                    config,
+                    db,
+                    staging_dir,
+                    progress.as_deref(),
+                )
+                .await;
                 (artist, album, result)
             }
             .boxed_local(),
@@ -338,6 +356,10 @@ pub async fn run_auto_mode(
     }
 
     let results = futures::future::join_all(futures_vec).await;
+
+    if let Some(ref p) = progress {
+        p.clear();
+    }
 
     // Collect outcomes into the run report and print the summary once at the
     // end. Environment errors (DB write, search) from inside process_album
@@ -383,7 +405,13 @@ pub async fn run_manual_mode(
     // then still propagated so the CLI exits non-zero.
     // Staging-dir creation above also propagates, but runs before the
     // report exists so no summary is printed for that failure.
-    let result = process_album(client, artist, album, config, db, staging_dir).await;
+    let progress = if is_interactive() {
+        Some(ProgressDisplay::new())
+    } else {
+        None
+    };
+    let progress_ref = progress.as_ref();
+    let result = process_album(client, artist, album, config, db, staging_dir, progress_ref).await;
     match &result {
         Ok(outcome) => report.record(artist, album_display, outcome.clone()),
         Err(e) => {
@@ -396,6 +424,10 @@ pub async fn run_manual_mode(
                 },
             );
         }
+    }
+
+    if let Some(ref p) = progress {
+        p.clear();
     }
 
     report.print_summary();
@@ -456,6 +488,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -493,6 +526,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -546,6 +580,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -647,6 +682,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -697,6 +733,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -753,6 +790,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -851,6 +889,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
         )
         .await;
         assert!(result.is_ok());

@@ -374,13 +374,29 @@ async fn run_batch_mode(
 
     let mut report = seakarr::report::RunReport::new();
 
+    let progress = if seakarr::progress::is_interactive() {
+        Some(seakarr::progress::ProgressDisplay::new())
+    } else {
+        None
+    };
+
     for line in &lines {
         let parts: Vec<&str> = line.splitn(2, " - ").collect();
         let artist = parts[0].trim();
         let album = parts.get(1).map(|a| a.trim()).filter(|a| !a.is_empty());
         let album_display = album.unwrap_or("(all)");
 
-        match seakarr::runner::process_album(client, artist, album, config, db, staging_dir).await {
+        match seakarr::runner::process_album(
+            client,
+            artist,
+            album,
+            config,
+            db,
+            staging_dir,
+            progress.as_ref(),
+        )
+        .await
+        {
             Ok(outcome) => report.record(artist, album_display, outcome),
             Err(e) => {
                 tracing::error!("Batch: failed {artist} — {album_display}: {e}");
@@ -393,6 +409,10 @@ async fn run_batch_mode(
                 );
             }
         }
+    }
+
+    if let Some(ref p) = progress {
+        p.clear();
     }
 
     report.print_summary();

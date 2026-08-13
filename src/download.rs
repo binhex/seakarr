@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
 use tokio::time::{timeout, Duration};
 
+use indicatif::ProgressBar;
+
 use crate::client::{DownloadStatus, FileInfo, SearchResult, SoulseekClient};
 use crate::config::DownloadConfig;
 use crate::error::{Result, SeakarrError};
 use crate::filter;
+use crate::formatting::format_speed;
+use crate::progress::ProgressDisplay;
 
 /// Sanitize a remote filename for local download: extract the basename
 /// (the crate already strips directory components), reject path-traversal
@@ -32,6 +36,7 @@ pub async fn download_file(
     username: &str,
     dir: &Path,
     config: &DownloadConfig,
+    bar: Option<&ProgressBar>,
 ) -> Result<PathBuf> {
     // Validate the remote name for traversal safety, but pass the FULL
     // share-relative path to the crate: the Soulseek QueueUpload wire
@@ -42,7 +47,15 @@ pub async fn download_file(
     // itself when writing the local file, so the local destination is
     // still dir/<basename>.
     let basename = safe_basename(&file.name)?;
-    let mut handle = client.download(file, username, dir).await?;
+    let mut handle = match client.download(file, username, dir).await {
+        Ok(h) => h,
+        Err(e) => {
+            if let Some(bar) = bar {
+                bar.abandon();
+            }
+            return Err(e);
+        }
+    };
     tracing::info!("Download queued: {basename} from {username}");
     let mut transfer_start: Option<tokio::time::Instant> = None;
 
@@ -59,10 +72,16 @@ pub async fn download_file(
         match msg {
             Ok(Some(DownloadStatus::InProgress {
                 speed_bytes_per_sec,
-                ..
+                bytes_downloaded,
+                total_bytes,
             })) => {
                 if transfer_start.is_none() {
                     transfer_start = Some(tokio::time::Instant::now());
+                    // Update bar length from the peer's actual transfer total
+                    // (may differ from stale search metadata in file.size).
+                    if let Some(bar) = bar {
+                        bar.set_length(total_bytes);
+                    }
                 }
                 // Speed check: only after the transfer has actually started
                 // transferring (not just queued), and past the wait period.
@@ -71,6 +90,9 @@ pub async fn download_file(
                         if ts.elapsed().as_secs() >= config.speed_check_wait_secs {
                             let speed_kbps = (speed_bytes_per_sec / 1024) as u32;
                             if speed_kbps < config.min_upload_speed_kbps {
+                                if let Some(bar) = bar {
+                                    bar.abandon();
+                                }
                                 let _ = handle.cancel_tx.send(()).await;
                                 return Err(SeakarrError::Download(format!(
                                     "speed {speed_kbps} KB/s below minimum {} KB/s",
@@ -80,24 +102,41 @@ pub async fn download_file(
                         }
                     }
                 }
+                // Update progress bar if present
+                if let Some(bar) = bar {
+                    bar.set_position(bytes_downloaded);
+                    bar.set_prefix(format_speed(speed_bytes_per_sec));
+                }
             }
             Ok(Some(DownloadStatus::Completed)) => {
+                if let Some(bar) = bar {
+                    bar.finish_and_clear();
+                }
                 let dest = dir.join(basename);
                 tracing::info!("Download completed: {basename}");
                 return Ok(dest);
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
+                if let Some(bar) = bar {
+                    bar.abandon();
+                }
                 tracing::warn!("Download of {basename} failed: {reason}");
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
             }
             Ok(Some(DownloadStatus::Queued { .. })) => {}
             Ok(None) => {
+                if let Some(bar) = bar {
+                    bar.abandon();
+                }
                 tracing::warn!("Download channel closed for {basename}");
                 return Err(SeakarrError::Download(
                     "download channel closed unexpectedly".into(),
                 ));
             }
             Err(_elapsed) => {
+                if let Some(bar) = bar {
+                    bar.abandon();
+                }
                 tracing::warn!(
                     "Download of {basename} timed out after {}s",
                     config.timeout_secs
@@ -119,6 +158,7 @@ pub async fn download_album(
     staging_dir: &Path,
     config: &DownloadConfig,
     filters: &crate::config::FilterConfig,
+    progress: Option<&ProgressDisplay>,
 ) -> Result<Vec<PathBuf>> {
     let mut last_err: Option<SeakarrError> = None;
 
@@ -158,7 +198,22 @@ pub async fn download_album(
         let mut failed = false;
 
         for file in &filtered_files {
-            match download_file(client, file, &candidate.username, staging_dir, config).await {
+            let bar = progress.as_ref().map(|p| {
+                let basename = safe_basename(&file.name).unwrap_or(file.name.as_str());
+                let total = file.size;
+                p.create_bar(basename, total)
+            });
+            let bar_ref = bar.as_ref();
+            match download_file(
+                client,
+                file,
+                &candidate.username,
+                staging_dir,
+                config,
+                bar_ref,
+            )
+            .await
+            {
                 Ok(path) => {
                     downloaded.push(path);
                 }
@@ -249,7 +304,7 @@ mod tests {
         );
         let config = default_dl_config();
 
-        let result = download_file(&client, &file, "peer", dir.path(), &config).await;
+        let result = download_file(&client, &file, "peer", dir.path(), &config, None).await;
         assert!(result.is_ok());
 
         let wire_name = client
@@ -265,13 +320,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_file_with_progress_bar() {
+        use indicatif::ProgressBar;
+
+        let client = MockClient::new();
+        let dir = TempDir::new().unwrap();
+        let file = make_file("01 - track.flac", 900, 10_000_000);
+
+        let config = default_dl_config();
+        let bar = ProgressBar::new(10_000_000);
+
+        let result =
+            download_file(&client, &file, "testuser", dir.path(), &config, Some(&bar)).await;
+        assert!(result.is_ok());
+        assert!(bar.is_finished());
+    }
+
+    #[tokio::test]
     async fn test_download_single_file_succeeds() {
         let client = MockClient::new();
         let dir = TempDir::new().unwrap();
         let file = make_file("track.flac", 900, 10_000_000);
         let config = default_dl_config();
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config).await;
+        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
         assert!(result.is_ok());
     }
 
@@ -286,7 +358,7 @@ mod tests {
         config.min_upload_speed_kbps = 200; // require >200 KB/s
         config.speed_check_wait_secs = 0;
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config).await;
+        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
         // Should detect slow speed and return error
         assert!(result.is_err());
     }
@@ -303,7 +375,7 @@ mod tests {
         config.max_retries = 2;
         config.retry_delay_secs = 0;
 
-        let result = download_file(&client, &file, "testuser", dir.path(), &config).await;
+        let result = download_file(&client, &file, "testuser", dir.path(), &config, None).await;
         assert!(result.is_err());
     }
 
@@ -327,6 +399,7 @@ mod tests {
             dir.path(),
             &config,
             &crate::config::FilterConfig::default(),
+            None,
         )
         .await;
         assert!(result.is_ok());

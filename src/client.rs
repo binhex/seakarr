@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, SeakarrError};
+use crate::formatting::{format_bytes, format_speed};
+use crate::progress::is_interactive;
 
 // ── Domain types ──
 
@@ -499,6 +501,9 @@ impl SoulseekClient for RealClient {
             let mut last_progress_log = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(6))
                 .unwrap();
+            // Evaluate once: isatty is a syscall per call, and the
+            // interactive/non-interactive decision does not change mid-transfer.
+            let interactive = is_interactive();
             loop {
                 match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
                     Ok(status) => {
@@ -506,9 +511,46 @@ impl SoulseekClient for RealClient {
                             &status,
                             SsDownloadStatus::InProgress { .. } | SsDownloadStatus::Paused { .. }
                         ) {
-                            if last_progress_log.elapsed() >= std::time::Duration::from_secs(5) {
-                                tracing::info!("Bridge progress for {bridge_filename}: {status:?}");
-                                last_progress_log = std::time::Instant::now();
+                            if !interactive {
+                                // Non-interactive: human-friendly fallback log,
+                                // still throttled to once per 5 seconds. When
+                                // interactive the line is fully suppressed — the
+                                // progress bar handles display.
+                                if last_progress_log.elapsed() >= std::time::Duration::from_secs(5)
+                                {
+                                    // Log both InProgress and Paused (Paused
+                                    // maps to InProgress with speed=0 in the
+                                    // domain type, so display it consistently).
+                                    let (bd, tb, sp) = match &status {
+                                        SsDownloadStatus::InProgress {
+                                            bytes_downloaded,
+                                            total_bytes,
+                                            speed_bytes_per_sec,
+                                        } => {
+                                            (*bytes_downloaded, *total_bytes, *speed_bytes_per_sec)
+                                        }
+                                        SsDownloadStatus::Paused {
+                                            bytes_downloaded,
+                                            total_bytes,
+                                        } => (*bytes_downloaded, *total_bytes, 0.0),
+                                        // The outer `matches!` guard ensures only
+                                        // InProgress or Paused reach here.
+                                        _ => unreachable!(
+                                            "outer matches! guard should have filtered this"
+                                        ),
+                                    };
+                                    let safe_name: String = bridge_filename
+                                        .chars()
+                                        .filter(|c| !c.is_control())
+                                        .collect();
+                                    tracing::info!(
+                                        "Downloading: {safe_name} — {} / {} @ {}",
+                                        format_bytes(bd),
+                                        format_bytes(tb),
+                                        format_speed(sp.round() as u64),
+                                    );
+                                    last_progress_log = std::time::Instant::now();
+                                }
                             }
                         } else {
                             tracing::info!("Bridge status for {bridge_filename}: {status:?}");
