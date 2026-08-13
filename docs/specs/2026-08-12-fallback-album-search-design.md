@@ -52,24 +52,43 @@ Rationale:
 - Stop-words never block a match — only the distinctive words carry the decision.
 
 Accepted risk: substring-per-word means `Prince` also matches a path containing `Princess`. Downstream
-quality filters (extension, bitrate, exclude-words) still apply, and the wrong-artist window is narrow.
-A result passes if **any** of its files' paths match the artist; per-file filtering happens afterwards in
-the normal `filter_results` step.
+quality filters (extension, bitrate, exclude-words) still apply.
+
+**Per-file filtering (2026-08-13 amendment):** a result passes only if at least one of its files'
+paths matches the artist, AND within every kept result only the artist-matching files survive —
+non-matching files are dropped inside `search_album_with_fallback` itself. This prevents mixed shares
+(one matching file alongside other artists' tracks that match the broad album-only query) from
+donating wrong-artist files to the download stage. Downloads therefore only ever take
+artist-matching files. The whole album still comes from a single peer: `download_album`'s
+per-candidate all-or-nothing behaviour is unchanged, and a peer switch happens only on a download
+failure from the current candidate.
+
+Accepted residual of this amendment: the filter matches the **artist only**, not artist+album. A
+mixed share containing several albums by the SAME artist can still donate tracks from the wrong
+album into the download set; and legitimate files whose share paths omit the artist are rejected
+(precision over recall). Both are consequences of the word-level artist matching chosen in
+Section 2.
 
 ## 3. Components
 
 ### `search.rs` (changes)
 
-- `pub struct SearchOutcome { pub results: Vec<SearchResult>, pub used_fallback: bool }`
+- `pub struct SearchOutcome { pub results: Vec<SearchResult>, pub used_fallback: bool, pub
+  fallback_duration_ms: Option<u64> }` — the third field records the fallback search's own duration
+  (`None` when the fallback did not run) so history rows can record per-search durations.
 - `pub async fn search_album_with_fallback(client, artist, album: Option<&str>, timeout_secs,
   fallback_enabled: bool) -> Result<SearchOutcome>`:
   - Calls the existing `search_album` for the primary `"Artist Album"` query (reusing its
-    deduplication).
+    deduplication). The album name is trimmed before use in the fallback query (padded tag metadata
+    would otherwise defeat the album-only search), and a blank artist or blank album skips the
+    fallback entirely.
   - If the primary result set is non-empty, returns immediately with `used_fallback = false`.
-  - If empty and `album` is `Some` and `fallback_enabled`: performs the album-only search, filters
-    results by `path_matches_artist` across each result's files, deduplicates (same rules as the
-    primary), and returns with `used_fallback = true`.
+  - If empty and `album` is `Some` and `fallback_enabled`: performs the album-only search (which
+    deduplicates via the shared `search_raw` helper, same rules as the primary), then per Section 2
+    drops non-artist-matching files from every result and discards results left empty, and returns
+    with `used_fallback = true` and `fallback_duration_ms` set.
 - `pub fn path_matches_artist(path: &str, artist: &str) -> bool` — pure, as specified in Section 2.
+  A blank artist returns `false` (an empty artist must never match every path).
 - The existing dedup loop is extracted into a small private helper shared by both searches.
 - The existing `search_album` function signature and behaviour are unchanged; it remains the
   single-query primitive.
@@ -78,8 +97,8 @@ the normal `filter_results` step.
 
 - Replace the `search::search_album(...)` call in `process_album` with
   `search::search_album_with_fallback(..., config.search.fallback_search)`.
-- Add INFO logs: one when the fallback fires, and one reporting how many fallback results matched the
-  artist (or that none matched).
+- Add an INFO log when the fallback fires, reporting how many fallback results matched the artist
+  (or that none matched).
 - The zero-result / filter-fail / download / organize / notify logic is otherwise untouched.
 
 ### `config.rs` (changes)

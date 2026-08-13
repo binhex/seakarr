@@ -83,6 +83,8 @@ pub struct MockClient {
     /// the wire filename is the full share-relative path (regression guard
     /// for the UploadDenied-everywhere bug).
     pub last_download_filename: Mutex<Option<String>>,
+    /// Every filename passed to `download()`, in call order.
+    pub download_filenames: Mutex<Vec<String>>,
 }
 
 impl MockClient {
@@ -94,6 +96,7 @@ impl MockClient {
             download_speed: Mutex::new(1_000_000), // 1 MB/s
             login_should_fail: Mutex::new(false),
             last_download_filename: Mutex::new(None),
+            download_filenames: Mutex::new(vec![]),
         }
     }
 
@@ -157,6 +160,10 @@ impl SoulseekClient for MockClient {
         _dir: &Path,
     ) -> Result<DownloadHandle> {
         *self.last_download_filename.lock().unwrap() = Some(file.name.clone());
+        self.download_filenames
+            .lock()
+            .unwrap()
+            .push(file.name.clone());
         let (status_tx, status_rx) = mpsc::channel(32);
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let speed = *self.download_speed.lock().unwrap();

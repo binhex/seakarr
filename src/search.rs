@@ -50,10 +50,10 @@ pub struct SearchOutcome {
 /// combined "Artist Album" search returns zero results.
 ///
 /// Soulseek sometimes bans specific artist+album criteria. The fallback
-/// searches by album name alone and keeps only results where at least one
-/// file's share-relative path matches the artist (see
-/// [`path_matches_artist`]), so the download pipeline receives the same
-/// quality-filtered candidates as a normal search.
+/// searches by album name alone, keeps only results with at least one
+/// artist-matching file, and prunes each kept result down to its
+/// artist-matching files only (see [`path_matches_artist`]) so the download
+/// pipeline receives only quality-filtered, artist-matching candidates.
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
@@ -83,7 +83,16 @@ pub async fn search_album_with_fallback(
 
     let fallback_start = std::time::Instant::now();
     let mut fallback = search_raw(client, album_name, timeout_secs).await?;
-    fallback.retain(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)));
+    // Keep only results that contain at least one artist-matching file, and
+    // within each kept result keep ONLY the artist-matching files. Without
+    // the per-file filter, download_album would take every quality-passing
+    // file of the chosen result — a mixed share (one matching file + other
+    // artists' tracks that match the broad album-only query) would donate
+    // wrong-artist files, defeating the fallback's purpose.
+    fallback.retain_mut(|r| {
+        r.files.retain_mut(|f| path_matches_artist(&f.name, artist));
+        !r.files.is_empty()
+    });
     Ok(SearchOutcome {
         results: fallback,
         used_fallback: true,
@@ -119,10 +128,15 @@ const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 /// artist name is matched as a substring instead.
 ///
 /// Known accepted risk: substring-per-word means "Prince" also matches
-/// "Princess". Degenerate artists widen the window further (single-letter
-/// tokens like "U2" match any path containing `u` and `2`; a lone stop-word
-/// artist like "The" matches nearly every path). Empty or blank artist
-/// names never match. Downstream quality filters still apply.
+/// "Princess". Degenerate artists widen the window further, e.g.:
+/// single-letter tokens ("U2" matches any path containing `u` and `2`),
+/// a lone stop-word artist ("The" matches nearly every path via the
+/// full-name fallback), contraction words ("Guns N' Roses" requires only
+/// `guns`, `n`, and `roses` anywhere), and a single-letter artist ("A"
+/// matches nearly every path). Empty or blank artist names never match.
+/// Accented characters are compared literally ("Tiësto" ≠ "Tiesto") — a
+/// false negative, not a false positive. Downstream quality filters still
+/// apply.
 pub fn path_matches_artist(path: &str, artist: &str) -> bool {
     if artist.trim().is_empty() {
         return false;
@@ -138,7 +152,11 @@ pub fn path_matches_artist(path: &str, artist: &str) -> bool {
         .filter(|w| !ARTIST_STOP_WORDS.contains(&w.as_str()))
         .collect();
     if distinctive.is_empty() {
-        return normalised.contains(&artist.to_lowercase());
+        // All words were stop-words (e.g. artist "The The"): fall back to
+        // the full lowercased name as a substring match. Trimmed so a
+        // padded batch line (" The The ") still matches paths carrying the
+        // unpadded name.
+        return normalised.contains(artist.trim().to_lowercase().as_str());
     }
     distinctive.iter().all(|w| normalised.contains(w.as_str()))
 }
@@ -247,6 +265,11 @@ mod tests {
         assert!(path_matches_artist(
             "The The - Infected - 01.flac",
             "The The"
+        ));
+        // Padded artist from a sloppy batch line must still match.
+        assert!(path_matches_artist(
+            "The The - Infected - 01.flac",
+            " The The "
         ));
         assert!(!path_matches_artist(
             "Some Other Artist - 01.flac",
@@ -426,5 +449,66 @@ mod tests {
         assert!(outcome.used_fallback);
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].username, "right");
+    }
+
+    // Regression: a fallback result that mixes artist-matching and
+    // non-matching files must not leak the non-matching files into the
+    // download set. The result-level retain kept the whole result when ANY
+    // file matched; download_album then downloaded every quality-passing
+    // file, so a peer with a mixed share donated wrong-artist tracks (e.g.
+    // an album-only "History" fallback downloaded a Tiësto track from a
+    // result that also contained a Michael Jackson file).
+    #[tokio::test]
+    async fn test_fallback_keeps_only_artist_matching_files_within_result() {
+        let client = MockClient::new();
+        client.search_results_by_query.lock().unwrap().insert(
+            "History".into(),
+            vec![SearchResult {
+                username: "mixed-share".into(),
+                speed: 862_220,
+                slots: 1,
+                files: vec![
+                    make_file(
+                        r"Music\Michael Jackson\History\01 - Billie Jean.flac",
+                        900,
+                        30_000_000,
+                    ),
+                    make_file(
+                        r"Music\Michael Jackson\History\02 - The Way You Make Me Feel.flac",
+                        900,
+                        30_000_000,
+                    ),
+                    // The wrong-artist track from the production report:
+                    // matches the album-only query, passes quality filters,
+                    // but the artist is not in the path.
+                    make_file(
+                        r"@@sedlr\FLACS\CD RIPS\Tiësto - Parade Of The Athletes (CD RIP) [FLAC]\03 Ancient History.flac",
+                        900,
+                        45_284_928,
+                    ),
+                ],
+            }],
+        );
+
+        let outcome =
+            search_album_with_fallback(&client, "Michael Jackson", Some("History"), 15, true)
+                .await
+                .unwrap();
+        assert!(outcome.used_fallback);
+        assert_eq!(outcome.results.len(), 1);
+        let files = &outcome.results[0].files;
+        assert_eq!(
+            files.len(),
+            2,
+            "mixed result must keep all artist-matching files and drop non-matching ones, got {}",
+            files.len()
+        );
+        assert!(
+            files
+                .iter()
+                .all(|f| f.name.to_lowercase().contains("michael jackson")),
+            "only artist-matching files may survive, got: {:?}",
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+        );
     }
 }

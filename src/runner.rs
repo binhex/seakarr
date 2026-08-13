@@ -54,13 +54,16 @@ pub async fn process_album(
     )
     .await?;
     let duration_ms = search_start.elapsed().as_millis() as u64;
+    // Store the canonical (trimmed) album in history so rows match the
+    // album-only fallback query, which trims padded tag metadata.
+    let history_album = album.map(str::trim);
     // When the fallback ran, the primary row gets only the primary search's
     // own duration (total minus fallback), so the two history rows don't
     // double-count the fallback time.
     let primary_duration_ms = duration_ms.saturating_sub(outcome.fallback_duration_ms.unwrap_or(0));
     if let Err(e) = search::record_search(
         artist,
-        album,
+        history_album,
         if outcome.used_fallback {
             0
         } else {
@@ -82,7 +85,7 @@ pub async fn process_album(
         );
         if let Err(e) = search::record_search(
             artist,
-            album,
+            history_album,
             outcome.results.len(),
             outcome.fallback_duration_ms.unwrap_or(duration_ms),
             db,
@@ -409,11 +412,22 @@ mod tests {
                 username: "user1".into(),
                 speed: 500,
                 slots: 1,
-                files: vec![make_file(
-                    r"Music\Test Artist\Test Album\01 - track.flac",
-                    900,
-                    10_000_000,
-                )],
+                files: vec![
+                    make_file(
+                        r"Music\Test Artist\Test Album\01 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    // A mixed-share decoy: matches the album-only query and
+                    // passes quality filters, but the artist is not in the
+                    // path. Per-file filtering must keep it out of the
+                    // download stage entirely.
+                    make_file(
+                        r"Music\Someone Else\Test Album\02 - decoy.flac",
+                        900,
+                        10_000_000,
+                    ),
+                ],
             }],
         );
         // Primary query "Test Artist Test Album" has no map entry -> empty.
@@ -441,6 +455,15 @@ mod tests {
                 "Test Artist Test Album".to_string(),
                 "Test Album".to_string()
             ]
+        );
+
+        // Per-file filtering held at the download boundary: exactly the
+        // artist-matching file was queued for download, never the decoy.
+        let downloads = client.download_filenames.lock().unwrap().clone();
+        assert_eq!(
+            downloads,
+            vec![r"Music\Test Artist\Test Album\01 - track.flac".to_string()],
+            "only artist-matching files may be downloaded"
         );
 
         // Album completed successfully.
