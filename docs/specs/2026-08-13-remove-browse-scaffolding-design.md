@@ -144,10 +144,10 @@ browse_timeout_secs: 60,
 1. **`cargo test`** — all existing tests pass with the removed fields/table
    (schema test updated, download test config updated).
 2. **`cargo build --release`** — no dangling references to the removed fields.
-3. **Schema check** — an in-memory test DB no longer contains `browse_cache`;
-   the `DROP TABLE IF EXISTS` runs without error on a DB that already has the
-   table (covered by the existing schema test if it creates and re-runs init,
-   otherwise verified manually with a scratch DB).
+3. **Schema check** — an in-memory test DB no longer contains `browse_cache`
+   after `migrate()`. Extend the schema test to simulate an existing install:
+   pre-create a `browse_cache` table, run `migrate()`, and assert the table is
+   gone (this exercises the `DROP TABLE IF EXISTS` path).
 
 ## 6. Risks
 
