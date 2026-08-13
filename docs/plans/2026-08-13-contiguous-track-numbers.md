@@ -3,9 +3,13 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use sub-agents (recommended) to implement this plan
 > task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reject search results whose downloadable tracks are not numbered contiguously, so seakarr never downloads an incomplete album (duplicate track numbers permitted, missing track numbers not).
+**Goal:** Reject search results whose downloadable tracks are not numbered contiguously, so seakarr
+never downloads an incomplete album (duplicate track numbers permitted, missing track numbers not).
 
-**Architecture:** A new pure module `src/tracks.rs` parses track numbers from filenames and checks contiguity; `filter::filter_results` consults it (when `filters.contiguous_tracks` is enabled, default true) over each result's quality-filter-passing files. Everything downstream (rank/download) is unchanged.
+**Architecture:** A new pure module `src/tracks.rs` parses track numbers from filenames and checks
+contiguity; `filter::filter_results` consults it (when `filters.contiguous_tracks` is enabled,
+default true) over each result's quality-filter-passing files. Everything downstream (rank/download)
+is unchanged.
 
 **Tech Stack:** Rust, tokio, serde/serde_yaml. No new dependencies.
 
@@ -17,7 +21,8 @@ Design spec (source of truth): `docs/specs/2026-08-13-contiguous-track-numbers-d
 
 Decisions locked in the spec:
 
-- Track numbers are **1–3 digit all-numeric tokens**, leading (`04_Cure for Me.flac`) or anywhere in the filename (`… - 11 - Cure for the Itch.flac`). 4-digit tokens are ignored (years).
+- Track numbers are **1–3 digit all-numeric tokens**, leading (`04_Cure for Me.flac`) or anywhere
+  in the filename (`… - 11 - Cure for the Itch.flac`). 4-digit tokens are ignored (years).
 - The **first** such token wins (multi-number names like `1-01` yield 1).
 - The check runs over **quality-filter-passing files only** (the set `download_album` downloads).
 - A result with **no** parseable numbers is **rejected**.
@@ -29,7 +34,7 @@ Decisions locked in the spec:
 ## File Map
 
 | File | Action | Responsibility |
-|------|--------|----------------|
+| ---- | ------ | -------------- |
 | `src/tracks.rs` | **Create** | Pure parsing + contiguity helpers |
 | `src/lib.rs` | Modify | Register `pub mod tracks;` |
 | `src/filter.rs` | Modify | `filter_results` gains the contiguity predicate |
