@@ -103,9 +103,11 @@ pub async fn process_album(
     if results.is_empty() {
         tracing::info!("No results for {artist} — {}", album.unwrap_or("(all)"));
         if let Some(a) = album {
-            db.mark_album_processed(artist, a, "skipped")?;
+            db.mark_album_processed(artist, a, "failed")?;
         }
-        return Ok(AlbumOutcome::Skipped);
+        return Ok(AlbumOutcome::Failed {
+            reason: "no results found".into(),
+        });
     }
 
     // Filter + rank
@@ -159,9 +161,11 @@ pub async fn process_album(
             config.filters.allowed_extensions,
         );
         if let Some(a) = album {
-            db.mark_album_processed(artist, a, "skipped")?;
+            db.mark_album_processed(artist, a, "failed")?;
         }
-        return Ok(AlbumOutcome::Skipped);
+        return Ok(AlbumOutcome::Failed {
+            reason: "no results passed filters".into(),
+        });
     }
     let ranked = filter::rank_candidates(&filtered, &config.filters);
     tracing::info!(
@@ -530,14 +534,17 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
 
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
 
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "skipped");
+        assert_eq!(rows[0].status, "failed");
     }
 
     #[tokio::test]
@@ -706,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fallback_no_matches_marks_skipped() {
+    async fn test_fallback_no_matches_marks_failed() {
         let client = Arc::new(MockClient::new());
         client.search_results_by_query.lock().unwrap().insert(
             "Test Album".into(),
@@ -737,7 +744,10 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
 
         // The fallback fired: primary query then album-only query.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -751,11 +761,11 @@ mod tests {
 
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "skipped");
+        assert_eq!(rows[0].status, "failed");
     }
 
     #[tokio::test]
-    async fn test_fallback_with_gappy_tracks_marks_skipped() {
+    async fn test_fallback_with_gappy_tracks_marks_failed() {
         let client = Arc::new(MockClient::new());
         client.search_results_by_query.lock().unwrap().insert(
             "Test Album".into(),
@@ -794,13 +804,16 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results passed filters"),
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
 
-        // Gappy track set rejected at the filter stage -> album skipped,
+        // Gappy track set rejected at the filter stage -> album failed,
         // nothing downloaded.
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "skipped");
+        assert_eq!(rows[0].status, "failed");
         assert!(client.download_filenames.lock().unwrap().is_empty());
     }
 

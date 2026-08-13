@@ -83,9 +83,12 @@ async fn test_full_pipeline_auto_mode_no_results() {
     )
     .await;
 
-    // Should succeed even with no results (marks as skipped)
+    // Should succeed even with no results (marked as failed, not skipped)
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
+    match result.unwrap() {
+        AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
+        other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+    }
 
     // The fallback search fires too (default on): primary + album-only,
     // both recorded in search_history.

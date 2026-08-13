@@ -288,12 +288,16 @@ pre-commit run --all-files
 
 ## FAQ
 
-**Q: Why are some albums skipped with "0 passed filters"?**
+**Q: Why do some albums fail with "no results passed filters"?**
 
 `filters.contiguous_tracks` (default `true`) rejects search results whose track numbers have gaps,
 and results with no parseable track numbers at all. Shares numbered like `track01.flac` (digits
 fused to letters) or without numbers are treated as unnumbered. If your collection uses such
 naming, set `filters.contiguous_tracks: false` in `seakarr.yml`.
+
+These albums appear in the "Failed" section of the run summary with the reason
+"no results passed filters". Albums with zero search results at all appear with the reason
+"no results found". Both are retried on subsequent runs.
 
 Two known limitations of the heuristic, also solvable with `contiguous_tracks: false`: (1) the
 first number in the filename wins, so artist names containing digits (`Maroon 5`, `50 Cent`,
