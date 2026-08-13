@@ -100,6 +100,8 @@ pub struct FilterConfig {
     pub exclude_words: Vec<String>,
     #[serde(default)]
     pub include_locked: bool,
+    #[serde(default = "default_true")]
+    pub contiguous_tracks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +499,7 @@ impl Default for Config {
                 min_bitdepth: None,
                 exclude_words: vec![],
                 include_locked: false,
+                contiguous_tracks: default_true(),
             },
             download: DownloadConfig {
                 concurrent: default_concurrent(),
@@ -577,6 +580,7 @@ filters:
   min_bitdepth: null
   exclude_words: []
   include_locked: false
+  contiguous_tracks: true
 
 download:
   concurrent: 5
@@ -690,6 +694,23 @@ daemon:
     }
 
     #[test]
+    fn test_contiguous_tracks_defaults_true() {
+        let config = Config::default();
+        assert!(config.filters.contiguous_tracks);
+    }
+
+    #[test]
+    fn test_contiguous_tracks_from_yaml() {
+        let dir = TempDir::new().unwrap();
+        let yaml_path = dir.path().join("seakarr.yml");
+        fs::write(&yaml_path, sample_yaml()).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert!(config.filters.contiguous_tracks);
+    }
+
+    #[test]
     fn test_create_default_config_when_missing() {
         let dir = TempDir::new().unwrap();
         // No seakarr.yml exists
@@ -697,11 +718,20 @@ daemon:
         let config = Config::load(dir.path()).unwrap();
 
         // Default config should have been created
-        assert!(dir.path().join("seakarr.yml").exists());
+        let yaml_path = dir.path().join("seakarr.yml");
+        assert!(yaml_path.exists());
         // Default values
         assert_eq!(config.soulseek.server, "server.slsknet.org:2242");
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.download.concurrent, 1);
+        // The generated file must serialize every default key, including
+        // the new filters toggle (round-trip requirement from the
+        // contiguous-track-numbers spec).
+        let generated = fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            generated.contains("contiguous_tracks: true"),
+            "generated default config must contain contiguous_tracks: true"
+        );
     }
 
     #[test]

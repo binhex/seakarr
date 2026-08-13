@@ -166,6 +166,7 @@ Controls which Soulseek search results pass the quality gate.
 | `min_bitdepth` | Minimum bit depth in bits (e.g. `16` or `24`). *(Reserved for future use — not yet enforced.)* | `null` |
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
+| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered or multi-disc collections. | `true` |
 
 ### `download`
 
@@ -234,7 +235,9 @@ Seakarr has three operating modes:
 2. **Detect upgrades** — for each album, checks whether any track is in a non-allowed format or below
    `min_bitrate`. Albums with tagged bitrate `None` are also flagged (unknown quality).
 3. **Search** — queries the Soulseek network for each flagged album.
-4. **Filter & rank** — filters results by extension, bitrate, excluded words, and free upload slots.
+4. **Filter & rank** — filters results by extension, bitrate, excluded words, and free upload slots;
+   when `filters.contiguous_tracks` is enabled, results whose downloadable track numbers have gaps
+   (or none at all) are discounted.
    Ranks candidates by `speed × slot_bonus × bitrate_bonus`.
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer speed in real time. If the
    speed drops below `min_upload_speed_kbps`, the transfer is cancelled and the next candidate is tried.
@@ -287,6 +290,19 @@ pre-commit run --all-files
 ```
 
 ## FAQ
+
+**Q: Why are some albums skipped with "0 passed filters"?**
+
+`filters.contiguous_tracks` (default `true`) rejects search results whose track numbers have gaps,
+and results with no parseable track numbers at all. Shares numbered like `track01.flac` (digits
+fused to letters) or without numbers are treated as unnumbered. If your collection uses such
+naming, set `filters.contiguous_tracks: false` in `seakarr.yml`.
+
+Two known limitations of the heuristic, also solvable with `contiguous_tracks: false`: (1) the
+first number in the filename wins, so artist names containing digits (`Maroon 5`, `50 Cent`,
+`Blink 182`) are parsed instead of the track number and can mask gaps; (2) multi-disc numbering
+(`1-01`, `2-03`) is treated as a single track number per file, so partial multi-disc shares may
+pass.
 
 **Q: How should I organise my music library?**
 

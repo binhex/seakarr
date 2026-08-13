@@ -1,8 +1,10 @@
 use crate::client::{FileInfo, SearchResult};
 use crate::config::FilterConfig;
 
-/// Filter search results by extension, bitrate, excluded words, and slots.
-/// Returns only results with at least one matching file.
+/// Filter search results by extension, bitrate, excluded words, free slots,
+/// and — when `contiguous_tracks` is enabled — contiguous track numbers over
+/// the downloadable set. Returns only results with at least one matching
+/// file.
 pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<SearchResult> {
     results
         .iter()
@@ -12,8 +14,41 @@ pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<Se
                 return false;
             }
 
-            // Filter: at least one file must pass extension + bitrate + word filters
-            r.files.iter().any(|f| file_passes_filters(f, config))
+            // The downloadable set: files passing extension + bitrate +
+            // word filters AND the basename safety check download_album
+            // applies — the contiguity check must mirror what will really
+            // be downloaded, or an unsafe-named numbered track would pass
+            // here and then be dropped at download time, recreating the
+            // gap this feature exists to prevent.
+            if !config.contiguous_tracks {
+                // Toggle off: exact pre-existing behaviour — at least one
+                // file must pass the quality filters.
+                return r.files.iter().any(|f| file_passes_filters(f, config));
+            }
+            let safe_and_passing = |f: &FileInfo| {
+                crate::download::safe_basename(&f.name).is_ok() && file_passes_filters(f, config)
+            };
+            let passing: Vec<&FileInfo> = r.files.iter().filter(|f| safe_and_passing(f)).collect();
+            if passing.is_empty() {
+                return false;
+            }
+            if !crate::tracks::files_have_contiguous_tracks(&passing) {
+                // Distinguish the two rejection causes for operators.
+                let any_numbered = passing
+                    .iter()
+                    .any(|f| crate::tracks::track_number_from_filename(&f.name).is_some());
+                tracing::debug!(
+                    "result from {} rejected: {}",
+                    r.username,
+                    if any_numbered {
+                        "non-contiguous track numbers"
+                    } else {
+                        "no parseable track numbers"
+                    }
+                );
+                return false;
+            }
+            true
         })
         .cloned()
         .collect()
@@ -116,6 +151,7 @@ mod tests {
             min_bitdepth: None,
             exclude_words: vec![],
             include_locked: false,
+            contiguous_tracks: true,
         }
     }
 
@@ -127,13 +163,13 @@ mod tests {
                 "user1",
                 500,
                 1,
-                vec![make_file("track.mp3", 320, 10_000_000)],
+                vec![make_file("01 - track.mp3", 320, 10_000_000)],
             ),
             make_result(
                 "user2",
                 400,
                 2,
-                vec![make_file("track.flac", 900, 30_000_000)],
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
         ];
 
@@ -153,13 +189,13 @@ mod tests {
                 "user1",
                 500,
                 1,
-                vec![make_file("track.flac", 128, 5_000_000)],
+                vec![make_file("01 - track.flac", 128, 5_000_000)],
             ),
             make_result(
                 "user2",
                 400,
                 2,
-                vec![make_file("track.flac", 900, 30_000_000)],
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
         ];
 
@@ -177,13 +213,13 @@ mod tests {
                 "user1",
                 500,
                 0,
-                vec![make_file("track.flac", 900, 30_000_000)],
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
             make_result(
                 "user2",
                 400,
                 2,
-                vec![make_file("track.flac", 320, 10_000_000)],
+                vec![make_file("01 - track.flac", 320, 10_000_000)],
             ),
         ];
 
@@ -233,18 +269,124 @@ mod tests {
                 "user1",
                 500,
                 1,
-                vec![make_file("track (vinyl rip).flac", 900, 30_000_000)],
+                vec![make_file("01 - track (vinyl rip).flac", 900, 30_000_000)],
             ),
             make_result(
                 "user2",
                 400,
                 2,
-                vec![make_file("track.flac", 900, 30_000_000)],
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
         ];
 
         let filtered = filter_results(&results, &cfg);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
+    }
+
+    #[test]
+    fn test_filter_rejects_gappy_tracks_when_toggle_on() {
+        let cfg = FilterConfig {
+            contiguous_tracks: true,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_accepts_gappy_tracks_when_toggle_off() {
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_rejects_unnumbered_result_when_toggle_on() {
+        let cfg = FilterConfig {
+            contiguous_tracks: true,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file("Title.flac", 900, 30_000_000)],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_contiguity_runs_over_quality_passing_files_only() {
+        // The full result looks contiguous (01, 02, 03), but track 02 is an
+        // mp3 that fails the quality filters — the downloadable set is
+        // 01, 03, which has a gap, so the result must be rejected.
+        let cfg = FilterConfig {
+            contiguous_tracks: true,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("02 - B.mp3", 320, 10_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_contiguity_excludes_unsafe_basenames() {
+        // Tracks 01, 02, 03 where 02 has an unsafe basename (contains
+        // ".."): the contiguity set mirrors what download_album would
+        // really fetch, so 02 is excluded, leaving the gap {1, 3} and the
+        // result must be rejected.
+        let cfg = FilterConfig {
+            contiguous_tracks: true,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("02 - B..flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg);
+        assert!(filtered.is_empty());
     }
 }

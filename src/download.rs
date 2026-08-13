@@ -9,7 +9,7 @@ use crate::filter;
 /// Sanitize a remote filename for local download: extract the basename
 /// (the crate already strips directory components), reject path-traversal
 /// patterns, and return a safe filename suitable for path construction.
-fn safe_basename(remote_name: &str) -> Result<&str> {
+pub(crate) fn safe_basename(remote_name: &str) -> Result<&str> {
     // Soulseek filenames may use either / or \\ as path separators
     // (many peers share from Windows machines).  Split on both and
     // take the last component.

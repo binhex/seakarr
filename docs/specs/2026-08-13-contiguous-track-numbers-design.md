@@ -30,8 +30,9 @@ Locked-in rules:
 - A result where **no** filter-passing file yields a number is **rejected** — contiguity cannot be
   verified, so the result is not trusted.
 - The check runs over **filter-passing files only** — the same set `download_album` would actually
-  download, so a full-looking listing with non-downloadable tracks (e.g. mp3 tracks among flacs)
-  cannot pass on the strength of files that will never be fetched.
+  download. Concretely: files passing the quality filters AND the basename safety check
+  (`safe_basename`), so a numbered track that would be dropped at download time cannot pass the
+  contiguity check.
 - The check applies to **both primary and fallback** results, since both flow through
   `filter_results`. Opt-out via config.
 
@@ -76,7 +77,15 @@ Scope notes:
 
 - Document the new key in the `filters:` table.
 
-No changes to `download.rs`, `runner.rs`, or the search/fallback flow.
+### `src/download.rs` (changes)
+
+- `safe_basename` becomes `pub(crate)` so `filter_results` can apply the same safety check when
+  computing the contiguity set (visibility-only; behaviour unchanged).
+
+### `src/runner.rs` (changes)
+
+- The "0 passed filters" log appends a contiguity note when `filters.contiguous_tracks` is enabled;
+  an integration test covers a gappy fallback result being marked `skipped`.
 
 ## 3. Data flow
 
@@ -84,7 +93,7 @@ No changes to `download.rs`, `runner.rs`, or the search/fallback flow.
 runner.process_album
   → filter::filter_results(results, config)
       per result:
-        passing = files where file_passes_filters(f, config)
+        passing = files where safe_basename(f) && file_passes_filters(f, config)
         if passing.is_empty() → reject
         if config.contiguous_tracks && !tracks::files_have_contiguous_tracks(&passing) → reject
   → rank_candidates → download_album   [unchanged]
@@ -136,3 +145,11 @@ filters:
 - Requiring the track set to start at 1.
 - Completeness checks at download time (beyond the existing all-or-nothing candidate fallback).
 - Album-duration or track-count heuristics from tag metadata.
+
+## 8. Second-chance fallback trigger (2026-08-13 amendment)
+
+The album-only fallback now also fires when the primary search returned results but **every** one
+was rejected at the filter stage (e.g. all gappy by the contiguity gate) — previously it only fired
+on an empty primary. The runner performs a second-chance `search_fallback_only` (extracted from
+`search_album_with_fallback`) and filters its results normally; the album is marked `skipped` only
+if both passes come up empty. History recording and the one-peer download rule are unchanged.

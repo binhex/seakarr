@@ -82,6 +82,23 @@ pub async fn search_album_with_fallback(
     }
 
     let fallback_start = std::time::Instant::now();
+    let fallback = search_fallback_only(client, artist, album_name, timeout_secs).await?;
+    Ok(SearchOutcome {
+        results: fallback,
+        used_fallback: true,
+        fallback_duration_ms: Some(fallback_start.elapsed().as_millis() as u64),
+    })
+}
+
+/// Perform the album-only fallback search: query by album name alone and
+/// keep only results that contain at least one artist-matching file, pruned
+/// down to the artist-matching files (see [`path_matches_artist`]).
+pub async fn search_fallback_only(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    album_name: &str,
+    timeout_secs: u64,
+) -> Result<Vec<SearchResult>> {
     let mut fallback = search_raw(client, album_name, timeout_secs).await?;
     // Keep only results that contain at least one artist-matching file, and
     // within each kept result keep ONLY the artist-matching files. Without
@@ -93,11 +110,7 @@ pub async fn search_album_with_fallback(
         r.files.retain_mut(|f| path_matches_artist(&f.name, artist));
         !r.files.is_empty()
     });
-    Ok(SearchOutcome {
-        results: fallback,
-        used_fallback: true,
-        fallback_duration_ms: Some(fallback_start.elapsed().as_millis() as u64),
-    })
+    Ok(fallback)
 }
 
 /// Record a search in history (used by runner for stats).

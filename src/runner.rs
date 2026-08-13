@@ -108,10 +108,50 @@ pub async fn process_album(
     // Filter + rank
     let total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let total_users = results.len();
-    let filtered = filter::filter_results(&results, &config.filters);
+    let mut filtered = filter::filter_results(&results, &config.filters);
+    // Second-chance fallback: when the primary search returned results but
+    // every one was rejected (e.g. by the contiguity gate), the album-only
+    // fallback query may find a complete share that the combined query
+    // missed. Only fires when the fallback has not already been used.
+    if filtered.is_empty()
+        && !outcome.used_fallback
+        && config.search.fallback_search
+        && !artist.trim().is_empty()
+    {
+        if let Some(album_name) = album.map(str::trim).filter(|a| !a.is_empty()) {
+            match search::search_fallback_only(
+                client,
+                artist,
+                album_name,
+                config.search.timeout_secs,
+            )
+            .await
+            {
+                Ok(fallback_results) => {
+                    tracing::info!(
+                        "{artist} — {}: all primary results rejected; fallback album-only search found {} result(s)",
+                        album.unwrap_or("(all)"),
+                        fallback_results.len(),
+                    );
+                    filtered = filter::filter_results(&fallback_results, &config.filters);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "{artist} — {}: second-chance fallback search failed: {e}",
+                        album.unwrap_or("(all)")
+                    );
+                }
+            }
+        }
+    }
     if filtered.is_empty() {
+        let contiguity_note = if config.filters.contiguous_tracks {
+            ", contiguous track numbers"
+        } else {
+            ""
+        };
         tracing::info!(
-            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot)",
+            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot{contiguity_note})",
             album.unwrap_or("(all)"),
             config.filters.allowed_extensions,
         );
@@ -341,7 +381,7 @@ mod tests {
             username: "user1".into(),
             speed: 500,
             slots: 1,
-            files: vec![make_file("track.flac", 900, 10_000_000)],
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
         }];
 
         let config = make_test_config();
@@ -489,6 +529,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_second_chance_fallback_when_primary_all_rejected() {
+        let client = Arc::new(MockClient::new());
+        // Primary search (static results): gappy tracks 01, 03 — rejected
+        // by the contiguity gate.
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "gappy-peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+        // The album-only fallback finds a complete share.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Album".into(),
+            vec![SearchResult {
+                username: "complete-peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(
+                        r"Music\Test Artist\Test Album\01 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    make_file(
+                        r"Music\Test Artist\Test Album\02 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                ],
+            }],
+        );
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await
+        .unwrap();
+
+        // Both the primary and the second-chance fallback query ran.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Test Artist Test Album".to_string(),
+                "Test Album".to_string()
+            ]
+        );
+        // The complete fallback share was downloaded, album succeeded.
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "success");
+        let downloads = client.download_filenames.lock().unwrap().clone();
+        assert_eq!(downloads.len(), 2, "complete fallback share downloaded");
+    }
+
+    #[tokio::test]
     async fn test_fallback_no_matches_marks_skipped() {
         let client = Arc::new(MockClient::new());
         client.search_results_by_query.lock().unwrap().insert(
@@ -533,6 +649,54 @@ mod tests {
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "skipped");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_with_gappy_tracks_marks_skipped() {
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Album".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(
+                        r"Music\Test Artist\Test Album\01 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    make_file(
+                        r"Music\Test Artist\Test Album\03 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                ],
+            }],
+        );
+        // Primary query "Test Artist Test Album" has no map entry -> empty.
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Gappy track set rejected at the filter stage -> album skipped,
+        // nothing downloaded.
+        let rows = db.get_processed_albums().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "skipped");
+        assert!(client.download_filenames.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

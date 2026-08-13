@@ -12,3 +12,4 @@ pub mod organizer;
 pub mod runner;
 pub mod scanner;
 pub mod search;
+pub mod tracks;
