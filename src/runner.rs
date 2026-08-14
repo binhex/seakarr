@@ -47,6 +47,16 @@ pub fn spawn_cancel_listener(cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle
     })
 }
 
+/// Extract the track number from a downloaded file's stem for the organize
+/// pattern's `%track%` placeholder. Falls back to `"01"` when the filename
+/// carries no parseable track number (matching the historical hardcoded
+/// value). Returns the raw number (e.g. `"02 - Track"` -> `"2"`).
+fn track_number_for_organize(stem: &str) -> String {
+    crate::tracks::track_number_from_filename(stem)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "01".to_string())
+}
+
 /// Process a single album: search → filter rank → download → organize → notify.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_album(
@@ -256,13 +266,17 @@ pub async fn process_album(
             // Extract metadata from filename for pattern
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let ext = path.extension().unwrap_or_default().to_string_lossy();
+            // Real track number from the filename (e.g. "02 - Track" -> 2),
+            // falling back to "01" for unnumbered files — previously every
+            // file was organized onto track "01".
+            let track = track_number_for_organize(&stem);
             match organizer::organize_file(organizer::OrganizeInput {
                 src: path,
                 library_root: lib_root,
                 pattern: &config.storage.organize_pattern,
                 artist,
                 album: album.unwrap_or("Unknown"),
-                track: "01",
+                track: &track,
                 title: &stem,
                 ext: &ext,
             }) {
@@ -542,6 +556,20 @@ mod tests {
             size,
             attribs,
         }
+    }
+
+    // Regression guard: the organize step must use the REAL track number
+    // from each downloaded filename ("02 - Track.flac" -> 2), not the
+    // hardcoded "01" that made every organized file land on track 1.
+    #[test]
+    fn organize_uses_real_track_number_from_filename() {
+        assert_eq!(track_number_for_organize("02 - Track One"), "2");
+        assert_eq!(track_number_for_organize("13 - Tender"), "13");
+        assert_eq!(track_number_for_organize("01 - Intro"), "1");
+        // No parseable number -> previous fallback behaviour ("01").
+        assert_eq!(track_number_for_organize("Cover Art"), "01");
+        // 4+ digit tokens (years) are ignored -> fallback "01".
+        assert_eq!(track_number_for_organize("2001 - A Space Odyssey"), "01");
     }
 
     fn make_test_config() -> Config {
