@@ -1,5 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Check if stderr is an interactive terminal.
 /// When false, progress bars should not be created.
@@ -7,7 +8,7 @@ pub fn is_interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
-/// Manages download progress bars — one per active album.
+/// Manages download progress bars — one per active track download.
 ///
 /// Wraps `indicatif::MultiProgress` so multiple concurrent album downloads
 /// each get their own progress bar. Callers should check `is_interactive()`
@@ -15,6 +16,10 @@ pub fn is_interactive() -> bool {
 /// entirely rather than relying on this struct to no-op.
 pub struct ProgressDisplay {
     multi: MultiProgress,
+    /// Monotonic count of progress bars created, so tests (and future
+    /// diagnostics) can observe that bars are only created once a transfer
+    /// has actually started. Never decremented.
+    bars_created: AtomicUsize,
 }
 
 impl ProgressDisplay {
@@ -23,13 +28,23 @@ impl ProgressDisplay {
     pub fn new() -> Self {
         let multi = MultiProgress::new();
         // indicatif renders to stderr by default — matches spec.
-        Self { multi }
+        Self {
+            multi,
+            bars_created: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of progress bars created so far (monotonic). Lets tests assert
+    /// that bars are only created once a transfer actually starts.
+    pub fn created_bars(&self) -> usize {
+        self.bars_created.load(Ordering::SeqCst)
     }
 
     /// Create a progress bar for a track download.
     ///
     /// The bar shows: filename | downloaded/total | speed | bar | percentage
     pub fn create_bar(&self, filename: &str, total_bytes: u64) -> ProgressBar {
+        self.bars_created.fetch_add(1, Ordering::SeqCst);
         // Initialise with the actual total so the bar starts at 0% — using
         // length 0 renders as a full 100% bar (0/0 = complete) before any
         // transfer begins.

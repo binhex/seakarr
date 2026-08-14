@@ -47,13 +47,17 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
 }
 
 /// Download a single file from a specific user, monitoring speed.
+///
+/// The progress bar is created lazily on the first `InProgress` status —
+/// before that point no bar renders. Pass `None` for `progress` to skip
+/// the bar entirely.
 pub async fn download_file(
     client: &dyn SoulseekClient,
     file: &FileInfo,
     username: &str,
     dir: &Path,
     config: &DownloadConfig,
-    bar: Option<&ProgressBar>,
+    progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<PathBuf> {
     // Validate the remote name for traversal safety, but pass the FULL
@@ -67,15 +71,19 @@ pub async fn download_file(
     let basename = safe_basename(&file.name)?;
     let mut handle = match client.download(file, username, dir).await {
         Ok(h) => h,
-        Err(e) => {
-            if let Some(bar) = bar {
-                bar.finish_and_clear();
-            }
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
     tracing::info!("Download queued: {basename} from {username}");
     let mut transfer_start: Option<tokio::time::Instant> = None;
+    // Progress bar for this transfer, created lazily on the first InProgress
+    // status. Before the transfer actually starts no bar may render — the
+    // user should only see progress once a download is underway (the bar was
+    // previously created eagerly in download_album from search metadata,
+    // so a 0 B/[total] [0%] bar appeared before the bridge even started).
+    let mut bar: Option<ProgressBar> = None;
+    // Track the peer's reported total so the bar can be snapped to 100%
+    // on completion (the final InProgress may lag the actual end).
+    let mut last_total_bytes: u64 = 0;
     // Wall-clock deadline for the entire transfer — reset on every status
     // message. With 1-second polling, Err(_elapsed) fires every second;
     // only trigger timeout when the deadline is truly exceeded.
@@ -87,7 +95,7 @@ pub async fn download_file(
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             let _ = handle.cancel_tx.send(()).await;
             drain_transfer(&mut handle.status_rx, 5).await;
-            if let Some(bar) = bar {
+            if let Some(bar) = &bar {
                 bar.finish_and_clear();
             }
             return Err(SeakarrError::Download("download cancelled by user".into()));
@@ -112,12 +120,17 @@ pub async fn download_file(
             })) => {
                 if transfer_start.is_none() {
                     transfer_start = Some(tokio::time::Instant::now());
-                    // Update bar length from the peer's actual transfer total
-                    // (may differ from stale search metadata in file.size).
-                    if let Some(bar) = bar {
-                        bar.set_length(total_bytes);
+                    // Create the progress bar only once the transfer has
+                    // actually started (first InProgress). Skip for
+                    // zero-length transfers — indicatif renders len==0 as
+                    // 100% (state.rs:282), which reproduces the bug.
+                    if total_bytes > 0 {
+                        if let Some(p) = progress {
+                            bar = Some(p.create_bar(basename, total_bytes));
+                        }
                     }
                 }
+                last_total_bytes = total_bytes;
                 // Speed check: only after the transfer has actually started
                 // transferring (not just queued), and past the wait period.
                 if config.min_upload_speed_kbps > 0 {
@@ -125,7 +138,7 @@ pub async fn download_file(
                         if ts.elapsed().as_secs() >= config.speed_check_wait_secs {
                             let speed_kbps = (speed_bytes_per_sec / 1024) as u32;
                             if speed_kbps < config.min_upload_speed_kbps {
-                                if let Some(bar) = bar {
+                                if let Some(bar) = &bar {
                                     bar.finish_and_clear();
                                 }
                                 let _ = handle.cancel_tx.send(()).await;
@@ -141,16 +154,18 @@ pub async fn download_file(
                     }
                 }
                 // Update progress bar if present
-                if let Some(bar) = bar {
+                if let Some(bar) = &bar {
                     bar.set_position(bytes_downloaded);
                     bar.set_prefix(format_speed(speed_bytes_per_sec));
                 }
             }
             Ok(Some(DownloadStatus::Completed)) => {
-                if let Some(bar) = bar {
-                    // Show 100% before clearing — finish() keeps the final
-                    // frame visible, unlike finish_and_clear() which removes
-                    // the bar before the 100% render.
+                if let Some(bar) = &bar {
+                    // Snap to 100% before finishing — the final InProgress
+                    // may have left the bar below the total. finish()
+                    // keeps the final frame visible (cleared by the
+                    // runner's p.clear() at end of run).
+                    bar.set_position(last_total_bytes);
                     bar.finish();
                 }
                 let dest = dir.join(basename);
@@ -158,7 +173,7 @@ pub async fn download_file(
                 return Ok(dest);
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
-                if let Some(bar) = bar {
+                if let Some(bar) = &bar {
                     bar.finish_and_clear();
                 }
                 tracing::warn!("Download of {basename} failed: {reason}");
@@ -166,7 +181,7 @@ pub async fn download_file(
             }
             Ok(Some(DownloadStatus::Queued { .. })) => {}
             Ok(None) => {
-                if let Some(bar) = bar {
+                if let Some(bar) = &bar {
                     bar.finish_and_clear();
                 }
                 tracing::warn!("Download channel closed for {basename}");
@@ -178,7 +193,7 @@ pub async fn download_file(
                 // The 1-second poll timed out — check the wall-clock
                 // deadline before declaring the transfer dead.
                 if tokio::time::Instant::now() >= deadline {
-                    if let Some(bar) = bar {
+                    if let Some(bar) = &bar {
                         bar.finish_and_clear();
                     }
                     tracing::warn!(
@@ -270,19 +285,13 @@ pub async fn download_album(
         let mut failed = false;
 
         for file in &filtered_files {
-            let bar = progress.as_ref().map(|p| {
-                let basename = safe_basename(&file.name).unwrap_or(file.name.as_str());
-                let total = file.size;
-                p.create_bar(basename, total)
-            });
-            let bar_ref = bar.as_ref();
             match download_file(
                 client,
                 file,
                 &candidate.username,
                 staging_dir,
                 config,
-                bar_ref,
+                progress,
                 cancel,
             )
             .await
@@ -340,10 +349,13 @@ pub async fn download_album(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{FileInfo, MockClient, SearchResult};
+    use crate::client::{DownloadHandle, FileInfo, MockClient, SearchResult, UserInfo, UserStatus};
     use crate::config::{DownloadConfig, FilterConfig};
+    use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
 
     fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
         let mut attribs = HashMap::new();
@@ -382,6 +394,59 @@ mod tests {
         }
     }
 
+    /// A client whose download status channel the test drives manually, so
+    /// the moment a transfer "starts" (first InProgress) is under the test's
+    /// control rather than raced against a background task.
+    struct ControllableClient {
+        /// Set when `download()` is called — signals the transfer was queued.
+        download_called: Arc<std::sync::atomic::AtomicBool>,
+        /// Sender captured by `download()`; the test pushes statuses through it.
+        status_tx: Mutex<Option<mpsc::Sender<DownloadStatus>>>,
+    }
+
+    impl ControllableClient {
+        fn new() -> Self {
+            ControllableClient {
+                download_called: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                status_tx: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SoulseekClient for ControllableClient {
+        async fn login(&self, _username: &str, _password: &str, _server: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
+        async fn download(
+            &self,
+            _file: &FileInfo,
+            _username: &str,
+            _dir: &Path,
+        ) -> Result<DownloadHandle> {
+            let (status_tx, status_rx) = mpsc::channel(32);
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            *self.status_tx.lock().unwrap() = Some(status_tx);
+            self.download_called.store(true, Ordering::SeqCst);
+            Ok(DownloadHandle {
+                status_rx,
+                cancel_tx,
+            })
+        }
+
+        async fn user_info(&self, username: &str) -> Result<UserInfo> {
+            Ok(UserInfo {
+                username: username.into(),
+                status: UserStatus::Online,
+            })
+        }
+    }
+
     // Regression guard for the UploadDenied-everywhere bug: the Soulseek
     // QueueUpload wire message must carry the FULL share-relative path
     // exactly as the peer shared it ("Music\\Artist\\Album\\01 - Track.flac"),
@@ -416,14 +481,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_file_with_progress_bar() {
-        use indicatif::ProgressBar;
-
         let client = MockClient::new();
         let dir = TempDir::new().unwrap();
         let file = make_file("01 - track.flac", 900, 10_000_000);
 
         let config = default_dl_config();
-        let bar = ProgressBar::new(10_000_000);
+        let display = ProgressDisplay::new();
 
         let result = download_file(
             &client,
@@ -431,12 +494,101 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
-            Some(&bar),
+            Some(&display),
             None,
         )
         .await;
         assert!(result.is_ok());
-        assert!(bar.is_finished());
+        // The mock client emits InProgress immediately, so a bar must have
+        // been created once the transfer started.
+        assert_eq!(display.created_bars(), 1);
+    }
+
+    // Regression guard: the progress bar must not be created until a
+    // transfer has actually started (first InProgress status). Previously
+    // download_album created the bar eagerly from search metadata BEFORE
+    // calling download_file, so indicatif rendered a 0 B/29.77 MiB [0%] bar
+    // on the runner's log line while the bridge was still starting.
+    #[tokio::test]
+    async fn progress_bar_not_created_until_transfer_starts() {
+        let client = Arc::new(ControllableClient::new());
+        let display = Arc::new(ProgressDisplay::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+        let config = default_dl_config();
+
+        let task = tokio::spawn({
+            let client = client.clone();
+            let display = display.clone();
+            let dir_path = dir.path().to_path_buf();
+            async move {
+                download_album(
+                    client.as_ref() as &dyn SoulseekClient,
+                    &candidates,
+                    &dir_path,
+                    &config,
+                    &default_filter_config_test(),
+                    Some(display.as_ref()),
+                    None,
+                )
+                .await
+            }
+        });
+
+        // Wait until the transfer has been queued with the client but no
+        // status has been pushed yet.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while !client.download_called.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download() was never called"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        // RED: while the transfer is only queued, no progress bar may exist.
+        assert_eq!(
+            display.created_bars(),
+            0,
+            "progress bar must not appear before the transfer starts"
+        );
+
+        // The transfer starts — push the first InProgress status.
+        let tx = client
+            .status_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("status sender captured by download()");
+        tx.send(DownloadStatus::InProgress {
+            speed_bytes_per_sec: 1_000_000,
+            bytes_downloaded: 1_000_000,
+            total_bytes: 10_000_000,
+        })
+        .await
+        .unwrap();
+
+        // The bar must now exist.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while display.created_bars() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "bar was never created after the transfer started"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(display.created_bars(), 1);
+
+        // Complete the transfer so the task can finish.
+        tx.send(DownloadStatus::Completed).await.unwrap();
+        let result = task.await.unwrap();
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
