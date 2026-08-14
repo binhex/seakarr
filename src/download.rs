@@ -601,6 +601,74 @@ mod tests {
         }
     }
 
+    /// A client that fails downloads for specific filenames, simulating
+    /// partial downloads where some files in a candidate fail.
+    struct SelectiveFailClient {
+        /// Filenames that should return an error from `download()`.
+        fail_files: std::collections::HashSet<String>,
+    }
+
+    impl SelectiveFailClient {
+        fn new(fail_files: Vec<&str>) -> Self {
+            SelectiveFailClient {
+                fail_files: fail_files.into_iter().map(String::from).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SoulseekClient for SelectiveFailClient {
+        async fn login(&self, _u: &str, _p: &str, _s: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _q: &str, _t: u64) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
+        async fn download(
+            &self,
+            file: &FileInfo,
+            _username: &str,
+            _dir: &Path,
+        ) -> Result<DownloadHandle> {
+            if self.fail_files.contains(&file.name) {
+                return Err(SeakarrError::Download("simulated failure".into()));
+            }
+            let (status_tx, status_rx) = mpsc::channel(32);
+            let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                if cancel_rx.try_recv().is_ok() {
+                    let _ = status_tx
+                        .send(DownloadStatus::Failed {
+                            reason: "cancelled".into(),
+                        })
+                        .await;
+                    return;
+                }
+                let _ = status_tx
+                    .send(DownloadStatus::InProgress {
+                        speed_bytes_per_sec: 1_000_000,
+                        bytes_downloaded: 10_000_000,
+                        total_bytes: 10_000_000,
+                    })
+                    .await;
+                let _ = status_tx.send(DownloadStatus::Completed).await;
+            });
+            Ok(DownloadHandle {
+                status_rx,
+                cancel_tx,
+            })
+        }
+
+        async fn user_info(&self, username: &str) -> Result<UserInfo> {
+            Ok(UserInfo {
+                username: username.into(),
+                status: UserStatus::Online,
+            })
+        }
+    }
+
     // Regression guard for the UploadDenied-everywhere bug: the Soulseek
     // QueueUpload wire message must carry the FULL share-relative path
     // exactly as the peer shared it ("Music\\Artist\\Album\\01 - Track.flac"),
@@ -900,6 +968,116 @@ mod tests {
         let result =
             download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
         assert!(result.is_ok());
+    }
+
+    // Regression guard: when a candidate has multiple files but some
+    // fail to download, download_album must NOT return Ok — it should
+    // fall back to the next candidate (or return an error if exhausted).
+    // The failure is detected by download_file returning Err, which sets
+    // failed=true and breaks the loop — the candidate is abandoned and
+    // the staging dir is cleaned up.
+    #[tokio::test]
+    async fn download_album_fails_when_not_all_files_downloaded() {
+        // Candidate has 3 files, but "02 - track.flac" always fails.
+        // With max_retries=0 (no retries), the 1st file succeeds, the
+        // 2nd fails → failed=true, loop breaks, candidate abandoned.
+        let client = Arc::new(SelectiveFailClient::new(vec!["02 - track.flac"]));
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0; // no retries — fail fast
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        // Must fail: file "02" returned Err → failed=true → candidate
+        // abandoned → no more candidates → all candidates exhausted.
+        assert!(
+            result.is_err(),
+            "download_album must fail when a file download fails, got: {result:?}"
+        );
+    }
+
+    // Same as above but with a fallback candidate that succeeds completely.
+    // download_album should skip the failed candidate and succeed with
+    // the fallback.
+    #[tokio::test]
+    async fn download_album_falls_back_to_next_candidate_on_failure() {
+        // Candidate A: 3 files, "02" fails → incomplete.
+        // Candidate B: 2 files with DIFFERENT paths, all succeed.
+        let client = Arc::new(SelectiveFailClient::new(vec![
+            "02 - track.flac", // fails for candidate A
+        ]));
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![
+            SearchResult {
+                username: "user_a".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file("01 - track.flac", 900, 10_000_000),
+                    make_file("02 - track.flac", 900, 10_000_000),
+                    make_file("03 - track.flac", 900, 10_000_000),
+                ],
+            },
+            SearchResult {
+                username: "user_b".into(),
+                speed: 400,
+                slots: 1,
+                files: vec![
+                    make_file("01 - track.flac", 900, 10_000_000),
+                    make_file("03 - track.flac", 900, 10_000_000),
+                ],
+            },
+        ];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        // Should succeed via fallback candidate B (2 files).
+        assert!(
+            result.is_ok(),
+            "download_album should succeed via fallback candidate: {result:?}"
+        );
+        let downloaded = result.unwrap();
+        assert_eq!(
+            downloaded.len(),
+            2,
+            "fallback candidate should yield 2 files"
+        );
     }
 
     #[tokio::test]
