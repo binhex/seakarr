@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_retries_then_fails() {
+    async fn test_download_slow_speed_fails() {
         let client = MockClient::new();
         *client.download_speed.lock().unwrap() = 100_000; // Always slow → will retry and fail
         let dir = TempDir::new().unwrap();

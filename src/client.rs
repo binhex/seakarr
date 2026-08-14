@@ -386,6 +386,9 @@ fn forward_transfer_status(
     interactive: bool,
     filename: &str,
 ) {
+    // Sanitize peer-supplied filename for logging: strip control characters
+    // to prevent terminal injection.
+    let safe_filename: String = filename.chars().filter(|c| !c.is_control()).collect();
     // Throttle per-status progress logs: the crate emits InProgress
     // updates several times a second, which floods the console. Log
     // state transitions immediately, but progress at most once per
@@ -423,10 +426,8 @@ fn forward_transfer_status(
                                 // InProgress or Paused reach here.
                                 _ => unreachable!("outer matches! guard should have filtered this"),
                             };
-                            let safe_name: String =
-                                filename.chars().filter(|c| !c.is_control()).collect();
                             tracing::info!(
-                                "Downloading: {safe_name} — {} / {} @ {}",
+                                "Downloading: {safe_filename} — {} / {} @ {}",
                                 format_bytes(bd),
                                 format_bytes(tb),
                                 format_speed(sp.round() as u64),
@@ -435,7 +436,7 @@ fn forward_transfer_status(
                         }
                     }
                 } else {
-                    tracing::info!("Bridge status for {filename}: {status:?}");
+                    tracing::info!("Bridge status for {safe_filename}: {status:?}");
                 }
                 if forward_cancelled.load(Ordering::SeqCst) {
                     break;
@@ -467,7 +468,7 @@ fn forward_transfer_status(
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                tracing::info!("Bridge disconnected for {filename}");
+                tracing::info!("Bridge disconnected for {safe_filename}");
                 break;
             }
         }

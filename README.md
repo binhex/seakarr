@@ -13,14 +13,14 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
 - **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
-  free upload slots. Reject locked files and path-traversal names.
+  free upload slots. Reject files with no free upload slots and path-traversal names.
 - **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
   stall timeout with cancel, and candidate fallback (try the next ranked peer on failure).
 - **Post-download organisation** — move completed files from a staging directory into your library using a
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
-- **SQLite persistence** — tracks processed albums, download queue, peer reputation, search history,
-  download stats, and batch job progress across restarts and daemon cycles.
+- **SQLite persistence** — tracks processed albums, download queue, peer reputation, and search history
+  across restarts and daemon cycles.
 - **Daemon mode** — run continuously, re-scanning your library on a configurable interval and upgrading
   albums as they become available on Soulseek. Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
@@ -240,7 +240,7 @@ Seakarr has three operating modes:
    Ranks candidates by `speed × slot_bonus × bitrate_bonus`.
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer speed in real time. If the
    speed drops below `min_upload_speed_kbps`, the transfer is cancelled and the next candidate is tried.
-   Per-file retry and per-album stall timeout guard against unresponsive peers.
+   Per-album stall timeout guards against unresponsive peers. *(Per-file retry is reserved for future use.)*
 6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
    into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
 7. **Persist & notify** — the album is marked as processed in SQLite and an Apprise notification is sent
