@@ -369,6 +369,111 @@ fn ss_user_status_to_domain(status: SsUserStatus) -> UserStatus {
     }
 }
 
+/// Forward download status updates from the crate's std mpsc channel to the
+/// consumer's tokio channel, until a terminal status, a send failure, a
+/// channel disconnect, or a cancellation request.
+///
+/// Runs on a blocking-pool thread for the whole transfer. It must terminate
+/// promptly once cancellation is requested — even when the transfer stalls
+/// and no status updates arrive — otherwise the task outlives the run it
+/// belongs to and the tokio runtime drop blocks forever on it (a runtime
+/// waits for spawned blocking tasks to finish), leaving the process unable
+/// to exit.
+fn forward_transfer_status(
+    crate_rx: &std::sync::mpsc::Receiver<SsDownloadStatus>,
+    forward_tx: &tokio::sync::mpsc::Sender<DownloadStatus>,
+    forward_cancelled: &AtomicBool,
+    interactive: bool,
+    filename: &str,
+) {
+    // Throttle per-status progress logs: the crate emits InProgress
+    // updates several times a second, which floods the console. Log
+    // state transitions immediately, but progress at most once per
+    // 5 seconds.
+    let mut last_progress_log = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(6))
+        .unwrap();
+    loop {
+        match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
+            Ok(status) => {
+                if matches!(
+                    &status,
+                    SsDownloadStatus::InProgress { .. } | SsDownloadStatus::Paused { .. }
+                ) {
+                    if !interactive {
+                        // Non-interactive: human-friendly fallback log,
+                        // still throttled to once per 5 seconds. When
+                        // interactive the line is fully suppressed — the
+                        // progress bar handles display.
+                        if last_progress_log.elapsed() >= std::time::Duration::from_secs(5) {
+                            // Log both InProgress and Paused (Paused
+                            // maps to InProgress with speed=0 in the
+                            // domain type, so display it consistently).
+                            let (bd, tb, sp) = match &status {
+                                SsDownloadStatus::InProgress {
+                                    bytes_downloaded,
+                                    total_bytes,
+                                    speed_bytes_per_sec,
+                                } => (*bytes_downloaded, *total_bytes, *speed_bytes_per_sec),
+                                SsDownloadStatus::Paused {
+                                    bytes_downloaded,
+                                    total_bytes,
+                                } => (*bytes_downloaded, *total_bytes, 0.0),
+                                // The outer `matches!` guard ensures only
+                                // InProgress or Paused reach here.
+                                _ => unreachable!("outer matches! guard should have filtered this"),
+                            };
+                            let safe_name: String =
+                                filename.chars().filter(|c| !c.is_control()).collect();
+                            tracing::info!(
+                                "Downloading: {safe_name} — {} / {} @ {}",
+                                format_bytes(bd),
+                                format_bytes(tb),
+                                format_speed(sp.round() as u64),
+                            );
+                            last_progress_log = std::time::Instant::now();
+                        }
+                    }
+                } else {
+                    tracing::info!("Bridge status for {filename}: {status:?}");
+                }
+                if forward_cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mapped = ss_download_status_to_domain(status);
+                let terminal = matches!(
+                    mapped,
+                    DownloadStatus::Completed | DownloadStatus::Failed { .. }
+                );
+                if forward_tx.blocking_send(mapped).is_err() {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+            // No update yet (e.g. a long queue wait) — keep polling. The
+            // consumer enforces its own overall timeout and cancels via
+            // `cancel_tx`.
+            Err(RecvTimeoutError::Timeout) => {
+                // Honour cancellation even when the transfer is stalled and no
+                // status updates arrive. Without this the blocking task spins
+                // forever, and the tokio runtime drop blocks on it after the
+                // run — the process never exits, and Ctrl+C cannot terminate
+                // it (the tokio signal handler swallows SIGINT).
+                if forward_cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::info!("Bridge disconnected for {filename}");
+                break;
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl SoulseekClient for RealClient {
     async fn login(&self, username: &str, password: &str, server: &str) -> Result<()> {
@@ -494,92 +599,16 @@ impl SoulseekClient for RealClient {
             // Keep _download_handle alive for the entire bridge lifetime.
             let _keep = &_download_handle;
             tracing::info!("Bridge started for {bridge_filename} from {bridge_username}");
-            // Throttle per-status progress logs: the crate emits InProgress
-            // updates several times a second, which floods the console. Log
-            // state transitions immediately, but progress at most once per
-            // 5 seconds.
-            let mut last_progress_log = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(6))
-                .unwrap();
             // Evaluate once: isatty is a syscall per call, and the
             // interactive/non-interactive decision does not change mid-transfer.
             let interactive = is_interactive();
-            loop {
-                match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
-                    Ok(status) => {
-                        if matches!(
-                            &status,
-                            SsDownloadStatus::InProgress { .. } | SsDownloadStatus::Paused { .. }
-                        ) {
-                            if !interactive {
-                                // Non-interactive: human-friendly fallback log,
-                                // still throttled to once per 5 seconds. When
-                                // interactive the line is fully suppressed — the
-                                // progress bar handles display.
-                                if last_progress_log.elapsed() >= std::time::Duration::from_secs(5)
-                                {
-                                    // Log both InProgress and Paused (Paused
-                                    // maps to InProgress with speed=0 in the
-                                    // domain type, so display it consistently).
-                                    let (bd, tb, sp) = match &status {
-                                        SsDownloadStatus::InProgress {
-                                            bytes_downloaded,
-                                            total_bytes,
-                                            speed_bytes_per_sec,
-                                        } => {
-                                            (*bytes_downloaded, *total_bytes, *speed_bytes_per_sec)
-                                        }
-                                        SsDownloadStatus::Paused {
-                                            bytes_downloaded,
-                                            total_bytes,
-                                        } => (*bytes_downloaded, *total_bytes, 0.0),
-                                        // The outer `matches!` guard ensures only
-                                        // InProgress or Paused reach here.
-                                        _ => unreachable!(
-                                            "outer matches! guard should have filtered this"
-                                        ),
-                                    };
-                                    let safe_name: String = bridge_filename
-                                        .chars()
-                                        .filter(|c| !c.is_control())
-                                        .collect();
-                                    tracing::info!(
-                                        "Downloading: {safe_name} — {} / {} @ {}",
-                                        format_bytes(bd),
-                                        format_bytes(tb),
-                                        format_speed(sp.round() as u64),
-                                    );
-                                    last_progress_log = std::time::Instant::now();
-                                }
-                            }
-                        } else {
-                            tracing::info!("Bridge status for {bridge_filename}: {status:?}");
-                        }
-                        if forward_cancelled.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mapped = ss_download_status_to_domain(status);
-                        let terminal = matches!(
-                            mapped,
-                            DownloadStatus::Completed | DownloadStatus::Failed { .. }
-                        );
-                        if forward_tx.blocking_send(mapped).is_err() {
-                            break;
-                        }
-                        if terminal {
-                            break;
-                        }
-                    }
-                    // No update yet (e.g. a long queue wait) — keep polling.
-                    // The consumer enforces its own overall timeout and
-                    // cancels via `cancel_tx`.
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        tracing::info!("Bridge disconnected for {bridge_filename}");
-                        break;
-                    }
-                }
-            }
+            forward_transfer_status(
+                &crate_rx,
+                &forward_tx,
+                &forward_cancelled,
+                interactive,
+                &bridge_filename,
+            );
             let _ = bridge_client.remove_download(&bridge_username, &bridge_filename);
         });
 
@@ -654,6 +683,40 @@ mod real_client_tests {
     fn real_client_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RealClient>();
+    }
+
+    // Regression guard: a stalled transfer (no status updates arriving) must
+    // still terminate the status bridge once cancellation is requested.
+    // Previously the recv_timeout Timeout arm never checked the cancel flag,
+    // so the blocking task spun forever and the tokio runtime drop blocked on
+    // it after the run — the process never exited, and Ctrl+C could not kill
+    // it (the tokio signal handler swallowed SIGINT).
+    #[test]
+    fn forward_transfer_status_exits_on_cancellation_during_stalled_transfer() {
+        // A channel that never receives a status, and stays open (the sender
+        // is held until after the assertion — a dropped sender would close
+        // the channel and exit the bridge via the Disconnected arm, masking
+        // the bug).
+        let (tx, rx) = std::sync::mpsc::channel::<SsDownloadStatus>();
+        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(32);
+        // Cancellation is already requested before the bridge starts.
+        let cancelled = AtomicBool::new(true);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            forward_transfer_status(&rx, &fwd_tx, &cancelled, false, "01 - track.flac");
+            done_tx.send(()).unwrap();
+        });
+
+        // The bridge polls every 200 ms, so with the cancel flag set it must
+        // return almost immediately. Give it 5 s — with the bug it never
+        // returns and the test times out (RED).
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("status bridge did not exit on cancellation (hang reproduced)");
+        worker.join().unwrap();
+        drop(tx);
+        drop(fwd_rx);
     }
 
     // Regression guard for the peer-connection bug: soulseek-rs-lib v8.0.0

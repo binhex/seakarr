@@ -13,6 +13,40 @@ use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, RunReport};
 use crate::{download, filter, notifier, organizer, scanner, search};
 
+/// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
+///
+/// The first press sets the shared cancellation flag, aborting in-flight
+/// downloads (their staging dirs are cleaned by `download_album`). A second
+/// press force-exits the process — the run may be wedged on a network call
+/// that ignores the flag, and Ctrl+C must always be able to terminate
+/// seakarr.
+pub fn spawn_cancel_listener(cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    if cancel.swap(true, Ordering::SeqCst) {
+                        // The first press already requested graceful
+                        // cancellation; the run may be wedged on a network
+                        // call that ignores the flag, so a second press must
+                        // always terminate seakarr.
+                        tracing::info!("Received second SIGINT — forcing exit");
+                        std::process::exit(130);
+                    }
+                    tracing::info!("Received SIGINT — aborting in-flight downloads...");
+                }
+                Err(e) => {
+                    // Signal driver unavailable — cancellation via Ctrl+C
+                    // will not work. Log and exit the listener loop so the
+                    // caller is not left waiting for a flag that never flips.
+                    tracing::warn!("Failed to register SIGINT handler: {e} — Ctrl+C will not work");
+                    return;
+                }
+            }
+        }
+    })
+}
+
 /// Process a single album: search → filter rank → download → organize → notify.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_album(
@@ -345,13 +379,7 @@ pub async fn run_auto_mode(
     // Shared cancellation flag: SIGINT (Ctrl+C) sets it, aborting in-flight
     // downloads. Each album's staging dir is cleaned by download_album.
     let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_signal = Arc::clone(&cancel);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Received SIGINT — aborting in-flight downloads...");
-            cancel_signal.store(true, Ordering::SeqCst);
-        }
-    });
+    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
 
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
@@ -416,6 +444,12 @@ pub async fn run_auto_mode(
     }
     report.print_summary();
 
+    // Abort the cancel listener so the tokio task does not accumulate across
+    // daemon scan cycles (each cycle calls run_auto_mode again). Without
+    // abort(), the JoinHandle drop only detaches the task — it keeps running
+    // and waiting for SIGINT, leaking one task per scan.
+    _listener.abort();
+
     Ok(())
 }
 
@@ -447,13 +481,7 @@ pub async fn run_manual_mode(
     // Cancellation flag: SIGINT aborts the in-flight download; download_album
     // cleans the album's staging dir.
     let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_signal = Arc::clone(&cancel);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Received SIGINT — aborting download...");
-            cancel_signal.store(true, Ordering::SeqCst);
-        }
-    });
+    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
     let result = process_album(
         client,
         artist,
@@ -484,6 +512,7 @@ pub async fn run_manual_mode(
     }
 
     report.print_summary();
+    _listener.abort();
     result.map(|_| ())
 }
 
@@ -975,6 +1004,184 @@ mod tests {
                 );
             }
             other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
+    }
+
+    // Regression guard: the first SIGINT must set the cancellation flag so
+    // in-flight downloads abort gracefully. Runs in a child process — raising
+    // SIGINT in the shared test process would also hit other tests' listeners
+    // (cancelling their in-flight albums) when tests run in parallel.
+    #[cfg(unix)]
+    #[test]
+    fn cancel_listener_sets_flag_on_first_sigint() {
+        if std::env::var("SEAKARR_SIGINT_FLAG_CHILD").is_ok() {
+            // Child branch: run the real listener, report when the flag is set.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+                // Yield so the runtime polls the listener and registers the
+                // SIGINT handler before we signal readiness.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                println!("READY");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                // Wait for the first SIGINT to set the flag.
+                for _ in 0..100 {
+                    if cancel.load(Ordering::SeqCst) {
+                        println!("FLAG_SET");
+                        std::io::stdout().flush().unwrap();
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                panic!("cancel flag was not set after SIGINT");
+            });
+            return;
+        }
+
+        // Parent branch: spawn the child, wait for READY, send one SIGINT,
+        // expect FLAG_SET.
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("runner::tests::cancel_listener_sets_flag_on_first_sigint")
+            .arg("--nocapture")
+            .env("SEAKARR_SIGINT_FLAG_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn child");
+
+        let pid = child.id() as i32;
+        use std::io::BufRead;
+        let mut flag_line = String::new();
+        {
+            let mut stdout = std::io::BufReader::new(child.stdout.as_mut().unwrap());
+            // Skip harness banner lines until READY.
+            loop {
+                let mut line = String::new();
+                stdout
+                    .read_line(&mut line)
+                    .expect("child did not print READY");
+                if line.contains("READY") {
+                    break;
+                }
+            }
+
+            unsafe { libc::kill(pid, libc::SIGINT) };
+
+            // The child must observe the flag and print FLAG_SET within 10 s.
+            stdout
+                .read_line(&mut flag_line)
+                .expect("child did not print FLAG_SET");
+        }
+        assert!(
+            flag_line.contains("FLAG_SET"),
+            "first SIGINT must set the cancel flag, got: {flag_line:?}"
+        );
+        let status = child.wait().expect("child did not exit");
+        assert!(
+            status.success(),
+            "child should exit cleanly, got {status:?}"
+        );
+    }
+
+    // Regression guard: Ctrl+C must always be able to terminate seakarr.
+    // The first press requests graceful cancellation; a second press must
+    // force-exit the process (exit code 130). With the old single-shot
+    // listener the second SIGINT was swallowed by tokio's signal handler and
+    // the process stayed alive forever.
+    #[cfg(unix)]
+    #[test]
+    fn second_sigint_forces_process_exit() {
+        if std::env::var("SEAKARR_SIGINT_CHILD").is_ok() {
+            // Child branch: run the real listener, then sleep — only a forced
+            // exit can end the process.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+                // Yield so the runtime polls the listener task and registers
+                // the SIGINT handler before we signal readiness — otherwise
+                // the first SIGINT hits the default handler and kills the
+                // child, masking what the test is checking.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                println!("READY");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            });
+            panic!("child should have been force-exited by the second SIGINT");
+        }
+
+        // Parent branch: spawn the child (this test, exactly), wait for it to
+        // arm the listener, then send two SIGINTs. The second must exit 130.
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("runner::tests::second_sigint_forces_process_exit")
+            .arg("--nocapture")
+            .env("SEAKARR_SIGINT_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn child");
+
+        use std::io::BufRead;
+        let mut ready_line = String::new();
+        {
+            let stdout = child.stdout.as_mut().unwrap();
+            let mut reader = std::io::BufReader::new(stdout);
+            // Skip harness banner lines until the child's READY marker.
+            loop {
+                ready_line.clear();
+                reader
+                    .read_line(&mut ready_line)
+                    .expect("child did not print READY");
+                if ready_line.contains("READY") {
+                    break;
+                }
+            }
+        }
+        assert!(
+            ready_line.contains("READY"),
+            "child did not become ready: {ready_line:?}"
+        );
+
+        let pid = child.id() as i32;
+        unsafe { libc::kill(pid, libc::SIGINT) };
+        // Give the first press time to be processed before the second.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        unsafe { libc::kill(pid, libc::SIGINT) };
+
+        // The second SIGINT must terminate the child with exit code 130. Poll
+        // try_wait so a hang surfaces as a timeout rather than blocking.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert_eq!(
+                        status.code(),
+                        Some(130),
+                        "second SIGINT must force-exit with code 130, got {status:?}"
+                    );
+                    break;
+                }
+                None => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "child did not exit after two SIGINTs (second press swallowed — hang reproduced)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
         }
     }
 }

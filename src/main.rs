@@ -385,13 +385,7 @@ async fn run_batch_mode(
     // Shared cancellation flag: SIGINT aborts the in-flight album download;
     // its staging dir is cleaned by download_album.
     let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_signal = Arc::clone(&cancel);
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Received SIGINT — aborting download...");
-            cancel_signal.store(true, Ordering::SeqCst);
-        }
-    });
+    let _listener = seakarr::runner::spawn_cancel_listener(Arc::clone(&cancel));
 
     for line in &lines {
         // Check cancellation between batch lines — stop processing
@@ -437,5 +431,6 @@ async fn run_batch_mode(
     }
 
     report.print_summary();
+    _listener.abort();
     Ok(())
 }
