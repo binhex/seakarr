@@ -76,9 +76,25 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run().await {
-        eprintln!("seakarr: {e}");
-        std::process::exit(1);
+    std::process::exit(exit_code_after_run(run().await));
+}
+
+/// Map a run result to a process exit code, printing the error on failure.
+///
+/// `main` calls `std::process::exit` with this value instead of returning
+/// normally: after the run completes the tokio runtime drop would block
+/// indefinitely on any still-running spawned blocking task (e.g. a download
+/// status bridge), leaving the process hung and Ctrl+C unable to terminate
+/// it (the SIGINT listener is aborted after the run summary, and tokio's
+/// global signal handler swallows further presses). An explicit exit
+/// bypasses the runtime drop entirely.
+fn exit_code_after_run(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("seakarr: {e}");
+            1
+        }
     }
 }
 
@@ -434,4 +450,82 @@ async fn run_batch_mode(
     report.print_summary();
     _listener.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: seakarr must exit after a run completes even when a
+    // blocking task (e.g. the download status bridge) is still running.
+    // Previously main() returned normally on success, and the tokio runtime
+    // drop blocked indefinitely on the stuck spawn_blocking task — the
+    // process hung and Ctrl+C could not kill it (the SIGINT listener is
+    // aborted right after the run summary prints, and tokio's global signal
+    // handler swallows further presses).
+    #[test]
+    fn process_exits_after_run_despite_stuck_blocking_task() {
+        if std::env::var("SEAKARR_EXIT_CHILD").is_ok() {
+            // Child branch: reproduce main()'s runtime structure — a
+            // multi-thread runtime with a stuck blocking task (mimicking the
+            // download bridge that never terminates). The exit path must
+            // terminate the process without waiting for the runtime drop.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // Enter the runtime so the free-function spawn_blocking has a
+            // context (mirroring #[tokio::main]'s block_on wrapper).
+            let _guard = rt.enter();
+            // A blocking task that never returns — the runtime drop would
+            // wait for this forever, hanging the process.
+            tokio::task::spawn_blocking(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            });
+            // main()'s exit path after a successful run:
+            std::process::exit(exit_code_after_run(Ok(())));
+        }
+
+        // Parent branch: spawn the child and assert it exits promptly with
+        // code 0. Without the explicit exit, the runtime drop blocks on the
+        // stuck blocking task and the child never exits.
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("tests::process_exits_after_run_despite_stuck_blocking_task")
+            .arg("--nocapture")
+            .env("SEAKARR_EXIT_CHILD", "1")
+            .spawn()
+            .expect("failed to spawn child");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert_eq!(
+                        status.code(),
+                        Some(0),
+                        "process must exit cleanly after the run, got {status:?}"
+                    );
+                    break;
+                }
+                None => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        panic!(
+                            "process did not exit after the run (runtime drop hung on a stuck blocking task — hang reproduced)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exit_code_after_run_maps_result() {
+        assert_eq!(exit_code_after_run(Ok(())), 0);
+        let err: Result<()> = Err(SeakarrError::Config("bad".into()));
+        assert_eq!(exit_code_after_run(err), 1);
+    }
 }
