@@ -134,7 +134,7 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
 pub fn find_albums_to_upgrade(
     albums: &[ScannedAlbum],
     config: &FilterConfig,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, usize)> {
     let allowed_set: HashSet<String> = config
         .allowed_extensions
         .iter()
@@ -162,7 +162,7 @@ pub fn find_albums_to_upgrade(
 
             false
         })
-        .map(|a| (a.artist.clone(), a.album.clone()))
+        .map(|a| (a.artist.clone(), a.album.clone(), a.track_count))
         .collect()
 }
 
@@ -239,6 +239,7 @@ mod tests {
             include_locked: false,
             contiguous_tracks: true,
             min_tracks: 3,
+            peer_track_count: true,
         };
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
@@ -247,6 +248,7 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         assert_eq!(to_upgrade[0].0, "Artist1");
         assert_eq!(to_upgrade[0].1, "Album1");
+        assert_eq!(to_upgrade[0].2, 3); // track_count
     }
 
     #[test]
@@ -269,9 +271,12 @@ mod tests {
             include_locked: false,
             contiguous_tracks: true,
             min_tracks: 3,
+            peer_track_count: true,
         };
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
         assert_eq!(to_upgrade.len(), 1); // mp3 should trigger upgrade (not flac)
+        assert_eq!(to_upgrade[0].0, "Artist");
+        assert_eq!(to_upgrade[0].2, 2); // track_count
     }
 }

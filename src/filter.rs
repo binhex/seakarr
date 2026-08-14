@@ -2,15 +2,22 @@ use crate::client::{FileInfo, SearchResult};
 use crate::config::FilterConfig;
 
 /// Filter search results by extension, bitrate, excluded words, free slots,
-/// minimum track count (`min_tracks`), and — when `contiguous_tracks` is
-/// enabled — contiguous track numbers over the downloadable set. Returns
-/// only results with at least `min_tracks` matching files (or at least one
-/// when `min_tracks` is 0).
-pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<SearchResult> {
+/// minimum track count (`min_tracks`), contiguous track numbers (when
+/// `contiguous_tracks` is enabled), and — in auto mode — the library track
+/// count (`peer_track_count`): results whose usable track count is below the
+/// library's existing track count are rejected. Returns only results with at
+/// least `min_tracks` matching files (or at least one when `min_tracks` is 0).
+pub fn filter_results(
+    results: &[SearchResult],
+    config: &FilterConfig,
+    library_track_count: Option<usize>,
+) -> Vec<SearchResult> {
     results
         .iter()
         .filter(|r| {
-            // Filter: must have free slots (if max_queue_length == 0)
+            // Filter: must have free upload slots. Results with no free
+            // slots (slots == 0) are always rejected. The include_locked
+            // field is defined but not yet enforced.
             if r.slots == 0 {
                 return false;
             }
@@ -21,24 +28,40 @@ pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<Se
             // be downloaded, or an unsafe-named numbered track would pass
             // here and then be dropped at download time, recreating the
             // gap this feature exists to prevent.
+            let safe_and_passing = |f: &FileInfo| {
+                crate::download::safe_basename(&f.name).is_ok() && file_passes_filters(f, config)
+            };
             if !config.contiguous_tracks {
                 // Toggle off: count safe, quality-passing files (mirroring
                 // download_album) and reject incomplete shares below
                 // min_tracks. min_tracks.max(1) keeps the "at least one
                 // usable file" floor when the gate is disabled (0).
-                let safe_and_passing = |f: &FileInfo| {
-                    crate::download::safe_basename(&f.name).is_ok()
-                        && file_passes_filters(f, config)
-                };
                 let passing_count = r.files.iter().filter(|f| safe_and_passing(f)).count();
                 // min_tracks == 0 disables the gate but never accepts a
                 // result with zero usable files.
                 let min = config.min_tracks.max(1) as usize;
-                return passing_count >= min;
+                if passing_count < min {
+                    return false;
+                }
+                // Library track count check (auto mode only).
+                // Note: passing_count counts files passing quality filters,
+                // not unique track numbers — duplicate filenames are counted
+                // separately. This is intentional: the check compares the
+                // library's total file count against the peer's usable file
+                // count, so track-number deduplication would undercount.
+                if let Some(lib_count) = library_track_count {
+                    if config.peer_track_count && passing_count < lib_count {
+                        tracing::debug!(
+                            "result from {} rejected: {} filtered tracks < library track count {}",
+                            r.username,
+                            passing_count,
+                            lib_count
+                        );
+                        return false;
+                    }
+                }
+                return true;
             }
-            let safe_and_passing = |f: &FileInfo| {
-                crate::download::safe_basename(&f.name).is_ok() && file_passes_filters(f, config)
-            };
             let passing: Vec<&FileInfo> = r.files.iter().filter(|f| safe_and_passing(f)).collect();
             if passing.len() < config.min_tracks as usize {
                 // Incomplete share: fewer tracks than the configured minimum
@@ -70,6 +93,28 @@ pub fn filter_results(results: &[SearchResult], config: &FilterConfig) -> Vec<Se
                 );
                 return false;
             }
+            // Library track count check (auto mode only).
+            // Note: with the default min_tracks=3, albums with 1-2 tracks
+            // (EPs, singles) are already rejected by the min_tracks gate
+            // before this check runs. To apply the library check to EPs,
+            // set min_tracks to 0 or 1.
+            if let Some(lib_count) = library_track_count {
+                if config.peer_track_count && passing.len() < lib_count {
+                    tracing::debug!(
+                        "result from {} rejected: {} filtered tracks < library track count {}",
+                        r.username,
+                        passing.len(),
+                        lib_count
+                    );
+                    return false;
+                }
+            }
+            // Edge case: peers sharing multiple files with the same track
+            // number (e.g. two "01 - Intro.flac" with different codecs)
+            // can pass count+contiguity but collapse to one file during
+            // download (safe_basename deduplication). The last file in
+            // name-sorted order survives; downloaded.len() may overcount
+            // relative to unique tracks. Accepted by design.
             true
         })
         .cloned()
@@ -178,6 +223,7 @@ mod tests {
             // they exercise extension/bitrate/word/slot filtering, not
             // share completeness. Dedicated tests set min_tracks explicitly.
             min_tracks: 0,
+            peer_track_count: true,
         }
     }
 
@@ -199,7 +245,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -225,7 +271,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -249,7 +295,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -305,7 +351,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -326,7 +372,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(filtered.is_empty());
     }
 
@@ -346,7 +392,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(filtered.len(), 1);
     }
 
@@ -371,7 +417,7 @@ mod tests {
             )],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(
             filtered.is_empty(),
             "single-track result must be rejected when min_tracks is 3 (toggle off)"
@@ -396,7 +442,7 @@ mod tests {
             vec![make_file("01 - A.mp3", 320, 10_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(
             filtered.is_empty(),
             "zero-file result must be rejected even with min_tracks: 0"
@@ -422,7 +468,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -445,7 +491,7 @@ mod tests {
             vec![make_file("01 - Single.flac", 900, 30_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -466,7 +512,7 @@ mod tests {
             vec![make_file("Title.flac", 900, 30_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(filtered.is_empty());
     }
 
@@ -490,7 +536,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(filtered.is_empty());
     }
 
@@ -515,7 +561,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(filtered.is_empty());
     }
 
@@ -539,7 +585,7 @@ mod tests {
             )],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert!(
             filtered.is_empty(),
             "single-track result must be rejected when min_tracks is 3"
@@ -563,11 +609,222 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg);
+        let filtered = filter_results(&results, &cfg, None);
         assert_eq!(
             filtered.len(),
             1,
             "3-track result must pass with min_tracks=3"
+        );
+    }
+
+    #[test]
+    fn test_peer_track_count_rejects_lesser() {
+        // Peer has 3 filtered files, library has 5 → rejected.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5));
+        assert!(filtered.is_empty(), "3 tracks < library 5 → rejected");
+    }
+
+    #[test]
+    fn test_peer_track_count_accepts_equal() {
+        // Peer has 5 filtered files, library has 5 → passes.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+                make_file("04 - track.flac", 900, 10_000_000),
+                make_file("05 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5));
+        assert_eq!(filtered.len(), 1, "5 tracks == library 5 → accepted");
+    }
+
+    #[test]
+    fn test_peer_track_count_accepts_greater() {
+        // Peer has 7 filtered files, library has 5 → passes.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+                make_file("04 - track.flac", 900, 10_000_000),
+                make_file("05 - track.flac", 900, 10_000_000),
+                make_file("06 - track.flac", 900, 10_000_000),
+                make_file("07 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5));
+        assert_eq!(filtered.len(), 1, "7 tracks > library 5 → accepted");
+    }
+
+    #[test]
+    fn test_peer_track_count_disabled() {
+        // peer_track_count: false → peer with 3 files passes even though
+        // library has 5.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: false,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5));
+        assert_eq!(filtered.len(), 1, "check disabled → accepted regardless");
+    }
+
+    #[test]
+    fn test_peer_track_count_none_skips() {
+        // library_track_count: None (batch/manual mode) → check skipped.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, None);
+        assert_eq!(
+            filtered.len(),
+            1,
+            "library_track_count None → check skipped"
+        );
+    }
+
+    #[test]
+    fn test_peer_track_count_with_contiguous_tracks() {
+        // ON-branch: contiguous_tracks enabled, peer has fewer tracks than
+        // library → rejected. Verifies the check works in the contiguous branch
+        // (all other peer_track_count tests use contiguous_tracks: false).
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5));
+        assert!(
+            filtered.is_empty(),
+            "3 tracks < library 5 with contiguous_tracks ON → rejected"
+        );
+    }
+
+    #[test]
+    fn test_min_tracks_preempts_peer_track_count() {
+        // With default min_tracks=3, a 2-track peer is rejected by min_tracks
+        // before the library track count check runs — even if the library has
+        // only 1 track (so the peer would have passed the library check).
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 3,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+            ],
+        }];
+        // Library has 1 track; peer has 2 (>=1). But min_tracks=3 rejects
+        // because 2 < 3. The library check never runs.
+        let filtered = filter_results(&results, &cfg, Some(1));
+        assert!(
+            filtered.is_empty(),
+            "2 tracks < min_tracks=3 → rejected by min_tracks before library check"
         );
     }
 }

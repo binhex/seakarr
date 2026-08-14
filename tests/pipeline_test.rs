@@ -52,6 +52,7 @@ async fn test_full_pipeline_manual_mode() {
         staging.path(),
         None,
         None,
+        None, // library_track_count (not applicable in manual mode)
     )
     .await;
 
@@ -84,6 +85,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         staging.path(),
         None,
         None,
+        None, // library_track_count (not applicable in manual mode)
     )
     .await;
 

@@ -58,6 +58,7 @@ pub async fn process_album(
     staging_dir: &Path,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
+    library_track_count: Option<usize>,
 ) -> Result<AlbumOutcome> {
     // Skip if already processed
     if let Some(a) = album {
@@ -152,7 +153,7 @@ pub async fn process_album(
     // Filter + rank
     let total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let total_users = results.len();
-    let mut filtered = filter::filter_results(&results, &config.filters);
+    let mut filtered = filter::filter_results(&results, &config.filters, library_track_count);
     // Second-chance fallback: when the primary search returned results but
     // every one was rejected (e.g. by the contiguity gate), the album-only
     // fallback query may find a complete share that the combined query
@@ -177,7 +178,11 @@ pub async fn process_album(
                         album.unwrap_or("(all)"),
                         fallback_results.len(),
                     );
-                    filtered = filter::filter_results(&fallback_results, &config.filters);
+                    filtered = filter::filter_results(
+                        &fallback_results,
+                        &config.filters,
+                        library_track_count,
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -336,7 +341,7 @@ pub async fn run_auto_mode(
     // Scan library
     tracing::info!("Scanning library...");
     let albums = scanner::scan_library(&config.library.paths)?;
-    let targets = scanner::find_albums_to_upgrade(&albums, &config.filters);
+    let targets_with_counts = scanner::find_albums_to_upgrade(&albums, &config.filters);
     for album in &albums {
         let fmt_str: Vec<&str> = album.formats.iter().map(|f| f.as_str()).collect();
         tracing::info!(
@@ -350,11 +355,11 @@ pub async fn run_auto_mode(
     }
     tracing::info!(
         "Found {} albums to upgrade out of {} total",
-        targets.len(),
+        targets_with_counts.len(),
         albums.len()
     );
 
-    if targets.is_empty() {
+    if targets_with_counts.is_empty() {
         tracing::info!("Nothing to upgrade.");
         return Ok(());
     }
@@ -383,15 +388,16 @@ pub async fn run_auto_mode(
 
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
-    let targets_vec: Vec<(String, String)> = targets;
+    let targets_vec: Vec<(String, String, usize)> = targets_with_counts;
     let mut futures_vec = Vec::new();
 
-    for (artist, album) in &targets_vec {
+    for (artist, album, track_count) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
         let cancel = cancel.clone();
         let artist = artist.clone();
         let album = album.clone();
+        let library_track_count = *track_count;
         futures_vec.push(
             async move {
                 // Park until a permit is free — this is what bounds concurrency.
@@ -408,6 +414,7 @@ pub async fn run_auto_mode(
                     staging_dir,
                     progress.as_deref(),
                     Some(&cancel),
+                    Some(library_track_count),
                 )
                 .await;
                 (artist, album, result)
@@ -491,6 +498,7 @@ pub async fn run_manual_mode(
         staging_dir,
         progress_ref,
         Some(&cancel),
+        None, // library_track_count (manual mode: no scanner data)
     )
     .await;
     match &result {
@@ -576,6 +584,7 @@ mod tests {
             staging.path(),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -613,6 +622,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
         )
@@ -671,6 +681,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
         )
@@ -776,6 +787,7 @@ mod tests {
             staging.path(),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -826,6 +838,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
         )
@@ -887,6 +900,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
         )
@@ -990,6 +1004,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
         )

@@ -409,6 +409,7 @@ async fn run_batch_mode(
             staging_dir,
             progress.as_ref(),
             Some(&cancel),
+            None, // library_track_count (batch mode: no scanner data)
         )
         .await
         {

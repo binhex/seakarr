@@ -104,6 +104,8 @@ pub struct FilterConfig {
     pub contiguous_tracks: bool,
     #[serde(default = "default_min_tracks")]
     pub min_tracks: u32,
+    #[serde(default = "default_true")]
+    pub peer_track_count: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,6 +498,7 @@ impl Default for Config {
                 include_locked: false,
                 contiguous_tracks: default_true(),
                 min_tracks: default_min_tracks(),
+                peer_track_count: default_true(),
             },
             download: DownloadConfig {
                 concurrent: default_concurrent(),
@@ -576,6 +579,7 @@ filters:
   include_locked: false
   contiguous_tracks: true
   min_tracks: 3
+  peer_track_count: true
 
 download:
   concurrent: 5
@@ -667,6 +671,7 @@ daemon:
         assert_eq!(config.download.concurrent, 5);
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.filters.allowed_extensions, vec!["flac"]);
+        assert!(config.filters.peer_track_count);
     }
 
     #[test]
@@ -701,6 +706,23 @@ daemon:
         let config = Config::load(dir.path()).unwrap();
 
         assert!(config.filters.contiguous_tracks);
+    }
+
+    #[test]
+    fn test_peer_track_count_defaults_true() {
+        let config = Config::default();
+        assert!(config.filters.peer_track_count);
+    }
+
+    #[test]
+    fn test_peer_track_count_from_yaml() {
+        let dir = TempDir::new().unwrap();
+        let yaml_path = dir.path().join("seakarr.yml");
+        fs::write(&yaml_path, sample_yaml()).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert!(config.filters.peer_track_count);
     }
 
     #[test]

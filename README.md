@@ -167,6 +167,7 @@ Controls which Soulseek search results pass the quality gate.
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered or multi-disc collections. | `true` |
 | `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. | `3` |
+| `peer_track_count` | In auto mode, reject search results whose usable track count is below the library's existing track count for the same album. Prevents silent downgrades when the library already has a more complete copy. Ignored in batch and manual mode. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
 
