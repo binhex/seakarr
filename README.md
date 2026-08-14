@@ -15,7 +15,8 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
   free upload slots. Reject files with no free upload slots and path-traversal names.
 - **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
-  stall timeout with cancel, and candidate fallback (try the next ranked peer on failure).
+  stall timeout with cancel, per-file retries with configurable count and delay, and candidate fallback
+  (try the next ranked peer once retries are exhausted).
 - **Post-download organisation** — move completed files from a staging directory into your library using a
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
@@ -181,8 +182,8 @@ Controls which Soulseek search results pass the quality gate.
 | `speed_check_wait_secs` | Seconds to wait after a transfer starts before measuring speed. | `30` |
 | `timeout_secs` | Inactivity timeout — cancel the download if no status update arrives within this period. | `180` |
 | `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. *(Reserved for future use — not yet enforced.)* | `120` |
-| `max_retries` | Per-file retry attempts on transfer error. *(Reserved for future use — not yet enforced.)* | `4` |
-| `retry_delay_secs` | Seconds to wait between retry attempts. *(Reserved for future use — not yet enforced.)* | `30` |
+| `max_retries` | Per-file retry attempts on the same peer before falling back to the next candidate. `0` disables retries. | `4` |
+| `retry_delay_secs` | Seconds to wait between retry attempts. | `30` |
 | `min_filtered_users` | Minimum number of filtered candidates required to apply the speed check. *(Reserved for future use — not yet enforced.)* | `10` |
 | `skip_retry_hours` | Cooldown in hours before re-attempting a transiently-failed album on the next run. *(Reserved for future use — not yet enforced.)* | `24` |
 
@@ -240,7 +241,8 @@ Seakarr has three operating modes:
    Ranks candidates by `speed × slot_bonus × bitrate_bonus`.
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer speed in real time. If the
    speed drops below `min_upload_speed_kbps`, the transfer is cancelled and the next candidate is tried.
-   Per-album stall timeout guards against unresponsive peers. *(Per-file retry is reserved for future use.)*
+   Per-album stall timeout guards against unresponsive peers. Per-file retries with configurable count
+   and delay (`max_retries`, `retry_delay_secs`) re-attempt the same peer before falling back to the next candidate.
 6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
    into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
 7. **Persist & notify** — the album is marked as processed in SQLite and an Apprise notification is sent

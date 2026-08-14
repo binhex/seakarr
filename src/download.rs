@@ -48,6 +48,12 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
 
 /// Download a single file from a specific user, monitoring speed.
 ///
+/// Retries the same peer up to `config.max_retries` times on failure,
+/// waiting `config.retry_delay_secs` between attempts, before surfacing the
+/// last error. A user-initiated cancellation (Ctrl+C) aborts at the next
+/// safe point — between attempts or within the status polling loop — and
+/// is never retried.
+///
 /// The progress bar is created lazily on the first `InProgress` status —
 /// before that point no bar renders. Pass `None` for `progress` to skip
 /// the bar entirely.
@@ -69,6 +75,75 @@ pub async fn download_file(
     // itself when writing the local file, so the local destination is
     // still dir/<basename>.
     let basename = safe_basename(&file.name)?;
+
+    // Retry the same peer up to max_retries times. On cancellation the
+    // first attempt already aborts via the cancel flag inside download_once,
+    // and the loop re-checks the flag between attempts so a SIGINT during
+    // the delay window is honoured as soon as the sleep completes.
+    //
+    // NOTE: all failure types are retried, including non-transient ones
+    // (e.g. "user declined", "could not connect"). This is intentional —
+    // the retry_delay_secs penalty is the cost of a failed attempt, and
+    // the candidate-list fallback provides the real diversity. Permanent
+    // failures waste one delay window per retry, then fall back.
+    //
+    // NOTE: with very low retry_delay_secs (< ~30 s), the vendor crate's
+    // transfer thread may still be winding down (30 s socket read timeout)
+    // when the retry opens a new connection to the same peer+file. Both
+    // threads write to the same .part file (O_APPEND). The default 30 s
+    // delay makes this negligible; lower values risk interleaved writes.
+    let mut last_err: Option<SeakarrError> = None;
+    for attempt in 0..=config.max_retries {
+        if attempt > 0 {
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return Err(SeakarrError::Download("download cancelled by user".into()));
+            }
+            tracing::info!(
+                "Retrying download of {basename} from {username} (attempt {attempt}/{})",
+                config.max_retries
+            );
+            tokio::time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
+            // Re-check after the delay — a SIGINT during sleep must not
+            // fall through to queueing another download.
+            if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return Err(SeakarrError::Download("download cancelled by user".into()));
+            }
+        }
+        match download_once(
+            client, file, basename, username, dir, config, progress, cancel,
+        )
+        .await
+        {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                // If the cancel flag is set, the error is from a user-
+                // initiated abort — surface it immediately, don't retry.
+                if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    // Unreachable in practice: the loop always executes at least once
+    // (max_retries >= 0), so last_err is always set on this path.
+    Err(last_err.unwrap())
+}
+
+/// Single download attempt for `download_file` (no retry loop). Queues the
+/// transfer and polls status until success, failure, timeout, or cancel.
+/// The `basename` parameter must be pre-validated by the caller.
+#[allow(clippy::too_many_arguments)]
+async fn download_once(
+    client: &dyn SoulseekClient,
+    file: &FileInfo,
+    basename: &str,
+    username: &str,
+    dir: &Path,
+    config: &DownloadConfig,
+    progress: Option<&ProgressDisplay>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<PathBuf> {
     let mut handle = match client.download(file, username, dir).await {
         Ok(h) => h,
         Err(e) => return Err(e),
@@ -300,13 +375,13 @@ pub async fn download_album(
                     downloaded.push(path);
                 }
                 Err(e) => {
-                    // Do NOT retry the same user: an unresponsive peer
-                    // (silent transfer handshake) burns timeout_secs per
-                    // attempt, and retrying it N times just delays the
-                    // ranked candidate fallback by N × timeout_secs. The
-                    // candidate list IS the retry mechanism.
+                    // download_file already retried this file on the same
+                    // peer up to max_retries times (with retry_delay_secs
+                    // between attempts). A failure here means those retries
+                    // were exhausted, so fall back to the next ranked
+                    // candidate — the candidate list is the outer fallback.
                     tracing::warn!(
-                        "Download of {} from {} failed: {e}",
+                        "Download of {} from {} failed after retries: {e}",
                         file.name,
                         candidate.username
                     );
@@ -433,6 +508,85 @@ mod tests {
             let (cancel_tx, _cancel_rx) = mpsc::channel(1);
             *self.status_tx.lock().unwrap() = Some(status_tx);
             self.download_called.store(true, Ordering::SeqCst);
+            Ok(DownloadHandle {
+                status_rx,
+                cancel_tx,
+            })
+        }
+
+        async fn user_info(&self, username: &str) -> Result<UserInfo> {
+            Ok(UserInfo {
+                username: username.into(),
+                status: UserStatus::Online,
+            })
+        }
+    }
+
+    /// A client whose `download()` fails the first `failures` calls (e.g.
+    /// with a timeout), then succeeds like MockClient. Records every call so
+    /// tests can assert the retry count.
+    struct RetryClient {
+        /// How many initial `download()` calls should fail.
+        failures: std::sync::atomic::AtomicUsize,
+        /// Total `download()` calls made.
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RetryClient {
+        fn new(failures: usize) -> Self {
+            RetryClient {
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SoulseekClient for RetryClient {
+        async fn login(&self, _username: &str, _password: &str, _server: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
+        async fn download(
+            &self,
+            _file: &FileInfo,
+            _username: &str,
+            _dir: &Path,
+        ) -> Result<DownloadHandle> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures.load(Ordering::SeqCst) {
+                return Err(SeakarrError::Download("download timed out".into()));
+            }
+            let (status_tx, status_rx) = mpsc::channel(32);
+            let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+            let total = 10_000_000u64;
+            // Success: emit InProgress then Completed (mirrors MockClient).
+            tokio::spawn(async move {
+                if cancel_rx.try_recv().is_ok() {
+                    let _ = status_tx
+                        .send(DownloadStatus::Failed {
+                            reason: "cancelled".into(),
+                        })
+                        .await;
+                    return;
+                }
+                let _ = status_tx
+                    .send(DownloadStatus::InProgress {
+                        speed_bytes_per_sec: 1_000_000,
+                        bytes_downloaded: total,
+                        total_bytes: total,
+                    })
+                    .await;
+                let _ = status_tx.send(DownloadStatus::Completed).await;
+            });
             Ok(DownloadHandle {
                 status_rx,
                 cancel_tx,
@@ -589,6 +743,151 @@ mod tests {
         tx.send(DownloadStatus::Completed).await.unwrap();
         let result = task.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    // Regression guard: downloads must retry the SAME peer up to
+    // max_retries times (with retry_delay_secs between attempts) before
+    // giving up. Previously download_file made a single attempt — the
+    // max_retries/retry_delay_secs config values were dead code and a
+    // failing peer moved straight to the next candidate.
+    #[tokio::test]
+    async fn download_retries_same_peer_after_failure() {
+        // Fail the first 2 download() calls (timeout), succeed on the 3rd.
+        let client = Arc::new(RetryClient::new(2));
+        let dir = TempDir::new().unwrap();
+        let file = make_file("track.flac", 900, 10_000_000);
+
+        let mut config = default_dl_config();
+        config.max_retries = 2;
+        config.retry_delay_secs = 0; // instant retries for the test
+
+        let result = download_file(
+            client.as_ref() as &dyn SoulseekClient,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            None,
+            None,
+        )
+        .await;
+
+        // Succeeded after retries.
+        assert!(
+            result.is_ok(),
+            "download should succeed after retries: {result:?}"
+        );
+        // 1 initial attempt + 2 retries = 3 calls.
+        assert_eq!(
+            client.call_count(),
+            3,
+            "expected initial attempt + 2 retries (max_retries=2), got {} calls",
+            client.call_count()
+        );
+    }
+
+    // When all retries are exhausted, download_file must surface the last
+    // failure (not silently succeed or spin forever).
+    #[tokio::test]
+    async fn download_returns_error_after_all_retries_exhausted() {
+        let client = Arc::new(RetryClient::new(5)); // always fails
+        let dir = TempDir::new().unwrap();
+        let file = make_file("track.flac", 900, 10_000_000);
+
+        let mut config = default_dl_config();
+        config.max_retries = 2;
+        config.retry_delay_secs = 0;
+
+        let result = download_file(
+            client.as_ref() as &dyn SoulseekClient,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "download must fail after all retries exhausted"
+        );
+        assert_eq!(
+            client.call_count(),
+            3,
+            "expected 1 initial + 2 retries = 3 attempts total"
+        );
+    }
+
+    // When the cancel flag is set between attempts, the retry loop must
+    // abort without retrying — the user pressed Ctrl+C during the delay
+    // window or between attempt 1's failure and attempt 2's start.
+    #[tokio::test]
+    async fn download_does_not_retry_when_cancelled_between_attempts() {
+        let client = Arc::new(RetryClient::new(5)); // always fails
+        let dir = TempDir::new().unwrap();
+        let file = make_file("track.flac", 900, 10_000_000);
+
+        let mut config = default_dl_config();
+        config.max_retries = 2;
+        config.retry_delay_secs = 0;
+
+        // Cancel flag is already set — download_file must abort without
+        // retrying (the retry loop checks the flag before each attempt).
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let result = download_file(
+            client.as_ref() as &dyn SoulseekClient,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            None,
+            Some(&cancel),
+        )
+        .await;
+
+        assert!(result.is_err(), "download must fail when cancelled");
+        // Only the initial attempt should have been made — the cancel
+        // flag was set before the retry loop entered, so no retry.
+        assert_eq!(
+            client.call_count(),
+            1,
+            "expected exactly 1 attempt (cancel before any retry), got {}",
+            client.call_count()
+        );
+    }
+
+    // max_retries=0 disables retries entirely — a single attempt, then give up.
+    #[tokio::test]
+    async fn download_max_retries_zero_makes_single_attempt() {
+        let client = Arc::new(RetryClient::new(5)); // always fails
+        let dir = TempDir::new().unwrap();
+        let file = make_file("track.flac", 900, 10_000_000);
+
+        let mut config = default_dl_config();
+        config.max_retries = 0; // disabled
+        config.retry_delay_secs = 0;
+
+        let result = download_file(
+            client.as_ref() as &dyn SoulseekClient,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "download must fail after single attempt");
+        assert_eq!(
+            client.call_count(),
+            1,
+            "expected exactly 1 attempt (max_retries=0), got {}",
+            client.call_count()
+        );
     }
 
     #[tokio::test]

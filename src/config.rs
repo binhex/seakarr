@@ -439,6 +439,25 @@ impl Config {
         Ok(())
     }
 
+    /// Shared download-bound checks used by both `validate()` (real startup)
+    /// and `validate_for_test` (`--test` mode). Keeps the two paths in sync.
+    pub fn validate_download_bounds(&self) -> Result<()> {
+        Self::validate_concurrent_bounds(self.download.concurrent)?;
+        if self.download.max_retries > 10 {
+            return Err(SeakarrError::Config(format!(
+                "download.max_retries must be at most 10, got {}",
+                self.download.max_retries
+            )));
+        }
+        if self.download.retry_delay_secs > 300 {
+            return Err(SeakarrError::Config(format!(
+                "download.retry_delay_secs must be at most 300, got {}",
+                self.download.retry_delay_secs
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate required fields. Returns Ok(()) or the first error.
     pub fn validate(&self) -> Result<()> {
         if self.soulseek.username.is_empty() {
@@ -454,7 +473,7 @@ impl Config {
                 valid_levels, self.logging.level
             )));
         }
-        Self::validate_concurrent_bounds(self.download.concurrent)?;
+        self.validate_download_bounds()?;
         Ok(())
     }
 }
@@ -639,6 +658,40 @@ daemon:
         assert!(Config::validate_concurrent_bounds(8).is_ok());
         assert!(Config::validate_concurrent_bounds(9).is_err());
         assert!(Config::validate_concurrent_bounds(0).is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_high_max_retries() {
+        // max_retries > 10: a misconfigured retry count wastes time.
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.download.max_retries = 11;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_retries"), "got: {err}");
+
+        // Boundary values accepted.
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.download.max_retries = 10;
+        assert!(config.validate().is_ok());
+
+        config.download.max_retries = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_high_retry_delay() {
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.download.retry_delay_secs = 301;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("retry_delay_secs"), "got: {err}");
+
+        config.download.retry_delay_secs = 300;
+        assert!(config.validate().is_ok());
     }
 
     // Regression guard for the thread-explosion bug: with the default
