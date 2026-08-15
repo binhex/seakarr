@@ -70,6 +70,8 @@ pub struct SearchConfig {
     pub block_pause_secs: u64,
     #[serde(default = "default_true")]
     pub fallback_search: bool,
+    #[serde(default = "default_search_title_match")]
+    pub search_title_match: u32,
     #[serde(default)]
     pub manual: ManualConfig,
     #[serde(default)]
@@ -236,6 +238,10 @@ fn default_block_threshold() -> u32 {
 }
 fn default_block_pause() -> u64 {
     300
+}
+fn default_search_title_match() -> u32 {
+    // Match threshold (0-100) for title-word matching; 0 disables the feature.
+    70
 }
 fn default_extensions() -> Vec<String> {
     vec!["flac".into()]
@@ -474,6 +480,12 @@ impl Config {
             )));
         }
         self.validate_download_bounds()?;
+        if self.search.search_title_match > 100 {
+            return Err(SeakarrError::Config(format!(
+                "search.search_title_match must be 0-100 (0 = disabled), got {}",
+                self.search.search_title_match
+            )));
+        }
         Ok(())
     }
 }
@@ -506,6 +518,7 @@ impl Default for Config {
                 block_threshold: default_block_threshold(),
                 block_pause_secs: default_block_pause(),
                 fallback_search: default_true(),
+                search_title_match: default_search_title_match(),
                 manual: ManualConfig::default(),
                 batch: BatchConfig::default(),
             },
@@ -589,6 +602,7 @@ search:
   block_threshold: 5
   block_pause_secs: 300
   fallback_search: true
+  search_title_match: 70
 
 filters:
   allowed_extensions: ["flac"]
@@ -742,6 +756,34 @@ daemon:
         let config = Config::load(dir.path()).unwrap();
 
         assert!(config.search.fallback_search);
+    }
+
+    #[test]
+    fn test_search_title_match_defaults_70() {
+        let config = Config::default();
+        assert_eq!(config.search.search_title_match, 70);
+    }
+
+    #[test]
+    fn test_search_title_match_from_yaml() {
+        let yaml = r#"
+search:
+  search_title_match: 50
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.search.search_title_match, 50);
+    }
+
+    #[test]
+    fn test_search_title_match_zero_disables() {
+        // 0 means the title-match feature is disabled; it must parse as 0
+        // (not be treated as "unset" and defaulted to 70).
+        let yaml = r#"
+search:
+  search_title_match: 0
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.search.search_title_match, 0);
     }
 
     #[test]

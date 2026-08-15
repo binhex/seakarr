@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 
 # The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
@@ -29,6 +29,8 @@ thiserror = "2"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 indicatif = "0.17"
+unicode-normalization = "0.1"
+regex = "1"
 
 [dev-dependencies]
 rstest = "0.22"
