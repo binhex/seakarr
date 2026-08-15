@@ -63,7 +63,13 @@ pub struct DownloadHandle {
 
 #[async_trait]
 pub trait SoulseekClient: Send + Sync {
-    async fn login(&self, username: &str, password: &str, server: &str) -> Result<()>;
+    async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        server: &str,
+        listen_port: u16,
+    ) -> Result<()>;
     async fn search(&self, query: &str, timeout_secs: u64) -> Result<Vec<SearchResult>>;
     async fn download(&self, file: &FileInfo, username: &str, dir: &Path)
         -> Result<DownloadHandle>;
@@ -137,7 +143,13 @@ impl Default for MockClient {
 
 #[async_trait]
 impl SoulseekClient for MockClient {
-    async fn login(&self, _username: &str, _password: &str, _server: &str) -> Result<()> {
+    async fn login(
+        &self,
+        _username: &str,
+        _password: &str,
+        _server: &str,
+        _listen_port: u16,
+    ) -> Result<()> {
         if *self.login_should_fail.lock().unwrap() {
             return Err(SeakarrError::Auth {
                 attempts: 1,
@@ -477,9 +489,16 @@ fn forward_transfer_status(
 
 #[async_trait]
 impl SoulseekClient for RealClient {
-    async fn login(&self, username: &str, password: &str, server: &str) -> Result<()> {
+    async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        server: &str,
+        listen_port: u16,
+    ) -> Result<()> {
         let address = parse_server_address(server)?;
         let mut last_reason = "login failed".to_string();
+        let enable_listen = listen_port > 0;
 
         for attempt in 0..self.login_retries {
             // A fresh client per attempt: a failed connect/login leaves the
@@ -488,8 +507,8 @@ impl SoulseekClient for RealClient {
                 username: username.to_string(),
                 password: password.to_string(),
                 server_address: address.clone(),
-                // Headless CLI: never accept inbound transfers.
-                enable_listen: false,
+                enable_listen,
+                listen_port,
                 ..ClientSettings::default()
             };
             let mut client = Client::with_settings(settings);
@@ -510,6 +529,11 @@ impl SoulseekClient for RealClient {
             match result {
                 Ok((client, true)) => {
                     *self.inner.lock().await = Some(Arc::new(client));
+                    if enable_listen {
+                        tracing::info!("[listener] enabled on port {listen_port}");
+                    } else {
+                        tracing::info!("[listener] disabled (listen_port=0)");
+                    }
                     return Ok(());
                 }
                 Ok((_, false)) => {

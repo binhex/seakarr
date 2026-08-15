@@ -167,6 +167,7 @@ async fn run() -> Result<()> {
             &config.soulseek.username,
             &config.soulseek.password,
             &config.soulseek.server,
+            config.soulseek.listen_port,
         )
         .await?;
     tracing::info!("Connected to Soulseek.");

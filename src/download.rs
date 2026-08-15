@@ -617,7 +617,13 @@ mod tests {
 
     #[async_trait]
     impl SoulseekClient for ControllableClient {
-        async fn login(&self, _username: &str, _password: &str, _server: &str) -> Result<()> {
+        async fn login(
+            &self,
+            _username: &str,
+            _password: &str,
+            _server: &str,
+            _listen_port: u16,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -674,7 +680,13 @@ mod tests {
 
     #[async_trait]
     impl SoulseekClient for RetryClient {
-        async fn login(&self, _username: &str, _password: &str, _server: &str) -> Result<()> {
+        async fn login(
+            &self,
+            _username: &str,
+            _password: &str,
+            _server: &str,
+            _listen_port: u16,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -745,7 +757,7 @@ mod tests {
 
     #[async_trait]
     impl SoulseekClient for SelectiveFailClient {
-        async fn login(&self, _u: &str, _p: &str, _s: &str) -> Result<()> {
+        async fn login(&self, _u: &str, _p: &str, _s: &str, _l: u16) -> Result<()> {
             Ok(())
         }
 
