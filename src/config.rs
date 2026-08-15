@@ -32,6 +32,8 @@ pub struct SoulseekConfig {
     pub login_retries: u32,
     #[serde(default = "default_login_retry_delay")]
     pub login_retry_delay_secs: u64,
+    #[serde(default)]
+    pub listen_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +205,9 @@ fn default_login_retries() -> u32 {
 }
 fn default_login_retry_delay() -> u64 {
     5
+}
+fn default_listen_port() -> u16 {
+    2234
 }
 fn default_true() -> bool {
     true
@@ -497,6 +502,7 @@ impl Default for Config {
                 server: default_soulseek_server(),
                 login_retries: default_login_retries(),
                 login_retry_delay_secs: default_login_retry_delay(),
+                listen_port: default_listen_port(),
             },
             library: LibraryConfig {
                 paths: vec![],
@@ -580,6 +586,7 @@ soulseek:
   server: "server.slsknet.org:2242"
   login_retries: 3
   login_retry_delay_secs: 5
+  listen_port: 2234
 
 library:
   paths: ["/media/music"]
@@ -731,6 +738,7 @@ daemon:
 
         assert_eq!(config.soulseek.username, "testuser");
         assert_eq!(config.soulseek.password, "testpass");
+        assert_eq!(config.soulseek.listen_port, 2234);
         assert_eq!(config.download.concurrent, 5);
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.filters.allowed_extensions, vec!["flac"]);
@@ -786,6 +794,7 @@ search:
     fn test_peer_track_count_defaults_true() {
         let config = Config::default();
         assert!(config.filters.peer_track_count);
+        assert_eq!(config.soulseek.listen_port, 2234);
     }
 
     #[test]
