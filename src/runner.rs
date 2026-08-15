@@ -93,61 +93,24 @@ pub async fn process_album(
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
 
-    // Search, with an album-only fallback for banned artist+album criteria.
-    // Both searches are recorded in search_history; when the fallback fires
-    // the primary row gets result_count 0 and the fallback row its matched
-    // count, making fallback usage visible in the history table.
+    // Search for artist + album.
     let search_start = std::time::Instant::now();
-    let outcome = search::search_album_with_fallback(
-        client,
-        artist,
-        album,
-        config.search.timeout_secs,
-        config.search.fallback_search,
-    )
-    .await?;
+    let outcome =
+        search::search_album_with_fallback(client, artist, album, config.search.timeout_secs)
+            .await?;
     let duration_ms = search_start.elapsed().as_millis() as u64;
-    // Store the canonical (trimmed) album in history so rows match the
-    // album-only fallback query, which trims padded tag metadata.
     let history_album = album.map(str::trim);
-    // When the fallback ran, the primary row gets only the primary search's
-    // own duration (total minus fallback), so the two history rows don't
-    // double-count the fallback time.
-    let primary_duration_ms = duration_ms.saturating_sub(outcome.fallback_duration_ms.unwrap_or(0));
     if let Err(e) = search::record_search(
         artist,
         history_album,
-        if outcome.used_fallback {
-            0
-        } else {
-            outcome.results.len()
-        },
-        primary_duration_ms,
+        outcome.results.len(),
+        duration_ms,
         db,
     ) {
         tracing::warn!(
-            "{artist} — {}: failed to record primary search history: {e}",
+            "{artist} — {}: failed to record search history: {e}",
             album.unwrap_or("(all)")
         );
-    }
-    if outcome.used_fallback {
-        tracing::info!(
-            "{artist} — {}: fallback album-only search found {} result(s) matching artist in path",
-            album.unwrap_or("(all)"),
-            outcome.results.len(),
-        );
-        if let Err(e) = search::record_search(
-            artist,
-            history_album,
-            outcome.results.len(),
-            outcome.fallback_duration_ms.unwrap_or(duration_ms),
-            db,
-        ) {
-            tracing::warn!(
-                "{artist} — {}: failed to record fallback search history: {e}",
-                album.unwrap_or("(all)")
-            );
-        }
     }
     let results = outcome.results;
 
@@ -155,47 +118,7 @@ pub async fn process_album(
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let mut total_users = results.len();
     let mut filtered = filter::filter_results(&results, &config.filters, library_track_count);
-    // Second-chance fallback: when the primary search returned results but
-    // every one was rejected (e.g. by the contiguity gate), the album-only
-    // fallback query may find a complete share that the combined query
-    // missed. Only fires when the fallback has not already been used.
-    if filtered.is_empty()
-        && !outcome.used_fallback
-        && config.search.fallback_search
-        && !artist.trim().is_empty()
-    {
-        if let Some(album_name) = album.map(str::trim).filter(|a| !a.is_empty()) {
-            match search::search_fallback_only(
-                client,
-                artist,
-                album_name,
-                config.search.timeout_secs,
-            )
-            .await
-            {
-                Ok(fallback_results) => {
-                    tracing::info!(
-                        "{artist} — {}: all primary results rejected; fallback album-only search found {} result(s)",
-                        album.unwrap_or("(all)"),
-                        fallback_results.len(),
-                    );
-                    filtered = filter::filter_results(
-                        &fallback_results,
-                        &config.filters,
-                        library_track_count,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "{artist} — {}: second-chance fallback search failed: {e}",
-                        album.unwrap_or("(all)")
-                    );
-                }
-            }
-        }
-    }
-    // Third-tier title-search fallback: when both the primary and album-only
-    // searches came up empty (or every result was rejected), search Soulseek
+    // Title-search fallback: when the primary search returned no usable results
     // by the cleaned title of the album's alphabetically-first library track
     // and keep only results containing the album's library track titles.
     // Only fires when the local library holds the album (enabling the title
@@ -265,7 +188,7 @@ pub async fn process_album(
         if results.is_empty() {
             // Every search tier came up empty.
             let tried_suffix = if config.search.search_title_match > 0 {
-                " (tried: primary, album-only, title-search)"
+                " (tried: primary, title-search)"
             } else {
                 ""
             };
@@ -696,10 +619,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fallback_disabled_by_config_issues_single_search() {
+    async fn test_primary_search_issues_single_query() {
         let client = Arc::new(MockClient::new());
-        // Even though an album-only query would match, the config disables
-        // the fallback: exactly one (primary) query must be issued.
+        // The primary search for "Test Artist Test Album" returns 0 results.
+        // No fallback should be triggered — exactly one query must be issued.
         client.search_results_by_query.lock().unwrap().insert(
             "Test Album".into(),
             vec![SearchResult {
@@ -714,8 +637,7 @@ mod tests {
             }],
         );
 
-        let mut config = make_test_config();
-        config.search.fallback_search = false;
+        let config = make_test_config();
         let db = Database::open_in_memory().unwrap();
         let staging = TempDir::new().unwrap();
 
@@ -745,34 +667,31 @@ mod tests {
         assert_eq!(rows[0].status, "failed");
     }
 
+    // When the primary search returns results but all are rejected by filters
+    // (e.g. contiguity gate), the album must be marked as failed with
+    // "no results passed filters" — no fallback fires.
     #[tokio::test]
-    async fn test_fallback_download_completes_album_and_records_history() {
+    async fn test_results_rejected_by_filters_marks_failed() {
         let client = Arc::new(MockClient::new());
-        client.search_results_by_query.lock().unwrap().insert(
-            "Test Album".into(),
-            vec![SearchResult {
-                username: "user1".into(),
-                speed: 500,
-                slots: 1,
-                files: vec![
-                    make_file(
-                        r"Music\Test Artist\Test Album\01 - track.flac",
-                        900,
-                        10_000_000,
-                    ),
-                    // A mixed-share decoy: matches the album-only query and
-                    // passes quality filters, but the artist is not in the
-                    // path. Per-file filtering must keep it out of the
-                    // download stage entirely.
-                    make_file(
-                        r"Music\Someone Else\Test Album\02 - decoy.flac",
-                        900,
-                        10_000_000,
-                    ),
-                ],
-            }],
-        );
-        // Primary query "Test Artist Test Album" has no map entry -> empty.
+        // Primary search returns gappy tracks 01, 03 — rejected by
+        // the contiguity gate.
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "gappy-peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
 
         let config = make_test_config();
         let db = Database::open_in_memory().unwrap();
@@ -791,76 +710,32 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("no results passed filters"),
+                    "Expected 'no results passed filters', got: {reason}"
+                );
+            }
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
 
-        // Fallback fired: primary query then album-only query.
+        // Only one search issued — no fallback.
         let queries = client.search_queries.lock().unwrap().clone();
-        assert_eq!(
-            queries,
-            vec![
-                "Test Artist Test Album".to_string(),
-                "Test Album".to_string()
-            ]
-        );
+        assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
 
-        // Per-file filtering held at the download boundary: exactly the
-        // artist-matching file was queued for download, never the decoy.
-        let downloads = client.download_filenames.lock().unwrap().clone();
-        assert_eq!(
-            downloads,
-            vec![r"Music\Test Artist\Test Album\01 - track.flac".to_string()],
-            "only artist-matching files may be downloaded"
-        );
-
-        // Album completed successfully.
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "success");
-
-        // Both searches recorded: primary with 0 results, fallback with 1.
-        let history_count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(history_count, 2);
-        let fallback_count: i64 = db
-            .conn
-            .query_row(
-                "SELECT result_count FROM search_history WHERE album = 'Test Album' ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(fallback_count, 1);
+        assert_eq!(rows[0].status, "failed");
     }
 
     #[tokio::test]
-    async fn test_second_chance_fallback_when_primary_all_rejected() {
+    async fn test_primary_download_completes_album_and_records_history() {
         let client = Arc::new(MockClient::new());
-        // Primary search (static results): gappy tracks 01, 03 — rejected
-        // by the contiguity gate.
-        *client.search_results.lock().unwrap() = vec![SearchResult {
-            username: "gappy-peer".into(),
-            speed: 900,
-            slots: 1,
-            files: vec![
-                make_file(
-                    r"Music\Test Artist\Test Album\01 - track.flac",
-                    900,
-                    10_000_000,
-                ),
-                make_file(
-                    r"Music\Test Artist\Test Album\03 - track.flac",
-                    900,
-                    10_000_000,
-                ),
-            ],
-        }];
-        // The album-only fallback finds a complete share.
         client.search_results_by_query.lock().unwrap().insert(
-            "Test Album".into(),
+            "Test Artist Test Album".into(),
             vec![SearchResult {
-                username: "complete-peer".into(),
+                username: "user1".into(),
                 speed: 500,
                 slots: 1,
                 files: vec![
@@ -871,6 +746,14 @@ mod tests {
                     ),
                     make_file(
                         r"Music\Test Artist\Test Album\02 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    // A mixed-share decoy: passes quality filters but the
+                    // artist is not in the path. download_album must
+                    // reject it.
+                    make_file(
+                        r"Music\Someone Else\Test Album\02 - decoy.flac",
                         900,
                         10_000_000,
                     ),
@@ -897,34 +780,43 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        // Both the primary and the second-chance fallback query ran.
+        // Only the primary search fired.
         let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
+
+        // Per-file filtering held at the download boundary: exactly the
+        // artist-matching file was queued for download, never the decoy.
+        let downloads = client.download_filenames.lock().unwrap().clone();
         assert_eq!(
-            queries,
-            vec![
-                "Test Artist Test Album".to_string(),
-                "Test Album".to_string()
-            ]
+            downloads.len(),
+            2,
+            "both artist-matching files must be downloaded"
         );
-        // The complete fallback share was downloaded, album succeeded.
+
+        // Album completed successfully.
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "success");
-        let downloads = client.download_filenames.lock().unwrap().clone();
-        assert_eq!(downloads.len(), 2, "complete fallback share downloaded");
+
+        // One search recorded.
+        let history_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(history_count, 1);
     }
 
     // Third-tier title-search fallback: when the primary "Artist Album" and
-    // album-only searches both return nothing, seakarr searches Soulseek by
+    // primary search returns nothing, seakarr searches Soulseek by
     // the cleaned title of the library's alphabetically-first track and keeps
     // results whose files match the album's local track titles.
     #[tokio::test]
-    async fn test_title_search_fallback_when_primary_and_album_only_empty() {
+    async fn test_title_search_fallback_when_primary_empty() {
         let client = Arc::new(MockClient::new());
         // Library track "01 - I Miss You.mp3" cleans to "i miss you", the
         // alphabetically-first title and therefore the search query. The mock
         // has results ONLY for this query — the primary "Adele 25" and
-        // album-only "25" queries fall through to the (empty) static results.
+        // "25" queries fall through to the (empty) static results.
         client.search_results_by_query.lock().unwrap().insert(
             "i miss you".into(),
             vec![SearchResult {
@@ -966,27 +858,23 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        // All three tiers ran in order: primary, album-only, title search.
+        // Two tiers ran in order: primary, title search.
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
-            vec![
-                "Adele 25".to_string(),
-                "25".to_string(),
-                "i miss you".to_string()
-            ]
+            vec!["Adele 25".to_string(), "i miss you".to_string()]
         );
 
         // Both title-matching library tracks were downloaded.
         let downloads = client.download_filenames.lock().unwrap().clone();
         assert_eq!(downloads.len(), 2);
 
-        // Title search recorded in history alongside primary + fallback rows.
+        // Title search recorded in history alongside primary row.
         let history_count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(history_count, 3);
+        assert_eq!(history_count, 2);
         let title_count: i64 = db
             .conn
             .query_row(
@@ -1000,115 +888,6 @@ mod tests {
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "success");
-    }
-
-    #[tokio::test]
-    async fn test_fallback_no_matches_marks_failed() {
-        let client = Arc::new(MockClient::new());
-        client.search_results_by_query.lock().unwrap().insert(
-            "Test Album".into(),
-            vec![SearchResult {
-                username: "user1".into(),
-                speed: 500,
-                slots: 1,
-                files: vec![make_file(
-                    r"Music\Someone Else\Test Album\01 - track.flac",
-                    900,
-                    10_000_000,
-                )],
-            }],
-        );
-
-        let config = make_test_config();
-        let db = Database::open_in_memory().unwrap();
-        let staging = TempDir::new().unwrap();
-
-        let result = process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Test Album"),
-            &config,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(result.is_ok());
-        match result.unwrap() {
-            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
-        }
-
-        // The fallback fired: primary query then album-only query.
-        let queries = client.search_queries.lock().unwrap().clone();
-        assert_eq!(
-            queries,
-            vec![
-                "Test Artist Test Album".to_string(),
-                "Test Album".to_string()
-            ]
-        );
-
-        let rows = db.get_processed_albums().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "failed");
-    }
-
-    #[tokio::test]
-    async fn test_fallback_with_gappy_tracks_marks_failed() {
-        let client = Arc::new(MockClient::new());
-        client.search_results_by_query.lock().unwrap().insert(
-            "Test Album".into(),
-            vec![SearchResult {
-                username: "user1".into(),
-                speed: 500,
-                slots: 1,
-                files: vec![
-                    make_file(
-                        r"Music\Test Artist\Test Album\01 - track.flac",
-                        900,
-                        10_000_000,
-                    ),
-                    make_file(
-                        r"Music\Test Artist\Test Album\03 - track.flac",
-                        900,
-                        10_000_000,
-                    ),
-                ],
-            }],
-        );
-        // Primary query "Test Artist Test Album" has no map entry -> empty.
-
-        let config = make_test_config();
-        let db = Database::open_in_memory().unwrap();
-        let staging = TempDir::new().unwrap();
-
-        let result = process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Test Album"),
-            &config,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(result.is_ok());
-        match result.unwrap() {
-            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results passed filters"),
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
-        }
-
-        // Gappy track set rejected at the filter stage -> album failed,
-        // nothing downloaded.
-        let rows = db.get_processed_albums().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "failed");
-        assert!(client.download_filenames.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

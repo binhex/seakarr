@@ -150,7 +150,6 @@ A default config is created automatically on first run. The file is divided into
 | `delay_secs` | Minimum gap between consecutive network searches to avoid flooding. *(Reserved for future use — not yet enforced.)* | `5.0` |
 | `block_threshold` | Consecutive zero-result searches before checking for Soulseek rate-limiting. *(Reserved for future use — not yet enforced.)* | `5` |
 | `block_pause_secs` | Pause duration when rate-limiting is detected, in seconds. *(Reserved for future use — not yet enforced.)* | `300` |
-| `fallback_search` | When a combined artist+album search returns zero results, retry with an album-only search and accept results whose share paths match the artist. Soulseek sometimes bans specific artist+album criteria. Each zero-result album adds a second search per retry cycle — keep rate limits in mind. | `true` |
 | `manual.artist` | Artist for manual mode (used when `--artist` is not passed). | `""` |
 | `manual.album` | Album for manual mode (optional, used when `--album` is not passed). | `""` |
 | `batch.file_path` | Path to the batch text file (used when `--batch-file` is not passed). | `""` |

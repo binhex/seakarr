@@ -96,11 +96,10 @@ async fn test_full_pipeline_auto_mode_no_results() {
         other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
     }
 
-    // The fallback search fires too (default on): primary + album-only,
-    // both recorded in search_history.
+    // Only the primary search fires (no fallback).
     let history_count: i64 = db
         .conn
         .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(history_count, 2);
+    assert_eq!(history_count, 1);
 }
