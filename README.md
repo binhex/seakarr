@@ -98,6 +98,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | ------ | ----------- | ------- |
 | `--soulseek-user <user>` | Soulseek username (overrides config). | *(from config)* |
 | `--soulseek-password <pass>` | Soulseek password (overrides config). | *(from config)* |
+| `--listen-port <N>` | Override incoming peer port. `0` disables the listener. | *(from config)* |
 
 ### Mode selection
 
@@ -123,6 +124,7 @@ A default config is created automatically on first run. The file is divided into
 | `server` | Soulseek server address. | `server.slsknet.org:2242` |
 | `login_retries` | Maximum login attempts with exponential backoff. | `3` |
 | `login_retry_delay_secs` | Initial backoff delay in seconds (doubles each retry). | `5` |
+| `listen_port` | Incoming peer port for accepting connections from other Soulseek clients. Set to `0` to disable the listener (firewalled mode). Requires port forwarding at your router for values > 0. | `2234` |
 
 ### `library`
 
