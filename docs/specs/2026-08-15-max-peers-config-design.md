@@ -18,7 +18,7 @@ soulseek:
 ```
 
 - Default: **64**
-- Floor: 1 (enforced by the vendored library's `set_max_peers`)
+- Floor: 1 (enforced by seakarr's `validate()` — rejects 0 with an error; the vendored library's `set_max_peers` also enforces a floor of 1)
 - No upper bound (the OS enforces it via thread/memory limits)
 
 ### Code Changes
@@ -60,7 +60,7 @@ Add to the soulseek config table:
 | `max_peers: 64` (default) | 64 simultaneous connections allowed |
 | `max_peers: 32` | 32 connections (conservative) |
 | `max_peers: 128` | 128 connections (aggressive) |
-| `max_peers: 0` | Floor enforced: 1 connection |
+| `max_peers: 0` | Error: "soulseek.max_peers must be at least 1" (rejected by `validate()`) |
 | (not set) | Default 64 |
 
 ### Testing

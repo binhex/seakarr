@@ -34,6 +34,8 @@ pub struct SoulseekConfig {
     pub login_retry_delay_secs: u64,
     #[serde(default)]
     pub listen_port: u16,
+    #[serde(default = "default_max_peers")]
+    pub max_peers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +211,9 @@ fn default_login_retry_delay() -> u64 {
 }
 fn default_listen_port() -> u16 {
     2234
+}
+fn default_max_peers() -> usize {
+    64
 }
 fn default_true() -> bool {
     true
@@ -493,6 +498,11 @@ impl Config {
                 self.search.search_title_match
             )));
         }
+        if self.soulseek.max_peers == 0 {
+            return Err(SeakarrError::Config(
+                "soulseek.max_peers must be at least 1".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -507,6 +517,7 @@ impl Default for Config {
                 login_retries: default_login_retries(),
                 login_retry_delay_secs: default_login_retry_delay(),
                 listen_port: default_listen_port(),
+                max_peers: default_max_peers(),
             },
             library: LibraryConfig {
                 paths: vec![],
@@ -591,6 +602,7 @@ soulseek:
   login_retries: 3
   login_retry_delay_secs: 5
   listen_port: 2234
+  max_peers: 64
 
 library:
   paths: ["/media/music"]
@@ -715,6 +727,16 @@ daemon:
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn test_validate_rejects_zero_max_peers() {
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.soulseek.max_peers = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_peers"), "got: {err}");
+    }
+
     // Regression guard for the thread-explosion bug: with the default
     // concurrency, auto mode fires N concurrent album searches, each of which
     // makes the Soulseek server push ConnectToPeer for every result peer;
@@ -743,6 +765,7 @@ daemon:
         assert_eq!(config.soulseek.username, "testuser");
         assert_eq!(config.soulseek.password, "testpass");
         assert_eq!(config.soulseek.listen_port, 2234);
+        assert_eq!(config.soulseek.max_peers, 64);
         assert_eq!(config.download.concurrent, 5);
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.filters.allowed_extensions, vec!["flac"]);
@@ -799,6 +822,7 @@ search:
         let config = Config::default();
         assert!(config.filters.peer_track_count);
         assert_eq!(config.soulseek.listen_port, 2234);
+        assert_eq!(config.soulseek.max_peers, 64);
     }
 
     #[test]

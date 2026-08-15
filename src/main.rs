@@ -161,7 +161,7 @@ async fn run() -> Result<()> {
     // Connect to Soulseek
     // Suppress the crate's internal logger (it uses LOG_LEVEL / RUST_LOG
     // env vars, not the tracing ecosystem).  Set to INFO for debugging.
-    std::env::set_var("LOG_LEVEL", "ERROR");
+    std::env::set_var("LOG_LEVEL", &config.logging.level);
     tracing::info!(
         "Connecting to Soulseek server {}...",
         config.soulseek.server
@@ -176,6 +176,8 @@ async fn run() -> Result<()> {
         )
         .await?;
     tracing::info!("Connected to Soulseek.");
+
+    client.set_max_peers(config.soulseek.max_peers).await?;
 
     // Acquire PID lock only after DB + login succeed, so failures before
     // this point don't leave an orphaned PID file.
@@ -251,6 +253,11 @@ fn validate_for_test(config: &Config) -> Result<()> {
     // Same numeric bounds as Config::validate() so `--test` does not report
     // "valid" for a config that would fail at real startup.
     config.validate_download_bounds()?;
+    if config.soulseek.max_peers == 0 {
+        return Err(SeakarrError::Config(
+            "soulseek.max_peers must be at least 1".into(),
+        ));
+    }
     for path in &config.library.paths {
         if !Path::new(path).exists() {
             tracing::warn!("library path does not exist: {path}");

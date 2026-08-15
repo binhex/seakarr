@@ -125,6 +125,7 @@ A default config is created automatically on first run. The file is divided into
 | `login_retries` | Maximum login attempts with exponential backoff. | `3` |
 | `login_retry_delay_secs` | Initial backoff delay in seconds (doubles each retry). | `5` |
 | `listen_port` | Incoming peer port for accepting connections from other Soulseek clients. Set to `0` to disable the listener (firewalled mode). Requires port forwarding at your router for values > 0. | `2234` |
+| `max_peers` | Maximum simultaneous peer connections (minimum 1). Each connection uses a 256 KB actor thread. Higher values allow more parallel search/download candidates but use more memory. | `64` |
 
 ### `library`
 

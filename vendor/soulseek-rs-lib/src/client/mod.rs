@@ -56,7 +56,7 @@ pub const DEFAULT_UPLOAD_SLOTS: usize = 10;
 /// before giving up and failing the download. Matches the direct-dial timeout.
 const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-const DEFAULT_MAX_PEERS: usize = 32;
+const DEFAULT_MAX_PEERS: usize = 512;
 
 const BROWSE_PROTECT_WINDOW: Duration = Duration::from_mins(5);
 
