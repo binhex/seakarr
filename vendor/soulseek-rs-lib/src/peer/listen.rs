@@ -151,11 +151,13 @@ fn handle_peer_connection(
         match result {
             Ok(_) => true,
             Err(e) => {
-                // A refusal is a capacity decision (registry full, all peers
-                // inside the eviction grace window), not a malfunction — the
-                // outbound path logs the identical condition at trace!. Log
-                // at WARN so users aren't misled into thinking the listener
-                // is broken under heavy search load.
+                // All registration failures (capacity refusal, lock
+                // poisoning, spawn failure, defensive "vanished from
+                // registry" guard) are logged at WARN. The outbound path
+                // logs every variant at trace! (connection.rs). This keeps
+                // the inbound path visible without the ERROR level that
+                // misled users into thinking the listener was broken under
+                // heavy search load.
                 warn!(
                     "Failed to spawn peer actor for {:?}: {:?}",
                     peer.username, e
@@ -475,6 +477,21 @@ mod tests {
     // so users aren't misled into thinking something is broken.
     #[test]
     fn capacity_refusal_is_logged_at_warn_not_error() {
+        // NOTE: this test requires LOG_LEVEL (or RUST_LOG) != ERROR and no
+        // LOG_FILE to be set — enable_buffering() routes to the BUFFER
+        // mutex only when no log file is configured and the message passes
+        // the level filter. The test fails loudly if either condition is
+        // violated (no silent false-pass).
+
+        // RAII guard: disable_buffering() on drop so the global state is
+        // cleaned up even if an assertion panics.
+        struct BufferGuard;
+        impl Drop for BufferGuard {
+            fn drop(&mut self) {
+                logger::disable_buffering();
+            }
+        }
+
         let system = Arc::new(ActorSystem::new());
         let (tx, _rx) = std::sync::mpsc::channel::<ClientOperation>();
         let registry = PeerRegistry::with_max_peers(system, tx.clone(), "me".to_string(), 1);
@@ -505,6 +522,7 @@ mod tests {
 
         // Drain any prior buffered lines, then capture this refusal.
         logger::enable_buffering();
+        let _guard = BufferGuard; // drop guard: calls disable_buffering() even on panic
         let _ = logger::take_buffered_logs();
 
         let refused = Peer::new(
@@ -534,5 +552,6 @@ mod tests {
             refusal_line.contains("WARN"),
             "capacity refusal should be logged as WARN: {refusal_line:?}"
         );
+        // BufferGuard drop calls disable_buffering() — even on panic.
     }
 }
