@@ -108,13 +108,13 @@ fn extract_download_from_buffer(
         reader.buffer_len()
     );
     if reader.buffer_len() == 0 {
-        warn!(
+        debug!(
             "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: reader buffer empty, no transfer token available"
         );
         return None;
     }
     if reader.buffer_len() < 4 {
-        warn!(
+        debug!(
             "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: buffer has {} byte(s), need 4 for transfer token — partial data",
             reader.buffer_len()
         );
@@ -227,7 +227,21 @@ fn handle_file_connection(
             }
         }
     }
-    let download = extract_download_from_buffer(
+    // Extract the peer's transfer token from the buffer (the4 bytes we
+    // waited for above) so we can poll the download store if the first
+    // lookup misses.
+    let peer_token: Option<u32> = {
+        let buffer = reader.get_buffer();
+        if buffer.len() >= 4 {
+            Some(u32::from_le_bytes(
+                buffer.get(0..4).unwrap().try_into().unwrap(),
+            ))
+        } else {
+            None
+        }
+    };
+
+    let mut download = extract_download_from_buffer(
         &mut reader,
         &context.client_context,
         &peer.username,
@@ -236,6 +250,32 @@ fn handle_file_connection(
     );
     debug!(
         "[listener:{peer_ip}:{peer_port}] handle_file_connection: extract_download_from_buffer returned download.is_some()={}",
+        download.is_some()
+    );
+
+    // The token bytes may have arrived before the client's operations
+    // thread processed UpdateDownloadTokens. Poll the download store
+    // until the token appears or we time out.
+    if download.is_none()
+        && let Some(wait_token) = peer_token
+    {
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < wait_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Ok(ctx) = context.client_context.read_safe()
+                && let Some(dl) = ctx.get_download_by_token(wait_token)
+            {
+                info!(
+                    "[listener:{peer_ip}:{peer_port}] download for token {wait_token} appeared in store after wait"
+                );
+                download = Some(dl.clone());
+                break;
+            }
+        }
+    }
+
+    debug!(
+        "[listener:{peer_ip}:{peer_port}] handle_file_connection: final download.is_some()={}",
         download.is_some()
     );
     let failure_token = download.as_ref().map(|d| d.token);

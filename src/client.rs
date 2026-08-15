@@ -659,7 +659,11 @@ impl SoulseekClient for RealClient {
             }
             cancelled.store(true, Ordering::SeqCst);
             let _ = cancel_client.pause_download(&cancel_username, &cancel_filename);
-            let _ = cancel_client.remove_download(&cancel_username, &cancel_filename);
+            // Do NOT remove_download here — the F-connection transfer is
+            // still running and wait_while_paused holds a store reference.
+            // Removing the download races with the transfer thread and
+            // causes TokenNotFound. The bridge's own remove_download call
+            // after drain_transfer handles cleanup.
             let _ = status_tx
                 .send(DownloadStatus::Failed {
                     reason: "cancelled".into(),

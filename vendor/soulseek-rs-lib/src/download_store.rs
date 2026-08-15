@@ -144,6 +144,12 @@ pub fn collect_failed_tokens(
         .list()
         .iter()
         .filter(|d| d.username == username && filename.is_none_or(|f| d.filename == *f))
+        .filter(|d| {
+            !matches!(
+                d.status,
+                DownloadStatus::InProgress { .. } | DownloadStatus::Paused { .. }
+            )
+        })
         .map(|d| {
             let _ = d.sender.send(DownloadStatus::Failed(Some(
                 "The upload failed on the other side".to_string(),
@@ -319,6 +325,62 @@ mod tests {
         assert_eq!(tokens, vec![1]);
         assert!(matches!(
             rx_match.try_recv().unwrap(),
+            DownloadStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn collect_failed_tokens_skips_in_progress_and_paused_downloads() {
+        let mut store = DownloadStore::new();
+        let (tx_active, _rx_active) = mpsc::channel();
+        let (tx_paused, _rx_paused) = mpsc::channel();
+        let (tx_queued, rx_queued) = mpsc::channel();
+
+        // An active F-connection transfer: the P-connection may have dropped,
+        // but bytes are still flowing — removing it would kill the transfer
+        // and make wait_while_paused fail with TokenNotFound.
+        let mut active = make_download(
+            1,
+            DownloadStatus::InProgress {
+                bytes_downloaded: 500,
+                total_bytes: 1000,
+                speed_bytes_per_sec: 10.0,
+            },
+        );
+        active.sender = tx_active;
+        active.username = "peer".to_string();
+        active.filename = "active.mp3".to_string();
+
+        // A paused download can resume; dropping it would lose the part file
+        // position and the user's pause state.
+        let mut paused = make_download(
+            2,
+            DownloadStatus::Paused {
+                bytes_downloaded: 300,
+                total_bytes: 1000,
+            },
+        );
+        paused.sender = tx_paused;
+        paused.username = "peer".to_string();
+        paused.filename = "paused.mp3".to_string();
+
+        // A queued download has no active transfer and will never recover
+        // once the peer is gone — it should be collected as failed.
+        let mut queued = make_download(3, DownloadStatus::Queued);
+        queued.sender = tx_queued;
+        queued.username = "peer".to_string();
+        queued.filename = "queued.mp3".to_string();
+
+        store.add(active);
+        store.add(paused);
+        store.add(queued);
+
+        // Unscoped (filename: None) — the PeerDisconnected path.
+        let tokens = collect_failed_tokens(&store, "peer", None);
+
+        assert_eq!(tokens, vec![3], "only the queued download is collected");
+        assert!(matches!(
+            rx_queued.try_recv().unwrap(),
             DownloadStatus::Failed(_)
         ));
     }
