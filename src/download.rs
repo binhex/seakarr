@@ -314,6 +314,41 @@ async fn download_once(
 /// Tries each candidate in ranked order until one succeeds (or all fail).
 /// Only downloads files that are safe (no path traversal) and pass the
 /// configured extension filters.
+/// Group files by their share-relative parent directory path and return
+/// the largest group (most files). A peer's search result can span
+/// multiple album directories when the query matches several of their
+/// albums; downloading all of them would mix tracks from different albums
+/// into one staging folder. Files at the share root (no parent component)
+/// all belong to a single "<root>" group.
+///
+/// The key is the full parent path (not just the immediate directory name),
+/// so `Abba\Greatest Hits\...` and `Bee Gees\Greatest Hits\...` form
+/// separate groups despite sharing the leaf directory name "Greatest Hits".
+///
+/// Ties are broken by lexicographic key order for determinism.
+fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInfo> {
+    let mut groups: std::collections::HashMap<&str, Vec<&'a FileInfo>> = Default::default();
+    for f in files {
+        // rsplit_once gives the full parent path (everything before the
+        // last separator), not just the immediate directory name.
+        let dir = f
+            .name
+            .rsplit_once(['/', '\\'])
+            .map(|(parent, _basename)| parent)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("<root>");
+        groups.entry(dir).or_default().push(f);
+    }
+    // Deterministic tie-breaking: prefer the larger group; on equal size
+    // prefer lexicographically earlier key so the same album wins on
+    // every run.
+    groups
+        .into_iter()
+        .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| bk.cmp(ak)))
+        .map(|(_, v)| v)
+        .unwrap_or_default()
+}
+
 pub async fn download_album(
     client: &dyn SoulseekClient,
     candidates: &[SearchResult],
@@ -375,6 +410,15 @@ pub async fn download_album(
             ));
             continue;
         }
+
+        // A peer's search result may span multiple album directories (e.g.
+        // "Abba\\[1992] Gold_ Greatest Hits\\..." and
+        // "Abba\\[1993] More ABBA Gold\\..." when both match the query).
+        // Downloading every matching file would mix tracks from different
+        // albums into the single staging folder. Group by parent directory
+        // and keep only the largest group — the album the query most likely
+        // targeted — so one run downloads a single album per peer.
+        let filtered_files = largest_album_group(&filtered_files);
 
         // Create the staging directory only when we have valid files to
         // download — prevents empty dirs for albums where every candidate
@@ -1100,39 +1144,47 @@ mod tests {
         );
     }
 
-    // Same as above but with a fallback candidate that succeeds completely.
-    // download_album should skip the failed candidate and succeed with
-    // the fallback.
+    // Bug regression: a peer sharing multiple albums under the same artist
+    // (e.g. "Abba\\[1992] Gold_ Greatest Hits\\..." and
+    // "Abba\\[1993] More ABBA Gold\\...") returns files from ALL matching
+    // album directories in one search result. download_album must only
+    // download files from a single album directory, or the staging folder
+    // becomes a jumbled mix of tracks from different albums.
     #[tokio::test]
-    async fn download_album_falls_back_to_next_candidate_on_failure() {
-        // Candidate A: 3 files, "02" fails → incomplete.
-        // Candidate B: 2 files with DIFFERENT paths, all succeed.
-        let client = Arc::new(SelectiveFailClient::new(vec![
-            "02 - track.flac", // fails for candidate A
-        ]));
+    async fn download_album_downloads_only_one_album_directory_per_candidate() {
+        let client = Arc::new(MockClient::new());
         let dir = TempDir::new().unwrap();
 
-        let candidates = vec![
-            SearchResult {
-                username: "user_a".into(),
-                speed: 500,
-                slots: 1,
-                files: vec![
-                    make_file("01 - track.flac", 900, 10_000_000),
-                    make_file("02 - track.flac", 900, 10_000_000),
-                    make_file("03 - track.flac", 900, 10_000_000),
-                ],
-            },
-            SearchResult {
-                username: "user_b".into(),
-                speed: 400,
-                slots: 1,
-                files: vec![
-                    make_file("01 - track.flac", 900, 10_000_000),
-                    make_file("03 - track.flac", 900, 10_000_000),
-                ],
-            },
-        ];
+        let candidates = vec![SearchResult {
+            username: "cassland".into(),
+            speed: 900,
+            slots: 1,
+            // Two different album directories in the same peer's share:
+            // [1992] Gold_ Greatest Hits (tracks 16-19) and
+            // [1993] More ABBA Gold (tracks 01-08).
+            files: vec![
+                make_file(
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-16- One of Us.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-17- The Name of the Game (edit).flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\01. summer night city.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\02. angeleyes.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
 
         let mut config = default_dl_config();
         config.max_retries = 0;
@@ -1149,16 +1201,268 @@ mod tests {
         )
         .await;
 
-        // Should succeed via fallback candidate B (2 files).
+        // Must succeed (the single album's files are all downloadable).
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+
+        // Only files from ONE album directory may be downloaded — never a
+        // mix of two albums into the same staging folder.
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let dirs: std::collections::HashSet<String> = downloaded
+            .iter()
+            .map(|n| n.rsplit(['/', '\\']).nth(1).unwrap_or("<root>").to_string())
+            .collect();
         assert!(
-            result.is_ok(),
-            "download_album should succeed via fallback candidate: {result:?}"
+            dirs.len() == 1,
+            "files from multiple album directories were downloaded into the same staging folder: {downloaded:?}"
         );
-        let downloaded = result.unwrap();
+    }
+
+    // Same as above but with a fallback candidate that succeeds completely.
+    // download_album should skip the failed candidate and succeed with
+    // the fallback.
+    #[tokio::test]
+    async fn download_album_falls_back_to_next_candidate_on_failure() {
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // Small album: 2 files
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                // Large album: 4 files — should be selected
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\04 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
             downloaded.len(),
-            2,
-            "fallback candidate should yield 2 files"
+            4,
+            "should download the larger group (Disc 2), got {downloaded:?}"
+        );
+        // All downloaded files must be from Disc 2
+        assert!(
+            downloaded.iter().all(|n| n.contains("Disc 2")),
+            "expected all files from Disc 2, got {downloaded:?}"
+        );
+    }
+
+    // When a peer shares two albums with different sizes, the LARGER album
+    // group should be selected (not the first, not the last, not random).
+    #[tokio::test]
+    async fn download_album_prefers_largest_album_group() {
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // Small album: 2 files
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                // Large album: 4 files — should be selected
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\04 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            downloaded.len(),
+            4,
+            "should download the larger group (Disc 2), got {downloaded:?}"
+        );
+        // All downloaded files must be from Disc 2
+        assert!(
+            downloaded.iter().all(|n| n.contains("Disc 2")),
+            "expected all files from Disc 2, got {downloaded:?}"
+        );
+    }
+
+    // Two albums with the same leaf directory name under different parents
+    // must be treated as separate groups (e.g. "Abba\\Greatest Hits" vs
+    // "Bee Gees\\Greatest Hits"). The grouping key is the full parent
+    // path, not just the immediate directory name.
+    #[tokio::test]
+    async fn download_album_distinguishes_same_named_dirs_under_different_parents() {
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // Abba\Greatest Hits — 2 files
+                make_file(
+                    "Music\\Abba\\Greatest Hits\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Greatest Hits\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                // Bee Gees\Greatest Hits — 3 files (larger, should win)
+                make_file(
+                    "Music\\Bee Gees\\Greatest Hits\\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Bee Gees\\Greatest Hits\\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Bee Gees\\Greatest Hits\\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            downloaded.len(),
+            3,
+            "should download Bee Gees (larger group), got {downloaded:?}"
+        );
+        assert!(
+            downloaded.iter().all(|n| n.contains("Bee Gees")),
+            "expected all files from Bee Gees, got {downloaded:?}"
         );
     }
 
