@@ -3,15 +3,16 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::client::{ClientContext, ClientOperation};
+use crate::client::{Client, ClientContext, ClientOperation};
 
 use crate::message::{Message, MessageReader};
 use crate::peer::{ConnectionType, DownloadPeer, Peer};
 use crate::types::Download;
 use crate::utils::lock::RwLockExt;
-use crate::{DownloadStatus, debug, error, info, trace, warn};
+use crate::utils::semaphore::{Permit, Semaphore};
+use crate::{DownloadStatus, debug, error, info, trace};
 
 /// How long to wait before accepting again after a failure.
 ///
@@ -24,6 +25,10 @@ const PEER_INIT_MESSAGE_CODE: u8 = 1;
 
 /// How long an accepted peer gets to send its peer-init handshake.
 const PEER_INIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+const MAX_HANDSHAKES: usize = 128;
+
+const MAX_PEER_INIT_BYTES: usize = 4096;
 
 #[derive(Clone)]
 struct ConnectionContext {
@@ -41,15 +46,29 @@ struct PeerInitData {
 fn read_peer_init_message(
     stream: &mut TcpStream,
     reader: &mut MessageReader,
+    deadline: Instant,
 ) -> io::Result<Message> {
     // An untrusted peer gets a bounded handshake. Without this a peer that
     // connects and stays silent parks this read forever, pinning a thread that
     // owes us a peer init.
-    stream.set_read_timeout(Some(PEER_INIT_TIMEOUT))?;
     let message = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer init deadline passed",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
         reader.read_from_socket(stream)?;
         if let Ok(Some(msg)) = reader.extract_message() {
             break msg;
+        }
+        if reader.buffer_len() > MAX_PEER_INIT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer init larger than any handshake",
+            ));
         }
     };
 
@@ -132,43 +151,7 @@ fn handle_peer_connection(
     }
     stream.set_nodelay(true).ok();
 
-    let client_context = match context.client_context.read_safe() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("[listener] handle_peer_connection lock: {}", e);
-            return false;
-        }
-    };
-    if let Some(ref registry) = client_context.peer_registry {
-        // Mirror the outbound classification (connection.rs): a peer with a
-        // token is a search responder and takes the grace-protected path;
-        // token-less peers are download targets that may evict.
-        let result = if peer.token.is_some() {
-            registry.register_search_responder(peer.clone(), Some(stream), Some(reader))
-        } else {
-            registry.register_peer(peer.clone(), Some(stream), Some(reader))
-        };
-        match result {
-            Ok(_) => true,
-            Err(e) => {
-                // All registration failures (capacity refusal, lock
-                // poisoning, spawn failure, defensive "vanished from
-                // registry" guard) are logged at WARN. The outbound path
-                // logs every variant at trace! (connection.rs). This keeps
-                // the inbound path visible without the ERROR level that
-                // misled users into thinking the listener was broken under
-                // heavy search load.
-                warn!(
-                    "Failed to spawn peer actor for {:?}: {:?}",
-                    peer.username, e
-                );
-                false
-            }
-        }
-    } else {
-        error!("PeerRegistry not initialized");
-        false
-    }
+    Client::register_peer_or_fail(&context.client_context, peer, Some(stream), Some(reader))
 }
 
 fn handle_file_connection(
@@ -280,26 +263,16 @@ fn handle_pierce_firewall(
         0,
         0,
     );
-    // Consume the token only if registration succeeded: a failed
-    // registration (thread-spawn EAGAIN, skip-at-capacity) must not strand
-    // the queued downloads — the BROKER_CONNECT_TIMEOUT reaper finds the
-    // token missing and never fails them. On failure, restore the pending
-    // mapping so the reaper (or a retry) can still resolve it.
-    if !handle_peer_connection(peer, stream, reader, context)
-        && let Ok(mut ctx) = context.client_context.write_safe()
-    {
-        ctx.add_pending_connect(token, username);
-        return;
+    if handle_peer_connection(peer, stream, reader, context) {
+        // Inbound peers don't self-announce, so nudge the client to flush any
+        // downloads queued for this now-connected peer.
+        let _ = context
+            .client_sender
+            .send(ClientOperation::PeerConnected(username));
     }
-
-    // Inbound peers don't self-announce, so nudge the client to flush any
-    // downloads queued for this now-connected peer.
-    let _ = context
-        .client_sender
-        .send(ClientOperation::PeerConnected(username));
 }
 
-fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext) {
+fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext, permit: Permit) {
     let Ok(peer_addr) = stream.peer_addr() else {
         error!("[listener] failed to get peer address");
         return;
@@ -310,13 +283,15 @@ fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext)
     let mut reader = MessageReader::new();
 
     // A peer that dials and then goes away is routine, not an error.
-    let message = match read_peer_init_message(&mut stream, &mut reader) {
+    let deadline = Instant::now() + PEER_INIT_TIMEOUT;
+    let message = match read_peer_init_message(&mut stream, &mut reader, deadline) {
         Ok(message) => message,
         Err(e) => {
             debug!("[listener:{peer_ip}:{peer_port}] no peer init message: {e}");
             return;
         }
     };
+    drop(permit);
 
     // A firewalled peer brokered through the server connects back with a
     // PierceFirewall (code 0) instead of a PeerInit (code 1).
@@ -340,20 +315,12 @@ fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext)
     // twice — two sockets, two threads — and made every "already connected?"
     // check miss, so an inbound searcher still got a second, outbound
     // connection dialled at them.
-    //
-    // Preserve the peer-init token: a non-zero token marks a search
-    // responder, which must take the grace-protected registration path so an
-    // inbound responder at capacity cannot evict a fresh, grace-protected
-    // responder before it delivers (the exact failure the grace period
-    // prevents). Token 0 (plain control connection) stays a download-target
-    // registration that may evict.
-    let peer_token = (init_data.token != 0).then_some(init_data.token);
     let peer = Peer::new(
         init_data.username.clone(),
         init_data.connection_type.clone(),
         peer_ip.clone(),
         peer_port.into(),
-        peer_token,
+        None,
         0,
         0,
         0,
@@ -361,17 +328,14 @@ fn handle_incoming_connection(mut stream: TcpStream, context: ConnectionContext)
 
     match init_data.connection_type {
         ConnectionType::P => {
-            if !handle_peer_connection(peer, stream, reader, &context) {
-                // Registration refused (capacity + grace): announcing
-                // PeerConnected would flush messages into a dead end.
-                return;
+            if handle_peer_connection(peer, stream, reader, &context) {
+                // Inbound peers don't self-announce, so nudge the client to
+                // flush anything queued for this now-connected peer — same as
+                // the PierceFirewall path.
+                let _ = context
+                    .client_sender
+                    .send(ClientOperation::PeerConnected(init_data.username));
             }
-            // Inbound peers don't self-announce, so nudge the client to flush
-            // anything queued for this now-connected peer — same as the
-            // PierceFirewall path.
-            let _ = context
-                .client_sender
-                .send(ClientOperation::PeerConnected(init_data.username));
         }
 
         ConnectionType::F => handle_file_connection(
@@ -428,6 +392,7 @@ impl Listen {
             client_context,
             own_username,
         };
+        let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
 
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
@@ -443,11 +408,14 @@ impl Listen {
                 continue;
             };
 
+            let permit = handshakes.acquire();
             let context = context.clone();
             // One thread per connection: the peer-init handshake blocks, and a
             // peer that is slow to send one must not stop us accepting anybody
             // else — a wedged accept loop makes us unreachable to every peer.
-            thread::spawn(move || handle_incoming_connection(stream, context));
+            thread::spawn(move || {
+                handle_incoming_connection(stream, context, permit);
+            });
         }
     }
 }
@@ -455,103 +423,64 @@ impl Listen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::ActorSystem;
-    use crate::actor::peer_registry::PeerRegistry;
-    use crate::client::{ClientContext, ClientOperation};
-    use crate::utils::logger;
+    use std::io::Write;
+    use std::net::TcpListener;
 
-    /// A connected loopback TcpStream (peer side of a connection).
-    fn peer_stream() -> TcpStream {
+    #[test]
+    fn a_dribbling_handshake_hits_the_total_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect(addr).unwrap();
-        stream.set_nonblocking(true).unwrap();
-        let _server = listener.accept().unwrap().0;
-        stream
+        let writer = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(addr).unwrap();
+            let _ = socket.write_all(&1000u32.to_le_bytes());
+            for _ in 0..20 {
+                if socket.write_all(&[0u8]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = MessageReader::new();
+
+        let started = Instant::now();
+        let result = read_peer_init_message(
+            &mut stream,
+            &mut reader,
+            started + Duration::from_millis(300),
+        );
+
+        assert!(result.is_err(), "a dribbled handshake must not succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline must bound the whole handshake, not each read"
+        );
+        let _ = writer.join();
     }
 
-    // Regression: refusing a peer because the registry is at capacity with
-    // every entry inside the eviction grace period is a normal capacity
-    // decision, not a malfunction. The listener must log it at WARN — the
-    // outbound path (connection.rs) logs the identical refusal at trace! —
-    // so users aren't misled into thinking something is broken.
     #[test]
-    fn capacity_refusal_is_logged_at_warn_not_error() {
-        // NOTE: this test requires LOG_LEVEL (or RUST_LOG) != ERROR and no
-        // LOG_FILE to be set — enable_buffering() routes to the BUFFER
-        // mutex only when no log file is configured and the message passes
-        // the level filter. The test fails loudly if either condition is
-        // violated (no silent false-pass).
+    fn an_oversized_handshake_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(addr).unwrap();
+            let junk = vec![0xFFu8; MAX_PEER_INIT_BYTES * 2];
+            let _ = socket.write_all(&junk);
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = MessageReader::new();
 
-        // RAII guard: disable_buffering() on drop so the global state is
-        // cleaned up even if an assertion panics.
-        struct BufferGuard;
-        impl Drop for BufferGuard {
-            fn drop(&mut self) {
-                logger::disable_buffering();
-            }
-        }
-
-        let system = Arc::new(ActorSystem::new());
-        let (tx, _rx) = std::sync::mpsc::channel::<ClientOperation>();
-        let registry = PeerRegistry::with_max_peers(system, tx.clone(), "me".to_string(), 1);
-
-        // Fill the single slot inside the grace window so the next search
-        // responder is refused.
-        let filler = Peer::new(
-            "filler".to_string(),
-            ConnectionType::P,
-            "127.0.0.1".to_string(),
-            1234,
-            None,
-            0,
-            0,
-            0,
+        let result = read_peer_init_message(
+            &mut stream,
+            &mut reader,
+            Instant::now() + Duration::from_secs(5),
         );
-        registry
-            .register_peer(filler, Some(peer_stream()), None)
-            .expect("first registration must succeed");
-
-        let mut client_context = ClientContext::new();
-        client_context.peer_registry = Some(registry);
-        let ctx = ConnectionContext {
-            client_sender: tx,
-            client_context: Arc::new(RwLock::new(client_context)),
-            own_username: "me".to_string(),
-        };
-
-        // Drain any prior buffered lines, then capture this refusal.
-        logger::enable_buffering();
-        let _guard = BufferGuard; // drop guard: calls disable_buffering() even on panic
-        let _ = logger::take_buffered_logs();
-
-        let refused = Peer::new(
-            "refused-peer".to_string(),
-            ConnectionType::P,
-            "127.0.0.1".to_string(),
-            5678,
-            Some(42), // search responder: grace-protected path -> refused
-            0,
-            0,
-            0,
-        );
-        let accepted = handle_peer_connection(refused, peer_stream(), MessageReader::new(), &ctx);
-        assert!(!accepted, "capacity refusal must reject the peer");
-
-        let logs = logger::take_buffered_logs();
-        let refusal_line = logs
-            .iter()
-            .find(|l| l.contains("Failed to spawn peer actor") && l.contains("refused-peer"))
-            .expect("capacity refusal must produce a log line");
 
         assert!(
-            !refusal_line.contains("ERROR"),
-            "capacity refusal must not be logged as ERROR: {refusal_line:?}"
+            result.is_err(),
+            "an oversized handshake must be rejected, got {result:?}"
         );
-        assert!(
-            refusal_line.contains("WARN"),
-            "capacity refusal should be logged as WARN: {refusal_line:?}"
-        );
-        // BufferGuard drop calls disable_buffering() — even on panic.
+        let _ = writer.join();
     }
 }

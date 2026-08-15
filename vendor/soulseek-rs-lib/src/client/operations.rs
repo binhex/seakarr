@@ -1,93 +1,12 @@
 use super::{
-    Arc, BROKER_CONNECT_TIMEOUT, Client, ClientContext, ClientOperation, ConnectionType, Download,
-    DownloadPeer, DownloadStatus, Peer, PeerMessage, PeerRegistry, Receiver, RwLock, RwLockExt,
-    ServerMessage, build_search_response, debug, error, info, next_connect_token, sleep, thread,
-    trace, warn,
+    Arc, Client, ClientContext, ClientOperation, ConnectionType, Download, DownloadPeer,
+    DownloadStatus, Duration, Instant, Peer, PeerMessage, PeerRegistry, Receiver, RwLock,
+    RwLockExt, ServerMessage, build_search_response, debug, error, info, mpsc, next_connect_token,
+    thread, trace, warn,
 };
 use crate::message::server::MessageFactory;
-use std::collections::HashSet;
-use std::sync::{Condvar, Mutex};
 
-/// Maximum number of ConnectToPeer handler threads that may run concurrently.
-///
-/// The Soulseek server pushes one ConnectToPeer per search-result peer; a
-/// popular search yields hundreds. Without a bound, the ops loop spawned a
-/// fresh 2 MB-stack thread per op, and a flood measured 1600+ threads before
-/// the process died with "failed to set up alternative stack guard page:
-/// Cannot allocate memory". Handlers acquire a permit before spawning and
-/// release it on completion, so at most this many are in flight; excess ops
-/// wait in the ops loop.
-const MAX_CONCURRENT_PEER_CONNECTS: usize = 32;
-
-/// Maximum number of F-type (file-transfer) ConnectToPeer handlers that may
-/// run concurrently. These handlers run whole brokered downloads and are
-/// bounded by the download queue in normal operation; the cap exists so a
-/// hostile server emitting F-type ConnectToPeers cannot grow thread count
-/// without bound.
-const MAX_CONCURRENT_F_TRANSFERS: usize = 64;
-
-/// A tiny counting semaphore (the crate is zero-dependency; std's Semaphore
-/// is still unstable). Backed by a Mutex<usize> + Condvar.
-struct ConnectPermitPool {
-    available: Mutex<usize>,
-    wake: Condvar,
-}
-
-impl ConnectPermitPool {
-    const fn new(limit: usize) -> Self {
-        Self {
-            available: Mutex::new(limit),
-            wake: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *available == 0 {
-            available = self
-                .wake
-                .wait(available)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        *available -= 1;
-    }
-
-    fn release(&self) {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *available += 1;
-        self.wake.notify_one();
-    }
-}
-
-/// Releases a pool permit on drop (RAII), so handler threads free their slot
-/// when they finish, including on early returns / panics.
-struct PermitGuard<'a>(&'a ConnectPermitPool);
-
-impl Drop for PermitGuard<'_> {
-    fn drop(&mut self) {
-        self.0.release();
-    }
-}
-
-/// Removes a download token from the in-flight set on drop (RAII), so the
-/// duplicate-transfer guard cannot leak entries when a handler exits early
-/// or panics.
-struct ActiveDownloadGuard<'a>(&'a Mutex<HashSet<u32>>, u32);
-
-impl Drop for ActiveDownloadGuard<'_> {
-    fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.1);
-    }
-}
+const CONNECT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Client {
     pub(crate) fn listen_to_client_operations(
@@ -96,57 +15,25 @@ impl Client {
         own_username: String,
     ) {
         thread::spawn(move || {
-            // Bound the number of concurrently running ConnectToPeer
-            // handlers. The Soulseek server pushes one ConnectToPeer per
-            // search-result peer; a popular search yields hundreds, and an
-            // unbounded thread-per-op flood (measured: 1600+ threads, then
-            // an OOM abort "failed to set up alternative stack guard page")
-            // killed the process. Handlers acquire a permit before spawning
-            // and release it when done, so at most this many ops run
-            // concurrently; excess ops wait here in the loop.
-            let permits = Arc::new(ConnectPermitPool::new(MAX_CONCURRENT_PEER_CONNECTS));
-            // A separate pool for F-type (file-transfer) handlers. They run
-            // the whole brokered download inside the handler — dial,
-            // transfer, pause waits — so letting them share the P-type pool
-            // would let slow transfers stall the ops loop (head-of-line
-            // blocking). A dedicated pool bounds them independently: in
-            // normal operation the download queue is far below the limit,
-            // and a hostile server emitting F-type ConnectToPeers can no
-            // longer grow thread count without bound.
-            //
-            // Trade-off (bounded): if every F permit is held, the ops loop
-            // blocks in acquire() until a transfer finishes. Handlers drain
-            // within their dial/read timeouts, so the stall is temporary in
-            // normal operation; seakarr itself never pauses transfers and
-            // caps concurrent downloads far below the limit, so the pool
-            // cannot be exhausted by our own traffic.
-            let f_permits = Arc::new(ConnectPermitPool::new(MAX_CONCURRENT_F_TRANSFERS));
-            // In-flight download tokens. All DownloadFromPeer ops pass
-            // through this single-threaded loop, so the insert check is
-            // atomic with respect to sibling ops; handlers remove their
-            // token on completion via ActiveDownloadGuard. This closes the
-            // duplicate-transfer window that a status check cannot: the
-            // handler resets the download to Queued at entry and the status
-            // only becomes InProgress after the dial, so a peer that knows
-            // a token could replay TransferResponses and start concurrent
-            // writers on the same .part file.
-            let active_downloads: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
-            for operation in reader {
+            let mut last_sweep = Instant::now();
+            loop {
+                let next = reader.recv_timeout(CONNECT_SWEEP_INTERVAL);
+                if last_sweep.elapsed() >= CONNECT_SWEEP_INTERVAL {
+                    last_sweep = Instant::now();
+                    Self::sweep_expired_connects(&client_context);
+                }
+                let operation = match next {
+                    Ok(operation) => operation,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match operation {
                     ClientOperation::ConnectToPeer(peer) => {
-                        let pooled = matches!(peer.connection_type, ConnectionType::P);
-                        let pool = if pooled { &permits } else { &f_permits };
-                        pool.acquire();
-                        let pool_for_thread = pool.clone();
-                        let client_context_clone = client_context.clone();
-                        let own_username_clone = own_username.clone();
+                        if matches!(peer.connection_type, ConnectionType::F) {
+                            let client_context_clone = client_context.clone();
+                            let own_username_clone = own_username.clone();
 
-                        let result = thread::Builder::new()
-                            .name("connect-to-peer".to_string())
-                            .spawn(move || {
-                                // Release the permit only after the handler
-                                // has finished.
-                                let _permit = PermitGuard(&pool_for_thread);
+                            thread::spawn(move || {
                                 Self::connect_to_peer(
                                     peer,
                                     client_context_clone,
@@ -154,15 +41,13 @@ impl Client {
                                     None,
                                 );
                             });
-                        if let Err(e) = result {
-                            // Thread failed to start (EAGAIN under thread
-                            // pressure): the permit was acquired but no
-                            // PermitGuard was ever created, so release it
-                            // here — otherwise the effective pool capacity
-                            // drains with every failed spawn. Do not panic:
-                            // a panic here would kill the ops loop.
-                            pool.release();
-                            error!("[client] failed to spawn ConnectToPeer handler: {e}");
+                        } else {
+                            Self::connect_to_peer(
+                                peer,
+                                client_context.clone(),
+                                own_username.clone(),
+                                None,
+                            );
                         }
                     }
                     ClientOperation::SearchResult(search_result) => {
@@ -242,98 +127,65 @@ impl Client {
                             error!("Can't find download with token {:?}", token);
                             continue;
                         };
-
-                        // Terminal-state guard: a peer we downloaded from
-                        // knows the token (we sent it in our TransferRequest)
-                        // and can replay TransferResponses on the still-open
-                        // control connection. Never start a transfer for a
-                        // download that already completed or failed — the
-                        // handler would overwrite the finished file.
                         if matches!(
                             download.status,
-                            DownloadStatus::Completed | DownloadStatus::Failed { .. }
+                            DownloadStatus::InProgress { .. } | DownloadStatus::Completed
                         ) {
                             debug!(
-                                "[client] skipping DownloadFromPeer for token {token}: \
-                                 download is in a terminal state"
+                                "[client] transfer token {} already claimed; \
+                                 ignoring replayed TransferResponse",
+                                token
                             );
                             continue;
                         }
-
-                        // Duplicate-token guard: only start a transfer when
-                        // the token is not already in flight. The status is
-                        // unsuitable for this check — the handler resets it
-                        // to Queued at entry and it only becomes InProgress
-                        // after the dial — so track in-flight tokens in a
-                        // set. Two concurrent download_file calls for one
-                        // token both open the same .part file in append mode
-                        // and interleave writes, silently corrupting the
-                        // download.
-                        {
-                            let mut active = active_downloads
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if !active.insert(token) {
-                                debug!(
-                                    "[client] skipping DownloadFromPeer for token {token}: \
-                                     transfer already in flight"
-                                );
-                                continue;
-                            }
+                        if let Ok(mut ctx) = client_context.write_safe() {
+                            ctx.update_download_with_status(
+                                token,
+                                DownloadStatus::InProgress {
+                                    bytes_downloaded: 0,
+                                    total_bytes: download.size,
+                                    speed_bytes_per_sec: 0.0,
+                                },
+                            );
                         }
 
-                        // Bound the spawn like the other peer-dial handlers:
-                        // a malicious peer that knows our download tokens can
-                        // spam TransferResponses and grow dialing threads
-                        // without bound otherwise.
-                        f_permits.acquire();
-                        let pool_for_thread = f_permits.clone();
-                        let active_for_thread = active_downloads.clone();
-                        let result = thread::Builder::new()
-                            .name("download-from-peer".to_string())
-                            .spawn(move || {
-                                let _active = ActiveDownloadGuard(&active_for_thread, token);
-                                let _permit = PermitGuard(&pool_for_thread);
-                                let download_peer = DownloadPeer::new(
-                                    download.username.clone(),
-                                    peer.host.clone(),
-                                    peer.port,
-                                    token,
-                                    allowed,
-                                    own_username,
+                        thread::spawn(move || {
+                            let download_peer = DownloadPeer::new(
+                                download.username.clone(),
+                                peer.host.clone(),
+                                peer.port,
+                                token,
+                                allowed,
+                                own_username,
+                            );
+                            let Some(filename) = download.filename.split('\\').next_back() else {
+                                error!(
+                                    "Cant find filename to save download: {:?}",
+                                    download.filename
                                 );
-                                let Some(filename) =
-                                    download.filename.split('\\').next_back()
-                                else {
-                                    error!(
-                                        "Cant find filename to save download: {:?}",
-                                        download.filename
-                                    );
-                                    return;
-                                };
-                                match download_peer.download_file(
-                                    client_context_clone.clone(),
-                                    Some(download.clone()),
-                                    None,
-                                ) {
-                                    Ok((download, filename)) => {
-                                        let _ = download.sender.send(DownloadStatus::Completed);
-                                        match client_context_clone.write_safe() {
-                                            Ok(mut ctx) => ctx.update_download_with_status(
-                                                download.token,
-                                                DownloadStatus::Completed,
-                                            ),
-                                            Err(e) => {
-                                                error!("[client] download complete write: {}", e);
-                                            }
-                                        }
-                                        info!(
-                                            "Successfully downloaded {} bytes to {}",
-                                            download.size, filename
-                                        );
+                                return;
+                            };
+                            match download_peer.download_file(
+                                client_context_clone.clone(),
+                                Some(download.clone()),
+                                None,
+                            ) {
+                                Ok((download, filename)) => {
+                                    let _ = download.sender.send(DownloadStatus::Completed);
+                                    match client_context_clone.write_safe() {
+                                        Ok(mut ctx) => ctx.update_download_with_status(
+                                            download.token,
+                                            DownloadStatus::Completed,
+                                        ),
+                                        Err(e) => error!("[client] download complete write: {}", e),
                                     }
-                                    Err(e) => {
-                                        let reason = Some(e.to_string());
+                                    info!(
+                                        "Successfully downloaded {} bytes to {}",
+                                        download.size, filename
+                                    );
+                                }
+                                Err(e) => {
+                                    let reason = Some(e.to_string());
                                     let _ = download
                                         .sender
                                         .send(DownloadStatus::Failed(reason.clone()));
@@ -350,20 +202,7 @@ impl Client {
                                     );
                                 }
                             }
-                            });
-                        if let Err(e) = result {
-                            // Same permit-leak guard as the ConnectToPeer
-                            // branch: the permit was acquired but no
-                            // PermitGuard was created. Also release the
-                            // in-flight token — no handler will run to
-                            // remove it.
-                            f_permits.release();
-                            active_downloads
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .remove(&token);
-                            error!("[client] failed to spawn download handler: {e}");
-                        }
+                        });
                     }
                     ClientOperation::GetPeerAddressResponse {
                         username,
@@ -432,38 +271,20 @@ impl Client {
                                 host,
                                 port,
                                 None,
-                                // The `privileged` field is dead (never
-                                // consumed); pass 0 instead of conflating
-                                // it with obfuscation_type.
                                 0,
-                                0,
+                                // obfuscation_type is a small enum; a
+                                // real obfuscated_port is a full u16 and
+                                // must not be truncated into a u8 (which
+                                // panicked and took down the ops thread).
+                                u8::try_from(obfuscation_type).unwrap_or(0),
                                 obfuscated_port,
                             );
-                            let client_context_clone = client_context.clone();
-                            let own_username_clone = own_username.clone();
-
-                            permits.acquire();
-                            let permits_for_thread = permits.clone();
-                            let result = thread::Builder::new()
-                                .name("get-peer-address".to_string())
-                                .spawn(move || {
-                                    let _permit = PermitGuard(&permits_for_thread);
-                                    Self::connect_to_peer(
-                                        peer,
-                                        client_context_clone,
-                                        own_username_clone,
-                                        None,
-                                    );
-                                });
-                            if let Err(e) = result {
-                                // Same permit-leak guard as the
-                                // ConnectToPeer branch: the permit was
-                                // acquired but no PermitGuard was created.
-                                permits.release();
-                                error!(
-                                    "[client] failed to spawn peer-address connect handler: {e}"
-                                );
-                            }
+                            Self::connect_to_peer(
+                                peer,
+                                client_context.clone(),
+                                own_username.clone(),
+                                None,
+                            );
                         }
                     }
                     ClientOperation::UpdateDownloadTokens(transfer, username) => {
@@ -844,39 +665,19 @@ impl Client {
                             ConnectionType::P,
                         );
                         let _ = sender.send(ServerMessage::SendMessage(msg));
-
-                        // Bound the brokered attempt: if no PierceFirewall
-                        // consumes the token, fail the peer's queued
-                        // downloads (so the caller's Receiver unblocks)
-                        // and reclaim the token. A successful pierce
-                        // takes the token first, making this a no-op.
-                        //
-                        // Skip the reaper entirely when the peer has no
-                        // queued downloads: the 20s-sleeping thread would
-                        // be pure overhead, and fast-failing dial floods
-                        // could otherwise keep many of them alive at once.
-                        let has_queued_downloads = client_context.read_safe().is_ok_and(|ctx| {
-                            ctx.get_downloads().iter().any(|d| {
-                                d.username == username && matches!(d.status, DownloadStatus::Queued)
-                            })
-                        });
-                        if !has_queued_downloads {
-                            continue;
-                        }
-                        let timeout_ctx = client_context.clone();
-                        let timeout_user = username.clone();
-                        thread::spawn(move || {
-                            sleep(BROKER_CONNECT_TIMEOUT);
-                            let still_pending = timeout_ctx
-                                .write_safe()
-                                .is_ok_and(|mut c| c.take_pending_connect(token).is_some());
-                            if still_pending {
-                                Self::fail_queued_downloads(&timeout_ctx, &timeout_user);
-                            }
-                        });
                     }
                 }
             }
         });
+    }
+
+    fn sweep_expired_connects(client_context: &Arc<RwLock<ClientContext>>) {
+        let expired = match client_context.write_safe() {
+            Ok(mut ctx) => ctx.take_expired_connects(Instant::now()),
+            Err(_) => return,
+        };
+        for username in expired {
+            Self::fail_queued_downloads(client_context, &username);
+        }
     }
 }

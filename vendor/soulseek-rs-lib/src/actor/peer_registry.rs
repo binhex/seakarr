@@ -6,9 +6,9 @@ use crate::peer::Peer;
 use crate::utils::lock::MutexExt;
 use crate::{debug, error};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -17,42 +17,16 @@ use std::sync::{Arc, Mutex};
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Registered peers keyed by username, each stored with the unique id of the
-/// actor currently occupying the slot and its registration instant (used to
-/// avoid evicting fresh search-responder connections before they deliver).
-type PeerMap = HashMap<String, (u64, ActorHandle<PeerMessage>, std::time::Instant)>;
-
-/// Registry state guarded by a single mutex: the peer map plus FIFO
-/// registration order used for capacity eviction. Keeping both under one
-/// lock keeps the capacity check, eviction, and insertion race-free.
-struct RegistryState {
-    peers: PeerMap,
-    order: std::collections::VecDeque<String>,
-}
-
-/// A freshly registered peer is exempt from eviction for this long.
-///
-/// Search responders connect (server-brokered) and need a moment to deliver
-/// their FileSearchResponse before the registry may reap them; evicting on
-/// pure FIFO killed responders ~100 ms after connect and empty searches
-/// returned no results at all.
-pub const EVICTION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// actor currently occupying the slot.
+type PeerMap = HashMap<String, (u64, ActorHandle<PeerMessage>)>;
 
 pub struct PeerRegistry {
-    state: Arc<Mutex<RegistryState>>,
+    peers: Arc<Mutex<PeerMap>>,
     actor_system: Arc<ActorSystem>,
     client_channel: Sender<ClientOperation>,
     own_username: String,
-    max_peers: usize,
+    capacity: Arc<AtomicUsize>,
 }
-
-/// Default ceiling on simultaneous peer connections.
-///
-/// The Soulseek server pushes a ConnectToPeer for every search-result peer
-/// (hundreds per search), and each peer owns an OS thread for its lifetime;
-/// an unbounded registry flooded the process with threads and killed the ops
-/// loop. 16 is enough for the peers a client actually transfers with while
-/// keeping the thread count sane.
-pub const DEFAULT_MAX_PEERS: usize = 16;
 
 impl PeerRegistry {
     #[must_use]
@@ -61,30 +35,27 @@ impl PeerRegistry {
         client_channel: Sender<ClientOperation>,
         own_username: String,
     ) -> Self {
-        Self::with_max_peers(
+        Self::with_capacity(
             actor_system,
             client_channel,
             own_username,
-            DEFAULT_MAX_PEERS,
+            Arc::new(AtomicUsize::new(usize::MAX)),
         )
     }
 
     #[must_use]
-    pub fn with_max_peers(
+    pub(crate) fn with_capacity(
         actor_system: Arc<ActorSystem>,
         client_channel: Sender<ClientOperation>,
         own_username: String,
-        max_peers: usize,
+        capacity: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(RegistryState {
-                peers: HashMap::new(),
-                order: std::collections::VecDeque::new(),
-            })),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             actor_system,
             client_channel,
             own_username,
-            max_peers: max_peers.max(1),
+            capacity,
         }
     }
 
@@ -94,28 +65,15 @@ impl PeerRegistry {
         stream: Option<TcpStream>,
         reader: Option<MessageReader>,
     ) -> Result<ActorHandle<PeerMessage>, String> {
-        // A peer connecting without a search token is a download target:
-        // it must get a slot even when the registry is full of search
-        // responders inside the grace window.
-        self.register_peer_inner(peer, stream, reader, true)
+        self.register_peer_protected(peer, stream, reader, &HashSet::new())
     }
 
-    /// Force-register for server-brokered search responders (token Some).
-    pub(crate) fn register_search_responder(
+    pub(crate) fn register_peer_protected(
         &self,
         peer: Peer,
         stream: Option<TcpStream>,
         reader: Option<MessageReader>,
-    ) -> Result<ActorHandle<PeerMessage>, String> {
-        self.register_peer_inner(peer, stream, reader, false)
-    }
-
-    fn register_peer_inner(
-        &self,
-        peer: Peer,
-        stream: Option<TcpStream>,
-        reader: Option<MessageReader>,
-        is_download_target: bool,
+        protected: &HashSet<String>,
     ) -> Result<ActorHandle<PeerMessage>, String> {
         let username = peer.username.clone();
         let id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
@@ -129,82 +87,37 @@ impl PeerRegistry {
             id,
         );
 
-        // Take the lock before the actor exists: a peer that dies instantly
-        // (refused dial, immediate hangup) reports its terminal outcome to
-        // the client loop, whose eviction takes this same lock. With the
-        // insert racing the spawn, eviction could run first, find nothing,
-        // and the entry inserted afterwards became a permanent zombie
-        // claiming the username.
-        //
-        // Deadlock-avoidance invariant: the spawned actor must never call
-        // back into this registry while this lock is held. Actors talk to the
-        // client loop via channels; the loop blocks on this mutex until
-        // register_peer releases it (contention, not deadlock).
-        let mut state = self
-            .state
+        // Take the map lock before the actor exists: a peer that dies
+        // instantly (refused dial, immediate hangup) reports its terminal
+        // outcome to the client loop, whose eviction takes this same lock.
+        // With the insert racing the spawn, eviction could run first, find
+        // nothing, and the entry inserted afterwards became a permanent
+        // zombie claiming the username.
+        let mut peers = self
+            .peers
             .lock_safe()
             .map_err(|e| format!("peer registry lock poisoned: {e}"))?;
 
-        // Bound the number of simultaneous peer threads. The Soulseek server
-        // pushes ConnectToPeer for every search-result peer, and each peer
-        // owns an OS thread for its lifetime; without this cap a single
-        // popular search (hundreds of peers) flooded the process and killed
-        // the client ops loop.
-        if state.peers.contains_key(&username) && state.peers.len() >= self.max_peers {
-            // At capacity: skip replacement. Duplicate-username floods
-            // (one user with many search results) would otherwise spawn
-            // a fresh thread per duplicate while the replaced actor
-            // lingers in its dial window — the cap would bound entries,
-            // not threads. Keep the existing actor; it either serves or
-            // evicts itself on its terminal event, freeing the slot.
-            //
-            // Tradeoff: a duplicate arriving in the tiny window between
-            // a peer's terminal event and its processing is skipped even
-            // though the slot is about to free. Self-healing: the
-            // terminal event evicts the entry, and the server re-brokers
-            // the connection on the next retry.
-            debug!("[peer_registry] skipping replacement of {username} at capacity");
-            return state
-                .peers
-                .get(&username)
-                .map(|(_, h, _)| h.clone())
-                .ok_or_else(|| format!("peer {username} vanished from registry"));
-        }
-
-        // Spawn FIRST, evict after: a failed spawn (EAGAIN under thread
-        // pressure — the exact condition the cap exists for) must not stop a
-        // live peer for nothing. Eviction and insertion both happen under
-        // this same lock, so the capacity check remains race-free.
-        //
-        // BUT: the refusal decision must happen BEFORE the spawn. Refusing
-        // after spawning leaked an orphan actor: the freshly spawned thread
-        // dials its target and lives out its connect-timeout window even
-        // though its registration was rejected, so a ConnectToPeer flood
-        // (the server pushes one per search-result peer) accumulated
-        // hundreds of orphan dialing threads and the process OOM-aborted
-        // ("failed to set up alternative stack guard page: Cannot allocate
-        // memory"). If there is nothing to evict, refuse now, before any
-        // thread exists.
-        let now = std::time::Instant::now();
-        let evictable_before_spawn = if state.peers.len() >= self.max_peers {
-            if is_download_target {
-                // Download targets bypass the grace window entirely: any
-                // registered peer is evictable, so a slot is always free.
-                !state.peers.is_empty()
-            } else {
-                state.peers.values().any(|(_, _, registered)| {
-                    now.duration_since(*registered) >= EVICTION_GRACE_PERIOD
-                })
+        let capacity = self.capacity.load(Ordering::Relaxed).max(1);
+        if peers.len() >= capacity && !peers.contains_key(&username) {
+            let victim = peers
+                .iter()
+                .filter(|(name, _)| !protected.contains(name.as_str()))
+                .min_by_key(|(_, (id, _))| *id)
+                .map(|(name, _)| name.clone());
+            let Some(victim) = victim else {
+                return Err(format!(
+                    "peer registry at capacity ({capacity}) and every peer \
+                     is busy; refusing {username}"
+                ));
+            };
+            if let Some((_, handle)) = peers.remove(&victim) {
+                let _ = handle.stop();
+                debug!(
+                    "[peer_registry] evicted idle peer {} to admit {}",
+                    victim, username
+                );
             }
-        } else {
-            // Under capacity: no eviction needed, a free slot exists.
-            true
-        };
-        if !evictable_before_spawn {
-            return Err(format!(
-                "peer registry at capacity ({}) and all peers inside eviction grace period — refusing {username}",
-                self.max_peers
-            ));
         }
 
         let handle = self
@@ -213,88 +126,16 @@ impl PeerRegistry {
                 actor.set_self_handle(handle);
             })
             .map_err(|e| format!("failed to spawn peer actor thread: {e}"))?;
-
-        if !state.peers.contains_key(&username) && state.peers.len() >= self.max_peers {
-            // FIFO eviction with a grace period: drop the oldest
-            // registration that has been around long enough to have
-            // delivered its search response (or whatever it connected
-            // for). Search-result flood peers register first, so they are
-            // the natural eviction candidates — but a responder evicted
-            // milliseconds after connecting never delivers, which made
-            // searches return no results at all.
-            //
-            // If every peer is still inside the grace window, refuse the
-            // new registration instead: slot churn would otherwise kill
-            // responders faster than they can answer. Download targets
-            // bypass the grace window entirely — a peer we are queued to
-            // download FROM must never be refused while idle search
-            // responders hold the registry.
-            let now = std::time::Instant::now();
-            let oldest_evictable = if is_download_target {
-                state.peers.keys().cloned().min_by_key(|name| {
-                    state
-                        .peers
-                        .get(name)
-                        .map_or(now, |(_, _, registered)| *registered)
-                })
-            } else {
-                state
-                    .peers
-                    .iter()
-                    .filter(|(_, (_, _, registered))| {
-                        now.duration_since(*registered) >= EVICTION_GRACE_PERIOD
-                    })
-                    .map(|(name, _)| name.clone())
-                    .min_by_key(|name| {
-                        state
-                            .peers
-                            .get(name)
-                            .map_or(now, |(_, _, registered)| *registered)
-                    })
-            };
-
-            // Defensive only — unreachable since the pre-spawn check (above)
-            // ran under this same lock hold: state cannot change between the
-            // two checks, and an evictable peer at the pre-check is still
-            // evictable now. Kept as a safety net, not an exit path.
-            let Some(oldest) = oldest_evictable else {
-                return Err(format!(
-                    "peer registry at capacity ({}) and all peers inside eviction grace period — refusing {username}",
-                    self.max_peers
-                ));
-            };
-
-            state.order.retain(|u| u != &oldest);
-            debug_assert!(
-                state.peers.contains_key(&oldest),
-                "order/peers invariant violated: {oldest} in order but not in peers"
-            );
-            if let Some((_, old_handle, _)) = state.peers.remove(&oldest) {
-                let _ = old_handle.stop();
-                debug!("[peer_registry] evicted oldest peer {oldest} at capacity");
-            }
-        }
-
         // Stop any actor already registered under this username so it does not
         // become an orphan pinning a pool worker forever. Eviction on the
         // replaced actor's later shutdown is identity-aware (keyed on its id),
         // so stopping it here cannot evict this new connection.
-        if let Some((_, old_handle, _)) = state.peers.insert(
-            username.clone(),
-            (id, handle.clone(), std::time::Instant::now()),
-        ) {
+        if let Some((_, old_handle)) = peers.insert(username.clone(), (id, handle.clone())) {
             let _ = old_handle.stop();
-            // A replacement is a fresh connection: refresh its FIFO position
-            // so it is not evicted as "oldest" on the next capacity-triggering
-            // registration (it inherited the original registration's age).
-            state.order.retain(|u| u != &username);
-            state.order.push_back(username.clone());
             debug!(
                 "[peer_registry] Replaced existing peer actor for {}",
                 username
             );
-        } else {
-            state.order.push_back(username);
         }
 
         Ok(handle)
@@ -302,11 +143,8 @@ impl PeerRegistry {
 
     #[must_use]
     pub fn get_peer(&self, username: &str) -> Option<ActorHandle<PeerMessage>> {
-        match self.state.lock_safe() {
-            Ok(state) => state
-                .peers
-                .get(username)
-                .map(|(_, handle, _)| handle.clone()),
+        match self.peers.lock_safe() {
+            Ok(peers) => peers.get(username).map(|(_, handle)| handle.clone()),
             Err(e) => {
                 error!("[peer_registry] get_peer: {}", e);
                 None
@@ -316,21 +154,20 @@ impl PeerRegistry {
 
     #[must_use]
     pub fn remove_peer(&self, username: &str) -> Option<ActorHandle<PeerMessage>> {
-        let mut state = match self.state.lock_safe() {
-            Ok(s) => s,
+        let mut peers = match self.peers.lock_safe() {
+            Ok(p) => p,
             Err(e) => {
                 error!("[peer_registry] remove_peer: {}", e);
                 return None;
             }
         };
-        let removed = state.peers.remove(username);
+        let removed = peers.remove(username);
 
         if removed.is_some() {
-            state.order.retain(|u| u != username);
             debug!("[peer_registry] Removed peer actor for {}", username);
         }
 
-        removed.map(|(_, handle, _)| handle)
+        removed.map(|(_, handle)| handle)
     }
 
     /// Remove and return the actor for `username` only if it is still the actor
@@ -338,20 +175,15 @@ impl PeerRegistry {
     /// cannot evict the newer actor that now occupies the slot.
     #[must_use]
     pub fn remove_peer_if(&self, username: &str, id: u64) -> Option<ActorHandle<PeerMessage>> {
-        let mut state = match self.state.lock_safe() {
-            Ok(s) => s,
+        let mut peers = match self.peers.lock_safe() {
+            Ok(p) => p,
             Err(e) => {
                 error!("[peer_registry] remove_peer_if: {}", e);
                 return None;
             }
         };
-        if state
-            .peers
-            .get(username)
-            .is_some_and(|(stored, _, _)| *stored == id)
-        {
-            let removed = state.peers.remove(username).map(|(_, handle, _)| handle);
-            state.order.retain(|u| u != username);
+        if peers.get(username).is_some_and(|(stored, _)| *stored == id) {
+            let removed = peers.remove(username).map(|(_, handle)| handle);
             debug!("[peer_registry] Removed peer actor {} for {}", id, username);
             return removed;
         }
@@ -360,8 +192,8 @@ impl PeerRegistry {
 
     #[must_use]
     pub fn contains(&self, username: &str) -> bool {
-        match self.state.lock_safe() {
-            Ok(state) => state.peers.contains_key(username),
+        match self.peers.lock_safe() {
+            Ok(peers) => peers.contains_key(username),
             Err(e) => {
                 error!("[peer_registry] contains: {}", e);
                 false
@@ -374,32 +206,6 @@ impl PeerRegistry {
             .get_peer(username)
             .ok_or_else(|| format!("Peer {username} not found in registry"))?;
 
-        // Refresh FIFO position: an actively-used peer (e.g. one with a
-        // queued download or an in-flight transfer) must not be evicted as
-        // "oldest" while it is being used. Idle flood peers age out first.
-        //
-        // Known limitations (benign):
-        // - TOCTOU: the handle was fetched under an earlier lock hold; if the
-        //   peer is evicted/replaced between the two acquisitions, the refresh
-        //   is a no-op (contains_key guard) and the message goes to a stopped
-        //   actor, whose channel send still succeeds into the mailbox and is
-        //   dropped. At-most-once delivery; callers treat it as best-effort.
-        // - The refresh is triggerable by a chatty remote peer (repeated
-        //   requests pin its slot), so eviction protection is not absolute.
-        //   The thread cap still holds, which is the security-critical
-        //   property.
-        if let Ok(mut state) = self.state.lock_safe()
-            && let Some((_, _, registered)) = state.peers.get_mut(username)
-        {
-            // Refresh BOTH the FIFO order and the registration instant:
-            // eviction selects by the registration instant, so refreshing
-            // only the order deque would leave an actively-used peer
-            // evictable as "oldest".
-            *registered = std::time::Instant::now();
-            state.order.retain(|u| u != username);
-            state.order.push_back(username.to_string());
-        }
-
         handle.send(message)
     }
 
@@ -411,11 +217,11 @@ impl PeerRegistry {
 impl Clone for PeerRegistry {
     fn clone(&self) -> Self {
         Self {
-            state: self.state.clone(),
+            peers: self.peers.clone(),
             actor_system: self.actor_system.clone(),
             client_channel: self.client_channel.clone(),
             own_username: self.own_username.clone(),
-            max_peers: self.max_peers,
+            capacity: self.capacity.clone(),
         }
     }
 }
@@ -425,20 +231,97 @@ mod tests {
     use super::PeerRegistry;
     use crate::actor::ActorSystem;
     use crate::peer::{ConnectionType, Peer};
-    use crate::utils::lock::MutexExt;
+    use std::collections::HashSet;
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
-    /// Backdate every entry in the registry past the eviction grace period
-    /// so the next capacity-triggering registration evicts the oldest.
-    fn backdate_all(registry: &PeerRegistry) {
-        let mut state = registry.state.lock_safe().unwrap();
-        let old = std::time::Instant::now()
-            .checked_sub(super::EVICTION_GRACE_PERIOD * 2)
-            .unwrap();
-        for (_, _, registered) in state.peers.values_mut() {
-            *registered = old;
+    fn loopback_peer(name: &str) -> (Peer, TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let far_end = listener.accept().unwrap().0;
+        let peer = Peer::new(
+            name.to_string(),
+            ConnectionType::P,
+            "127.0.0.1".to_string(),
+            u32::from(addr.port()),
+            None,
+            0,
+            0,
+            0,
+        );
+        (peer, stream, far_end)
+    }
+
+    fn capped_registry(
+        capacity: usize,
+    ) -> (
+        PeerRegistry,
+        std::sync::mpsc::Receiver<crate::client::ClientOperation>,
+    ) {
+        let system = Arc::new(ActorSystem::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = PeerRegistry::with_capacity(
+            system,
+            tx,
+            "me".to_string(),
+            Arc::new(AtomicUsize::new(capacity)),
+        );
+        (registry, rx)
+    }
+
+    #[test]
+    fn capacity_evicts_the_oldest_idle_peer() {
+        let (registry, _rx) = capped_registry(2);
+
+        for name in ["a", "b", "c"] {
+            let (peer, stream, _far_end) = loopback_peer(name);
+            registry.register_peer(peer, Some(stream), None).unwrap();
         }
+
+        assert!(!registry.contains("a"), "the oldest peer must be evicted");
+        assert!(registry.contains("b"));
+        assert!(registry.contains("c"));
+    }
+
+    #[test]
+    fn capacity_refuses_when_every_peer_is_protected() {
+        let (registry, _rx) = capped_registry(1);
+
+        let (busy, busy_stream, _busy_far) = loopback_peer("busy");
+        registry
+            .register_peer(busy, Some(busy_stream), None)
+            .unwrap();
+
+        let protected: HashSet<String> = std::iter::once("busy".to_string()).collect();
+        let (newcomer, stream, _far) = loopback_peer("newcomer");
+        let result = registry.register_peer_protected(newcomer, Some(stream), None, &protected);
+
+        assert!(result.is_err(), "a full registry of busy peers must refuse");
+        assert!(registry.contains("busy"));
+        assert!(!registry.contains("newcomer"));
+    }
+
+    #[test]
+    fn a_returning_username_is_replaced_not_refused_at_capacity() {
+        let (registry, _rx) = capped_registry(1);
+
+        let (first, first_stream, _first_far) = loopback_peer("bob");
+        registry
+            .register_peer(first, Some(first_stream), None)
+            .unwrap();
+
+        let protected: HashSet<String> = std::iter::once("bob".to_string()).collect();
+        let (again, stream, _far) = loopback_peer("bob");
+        let result = registry.register_peer_protected(again, Some(stream), None, &protected);
+
+        assert!(
+            result.is_ok(),
+            "a reconnecting username must replace itself"
+        );
+        assert!(registry.contains("bob"));
     }
 
     #[test]
@@ -479,216 +362,6 @@ mod tests {
         assert!(!registry.contains("bob"));
     }
 
-    // The thread-per-peer design floods the process when the Soulseek server
-    // pushes a ConnectToPeer for every search result (measured: 487 peers
-    // from one album search). Each peer owns an OS thread for its lifetime,
-    // so an unbounded registry ballooned to 1600+ threads and the crate's
-    // ops loop died (thread::spawn EAGAIN), killing all downloads. The cap
-    // bounds the registry so only a sane number of peer threads exist.
-    #[test]
-    fn register_peer_evicts_oldest_beyond_cap() {
-        let system = Arc::new(ActorSystem::new());
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let registry = PeerRegistry::with_max_peers(system, tx, "me".to_string(), 2);
-
-        let peers: Vec<Peer> = (0..4)
-            .map(|i| {
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let addr = listener.local_addr().unwrap();
-                let stream = TcpStream::connect(addr).unwrap();
-                stream.set_nonblocking(true).unwrap();
-                let _server = listener.accept().unwrap().0;
-                Peer::new(
-                    format!("peer{i}"),
-                    ConnectionType::P,
-                    "127.0.0.1".to_string(),
-                    u32::from(addr.port()),
-                    None,
-                    0,
-                    0,
-                    0,
-                )
-            })
-            .collect();
-
-        assert!(
-            registry
-                .register_peer(peers[0].clone(), Some(peer_stream("p0")), None)
-                .is_ok()
-        );
-        assert!(
-            registry
-                .register_peer(peers[1].clone(), Some(peer_stream("p1")), None)
-                .is_ok()
-        );
-        // Backdate the entries past the eviction grace period so the FIFO
-        // policy (rather than the grace refusal) decides eviction.
-        backdate_all(&registry);
-        // At capacity: peer2 evicts peer0 (FIFO), peer3 evicts peer1.
-        assert!(
-            registry
-                .register_peer(peers[2].clone(), Some(peer_stream("p2")), None)
-                .is_ok()
-        );
-        assert!(
-            registry
-                .register_peer(peers[3].clone(), Some(peer_stream("p3")), None)
-                .is_ok()
-        );
-
-        assert!(!registry.contains("peer0"));
-        assert!(!registry.contains("peer1"));
-        assert!(registry.contains("peer2"));
-        assert!(registry.contains("peer3"));
-    }
-
-    // Duplicate-username floods must not bypass the cap: at capacity,
-    // re-registering a known username is skipped (no fresh thread spawned).
-    #[test]
-    fn register_peer_skips_replacement_at_capacity() {
-        let system = Arc::new(ActorSystem::new());
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let registry = PeerRegistry::with_max_peers(system, tx, "me".to_string(), 1);
-
-        let make_peer = |name: &str| {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let stream = TcpStream::connect(addr).unwrap();
-            stream.set_nonblocking(true).unwrap();
-            let _server = listener.accept().unwrap().0;
-            Peer::new(
-                name.to_string(),
-                ConnectionType::P,
-                "127.0.0.1".to_string(),
-                u32::from(addr.port()),
-                None,
-                0,
-                0,
-                0,
-            )
-        };
-
-        let first = registry
-            .register_peer(make_peer("bob"), Some(peer_stream("bob")), None)
-            .unwrap();
-        // Same username again at capacity: replacement skipped, still one entry.
-        let second = registry
-            .register_peer(make_peer("bob"), Some(peer_stream("bob")), None)
-            .unwrap();
-        assert!(registry.contains("bob"));
-        // Settle past the actor's Stop-drain window (the loop ticks every
-        // ~100 ms): only then does a send into a replaced-and-stopped actor
-        // actually fail, which is what distinguishes "skip" from "replace".
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        // The ORIGINAL actor must still be alive: if the skip guard were
-        // removed and a replacement actor spawned, the first handle's channel
-        // would be closed (old actor stopped) and this send would fail.
-        first
-            .send(crate::actor::peer_actor::PeerMessage::QueueUpload(
-                "probe.flac".to_string(),
-            ))
-            .expect("original actor must survive the skipped replacement");
-        // And the returned handle for the skipped registration is the same
-        // live actor, not a fresh one.
-        second
-            .send(crate::actor::peer_actor::PeerMessage::QueueUpload(
-                "probe2.flac".to_string(),
-            ))
-            .expect("skipped registration must return a live handle");
-    }
-
-    fn peer_stream(_name: &str) -> TcpStream {
-        // Reuse a fresh loopback stream; the registry accepts any stream.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stream = TcpStream::connect(addr).unwrap();
-        stream.set_nonblocking(true).unwrap();
-        let _server = listener.accept().unwrap().0;
-        stream
-    }
-
-    // Regression: a refused registration must not leave an orphan actor
-    // thread behind. register_peer_inner used to spawn the actor thread
-    // BEFORE the capacity/grace-window decision; when the refusal returned
-    // Err, the freshly spawned actor was already dialing its target and
-    // lived out its connect-timeout window as an orphan OS thread. Under a
-    // ConnectToPeer flood (the server pushes one per search-result peer) a
-    // single popular search leaked hundreds of dialing threads and the
-    // process OOM-aborted ("failed to set up alternative stack guard page:
-    // Cannot allocate memory").
-    //
-    // The observable contract: a refused registration must NOT dial.
-    // Point the refused peer at a listener we own; if an actor was spawned,
-    // it connects to us; after the fix, nothing connects.
-    #[test]
-    fn refused_registration_at_capacity_in_grace_does_not_dial() {
-        use std::io::Read;
-
-        let system = Arc::new(ActorSystem::new());
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let registry = PeerRegistry::with_max_peers(system, tx, "me".to_string(), 1);
-
-        // Fill the single slot inside the grace window.
-        let filler = Peer::new(
-            "filler".to_string(),
-            ConnectionType::P,
-            "127.0.0.1".to_string(),
-            {
-                let l = TcpListener::bind("127.0.0.1:0").unwrap();
-                u32::from(l.local_addr().unwrap().port())
-            },
-            None,
-            0,
-            0,
-            0,
-        );
-        registry
-            .register_peer(filler, Some(peer_stream("filler")), None)
-            .expect("first registration must succeed");
-
-        // A dial target we own: if a refused registration spawns an actor,
-        // that actor dials this address and we observe the connection.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let dial_target = listener.local_addr().unwrap();
-
-        // Distinct username at capacity with all entries inside the grace
-        // window: the search-responder path (grace-protected) must refuse.
-        let refused = Peer::new(
-            "flood-peer".to_string(),
-            ConnectionType::P,
-            "127.0.0.1".to_string(),
-            u32::from(dial_target.port()),
-            Some(42), // search responder token
-            0,
-            0,
-            0,
-        );
-        let result = registry.register_search_responder(refused, None, None);
-        assert!(
-            result.is_err(),
-            "registration at capacity inside grace must be refused"
-        );
-
-        // Give any orphaned actor a moment to dial.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let mut buf = [0u8; 1];
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.read(&mut buf);
-                panic!(
-                    "refused registration spawned an actor that dialed us \
-                     (orphan thread leak): connection received"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Nothing dialed — correct.
-            }
-            Err(e) => panic!("unexpected accept error: {e}"),
-        }
-    }
-
     // A dial that is refused reports its terminal outcome almost instantly —
     // possibly while register_peer is still between spawn and insert. The
     // registry holds its lock across both, so the eviction that follows must
@@ -698,51 +371,41 @@ mod tests {
     fn refused_dial_does_not_leave_a_zombie_entry() {
         use crate::client::ClientOperation;
 
-        // A bind-then-drop port can be re-used by another process before the
-        // dial, in which case the dial succeeds and no PeerConnectFailed
-        // arrives. Retry with a fresh port when that happens (rare flake).
-        for attempt in 0..3u8 {
-            let system = Arc::new(ActorSystem::new());
-            let (tx, rx) = std::sync::mpsc::channel();
-            let registry = PeerRegistry::new(system, tx, "me".to_string());
+        let system = Arc::new(ActorSystem::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = PeerRegistry::new(system, tx, "me".to_string());
 
-            let port = {
-                let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            };
+        // A port with nothing listening behind it: bind, learn it, drop it.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
 
-            let peer = Peer::new(
-                format!("ghost{attempt}"),
-                ConnectionType::P,
-                "127.0.0.1".to_string(),
-                u32::from(port),
-                None,
-                0,
-                0,
-                0,
-            );
-            let username = peer.username.clone();
-            registry.register_peer(peer, None, None).unwrap();
+        let peer = Peer::new(
+            "ghost".to_string(),
+            ConnectionType::P,
+            "127.0.0.1".to_string(),
+            u32::from(port),
+            None,
+            0,
+            0,
+            0,
+        );
+        registry.register_peer(peer, None, None).unwrap();
 
-            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(ClientOperation::PeerConnectFailed(id, name)) => {
-                    assert_eq!(name, username);
-                    if let Some(handle) = registry.remove_peer_if(&username, id) {
-                        let _ = handle.stop();
-                    }
-                    assert!(
-                        !registry.contains(&username),
-                        "a refused dial must not leave a registry entry"
-                    );
-                    return;
-                }
-                // Port was re-used and the dial succeeded — try a fresh one.
-                Ok(_) => {}
-                Err(err) => {
-                    panic!("timed out waiting for PeerConnectFailed: {err}")
+        // Play the client ops loop: take the terminal outcome, evict by id.
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ClientOperation::PeerConnectFailed(id, username)) => {
+                assert_eq!(username, "ghost");
+                if let Some(handle) = registry.remove_peer_if(&username, id) {
+                    let _ = handle.stop();
                 }
             }
+            other => panic!("expected PeerConnectFailed, got {other:?}"),
         }
-        panic!("could not produce a refused dial after 3 attempts");
+        assert!(
+            !registry.contains("ghost"),
+            "a refused dial must not leave a registry entry"
+        );
     }
 }

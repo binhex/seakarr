@@ -116,12 +116,7 @@ impl Peer {
             connection_type,
             host,
             port,
-            // Normalize token 0 to None so outbound and inbound
-            // classification agree: a zero token means "no search
-            // responder", and must route through the evicting
-            // download-target path (listen.rs does the same for inbound
-            // peer-init connections).
-            token: (token != 0).then_some(token),
+            token: Some(token),
             privileged: Some(privileged),
             unknown: Some(unknown),
             obfuscated_port: Some(u16::from(obfuscated_port)),

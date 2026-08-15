@@ -474,103 +474,136 @@ fn a_clean_disconnect_keeps_queued_uploads_an_error_drops_them() {
     }
 }
 
-// Regression: a ConnectToPeer flood (the server pushes one per search-result
-// peer) must not spawn an unbounded number of dialing actor threads. The
-// peer registry used to spawn its actor BEFORE the capacity/grace refusal,
-// so every refused registration leaked an orphan actor that dialed its
-// target and lived out its connect window — a single popular search leaked
-// hundreds of threads and the process OOM-aborted ("failed to set up
-// alternative stack guard page: Cannot allocate memory").
-//
-// Observable contract: refused flood registrations must not DIAL. We point
-// the flood peers at a listener we own and count the connections we receive:
-// pre-fix every refused registration's orphan actor connects (~N); post-fix
-// only the at-most-max_peers registered actors connect (<=8).
 #[test]
-fn connect_to_peer_flood_does_not_explode_dialing_actors() {
-    use crate::actor::ActorSystem;
-    use crate::actor::peer_registry::PeerRegistry;
+fn a_pending_connect_expires_after_the_broker_timeout() {
+    let mut context = ClientContext::new();
+    context.add_pending_connect(7, "ghost".to_string());
 
-    let client = Client::new("flood-test", "pw");
-    // Inject a bounded registry so the ops loop's connect_to_peer path is
-    // exercised end-to-end.
-    let system = Arc::new(ActorSystem::new());
-    let (reg_tx, _reg_rx) = mpsc::channel();
-    let registry = PeerRegistry::with_max_peers(system, reg_tx, "me".to_string(), 8);
-    client.context.write().unwrap().peer_registry = Some(registry);
+    assert!(context.take_expired_connects(Instant::now()).is_empty());
 
-    let (ops, ops_rx) = mpsc::channel();
-    Client::listen_to_client_operations(ops_rx, client.context.clone(), "me".to_string());
+    let after_deadline = Instant::now() + BROKER_CONNECT_TIMEOUT + Duration::from_secs(1);
+    assert_eq!(
+        context.take_expired_connects(after_deadline),
+        vec!["ghost".to_string()]
+    );
+    assert!(context.take_pending_connect(7).is_none());
+}
 
-    // A listener that accepts but never speaks: actors dial it and stay
-    // alive (reading) instead of exiting instantly, so every spawned actor
-    // shows up as a connection on this listener.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
+#[test]
+fn protected_peers_covers_downloads_uploads_and_pending_serves() {
+    let mut context = ClientContext::new();
+    context.add_download(download(
+        "downloader",
+        "song.mp3",
+        1,
+        DownloadStatus::Queued,
+        mpsc::channel().0,
+    ));
+    context.add_download(download(
+        "done",
+        "old.mp3",
+        2,
+        DownloadStatus::Completed,
+        mpsc::channel().0,
+    ));
+    context
+        .pending_serves
+        .insert("waiting".to_string(), vec![9]);
+    context.mark_browse_pending("browsed");
 
-    let n = 96;
-    for i in 0..n {
-        let peer = Peer::new(
-            format!("flood-{i}"),
-            ConnectionType::P,
-            "127.0.0.1".to_string(),
-            u32::from(addr.port()),
-            Some(1234 + i as u32), // search-responder token
-            0,
-            0,
-            0,
-        );
-        ops.send(ClientOperation::ConnectToPeer(peer)).unwrap();
+    let protected = context.protected_peers();
+    assert!(protected.contains("downloader"));
+    assert!(protected.contains("waiting"));
+    assert!(protected.contains("browsed"));
+    assert!(!protected.contains("done"));
+
+    context.store_browse_result("browsed".to_string(), Vec::new());
+    assert!(!context.protected_peers().contains("browsed"));
+}
+
+#[test]
+fn an_expired_broker_connect_fails_the_queued_downloads() {
+    let client = Client::new("u", "p");
+    let (sender, receiver) = mpsc::channel();
+    {
+        let mut ctx = client.context.write().unwrap();
+        ctx.add_download(download(
+            "ghost",
+            "f.mp3",
+            7,
+            DownloadStatus::Queued,
+            sender,
+        ));
+        ctx.pending_connect_tokens
+            .insert(7, ("ghost".to_string(), Instant::now()));
     }
+    let (_ops_tx, ops_rx) = mpsc::channel();
+    Client::listen_to_client_operations(ops_rx, client.context, "u".to_string());
 
-    // Drain the flood: the ops loop processes all ConnectToPeer ops before
-    // the fence (OwnPrivileges) — poll until the fence is visible. The
-    // sentinel starts as None (not Some(7)): only the ops loop's processing
-    // of the fence op overwrites it, so the poll genuinely waits for the
-    // ops loop to have consumed all preceding ConnectToPeer ops.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        client.context.write().unwrap().own_privileges = None;
-        ops.send(ClientOperation::OwnPrivileges(7)).unwrap();
-        let drained = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while client.context.read().unwrap().own_privileges != Some(7)
-            && std::time::Instant::now() < drained
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if client.context.read().unwrap().own_privileges == Some(7) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ops loop never drained the flood"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    // Give dials a moment to complete, then count the connections we
-    // received. Registered actors (<= max_peers = 8) legitimately connect;
-    // anything far beyond that is orphan dials from refused registrations.
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    let mut connected = 0usize;
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                connected += 1;
-                // Keep the peer side from blocking the actor's read loop
-                // teardown; drop the accepted side, the actor sees EOF/reset.
-                drop(stream);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("unexpected accept error: {e}"),
-        }
-    }
-
-    let bound = 8 + 8; // max_peers + drain slack
+    let status = receiver.recv_timeout(Duration::from_secs(5));
     assert!(
-        connected <= bound,
-        "ConnectToPeer flood produced {connected} dialing actors (bound {bound}): \
-         refused registrations are leaking orphan actor threads"
+        matches!(status, Ok(DownloadStatus::Failed(_))),
+        "the sweep must fail the queued download, got {status:?}"
+    );
+}
+
+#[test]
+fn a_replayed_transfer_response_does_not_start_a_second_transfer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = u32::from(listener.local_addr().unwrap().port());
+
+    let client = Client::new("u", "p");
+    let (sender, _receiver) = mpsc::channel();
+    client.context.write().unwrap().add_download(download(
+        "peer",
+        "f.mp3",
+        9,
+        DownloadStatus::Queued,
+        sender,
+    ));
+
+    let (ops_tx, ops_rx) = mpsc::channel();
+    Client::listen_to_client_operations(ops_rx, client.context, "u".to_string());
+
+    let peer = Peer::new(
+        "peer".to_string(),
+        ConnectionType::F,
+        "127.0.0.1".to_string(),
+        port,
+        None,
+        0,
+        0,
+        0,
+    );
+    ops_tx
+        .send(ClientOperation::DownloadFromPeer(9, peer.clone(), true))
+        .unwrap();
+    ops_tx
+        .send(ClientOperation::DownloadFromPeer(9, peer, true))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut connections = 0;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok(_) => {
+                connections += 1;
+                if connections == 1 {
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if connections >= 1 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        connections, 1,
+        "a replayed TransferResponse must not dial the peer again"
     );
 }

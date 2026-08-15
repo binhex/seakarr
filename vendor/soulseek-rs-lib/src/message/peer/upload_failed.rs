@@ -1,3 +1,4 @@
+use crate::info;
 use crate::{
     message::{Message, MessageHandler},
     peer::PeerMessage,
@@ -11,9 +12,29 @@ impl MessageHandler<PeerMessage> for UploadFailedHandler {
     }
     fn handle(&self, message: &mut Message, sender: Sender<PeerMessage>) {
         let filename = message.read_string();
-        // Forward to the actor so the queued download is failed and the
-        // caller's status channel unblocks (previously this only logged,
-        // leaving the download to hang until the caller's own timeout).
-        let _ = sender.send(PeerMessage::UploadDenied(filename));
+        info!("Upload failed for {}", filename);
+        let _ = sender.send(PeerMessage::UploadFailed(String::new(), filename));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::framed;
+
+    #[test]
+    fn the_failed_filename_is_forwarded() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut message = framed(|m| {
+            m.write_string("@@share\\gone.mp3");
+        });
+
+        UploadFailedHandler.handle(&mut message, tx);
+        match rx.try_recv() {
+            Ok(PeerMessage::UploadFailed(_, filename)) => {
+                assert_eq!(filename, "@@share\\gone.mp3");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
