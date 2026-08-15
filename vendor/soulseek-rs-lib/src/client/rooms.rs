@@ -159,7 +159,8 @@ impl Client {
     pub fn browse_user(&self, username: &str) -> Result<()> {
         let request = crate::message::server::MessageFactory::build_get_share_file_list();
         let (connected, registry) = {
-            let ctx = self.context.read_safe()?;
+            let mut ctx = self.context.write_safe()?;
+            ctx.mark_browse_pending(username);
             (
                 ctx.peer_registry
                     .as_ref()

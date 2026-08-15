@@ -1,25 +1,23 @@
+use crate::info;
 use crate::{
     message::{Message, MessageHandler},
     peer::PeerMessage,
 };
 use std::sync::mpsc::Sender;
 
-/// A peer refusing a queued upload with "UploadDenied" (peer code 50).
-///
-/// The file is no longer shared. Without this handler the refusal is silently
-/// dropped and the queued download hangs until the caller's own timeout; with
-/// it, the download is failed immediately so callers can fall back to the next
-/// candidate.
 pub struct UploadDeniedHandler;
-
 impl MessageHandler<PeerMessage> for UploadDeniedHandler {
     fn get_code(&self) -> u8 {
         50
     }
-
     fn handle(&self, message: &mut Message, sender: Sender<PeerMessage>) {
         let filename = message.read_string();
-        let _ = sender.send(PeerMessage::UploadDenied(filename));
+        let reason = message.read_string();
+        info!("Upload denied for {}: {}", filename, reason);
+        if reason == "Queued" {
+            return;
+        }
+        let _ = sender.send(PeerMessage::UploadFailed(String::new(), filename));
     }
 }
 
@@ -29,19 +27,30 @@ mod tests {
     use crate::message::framed;
 
     #[test]
-    fn parses_filename_and_forwards_denial() {
+    fn a_queued_reason_is_not_a_failure() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut message = framed(|m| {
-            m.write_string("shared\\Artist\\Album\\01 - Track.flac");
+            m.write_string("@@share\\gone.mp3").write_string("Queued");
         });
 
         UploadDeniedHandler.handle(&mut message, tx);
+        assert!(rx.try_recv().is_err());
+    }
 
+    #[test]
+    fn the_denied_filename_is_forwarded() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut message = framed(|m| {
+            m.write_string("@@share\\gone.mp3")
+                .write_string("File not shared.");
+        });
+
+        UploadDeniedHandler.handle(&mut message, tx);
         match rx.try_recv() {
-            Ok(PeerMessage::UploadDenied(filename)) => {
-                assert_eq!(filename, "shared\\Artist\\Album\\01 - Track.flac");
+            Ok(PeerMessage::UploadFailed(_, filename)) => {
+                assert_eq!(filename, "@@share\\gone.mp3");
             }
-            other => panic!("expected UploadDenied, got {other:?}"),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 }

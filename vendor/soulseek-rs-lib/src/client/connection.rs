@@ -46,10 +46,11 @@ impl Client {
             mpsc::channel();
 
         let mut ctx = self.context.write_safe()?;
-        let peer_registry = PeerRegistry::new(
+        let peer_registry = PeerRegistry::with_capacity(
             ctx.actor_system.clone(),
             sender.clone(),
             self.username.clone(),
+            ctx.max_peers.clone(),
         );
         ctx.peer_registry = Some(peer_registry);
 
@@ -171,6 +172,13 @@ impl Client {
         Ok(())
     }
 
+    pub fn set_max_peers(&self, max_peers: usize) {
+        if let Ok(ctx) = self.context.read_safe() {
+            ctx.max_peers
+                .store(max_peers.max(1), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[allow(dead_code)]
     pub fn remove_peer(&self, username: &str) {
         let context = match self.context.read_safe() {
@@ -187,6 +195,44 @@ impl Client {
         }
     }
 
+    pub(crate) fn register_peer_or_fail(
+        client_context: &Arc<RwLock<ClientContext>>,
+        peer: Peer,
+        stream: Option<TcpStream>,
+        reader: Option<crate::message::MessageReader>,
+    ) -> bool {
+        let username = peer.username.clone();
+        let registered = {
+            let context = match client_context.read_safe() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("[client] register peer read: {}", e);
+                    return false;
+                }
+            };
+            if let Some(ref registry) = context.peer_registry {
+                let protected = context.protected_peers();
+                match registry.register_peer_protected(peer, stream, reader, &protected) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(
+                            "[client] refusing peer connection for {:?}: {:?}",
+                            username, e
+                        );
+                        false
+                    }
+                }
+            } else {
+                trace!("PeerRegistry not initialized");
+                false
+            }
+        };
+        if !registered {
+            Self::fail_queued_downloads(client_context, &username);
+        }
+        registered
+    }
+
     pub(crate) fn connect_to_peer(
         peer: Peer,
         client_context: Arc<RwLock<ClientContext>>,
@@ -200,35 +246,7 @@ impl Client {
         );
         match peer.connection_type {
             ConnectionType::P => {
-                let username = peer.username;
-
-                let context = match client_context.read_safe() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("[client] connect_to_peer read: {}", e);
-                        return;
-                    }
-                };
-                if let Some(ref registry) = context.peer_registry {
-                    // Peers connecting without a search token are download
-                    // targets: they must get a slot even when the registry is
-                    // full of search responders inside the grace window.
-                    // Search responders (token Some) use the grace-protected
-                    // path so they aren't evicted before delivering results.
-                    let result = if peer_clone.token.is_some() {
-                        registry.register_search_responder(peer_clone, stream, None)
-                    } else {
-                        registry.register_peer(peer_clone, stream, None)
-                    };
-                    match result {
-                        Ok(_) => (),
-                        Err(e) => {
-                            trace!("Failed to spawn peer actor for {:?}: {:?}", username, e);
-                        }
-                    }
-                } else {
-                    trace!("PeerRegistry not initialized");
-                }
+                Self::register_peer_or_fail(&client_context, peer_clone, stream, None);
             }
 
             ConnectionType::F => {

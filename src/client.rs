@@ -819,17 +819,19 @@ mod real_client_tests {
             "vendored soulseek-rs-lib {version} lacks the GetPeerAddress fix — upgrade to >=11 (v14 verified working)"
         );
 
-        // 3. The vendored registry must carry the peer cap. Deleting the
-        // vendor directory or reverting the registry changes would otherwise
-        // build and pass while reintroducing the thread explosion.
-        let registry_src = std::fs::read_to_string(concat!(
+        // 3. The vendored client must carry the peer cap. In v14.1.0+
+        // the constant lives in client/mod.rs (the registry is capped by
+        // the client's max_peers field). Deleting the vendor directory or
+        // reverting the cap would otherwise build and pass while
+        // reintroducing the thread explosion.
+        let client_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/vendor/soulseek-rs-lib/src/actor/peer_registry.rs"
+            "/vendor/soulseek-rs-lib/src/client/mod.rs"
         ))
-        .expect("vendored peer_registry.rs readable");
+        .expect("vendored client/mod.rs readable");
         assert!(
-            registry_src.contains("DEFAULT_MAX_PEERS"),
-            "vendored peer registry must contain the peer cap"
+            client_src.contains("DEFAULT_MAX_PEERS"),
+            "vendored client must contain the peer cap constant"
         );
     }
 

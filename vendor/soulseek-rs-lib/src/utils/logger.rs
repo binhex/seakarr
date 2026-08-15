@@ -194,16 +194,6 @@ pub fn flush_buffered_logs() {
     }
 }
 
-/// Test-only: drain and return the buffered log lines so tests can assert on
-/// log levels and message content without a configured sink.
-#[cfg(test)]
-pub fn take_buffered_logs() -> Vec<String> {
-    BUFFER
-        .lock()
-        .map(|mut b| std::mem::take(&mut *b))
-        .unwrap_or_default()
-}
-
 #[macro_export]
 macro_rules! error {
     ($($arg:tt)*) => {
