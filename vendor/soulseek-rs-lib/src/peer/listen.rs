@@ -12,7 +12,7 @@ use crate::peer::{ConnectionType, DownloadPeer, Peer};
 use crate::types::Download;
 use crate::utils::lock::RwLockExt;
 use crate::utils::semaphore::{Permit, Semaphore};
-use crate::{DownloadStatus, debug, error, info, trace};
+use crate::{DownloadStatus, debug, error, info, trace, warn};
 
 /// How long to wait before accepting again after a failure.
 ///
@@ -104,6 +104,9 @@ fn extract_download_from_buffer(
     peer_port: u16,
 ) -> Option<Download> {
     if reader.buffer_len() == 0 {
+        warn!(
+            "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: reader buffer empty, no transfer token available"
+        );
         return None;
     }
     let buffer = reader.get_buffer();
@@ -124,9 +127,9 @@ fn extract_download_from_buffer(
 
     if download.is_none() {
         let download_tokens = context.get_download_tokens();
-        trace!(
-            "[listener:{peer_ip}:{peer_port}] download token not found: {:?}, download tokens: {:?}",
-            token, download_tokens
+        warn!(
+            "[listener:{peer_ip}:{peer_port}] download token not found: {token}, available tokens: {:?}",
+            download_tokens
         );
     }
 

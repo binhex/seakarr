@@ -289,6 +289,15 @@ impl RealClient {
             .cloned()
             .ok_or_else(|| SeakarrError::Client("not connected: call login() first".into()))
     }
+
+    /// Set the maximum number of simultaneous peer connections.
+    /// Delegates to the vendored library's `Client::set_max_peers` which
+    /// enforces a floor of 1.
+    pub async fn set_max_peers(&self, max_peers: usize) -> Result<()> {
+        let client = self.connected_client().await?;
+        client.set_max_peers(max_peers);
+        Ok(())
+    }
 }
 
 impl Default for RealClient {
@@ -448,7 +457,7 @@ fn forward_transfer_status(
                         }
                     }
                 } else {
-                    tracing::info!("Bridge status for {safe_filename}: {status:?}");
+                    tracing::debug!("Bridge status for {safe_filename}: {status:?}");
                 }
                 if forward_cancelled.load(Ordering::SeqCst) {
                     break;
@@ -633,6 +642,9 @@ impl SoulseekClient for RealClient {
                 &forward_cancelled,
                 interactive,
                 &bridge_filename,
+            );
+            tracing::info!(
+                "Bridge finished for {bridge_filename} from {bridge_username}, removing download"
             );
             let _ = bridge_client.remove_download(&bridge_username, &bridge_filename);
         });
