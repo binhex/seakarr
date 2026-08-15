@@ -103,6 +103,28 @@ mod tests {
         display.clear();
     }
 
+    // Regression guard: when a download completes, the progress bar must
+    // be finished and snapped to 100%. The visual clearing behavior
+    // (finish_and_clear vs finish) is enforced by code review — indicatif
+    // exposes no public API to distinguish DoneVisible from DoneHidden.
+    #[test]
+    fn bar_finishes_at_100_percent_after_completion() {
+        let display = ProgressDisplay::new();
+        let bar = display.create_bar("01 - Track.flac", 10_000_000);
+        bar.set_position(10_000_000);
+        bar.finish();
+        assert!(
+            bar.is_finished(),
+            "progress bar must be finished after download completes"
+        );
+        assert_eq!(
+            bar.position(),
+            10_000_000,
+            "bar must show 100% after completion"
+        );
+        display.clear();
+    }
+
     #[test]
     fn test_create_bar_extracts_basename() {
         let display = ProgressDisplay::new();

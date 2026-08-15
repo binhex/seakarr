@@ -261,12 +261,13 @@ async fn download_once(
             }
             Ok(Some(DownloadStatus::Completed)) => {
                 if let Some(bar) = &bar {
-                    // Snap to 100% before finishing — the final InProgress
-                    // may have left the bar below the total. finish()
-                    // keeps the final frame visible (cleared by the
-                    // runner's p.clear() at end of run).
+                    // Snap to 100% before clearing — the final InProgress
+                    // may have left the bar below the total.
+                    // finish_and_clear() removes the bar from the terminal
+                    // so the next track starts with a single bar (no
+                    // "double progress bar" effect).
                     bar.set_position(last_total_bytes);
-                    bar.finish();
+                    bar.finish_and_clear();
                 }
                 let dest = dir.join(basename);
                 tracing::info!("Download completed: {basename}");
