@@ -50,9 +50,9 @@ pub struct PeerRegistry {
 /// The Soulseek server pushes a ConnectToPeer for every search-result peer
 /// (hundreds per search), and each peer owns an OS thread for its lifetime;
 /// an unbounded registry flooded the process with threads and killed the ops
-/// loop. 16 is enough for the peers a client actually transfers with while
-/// keeping the thread count sane.
-pub const DEFAULT_MAX_PEERS: usize = 16;
+/// loop. 32 gives enough headroom for busy searches while keeping the thread
+/// count well within safe bounds (32 × 256 KB stack = 8 MB total).
+pub const DEFAULT_MAX_PEERS: usize = 32;
 
 impl PeerRegistry {
     #[must_use]
