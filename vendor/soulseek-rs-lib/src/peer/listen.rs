@@ -103,9 +103,20 @@ fn extract_download_from_buffer(
     peer_ip: &str,
     peer_port: u16,
 ) -> Option<Download> {
+    trace!(
+        "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer called, buffer_len={}",
+        reader.buffer_len()
+    );
     if reader.buffer_len() == 0 {
         warn!(
             "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: reader buffer empty, no transfer token available"
+        );
+        return None;
+    }
+    if reader.buffer_len() < 4 {
+        warn!(
+            "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: buffer has {} byte(s), need 4 for transfer token — partial data",
+            reader.buffer_len()
         );
         return None;
     }
@@ -130,6 +141,10 @@ fn extract_download_from_buffer(
         warn!(
             "[listener:{peer_ip}:{peer_port}] download token not found: {token}, available tokens: {:?}",
             download_tokens
+        );
+    } else {
+        trace!(
+            "[listener:{peer_ip}:{peer_port}] extract_download_from_buffer: found download for token {token}"
         );
     }
 
@@ -171,12 +186,57 @@ fn handle_file_connection(
         token, peer
     );
 
+    debug!(
+        "[listener:{peer_ip}:{peer_port}] handle_file_connection: calling extract_download_from_buffer, reader buffer_len={}",
+        reader.buffer_len()
+    );
+    // If the reader buffer is empty (or has < 4 bytes), the transfer token
+    // hasn't arrived yet — the PeerInit handshake was read in a previous
+    // step, but the token arrives in a separate TCP segment. Wait for it
+    // before looking up the download; otherwise the lookup returns None and
+    // the download fails with "Download info missing for token".
+    let mut stream = stream;
+    let token_read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while reader.buffer_len() < 4 {
+        if std::time::Instant::now() >= token_read_deadline {
+            warn!(
+                "[listener:{peer_ip}:{peer_port}] timed out waiting for transfer token (have {} bytes, need 4)",
+                reader.buffer_len()
+            );
+            break;
+        }
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .ok();
+        match reader.read_from_socket(&mut stream) {
+            Ok(()) => {
+                trace!(
+                    "[listener:{peer_ip}:{peer_port}] read {} bytes for transfer token",
+                    reader.buffer_len()
+                );
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No data yet, loop will retry
+            }
+            Err(e) => {
+                warn!("[listener:{peer_ip}:{peer_port}] error reading transfer token: {e}");
+                break;
+            }
+        }
+    }
     let download = extract_download_from_buffer(
         &mut reader,
         &context.client_context,
         &peer.username,
         peer_ip,
         peer_port,
+    );
+    debug!(
+        "[listener:{peer_ip}:{peer_port}] handle_file_connection: extract_download_from_buffer returned download.is_some()={}",
+        download.is_some()
     );
     let failure_token = download.as_ref().map(|d| d.token);
 
