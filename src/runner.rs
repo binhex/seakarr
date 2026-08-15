@@ -118,6 +118,8 @@ pub async fn process_album(
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let mut total_users = results.len();
     let mut filtered = filter::filter_results(&results, &config.filters, library_track_count);
+    // Track which results were last filtered (for rejection summary)
+    let mut last_filtered_results: Vec<crate::client::SearchResult> = results.clone();
     // Title-search fallback: when the primary search returned no usable results
     // by the cleaned title of the album's alphabetically-first library track
     // and keep only results containing the album's library track titles.
@@ -154,6 +156,7 @@ pub async fn process_album(
                                     &config.filters,
                                     library_track_count,
                                 );
+                                last_filtered_results = title_results.clone();
                             }
                             let title_duration_ms = title_start.elapsed().as_millis() as u64;
                             if let Err(e) = search::record_search(
@@ -208,10 +211,16 @@ pub async fn process_album(
         } else {
             ""
         };
+        let rejection_summary = filter::summarize_rejections(
+            &last_filtered_results,
+            &config.filters,
+            library_track_count,
+        );
         tracing::info!(
-            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot{contiguity_note})",
+            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot{contiguity_note})\n  → {}",
             album.unwrap_or("(all)"),
             config.filters.allowed_extensions,
+            rejection_summary.summary_line(),
         );
         if let Some(a) = album {
             db.mark_album_processed(artist, a, "failed")?;

@@ -828,3 +828,328 @@ mod tests {
         );
     }
 }
+
+/// Summary of why results were rejected by the filter.
+/// Used for concise log messages showing the primary rejection reason(s).
+#[derive(Debug, Default, Clone)]
+pub struct FilterRejectionSummary {
+    /// Files rejected because extension not in allowed_extensions
+    pub extension_rejected: usize,
+    /// Most common extension among extension-rejected files
+    pub most_common_rejected_ext: String,
+    /// Results rejected because no free upload slots
+    pub no_free_slots: usize,
+    /// Results rejected because track numbers aren't contiguous
+    pub non_contiguous: usize,
+    /// Results rejected because below min_tracks
+    pub below_min_tracks: usize,
+    /// Files rejected by bitrate check
+    pub bitrate_rejected: usize,
+    /// Files rejected by excluded words
+    pub words_rejected: usize,
+}
+
+impl FilterRejectionSummary {
+    /// Returns true if there were any rejections.
+    pub fn has_rejections(&self) -> bool {
+        self.extension_rejected > 0
+            || self.no_free_slots > 0
+            || self.non_contiguous > 0
+            || self.below_min_tracks > 0
+            || self.bitrate_rejected > 0
+            || self.words_rejected > 0
+    }
+
+    /// Returns a concise one-line summary for logging.
+    /// Example: "rejected: 93 not in [flac] (mostly: mp3), 5 no free slots"
+    pub fn summary_line(&self) -> String {
+        let mut parts = Vec::new();
+        if self.extension_rejected > 0 {
+            let ext_info = if !self.most_common_rejected_ext.is_empty() {
+                format!(" (mostly: {})", self.most_common_rejected_ext)
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "{} not in allowed formats{}",
+                self.extension_rejected, ext_info
+            ));
+        }
+        if self.no_free_slots > 0 {
+            parts.push(format!("{} no free slots", self.no_free_slots));
+        }
+        if self.non_contiguous > 0 {
+            parts.push(format!("{} non-contiguous tracks", self.non_contiguous));
+        }
+        if self.below_min_tracks > 0 {
+            parts.push(format!("{} below min tracks", self.below_min_tracks));
+        }
+        if self.bitrate_rejected > 0 {
+            parts.push(format!("{} below min bitrate", self.bitrate_rejected));
+        }
+        if self.words_rejected > 0 {
+            parts.push(format!("{} excluded words", self.words_rejected));
+        }
+        if parts.is_empty() {
+            "no rejections".to_string()
+        } else {
+            format!("rejected: {}", parts.join(", "))
+        }
+    }
+}
+
+/// Analyze why results were rejected without re-running the full filter.
+/// Returns a summary of rejection reasons across all results.
+pub fn summarize_rejections(
+    results: &[SearchResult],
+    config: &FilterConfig,
+    _library_track_count: Option<usize>,
+) -> FilterRejectionSummary {
+    let mut summary = FilterRejectionSummary::default();
+    let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for r in results {
+        // Slot check
+        if r.slots == 0 {
+            summary.no_free_slots += 1;
+            continue;
+        }
+
+        // Count files passing extension check
+        let mut passing_files = Vec::new();
+        for f in &r.files {
+            let ext = f.name.rsplit('.').next().unwrap_or("").to_lowercase();
+            if !config
+                .allowed_extensions
+                .iter()
+                .any(|e| e.to_lowercase() == ext)
+            {
+                summary.extension_rejected += 1;
+                *ext_counts.entry(ext.clone()).or_insert(0) += 1;
+                continue;
+            }
+            // Bitrate check
+            if let Some(min_br) = config.min_bitrate {
+                match f.attribs.get(&0) {
+                    None => {
+                        summary.bitrate_rejected += 1;
+                        continue;
+                    }
+                    Some(&file_br) if file_br < min_br => {
+                        summary.bitrate_rejected += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // Excluded words
+            let lower_name = f.name.to_lowercase();
+            if config
+                .exclude_words
+                .iter()
+                .any(|w| lower_name.contains(&w.to_lowercase()))
+            {
+                summary.words_rejected += 1;
+                continue;
+            }
+            passing_files.push(f);
+        }
+
+        // Min tracks check
+        if (passing_files.len() as u32) < config.min_tracks {
+            summary.below_min_tracks += 1;
+            continue;
+        }
+
+        // Contiguity check (only if enabled and we have files)
+        if config.contiguous_tracks
+            && !passing_files.is_empty()
+            && !crate::tracks::files_have_contiguous_tracks(&passing_files)
+        {
+            summary.non_contiguous += 1;
+            continue;
+        }
+    }
+
+    // Find most common rejected extension
+    if let Some((ext, _)) = ext_counts.iter().max_by_key(|(_, &count)| count) {
+        summary.most_common_rejected_ext = ext.clone();
+    }
+
+    summary
+}
+
+#[cfg(test)]
+mod rejection_summary_tests {
+    use super::*;
+    use crate::client::{FileInfo, SearchResult};
+    use crate::config::FilterConfig;
+    use std::collections::HashMap;
+
+    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
+        let mut attribs = HashMap::new();
+        attribs.insert(0, bitrate);
+        FileInfo {
+            name: name.into(),
+            size,
+            attribs,
+        }
+    }
+
+    fn make_result(username: &str, speed: u32, slots: u8, files: Vec<FileInfo>) -> SearchResult {
+        SearchResult {
+            username: username.into(),
+            speed,
+            slots,
+            files,
+        }
+    }
+
+    fn default_filter_config() -> FilterConfig {
+        FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 3,
+            peer_track_count: false,
+        }
+    }
+
+    #[test]
+    fn test_summary_extension_rejected() {
+        let cfg = default_filter_config();
+        let results = vec![
+            make_result(
+                "user1",
+                500,
+                1,
+                vec![
+                    make_file("01 - track.mp3", 320, 10_000_000),
+                    make_file("02 - track.mp3", 320, 10_000_000),
+                    make_file("03 - track.mp3", 320, 10_000_000),
+                ],
+            ),
+            make_result(
+                "user2",
+                400,
+                1,
+                vec![
+                    make_file("01 - track.mp3", 320, 10_000_000),
+                    make_file("02 - track.mp3", 320, 10_000_000),
+                    make_file("03 - track.mp3", 320, 10_000_000),
+                ],
+            ),
+        ];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(summary.has_rejections());
+        assert_eq!(summary.extension_rejected, 6);
+        assert_eq!(summary.most_common_rejected_ext, "mp3");
+        assert!(summary
+            .summary_line()
+            .contains("6 not in allowed formats (mostly: mp3)"));
+    }
+
+    #[test]
+    fn test_summary_no_free_slots() {
+        let cfg = default_filter_config();
+        let results = vec![
+            make_result(
+                "user1",
+                500,
+                0,
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
+            ),
+            make_result(
+                "user2",
+                400,
+                0,
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
+            ),
+        ];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(summary.has_rejections());
+        assert_eq!(summary.no_free_slots, 2);
+        assert!(summary.summary_line().contains("2 no free slots"));
+    }
+
+    #[test]
+    fn test_summary_non_contiguous() {
+        let cfg = FilterConfig {
+            contiguous_tracks: true,
+            min_tracks: 1,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(summary.has_rejections());
+        assert_eq!(summary.non_contiguous, 1);
+        assert!(summary.summary_line().contains("1 non-contiguous tracks"));
+    }
+
+    #[test]
+    fn test_summary_mixed_rejections() {
+        let cfg = default_filter_config();
+        let results = vec![
+            make_result(
+                "mp3-user",
+                500,
+                1,
+                vec![
+                    make_file("01 - track.mp3", 320, 10_000_000),
+                    make_file("02 - track.mp3", 320, 10_000_000),
+                    make_file("03 - track.mp3", 320, 10_000_000),
+                ],
+            ),
+            make_result(
+                "no-slots",
+                400,
+                0,
+                vec![make_file("01 - track.flac", 900, 30_000_000)],
+            ),
+        ];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(summary.has_rejections());
+        assert_eq!(summary.extension_rejected, 3);
+        assert_eq!(summary.no_free_slots, 1);
+        let line = summary.summary_line();
+        assert!(line.contains("3 not in allowed formats"));
+        assert!(line.contains("1 no free slots"));
+    }
+
+    #[test]
+    fn test_summary_no_rejections() {
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - A.flac", 900, 30_000_000),
+                make_file("02 - B.flac", 900, 30_000_000),
+                make_file("03 - C.flac", 900, 30_000_000),
+            ],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(!summary.has_rejections());
+        assert_eq!(summary.summary_line(), "no rejections");
+    }
+
+    #[test]
+    fn test_summary_empty_results() {
+        let cfg = default_filter_config();
+        let results: Vec<SearchResult> = vec![];
+        let summary = summarize_rejections(&results, &cfg, None);
+        assert!(!summary.has_rejections());
+    }
+}
