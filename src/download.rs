@@ -130,6 +130,24 @@ pub async fn download_file(
     Err(last_err.unwrap())
 }
 
+/// Update an exponential moving average (EMA) with a new sample.
+///
+/// Returns the updated EMA value. On the first call (`current` is `None`),
+/// the new value is returned unsmoothed.
+///
+/// `alpha` controls responsiveness vs. smoothness:
+/// - Higher alpha (e.g. 0.5) → faster response to real changes
+/// - Lower alpha (e.g. 0.2) → smoother but slower to react
+/// - Typical for speed display: 0.3 (responds within ~3-4 updates)
+const SPEED_EMA_ALPHA: f64 = 0.3;
+
+fn ema_update(current: Option<f64>, new_value: f64, alpha: f64) -> f64 {
+    match current {
+        Some(prev) => alpha * new_value + (1.0 - alpha) * prev,
+        None => new_value,
+    }
+}
+
 /// Single download attempt for `download_file` (no retry loop). Queues the
 /// transfer and polls status until success, failure, timeout, or cancel.
 /// The `basename` parameter must be pre-validated by the caller.
@@ -159,6 +177,10 @@ async fn download_once(
     // Track the peer's reported total so the bar can be snapped to 100%
     // on completion (the final InProgress may lag the actual end).
     let mut last_total_bytes: u64 = 0;
+    // Exponential moving average of the transfer speed. Smooths out
+    // the raw instantaneous speed_bytes_per_sec from each InProgress
+    // status so the displayed speed doesn't jump around.
+    let mut speed_ema: Option<f64> = None;
     // Wall-clock deadline for the entire transfer — reset on every status
     // message. With 1-second polling, Err(_elapsed) fires every second;
     // only trigger timeout when the deadline is truly exceeded.
@@ -228,10 +250,13 @@ async fn download_once(
                         }
                     }
                 }
-                // Update progress bar if present
+                // Update progress bar if present — use EMA-smoothed
+                // speed for display so it doesn't jump around.
+                let smoothed = ema_update(speed_ema, speed_bytes_per_sec as f64, SPEED_EMA_ALPHA);
+                speed_ema = Some(smoothed);
                 if let Some(bar) = &bar {
                     bar.set_position(bytes_downloaded);
-                    bar.set_prefix(format_speed(speed_bytes_per_sec));
+                    bar.set_prefix(format_speed(smoothed as u64));
                 }
             }
             Ok(Some(DownloadStatus::Completed)) => {
@@ -467,6 +492,63 @@ mod tests {
             min_tracks: 0,
             ..FilterConfig::default()
         }
+    }
+
+    // EMA (exponential moving average) tests — verifies the smoothing
+    // function used for speed display.
+
+    #[test]
+    fn ema_first_sample_returns_raw_value() {
+        // First call: no smoothing, return the raw value.
+        let result = ema_update(None, 1_000_000.0, 0.3);
+        assert_eq!(result, 1_000_000.0);
+    }
+
+    #[test]
+    fn ema_smooths_second_sample() {
+        // Second call: EMA = alpha * new + (1 - alpha) * prev
+        // 0.3 * 2_000_000 + 0.7 * 1_000_000 = 600_000 + 700_000 = 1_300_000
+        let result = ema_update(Some(1_000_000.0), 2_000_000.0, 0.3);
+        assert!(
+            (result - 1_300_000.0).abs() < 0.01,
+            "expected ~1_300_000, got {result}"
+        );
+    }
+
+    #[test]
+    fn ema_converges_to_steady_state() {
+        // Seed from 0 and feed the target repeatedly — EMA should converge.
+        let alpha = 0.3;
+        let target = 1_000_000.0;
+        let mut ema = ema_update(None, 0.0, alpha); // start from 0
+        for _ in 0..50 {
+            ema = ema_update(Some(ema), target, alpha);
+        }
+        // After 50 iterations with alpha=0.3, the residual from the
+        // initial 0 is (0.7)^50 ≈ 1.8e-8 — negligible.
+        assert!((ema - target).abs() < 1.0, "expected ~{target}, got {ema}");
+    }
+
+    #[test]
+    fn ema_smooths_out_spikes() {
+        // A single spike should be smoothed significantly.
+        let alpha = 0.3;
+        let mut ema = ema_update(None, 1_000_000.0, alpha);
+        // Spike: 10x normal speed
+        ema = ema_update(Some(ema), 10_000_000.0, alpha);
+        // EMA should be much less than the spike:
+        // 0.3 * 10_000_000 + 0.7 * 1_000_000 = 3_000_000 + 700_000 = 3_700_000
+        assert!(
+            (ema - 3_700_000.0).abs() < 0.01,
+            "expected ~3_700_000, got {ema}"
+        );
+        // Next reading back to normal:
+        ema = ema_update(Some(ema), 1_000_000.0, alpha);
+        // 0.3 * 1_000_000 + 0.7 * 3_700_000 = 300_000 + 2_590_000 = 2_890_000
+        assert!(
+            (ema - 2_890_000.0).abs() < 0.01,
+            "expected ~2_890_000, got {ema}"
+        );
     }
 
     /// A client whose download status channel the test drives manually, so
