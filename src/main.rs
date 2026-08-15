@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long)]
     soulseek_password: Option<String>,
 
+    /// Override incoming peer port (0 disables listener)
+    #[arg(long)]
+    listen_port: Option<u16>,
+
     /// Override search mode (auto|manual|batch)
     #[arg(long)]
     mode: Option<String>,
@@ -112,6 +116,7 @@ async fn run() -> Result<()> {
         library_path: cli.library_path.clone(),
         soulseek_user: cli.soulseek_user.clone(),
         soulseek_password: cli.soulseek_password.clone(),
+        listen_port: cli.listen_port,
         mode: cli.mode.clone(),
         batch_file: cli.batch_file.as_ref().map(|p| p.to_string_lossy().into()),
         artist: cli.artist.clone(),

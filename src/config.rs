@@ -187,6 +187,7 @@ pub struct CliOverrides {
     pub library_path: Option<Vec<String>>,
     pub soulseek_user: Option<String>,
     pub soulseek_password: Option<String>,
+    pub listen_port: Option<u16>,
     pub mode: Option<String>,
     pub batch_file: Option<String>,
     pub artist: Option<String>,
@@ -422,6 +423,9 @@ impl Config {
         }
         if let Some(ref v) = cli.soulseek_password {
             self.soulseek.password = v.clone();
+        }
+        if let Some(port) = cli.listen_port {
+            self.soulseek.listen_port = port;
         }
         if let Some(ref v) = cli.mode {
             self.search.default_mode = v.clone();
@@ -865,6 +869,7 @@ soulseek:
             db_path: Some("/custom/db".into()),
             library_path: Some(vec!["/other/music".into()]),
             soulseek_user: Some("overrideuser".into()),
+            listen_port: Some(8080),
             ..Default::default()
         };
 
@@ -873,6 +878,7 @@ soulseek:
         assert_eq!(config.database.path, "/custom/db");
         assert_eq!(config.library.paths, vec!["/other/music"]);
         assert_eq!(config.soulseek.username, "overrideuser");
+        assert_eq!(config.soulseek.listen_port, 8080);
         // Non-overridden values stay from YAML
         assert_eq!(config.download.concurrent, 5);
     }
