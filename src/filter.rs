@@ -843,6 +843,8 @@ pub struct FilterRejectionSummary {
     pub non_contiguous: usize,
     /// Results rejected because below min_tracks
     pub below_min_tracks: usize,
+    /// Results rejected because fewer tracks than library (peer_track_count)
+    pub peer_track_count_rejected: usize,
     /// Files rejected by bitrate check
     pub bitrate_rejected: usize,
     /// Files rejected by excluded words
@@ -856,6 +858,7 @@ impl FilterRejectionSummary {
             || self.no_free_slots > 0
             || self.non_contiguous > 0
             || self.below_min_tracks > 0
+            || self.peer_track_count_rejected > 0
             || self.bitrate_rejected > 0
             || self.words_rejected > 0
     }
@@ -866,7 +869,13 @@ impl FilterRejectionSummary {
         let mut parts = Vec::new();
         if self.extension_rejected > 0 {
             let ext_info = if !self.most_common_rejected_ext.is_empty() {
-                format!(" (mostly: {})", self.most_common_rejected_ext)
+                // Sanitize extension for safe logging (strip control chars)
+                let safe_ext: String = self
+                    .most_common_rejected_ext
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
+                format!(" (mostly: {})", safe_ext)
             } else {
                 String::new()
             };
@@ -876,19 +885,41 @@ impl FilterRejectionSummary {
             ));
         }
         if self.no_free_slots > 0 {
-            parts.push(format!("{} no free slots", self.no_free_slots));
+            parts.push(format!(
+                "{} no free slot{}",
+                self.no_free_slots,
+                if self.no_free_slots == 1 { "" } else { "s" }
+            ));
         }
         if self.non_contiguous > 0 {
-            parts.push(format!("{} non-contiguous tracks", self.non_contiguous));
+            parts.push(format!(
+                "{} non-contiguous track{}",
+                self.non_contiguous,
+                if self.non_contiguous == 1 { "" } else { "s" }
+            ));
         }
         if self.below_min_tracks > 0 {
-            parts.push(format!("{} below min tracks", self.below_min_tracks));
+            parts.push(format!(
+                "{} below min track{}",
+                self.below_min_tracks,
+                if self.below_min_tracks == 1 { "" } else { "s" }
+            ));
+        }
+        if self.peer_track_count_rejected > 0 {
+            parts.push(format!(
+                "{} below library track count",
+                self.peer_track_count_rejected
+            ));
         }
         if self.bitrate_rejected > 0 {
             parts.push(format!("{} below min bitrate", self.bitrate_rejected));
         }
         if self.words_rejected > 0 {
-            parts.push(format!("{} excluded words", self.words_rejected));
+            parts.push(format!(
+                "{} excluded word{}",
+                self.words_rejected,
+                if self.words_rejected == 1 { "" } else { "s" }
+            ));
         }
         if parts.is_empty() {
             "no rejections".to_string()
@@ -903,10 +934,11 @@ impl FilterRejectionSummary {
 pub fn summarize_rejections(
     results: &[SearchResult],
     config: &FilterConfig,
-    _library_track_count: Option<usize>,
+    library_track_count: Option<usize>,
 ) -> FilterRejectionSummary {
     let mut summary = FilterRejectionSummary::default();
-    let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ext_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
 
     for r in results {
         // Slot check
@@ -918,6 +950,10 @@ pub fn summarize_rejections(
         // Count files passing extension check
         let mut passing_files = Vec::new();
         for f in &r.files {
+            // Unsafe basename check (matches filter_results logic)
+            if crate::download::safe_basename(&f.name).is_err() {
+                continue;
+            }
             let ext = f.name.rsplit('.').next().unwrap_or("").to_lowercase();
             if !config
                 .allowed_extensions
@@ -955,19 +991,30 @@ pub fn summarize_rejections(
             passing_files.push(f);
         }
 
-        // Min tracks check
-        if (passing_files.len() as u32) < config.min_tracks {
+        // Min tracks check (mirror filter_results: min_tracks=0 still
+        // enforces floor of1 for zero-passing-file rejection)
+        let min = config.min_tracks.max(1) as usize;
+        if passing_files.len() < min {
             summary.below_min_tracks += 1;
             continue;
         }
 
         // Contiguity check (only if enabled and we have files)
+        // — matches filter_results check order (contiguity before library gate)
         if config.contiguous_tracks
             && !passing_files.is_empty()
             && !crate::tracks::files_have_contiguous_tracks(&passing_files)
         {
             summary.non_contiguous += 1;
             continue;
+        }
+
+        // Library track count check (auto mode only)
+        if let Some(lib_count) = library_track_count {
+            if config.peer_track_count && passing_files.len() < lib_count {
+                summary.peer_track_count_rejected += 1;
+                continue;
+            }
         }
     }
 
@@ -1094,7 +1141,7 @@ mod rejection_summary_tests {
         let summary = summarize_rejections(&results, &cfg, None);
         assert!(summary.has_rejections());
         assert_eq!(summary.non_contiguous, 1);
-        assert!(summary.summary_line().contains("1 non-contiguous tracks"));
+        assert!(summary.summary_line().contains("1 non-contiguous track"));
     }
 
     #[test]
@@ -1124,7 +1171,7 @@ mod rejection_summary_tests {
         assert_eq!(summary.no_free_slots, 1);
         let line = summary.summary_line();
         assert!(line.contains("3 not in allowed formats"));
-        assert!(line.contains("1 no free slots"));
+        assert!(line.contains("1 no free slot"));
     }
 
     #[test]
@@ -1150,6 +1197,62 @@ mod rejection_summary_tests {
         let cfg = default_filter_config();
         let results: Vec<SearchResult> = vec![];
         let summary = summarize_rejections(&results, &cfg, None);
+        assert!(!summary.has_rejections());
+    }
+
+    #[test]
+    fn test_summary_peer_track_count_rejected() {
+        // Library has 5 tracks, peer has 3 → peer_track_count gate rejects.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        )];
+        let summary = summarize_rejections(&results, &cfg, Some(5));
+        assert!(summary.has_rejections());
+        assert_eq!(summary.peer_track_count_rejected, 1);
+        assert!(summary.summary_line().contains("below library track count"));
+    }
+
+    #[test]
+    fn test_summary_peer_track_count_disabled() {
+        // Library has 5 tracks, peer has 3, but peer_track_count=false → passes.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: false,
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("01 - track.flac", 900, 10_000_000),
+                make_file("02 - track.flac", 900, 10_000_000),
+                make_file("03 - track.flac", 900, 10_000_000),
+            ],
+        )];
+        let summary = summarize_rejections(&results, &cfg, Some(5));
         assert!(!summary.has_rejections());
     }
 }

@@ -125,6 +125,9 @@ pub async fn process_album(
     // and keep only results containing the album's library track titles.
     // Only fires when the local library holds the album (enabling the title
     // list), the title search is enabled, and an album is being processed.
+    // Track whether the title-search tier actually fired
+    let mut title_search_attempted = false;
+
     if filtered.is_empty()
         && config.search.search_title_match > 0
         && !config.library.paths.is_empty()
@@ -134,6 +137,7 @@ pub async fn process_album(
         if let Some(album_name) = album {
             match search::get_library_track_filenames(&config.library.paths, artist, album_name) {
                 Ok(lib_filenames) if !lib_filenames.is_empty() => {
+                    title_search_attempted = true;
                     let title_start = std::time::Instant::now();
                     match search::search_by_title(
                         client,
@@ -190,7 +194,7 @@ pub async fn process_album(
     if filtered.is_empty() {
         if results.is_empty() {
             // Every search tier came up empty.
-            let tried_suffix = if config.search.search_title_match > 0 {
+            let tried_suffix = if title_search_attempted {
                 " (tried: primary, title-search)"
             } else {
                 ""
@@ -199,6 +203,21 @@ pub async fn process_album(
                 "No results for {artist} — {}{tried_suffix}",
                 album.unwrap_or("(all)")
             );
+            // If the title tier ran and found results that were rejected
+            // by filters, print a rejection summary so the user knows WHY.
+            if title_search_attempted && !last_filtered_results.is_empty() {
+                let rejection_summary = filter::summarize_rejections(
+                    &last_filtered_results,
+                    &config.filters,
+                    library_track_count,
+                );
+                if rejection_summary.has_rejections() {
+                    tracing::info!(
+                        "  → {} (title-search results)",
+                        rejection_summary.summary_line(),
+                    );
+                }
+            }
             if let Some(a) = album {
                 db.mark_album_processed(artist, a, "failed")?;
             }
