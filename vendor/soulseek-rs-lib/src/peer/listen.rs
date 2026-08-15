@@ -11,7 +11,7 @@ use crate::message::{Message, MessageReader};
 use crate::peer::{ConnectionType, DownloadPeer, Peer};
 use crate::types::Download;
 use crate::utils::lock::RwLockExt;
-use crate::{DownloadStatus, debug, error, info, trace};
+use crate::{DownloadStatus, debug, error, info, trace, warn};
 
 /// How long to wait before accepting again after a failure.
 ///
@@ -151,7 +151,12 @@ fn handle_peer_connection(
         match result {
             Ok(_) => true,
             Err(e) => {
-                error!(
+                // A refusal is a capacity decision (registry full, all peers
+                // inside the eviction grace window), not a malfunction — the
+                // outbound path logs the identical condition at trace!. Log
+                // at WARN so users aren't misled into thinking the listener
+                // is broken under heavy search load.
+                warn!(
                     "Failed to spawn peer actor for {:?}: {:?}",
                     peer.username, e
                 );
@@ -442,5 +447,92 @@ impl Listen {
             // else — a wedged accept loop makes us unreachable to every peer.
             thread::spawn(move || handle_incoming_connection(stream, context));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::ActorSystem;
+    use crate::actor::peer_registry::PeerRegistry;
+    use crate::client::{ClientContext, ClientOperation};
+    use crate::utils::logger;
+
+    /// A connected loopback TcpStream (peer side of a connection).
+    fn peer_stream() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let _server = listener.accept().unwrap().0;
+        stream
+    }
+
+    // Regression: refusing a peer because the registry is at capacity with
+    // every entry inside the eviction grace period is a normal capacity
+    // decision, not a malfunction. The listener must log it at WARN — the
+    // outbound path (connection.rs) logs the identical refusal at trace! —
+    // so users aren't misled into thinking something is broken.
+    #[test]
+    fn capacity_refusal_is_logged_at_warn_not_error() {
+        let system = Arc::new(ActorSystem::new());
+        let (tx, _rx) = std::sync::mpsc::channel::<ClientOperation>();
+        let registry = PeerRegistry::with_max_peers(system, tx.clone(), "me".to_string(), 1);
+
+        // Fill the single slot inside the grace window so the next search
+        // responder is refused.
+        let filler = Peer::new(
+            "filler".to_string(),
+            ConnectionType::P,
+            "127.0.0.1".to_string(),
+            1234,
+            None,
+            0,
+            0,
+            0,
+        );
+        registry
+            .register_peer(filler, Some(peer_stream()), None)
+            .expect("first registration must succeed");
+
+        let mut client_context = ClientContext::new();
+        client_context.peer_registry = Some(registry);
+        let ctx = ConnectionContext {
+            client_sender: tx,
+            client_context: Arc::new(RwLock::new(client_context)),
+            own_username: "me".to_string(),
+        };
+
+        // Drain any prior buffered lines, then capture this refusal.
+        logger::enable_buffering();
+        let _ = logger::take_buffered_logs();
+
+        let refused = Peer::new(
+            "refused-peer".to_string(),
+            ConnectionType::P,
+            "127.0.0.1".to_string(),
+            5678,
+            Some(42), // search responder: grace-protected path -> refused
+            0,
+            0,
+            0,
+        );
+        let accepted = handle_peer_connection(refused, peer_stream(), MessageReader::new(), &ctx);
+        assert!(!accepted, "capacity refusal must reject the peer");
+
+        let logs = logger::take_buffered_logs();
+        let refusal_line = logs
+            .iter()
+            .find(|l| l.contains("Failed to spawn peer actor") && l.contains("refused-peer"))
+            .expect("capacity refusal must produce a log line");
+
+        assert!(
+            !refusal_line.contains("ERROR"),
+            "capacity refusal must not be logged as ERROR: {refusal_line:?}"
+        );
+        assert!(
+            refusal_line.contains("WARN"),
+            "capacity refusal should be logged as WARN: {refusal_line:?}"
+        );
     }
 }
