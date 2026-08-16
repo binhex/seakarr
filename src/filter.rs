@@ -1,5 +1,6 @@
 use crate::client::{FileInfo, SearchResult};
 use crate::config::FilterConfig;
+use unicode_normalization::UnicodeNormalization;
 
 /// Filter search results by extension, bitrate, excluded words, free slots,
 /// minimum track count (`min_tracks`), contiguous track numbers (when
@@ -7,14 +8,31 @@ use crate::config::FilterConfig;
 /// count (`peer_track_count`): results whose usable track count is below the
 /// library's existing track count are rejected. Returns only results with at
 /// least `min_tracks` matching files (or at least one when `min_tracks` is 0).
+///
+/// When `album` is `Some`, results whose file paths do not contain the album
+/// name as whole words are also rejected (primary artist+album search tier).
+/// The track-name fallback tier passes `None` so it is never album-gated.
 pub fn filter_results(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
+    album: Option<&str>,
 ) -> Vec<SearchResult> {
     results
         .iter()
         .filter(|r| {
+            // Album-name gate (primary artist+album search tier only): when
+            // the caller knows the album name, reject results whose file
+            // paths do not contain it as a contiguous run of word tokens.
+            // This stops substring false matches like "S Club" matching
+            // "Sgt. Peppers Lonely Hearts **Club** Band". The track-name
+            // fallback tier passes None and is never gated here.
+            if let Some(album_name) = album {
+                if !album_matches_result(r, album_name) {
+                    return false;
+                }
+            }
+
             // Filter: must have free upload slots. Results with no free
             // slots (slots == 0) are always rejected. The include_locked
             // field is defined but not yet enforced.
@@ -153,14 +171,102 @@ pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> boo
     true
 }
 
-/// Rank candidates by score: speed × slot_bonus × bitrate_bonus.
+/// Split a name into lowercase alphanumeric word tokens, collapsing
+/// separators (spaces, punctuation, path separators).
+///
+/// `"S Club"` → `["s", "club"]`; `"Sgt. Peppers Lonely Hearts Club Band"`
+/// → `["sgt", "peppers", "lonely", "hearts", "club", "band"]`.
+fn word_tokens(name: &str) -> Vec<String> {
+    name.nfkd()
+        .filter(|c| c.is_ascii())
+        .collect::<String>()
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `tokens` contains `needle` as a contiguous run of words.
+///
+/// Word-boundary matching is essential: a naive substring check would let
+/// "S Club" match "Sgt. Peppers Lonely Hearts **Club** Band" (the "s" of
+/// "hearts" + "club") — the exact false match this check exists to prevent.
+fn tokens_contain_contiguous(tokens: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    tokens.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether any of a result's file paths contains the album name as a
+/// contiguous run of word tokens.
+fn album_matches_result(result: &SearchResult, album: &str) -> bool {
+    let album_tokens = word_tokens(album);
+    // An empty token set (punctuation-only album name like "( )", or
+    // whitespace-only) carries no discriminative constraint — skip the
+    // gate so the album can still be processed by other filters.
+    if album_tokens.is_empty() {
+        return true;
+    }
+    result.files.iter().any(|f| {
+        let path_tokens = word_tokens(&f.name);
+        tokens_contain_contiguous(&path_tokens, &album_tokens)
+    })
+}
+
+/// Match strength of a result against an album name, for ranking:
+/// - `2`: the album name appears in the file's album folder (the parent
+///   directory path components before the basename) — strongest signal.
+/// - `1`: the album name appears somewhere in the file path.
+/// - `0`: no match.
+fn album_match_strength(result: &SearchResult, album: &str) -> u8 {
+    let album_tokens = word_tokens(album);
+    if album_tokens.is_empty() {
+        return 1; // no discriminative content — treat as baseline match
+    }
+    let mut best = 0u8;
+    for f in &result.files {
+        let path_tokens = word_tokens(&f.name);
+        if !tokens_contain_contiguous(&path_tokens, &album_tokens) {
+            continue;
+        }
+        // Folder-level match: album name appears in the parent directory
+        // (everything before the last path separator / basename).
+        let parent = f
+            .name
+            .rsplit_once(['/', '\\'])
+            .map(|(parent, _basename)| parent)
+            .unwrap_or("");
+        let parent_tokens = word_tokens(parent);
+        if tokens_contain_contiguous(&parent_tokens, &album_tokens) {
+            return 2;
+        }
+        best = best.max(1);
+    }
+    best
+}
+
+/// Rank candidates by score: speed × slot_bonus × bitrate_bonus × album_bonus.
 /// Higher score = better candidate.
-pub fn rank_candidates(results: &[SearchResult], config: &FilterConfig) -> Vec<SearchResult> {
+pub fn rank_candidates(
+    results: &[SearchResult],
+    config: &FilterConfig,
+    album: Option<&str>,
+) -> Vec<SearchResult> {
     let mut scored: Vec<(f64, &SearchResult)> = results
         .iter()
         .map(|r| {
             let speed_score = r.speed as f64;
             let slot_bonus = if r.slots > 0 { 1.5 } else { 1.0 };
+            let album_bonus = match album {
+                Some(name) => match album_match_strength(r, name) {
+                    2 => 1.5,
+                    1 => 1.1,
+                    _ => 1.0,
+                },
+                None => 1.0,
+            };
             let bitrate_bonus = if let Some(min_br) = config.min_bitrate {
                 let max_br = r
                     .files
@@ -176,7 +282,7 @@ pub fn rank_candidates(results: &[SearchResult], config: &FilterConfig) -> Vec<S
             } else {
                 1.0
             };
-            let score = speed_score * slot_bonus * bitrate_bonus;
+            let score = speed_score * slot_bonus * bitrate_bonus * album_bonus;
             (score, r)
         })
         .collect();
@@ -245,7 +351,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -271,7 +377,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -295,7 +401,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -324,7 +430,7 @@ mod tests {
             ),
         ];
 
-        let ranked = rank_candidates(&results, &cfg);
+        let ranked = rank_candidates(&results, &cfg, None);
         assert_eq!(ranked[0].username, "fast"); // highest speed
         assert_eq!(ranked[1].username, "medium");
         assert_eq!(ranked[2].username, "slow");
@@ -351,7 +457,7 @@ mod tests {
             ),
         ];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
     }
@@ -372,7 +478,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(filtered.is_empty());
     }
 
@@ -392,7 +498,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
     }
 
@@ -417,7 +523,7 @@ mod tests {
             )],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(
             filtered.is_empty(),
             "single-track result must be rejected when min_tracks is 3 (toggle off)"
@@ -442,7 +548,7 @@ mod tests {
             vec![make_file("01 - A.mp3", 320, 10_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(
             filtered.is_empty(),
             "zero-file result must be rejected even with min_tracks: 0"
@@ -468,7 +574,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -491,7 +597,7 @@ mod tests {
             vec![make_file("01 - Single.flac", 900, 30_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -512,7 +618,7 @@ mod tests {
             vec![make_file("Title.flac", 900, 30_000_000)],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(filtered.is_empty());
     }
 
@@ -536,7 +642,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(filtered.is_empty());
     }
 
@@ -561,7 +667,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(filtered.is_empty());
     }
 
@@ -585,7 +691,7 @@ mod tests {
             )],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert!(
             filtered.is_empty(),
             "single-track result must be rejected when min_tracks is 3"
@@ -609,7 +715,7 @@ mod tests {
             ],
         )];
 
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -640,7 +746,7 @@ mod tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, Some(5));
+        let filtered = filter_results(&results, &cfg, Some(5), None);
         assert!(filtered.is_empty(), "3 tracks < library 5 → rejected");
     }
 
@@ -669,7 +775,7 @@ mod tests {
                 make_file("05 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, Some(5));
+        let filtered = filter_results(&results, &cfg, Some(5), None);
         assert_eq!(filtered.len(), 1, "5 tracks == library 5 → accepted");
     }
 
@@ -700,7 +806,7 @@ mod tests {
                 make_file("07 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, Some(5));
+        let filtered = filter_results(&results, &cfg, Some(5), None);
         assert_eq!(filtered.len(), 1, "7 tracks > library 5 → accepted");
     }
 
@@ -728,7 +834,7 @@ mod tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, Some(5));
+        let filtered = filter_results(&results, &cfg, Some(5), None);
         assert_eq!(filtered.len(), 1, "check disabled → accepted regardless");
     }
 
@@ -755,7 +861,7 @@ mod tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, None);
+        let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(
             filtered.len(),
             1,
@@ -788,7 +894,7 @@ mod tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         }];
-        let filtered = filter_results(&results, &cfg, Some(5));
+        let filtered = filter_results(&results, &cfg, Some(5), None);
         assert!(
             filtered.is_empty(),
             "3 tracks < library 5 with contiguous_tracks ON → rejected"
@@ -821,7 +927,7 @@ mod tests {
         }];
         // Library has 1 track; peer has 2 (>=1). But min_tracks=3 rejects
         // because 2 < 3. The library check never runs.
-        let filtered = filter_results(&results, &cfg, Some(1));
+        let filtered = filter_results(&results, &cfg, Some(1), None);
         assert!(
             filtered.is_empty(),
             "2 tracks < min_tracks=3 → rejected by min_tracks before library check"
@@ -849,6 +955,8 @@ pub struct FilterRejectionSummary {
     pub bitrate_rejected: usize,
     /// Files rejected by excluded words
     pub words_rejected: usize,
+    /// Results rejected because no file path contains the album name
+    pub album_mismatch: usize,
 }
 
 impl FilterRejectionSummary {
@@ -861,6 +969,7 @@ impl FilterRejectionSummary {
             || self.peer_track_count_rejected > 0
             || self.bitrate_rejected > 0
             || self.words_rejected > 0
+            || self.album_mismatch > 0
     }
 
     /// Returns a concise one-line summary for logging.
@@ -921,6 +1030,13 @@ impl FilterRejectionSummary {
                 if self.words_rejected == 1 { "" } else { "s" }
             ));
         }
+        if self.album_mismatch > 0 {
+            parts.push(format!(
+                "{} album mismatch{}",
+                self.album_mismatch,
+                if self.album_mismatch == 1 { "" } else { "es" }
+            ));
+        }
         if parts.is_empty() {
             "no rejections".to_string()
         } else {
@@ -935,12 +1051,21 @@ pub fn summarize_rejections(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
+    album: Option<&str>,
 ) -> FilterRejectionSummary {
     let mut summary = FilterRejectionSummary::default();
     let mut ext_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
     for r in results {
+        // Album-name gate check
+        if let Some(album_name) = album {
+            if !album_matches_result(r, album_name) {
+                summary.album_mismatch += 1;
+                continue;
+            }
+        }
+
         // Slot check
         if r.slots == 0 {
             summary.no_free_slots += 1;
@@ -1090,7 +1215,7 @@ mod rejection_summary_tests {
                 ],
             ),
         ];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(summary.has_rejections());
         assert_eq!(summary.extension_rejected, 6);
         assert_eq!(summary.most_common_rejected_ext, "mp3");
@@ -1116,7 +1241,7 @@ mod rejection_summary_tests {
                 vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
         ];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(summary.has_rejections());
         assert_eq!(summary.no_free_slots, 2);
         assert!(summary.summary_line().contains("2 no free slots"));
@@ -1138,7 +1263,7 @@ mod rejection_summary_tests {
                 make_file("03 - C.flac", 900, 30_000_000),
             ],
         )];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(summary.has_rejections());
         assert_eq!(summary.non_contiguous, 1);
         assert!(summary.summary_line().contains("1 non-contiguous track"));
@@ -1165,7 +1290,7 @@ mod rejection_summary_tests {
                 vec![make_file("01 - track.flac", 900, 30_000_000)],
             ),
         ];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(summary.has_rejections());
         assert_eq!(summary.extension_rejected, 3);
         assert_eq!(summary.no_free_slots, 1);
@@ -1187,7 +1312,7 @@ mod rejection_summary_tests {
                 make_file("03 - C.flac", 900, 30_000_000),
             ],
         )];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(!summary.has_rejections());
         assert_eq!(summary.summary_line(), "no rejections");
     }
@@ -1196,7 +1321,7 @@ mod rejection_summary_tests {
     fn test_summary_empty_results() {
         let cfg = default_filter_config();
         let results: Vec<SearchResult> = vec![];
-        let summary = summarize_rejections(&results, &cfg, None);
+        let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(!summary.has_rejections());
     }
 
@@ -1223,7 +1348,7 @@ mod rejection_summary_tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         )];
-        let summary = summarize_rejections(&results, &cfg, Some(5));
+        let summary = summarize_rejections(&results, &cfg, Some(5), None);
         assert!(summary.has_rejections());
         assert_eq!(summary.peer_track_count_rejected, 1);
         assert!(summary.summary_line().contains("below library track count"));
@@ -1252,7 +1377,236 @@ mod rejection_summary_tests {
                 make_file("03 - track.flac", 900, 10_000_000),
             ],
         )];
-        let summary = summarize_rejections(&results, &cfg, Some(5));
+        let summary = summarize_rejections(&results, &cfg, Some(5), None);
         assert!(!summary.has_rejections());
+    }
+
+    #[test]
+    fn test_filter_rejects_wrong_album_with_word_boundary_match() {
+        // Regression: searching album "S Club" matched The Beatles' "Sgt.
+        // Peppers Lonely Hearts Club Band" because "club" appears in the
+        // path. A whole-word match for "s club" must reject it: the words
+        // "s" and "club" do not appear adjacent as album tokens.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "chris",
+            11_015_233,
+            3,
+            vec![
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\The Beatles - (1967) Sgt. Peppers Lonely Hearts Club Band - 1 - Sgt. Peppers Lonely Hearts Club Band .flac",
+                    900,
+                    14_000_000,
+                ),
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\The Beatles - (1967) Sgt. Peppers Lonely Hearts Club Band - 2 - With A Little Help From My Friends.flac",
+                    900,
+                    19_000_000,
+                ),
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\The Beatles - (1967) Sgt. Peppers Lonely Hearts Club Band - 3 - Lucy In The Sky With Diamonds.flac",
+                    900,
+                    25_000_000,
+                ),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg, None, Some("S Club"));
+        assert!(
+            filtered.is_empty(),
+            "wrong album (Beatles Sgt. Pepper) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_filter_accepts_correct_album() {
+        // The genuine S Club 7 "S Club" album path contains "s club" as
+        // whole words → accepted.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "user1",
+            500,
+            2,
+            vec![
+                make_file(
+                    "Music\\S Club 7\\S Club\\01 - Bring It All Back.flac",
+                    900,
+                    25_000_000,
+                ),
+                make_file(
+                    "Music\\S Club 7\\S Club\\02 - S Club Party.flac",
+                    900,
+                    25_000_000,
+                ),
+                make_file(
+                    "Music\\S Club 7\\S Club\\03 - Two in a Million.flac",
+                    900,
+                    25_000_000,
+                ),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg, None, Some("S Club"));
+        assert_eq!(filtered.len(), 1, "correct album must pass");
+        assert_eq!(filtered[0].username, "user1");
+    }
+
+    #[test]
+    fn test_filter_no_album_param_gates_nothing() {
+        // Album=None (track-name fallback tier) must not gate results — a
+        // Beatles result passes through unchanged when the caller cannot
+        // offer an album name to match.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "chris",
+            11_015_233,
+            3,
+            vec![
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\01 - Sgt. Peppers Lonely Hearts Club Band.flac",
+                    900,
+                    14_000_000,
+                ),
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\02 - With A Little Help From My Friends.flac",
+                    900,
+                    19_000_000,
+                ),
+                make_file(
+                    "@@mwefg\\FLAC\\The Beatles\\The Beatles - 1967 - Sgt. Peppers Lonely Hearts Club Band \\03 - Lucy In The Sky With Diamonds.flac",
+                    900,
+                    25_000_000,
+                ),
+            ],
+        )];
+
+        let filtered = filter_results(&results, &cfg, None, None);
+        assert_eq!(filtered.len(), 1, "no album name → no album gating");
+    }
+
+    #[test]
+    fn test_rank_prefers_folder_level_album_match() {
+        // Two candidates at the same speed; the one whose album folder
+        // (parent directory) matches "S Club" must outrank the one where
+        // "s club" appears only in the file basename, not in any folder.
+        let cfg = default_filter_config();
+        let folder_match = make_result(
+            "foldermatch",
+            1000,
+            1,
+            vec![make_file(
+                "Music\\S Club 7\\S Club\\01 - Bring It All Back.flac",
+                900,
+                25_000_000,
+            )],
+        );
+        let deep_match = make_result(
+            "deepmatch",
+            1000,
+            1,
+            vec![make_file(
+                "Music\\Various\\Compilations\\01 - S Club - Bring It All Back.flac",
+                900,
+                25_000_000,
+            )],
+        );
+
+        let ranked = rank_candidates(&[deep_match, folder_match], &cfg, Some("S Club"));
+        assert_eq!(
+            ranked[0].username, "foldermatch",
+            "folder-level album match must outrank deep path match"
+        );
+    }
+
+    #[test]
+    fn test_rank_no_album_no_bonus() {
+        // With album=None the ranking is unchanged — equal speed keeps
+        // input order.
+        let cfg = default_filter_config();
+        let a = make_result(
+            "a",
+            1000,
+            1,
+            vec![make_file(
+                "Music\\S Club 7\\S Club\\01 - Bring It All Back.flac",
+                900,
+                25_000_000,
+            )],
+        );
+        let b = make_result(
+            "b",
+            1000,
+            1,
+            vec![make_file(
+                "Music\\S Club 7\\Greatest Hits Collection\\01 - Bring It All Back.flac",
+                900,
+                25_000_000,
+            )],
+        );
+
+        let ranked = rank_candidates(&[a, b], &cfg, None);
+        assert_eq!(ranked[0].username, "a", "no album → input order kept");
+    }
+
+    #[test]
+    fn test_filter_punctuation_only_album_passes_through() {
+        // Regression: punctuation-only album "( )" must not reject all
+        // results. word_tokens returns [] → empty-token guard skips gate.
+        let cfg = FilterConfig {
+            min_tracks: 1,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file("01 - track.flac", 900, 10_000_000)],
+        )];
+        let filtered = filter_results(&results, &cfg, None, Some("( )"));
+        assert_eq!(filtered.len(), 1, "punctuation-only album must not gate");
+    }
+
+    #[test]
+    fn test_filter_accented_album_matches_ascii_path() {
+        // Regression: "Café" must match a peer path containing "Cafe".
+        // NFKD decomposition folds é → e + combining accent, ASCII filter
+        // strips the accent.
+        let cfg = FilterConfig {
+            min_tracks: 1,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![make_file(
+                r"Music\Artist\Cafe\01 - Track.flac",
+                900,
+                10_000_000,
+            )],
+        )];
+        let filtered = filter_results(&results, &cfg, None, Some("Café"));
+        assert_eq!(filtered.len(), 1, "accented album must match ASCII path");
+    }
+
+    #[test]
+    fn test_summarize_rejections_counts_album_mismatch() {
+        // Regression: summarize_rejections must report album_mismatch when
+        // the album gate is the sole rejection reason.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "chris",
+            1000,
+            3,
+            vec![make_file(
+                "@@mwefg\\FLAC\\The Beatles\\Sgt. Pepper\\01 - Track.flac",
+                900,
+                14_000_000,
+            )],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None, Some("S Club"));
+        assert_eq!(summary.album_mismatch, 1);
+        assert!(summary.has_rejections());
+        assert!(summary.summary_line().contains("album mismatch"));
     }
 }

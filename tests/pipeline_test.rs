@@ -25,8 +25,16 @@ async fn test_full_pipeline_manual_mode() {
         speed: 1000,
         slots: 2,
         files: vec![
-            make_file("01 - Track One.flac", 900, 15_000_000),
-            make_file("02 - Track Two.flac", 850, 12_000_000),
+            make_file(
+                r"Test Artist\Test Album\01 - Track One.flac",
+                900,
+                15_000_000,
+            ),
+            make_file(
+                r"Test Artist\Test Album\02 - Track Two.flac",
+                850,
+                12_000_000,
+            ),
         ],
     }];
 

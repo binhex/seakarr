@@ -117,7 +117,8 @@ pub async fn process_album(
     // Filter + rank
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let mut total_users = results.len();
-    let mut filtered = filter::filter_results(&results, &config.filters, library_track_count);
+    let mut filtered =
+        filter::filter_results(&results, &config.filters, library_track_count, album);
     // Track which results were last filtered (for rejection summary)
     let mut last_filtered_results: Vec<crate::client::SearchResult> = results.clone();
     // Title-search fallback: when the primary search returned no usable results
@@ -159,6 +160,11 @@ pub async fn process_album(
                                     &title_results,
                                     &config.filters,
                                     library_track_count,
+                                    // The track-name fallback tier is never
+                                    // album-gated: we could not find the
+                                    // album by name, so rejecting on album
+                                    // would leave us with nothing.
+                                    None,
                                 );
                                 last_filtered_results = title_results.clone();
                             }
@@ -210,6 +216,8 @@ pub async fn process_album(
                     &last_filtered_results,
                     &config.filters,
                     library_track_count,
+                    // Title-search results are never album-gated.
+                    None,
                 );
                 if rejection_summary.has_rejections() {
                     tracing::info!(
@@ -234,6 +242,8 @@ pub async fn process_album(
             &last_filtered_results,
             &config.filters,
             library_track_count,
+            // When the title-search fallback fired, no album gate applies.
+            if title_search_attempted { None } else { album },
         );
         tracing::info!(
             "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot{contiguity_note})\n  → {}",
@@ -248,7 +258,11 @@ pub async fn process_album(
             reason: "no results passed filters".into(),
         });
     }
-    let ranked = filter::rank_candidates(&filtered, &config.filters);
+    // Rank bonus applies only to primary-tier results: when the title-search
+    // fallback fired, the album name is not a meaningful discriminator (we
+    // searched by track title because the album name search failed).
+    let rank_album = if title_search_attempted { None } else { album };
+    let ranked = filter::rank_candidates(&filtered, &config.filters, rank_album);
     tracing::info!(
         "{artist} — {}: {total_results} files from {total_users} users, {} users passed filters, best: {} (speed={})",
         album.unwrap_or("(all)"),
@@ -623,7 +637,11 @@ mod tests {
             username: "user1".into(),
             speed: 500,
             slots: 1,
-            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
         }];
 
         let config = make_test_config();
@@ -945,7 +963,11 @@ mod tests {
             username: "user1".into(),
             speed: 500,
             slots: 1,
-            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
         }];
 
         let mut config = make_test_config();
@@ -983,7 +1005,11 @@ mod tests {
             username: "user1".into(),
             speed: 500,
             slots: 1,
-            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
         }];
 
         let mut config = make_test_config();
