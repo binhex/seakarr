@@ -643,8 +643,8 @@ impl SoulseekClient for RealClient {
                 interactive,
                 &bridge_filename,
             );
-            tracing::info!(
-                "Bridge finished for {bridge_filename} from {bridge_username}, removing download"
+            tracing::debug!(
+                "Bridge finished for {bridge_filename} from {bridge_username}, clearing download state"
             );
             let _ = bridge_client.remove_download(&bridge_username, &bridge_filename);
         });
