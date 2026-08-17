@@ -416,8 +416,47 @@ impl Config {
 
         let contents = fs::read_to_string(&config_file)
             .map_err(|e| SeakarrError::Config(format!("failed to read {config_file:?}: {e}")))?;
-        serde_yaml::from_str(&contents)
-            .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))
+        let config: Config = serde_yaml::from_str(&contents)
+            .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
+        Self::reconcile_config_file(&config_file, &contents)?;
+        Ok(config)
+    }
+
+    /// Reconcile the on-disk config with the current schema: add any missing
+    /// entries (top-level sections and nested keys) from defaults, and remove
+    /// entries that no longer exist in the schema. The original file is
+    /// preserved as `seakarr.yml.bak`. No-op when the file already matches the
+    /// schema.
+    fn reconcile_config_file(config_file: &Path, contents: &str) -> Result<()> {
+        let default_value: serde_yaml::Value =
+            serde_yaml::to_value(Config::default()).map_err(|e| {
+                SeakarrError::Config(format!("failed to serialize default config: {e}"))
+            })?;
+        let file_value: serde_yaml::Value = serde_yaml::from_str(contents)
+            .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
+
+        let merged = merge_with_defaults(&default_value, &file_value);
+        if merged == file_value {
+            return Ok(());
+        }
+
+        let yaml = serde_yaml::to_string(&merged).map_err(|e| {
+            SeakarrError::Config(format!("failed to serialize migrated config: {e}"))
+        })?;
+
+        let backup_path = config_file.with_extension("yml.bak");
+        fs::copy(config_file, &backup_path).map_err(|e| {
+            SeakarrError::Config(format!("failed to back up config to {backup_path:?}: {e}"))
+        })?;
+        fs::write(
+            config_file,
+            format!(
+                "# seakarr.yml — Seakarr Configuration\n# Auto-created on first run.\n\n{yaml}"
+            ),
+        )
+        .map_err(|e| SeakarrError::Config(format!("failed to write migrated config: {e}")))?;
+        tracing::info!("config reconciled with current schema (backup: {backup_path:?})");
+        Ok(())
     }
 
     /// Merge CLI overrides onto config values. CLI takes precedence.
@@ -523,6 +562,29 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+/// Recursively merge a parsed config file value over the current schema
+/// defaults. Every key present in the defaults is kept (file value wins when
+/// present, default added when missing); keys present in the file but absent
+/// from the schema are dropped. User values are never overwritten.
+fn merge_with_defaults(default: &serde_yaml::Value, file: &serde_yaml::Value) -> serde_yaml::Value {
+    match (default, file) {
+        (serde_yaml::Value::Mapping(default_map), serde_yaml::Value::Mapping(file_map)) => {
+            let mut merged = serde_yaml::Mapping::new();
+            for (key, default_val) in default_map {
+                let value = match file_map.get(key) {
+                    Some(file_val) => merge_with_defaults(default_val, file_val),
+                    None => default_val.clone(),
+                };
+                merged.insert(key.clone(), value);
+            }
+            serde_yaml::Value::Mapping(merged)
+        }
+        // Scalars, sequences, null: file value wins when present; otherwise the
+        // default (covers missing-but-defaulted values and empty lists).
+        (_, file_val) => file_val.clone(),
     }
 }
 
@@ -928,6 +990,201 @@ soulseek:
         assert_eq!(config.soulseek.listen_port, 8080);
         // Non-overridden values stay from YAML
         assert_eq!(config.download.concurrent, 5);
+    }
+
+    #[test]
+    fn test_load_migrates_missing_sections_with_backup() {
+        let dir = TempDir::new().unwrap();
+        // Existing config WITHOUT the library_upgrade section (pre-v0.12.0 file)
+        let minimal = r#"
+soulseek:
+  username: "testuser"
+  password: "testpass"
+
+library:
+  paths: ["/media/music"]
+"#;
+        fs::write(dir.path().join("seakarr.yml"), minimal).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        // The loaded config must have the new section populated with defaults
+        assert!(!config.library_upgrade.enabled);
+        assert!(!config.library_upgrade.delete_lesser_quality);
+        // User's existing values preserved
+        assert_eq!(config.library.paths, vec!["/media/music"]);
+        assert_eq!(config.soulseek.username, "testuser");
+
+        // The file itself must be migrated: library_upgrade section written back
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(
+            migrated.contains("library_upgrade:"),
+            "migrated config must contain library_upgrade section, got:\n{migrated}"
+        );
+        assert!(
+            migrated.contains("enabled: false"),
+            "migrated config must contain library_upgrade.enabled: false, got:\n{migrated}"
+        );
+        // User values must survive the migration rewrite
+        assert!(
+            migrated.contains("/media/music"),
+            "migrated config must preserve user library paths, got:\n{migrated}"
+        );
+
+        // A backup of the original must exist
+        let backup = dir.path().join("seakarr.yml.bak");
+        assert!(backup.exists(), "backup seakarr.yml.bak must be created");
+        let backup_contents = fs::read_to_string(&backup).unwrap();
+        assert!(
+            !backup_contents.contains("library_upgrade"),
+            "backup must contain the ORIGINAL unmigrated config"
+        );
+        assert!(
+            backup_contents.contains("/media/music"),
+            "backup must preserve original content"
+        );
+    }
+
+    #[test]
+    fn test_load_migrates_only_once_no_duplicate_backup() {
+        let dir = TempDir::new().unwrap();
+        let minimal = r#"
+soulseek:
+  username: "testuser"
+  password: "testpass"
+"#;
+        fs::write(dir.path().join("seakarr.yml"), minimal).unwrap();
+
+        // First load migrates
+        Config::load(dir.path()).unwrap();
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(migrated.contains("library_upgrade:"));
+
+        // Second load must NOT rewrite or create a second backup
+        Config::load(dir.path()).unwrap();
+        let after = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert_eq!(
+            migrated, after,
+            "already-migrated config must not be rewritten"
+        );
+
+        let bak_entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("seakarr.yml"))
+            .collect();
+        assert_eq!(
+            bak_entries.len(),
+            2,
+            "expected only seakarr.yml + seakarr.yml.bak, got: {bak_entries:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_migrates_nested_missing_entries() {
+        let dir = TempDir::new().unwrap();
+        // Section present but missing some NESTED keys (simulates a schema change
+        // that added new keys inside an existing section)
+        let yaml = r#"
+soulseek:
+  username: "testuser"
+  password: "testpass"
+
+filters:
+  allowed_extensions: ["flac"]
+  contiguous_tracks: true
+
+library:
+  paths: ["/media/music"]
+"#;
+        fs::write(dir.path().join("seakarr.yml"), yaml).unwrap();
+
+        Config::load(dir.path()).unwrap();
+
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        // Nested keys missing from the filters section must be added with defaults
+        assert!(
+            migrated.contains("min_tracks: 3"),
+            "nested missing entry min_tracks must be added, got:\n{migrated}"
+        );
+        assert!(
+            migrated.contains("peer_track_count: true"),
+            "nested missing entry peer_track_count must be added, got:\n{migrated}"
+        );
+        // User's existing nested values preserved
+        assert!(
+            migrated.contains("allowed_extensions:\n- \"flac\"")
+                || migrated.contains("allowed_extensions:")
+        );
+        assert!(migrated.contains("contiguous_tracks: true"));
+    }
+
+    #[test]
+    fn test_load_removes_entries_no_longer_in_schema() {
+        let dir = TempDir::new().unwrap();
+        // Config containing a section that no longer exists in the schema
+        // (simulates a removed config entry from an old version)
+        let yaml = r#"
+soulseek:
+  username: "testuser"
+  password: "testpass"
+
+library:
+  paths: ["/media/music"]
+
+obsolete_section:
+  some_old_option: 42
+"#;
+        fs::write(dir.path().join("seakarr.yml"), yaml).unwrap();
+
+        Config::load(dir.path()).unwrap();
+
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(
+            !migrated.contains("obsolete_section"),
+            "removed config entry must be dropped, got:\n{migrated}"
+        );
+        assert!(
+            !migrated.contains("some_old_option"),
+            "removed nested entry must be dropped, got:\n{migrated}"
+        );
+        // User's valid values still present
+        assert!(migrated.contains("/media/music"));
+        assert!(migrated.contains("testuser"));
+    }
+
+    #[test]
+    fn test_load_preserves_existing_values_never_overwrites() {
+        let dir = TempDir::new().unwrap();
+        // User's custom values must survive reconciliation unchanged
+        let yaml = r#"
+soulseek:
+  username: "myuser"
+  password: "mypass"
+
+search:
+  timeout_secs: 99
+  response_limit: 1234
+
+library:
+  paths: ["/media/music"]
+"#;
+        fs::write(dir.path().join("seakarr.yml"), yaml).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert_eq!(config.soulseek.username, "myuser");
+        assert_eq!(config.search.timeout_secs, 99);
+        assert_eq!(config.search.response_limit, 1234);
+
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(
+            migrated.contains("timeout_secs: 99"),
+            "user value must not be overwritten: {migrated}"
+        );
+        assert!(migrated.contains("response_limit: 1234"));
+        assert!(migrated.contains("myuser"));
     }
 
     #[test]
