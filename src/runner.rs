@@ -307,8 +307,13 @@ pub async fn process_album(
     // Library upgrade (auto mode only, when enabled)
     if config.library_upgrade.enabled {
         if let Some(target_path) = target_library_path {
-            // Completeness gate: all files from the best peer must have downloaded
-            let expected_count = ranked.first().map(|r| r.files.len()).unwrap_or(0);
+            // Completeness gate: the library album's own track count is the
+            // reference — NOT the best peer's folder size. Peers share
+            // different editions (box sets, anniversary editions) whose folder
+            // can contain far more files than the album being upgraded has
+            // (e.g. a 121-file peer folder for a 19-track library album).
+            let expected_count = library_track_count
+                .unwrap_or_else(|| ranked.first().map(|r| r.files.len()).unwrap_or(0));
             if downloaded.len() < expected_count {
                 tracing::warn!(
                     "{artist} - {}: download incomplete ({}/{} tracks), skipping library upgrade",
@@ -1056,6 +1061,83 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_library_upgrade_completeness_uses_library_track_count_not_peer_folder_size() {
+        // Regression: a peer folder containing a different (larger) edition of
+        // the album — e.g. the real-world case where Abba Gold's best peer
+        // folder had 121 files but the library album only has 19 tracks.
+        // The completeness gate must compare against the LIBRARY track count,
+        // not the best peer's folder file count.
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Test Album".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                // Peer folder has 5 files: 2 that match the album + 3 decoys
+                // (different artist/other releases in the same share).
+                files: vec![
+                    make_file(
+                        r"Music\Test Artist\Test Album\01 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    make_file(
+                        r"Music\Test Artist\Test Album\02 - track.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    make_file(
+                        r"Music\Other Artist\Other Album\01 - decoy.flac",
+                        900,
+                        10_000_000,
+                    ),
+                    make_file(
+                        r"Music\Test Artist\Another Album\01 - decoy.flac",
+                        900,
+                        10_000_000,
+                    ),
+                ],
+            }],
+        );
+
+        let mut config = make_test_config();
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        // Pre-seed the album staging dir (staging/<artist>--<album>) with the
+        // 2 files the mock download will "write" (the mock returns
+        // dir/<basename> paths without creating file content, so
+        // copy_to_library needs them to already exist).
+        let album_staging = staging.path().join("Test Artist--Test Album");
+        std::fs::create_dir_all(&album_staging).unwrap();
+        std::fs::write(album_staging.join("01 - track.flac"), b"fake flac").unwrap();
+        std::fs::write(album_staging.join("02 - track.flac"), b"fake flac").unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            Some(2),             // library_track_count: library album has 2 tracks
+            Some(target.path()), // target_library_path
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            AlbumOutcome::Downloaded { track_count: 2 },
+            "album must complete: 2 matching tracks downloaded, peer folder size (5) is irrelevant"
+        );
     }
 
     #[tokio::test]
