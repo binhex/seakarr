@@ -327,7 +327,7 @@ async fn download_once(
 /// separate groups despite sharing the leaf directory name "Greatest Hits".
 ///
 /// Ties are broken by lexicographic key order for determinism.
-fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInfo> {
+pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInfo> {
     let mut groups: std::collections::HashMap<&str, Vec<&'a FileInfo>> = Default::default();
     for f in files {
         // rsplit_once gives the full parent path (everything before the

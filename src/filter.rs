@@ -54,25 +54,34 @@ pub fn filter_results(
                 // download_album) and reject incomplete shares below
                 // min_tracks. min_tracks.max(1) keeps the "at least one
                 // usable file" floor when the gate is disabled (0).
-                let passing_count = r.files.iter().filter(|f| safe_and_passing(f)).count();
+                let passing: Vec<&FileInfo> =
+                    r.files.iter().filter(|f| safe_and_passing(f)).collect();
                 // min_tracks == 0 disables the gate but never accepts a
                 // result with zero usable files.
                 let min = config.min_tracks.max(1) as usize;
-                if passing_count < min {
+                if passing.len() < min {
                     return false;
                 }
                 // Library track count check (auto mode only).
-                // Note: passing_count counts files passing quality filters,
-                // not unique track numbers — duplicate filenames are counted
-                // separately. This is intentional: the check compares the
-                // library's total file count against the peer's usable file
-                // count, so track-number deduplication would undercount.
+                // Note: the count mirrors what download_album will actually
+                // download — a peer's SearchResult can span multiple album
+                // directories (original edition + anniversary edition both
+                // matching the query), and download_album keeps only the
+                // LARGEST single directory group. Comparing the total passing
+                // file count against the library lets a multi-directory peer
+                // through whose largest album is below the library count,
+                // which then fails the post-download completeness gate.
+                // The count is of files passing quality filters, not unique
+                // track numbers — duplicate filenames are counted separately,
+                // matching the library's own file-based count.
                 if let Some(lib_count) = library_track_count {
-                    if config.peer_track_count && passing_count < lib_count {
+                    if config.peer_track_count
+                        && crate::download::largest_album_group(&passing).len() < lib_count
+                    {
                         tracing::debug!(
-                            "result from {} rejected: {} filtered tracks < library track count {}",
+                            "result from {} rejected: largest album directory has {} tracks < library track count {}",
                             r.username,
-                            passing_count,
+                            crate::download::largest_album_group(&passing).len(),
                             lib_count
                         );
                         return false;
@@ -112,16 +121,24 @@ pub fn filter_results(
                 return false;
             }
             // Library track count check (auto mode only).
+            // The count mirrors download_album: a peer's SearchResult can
+            // span multiple album directories, and only the LARGEST single
+            // directory group is ever downloaded. Comparing the total
+            // passing count against the library would let a multi-directory
+            // peer through whose largest album is below the library count,
+            // which then fails the post-download completeness gate.
             // Note: with the default min_tracks=3, albums with 1-2 tracks
             // (EPs, singles) are already rejected by the min_tracks gate
             // before this check runs. To apply the library check to EPs,
             // set min_tracks to 0 or 1.
             if let Some(lib_count) = library_track_count {
-                if config.peer_track_count && passing.len() < lib_count {
+                if config.peer_track_count
+                    && crate::download::largest_album_group(&passing).len() < lib_count
+                {
                     tracing::debug!(
-                        "result from {} rejected: {} filtered tracks < library track count {}",
+                        "result from {} rejected: largest album directory has {} tracks < library track count {}",
                         r.username,
-                        passing.len(),
+                        crate::download::largest_album_group(&passing).len(),
                         lib_count
                     );
                     return false;
@@ -931,6 +948,63 @@ mod tests {
         assert!(
             filtered.is_empty(),
             "2 tracks < min_tracks=3 → rejected by min_tracks before library check"
+        );
+    }
+
+    #[test]
+    fn test_peer_track_count_counts_largest_album_directory() {
+        // Regression for the Jennifer Lopez "This Is Me Then" case: a peer's
+        // SearchResult can span MULTIPLE album directories (original edition
+        // + anniversary edition version both matching the query). The peer
+        // passed the library track count check because the TOTAL passing
+        // files across all directories (6) >= library count (5) — but
+        // download_album only downloads the LARGEST single directory group
+        // (3 files here), which is then rejected by the post-download
+        // completeness gate, throwing away the download. The filter must
+        // count what will actually be downloaded: the largest directory
+        // group's size — and reject the peer up-front when that is below
+        // the library track count.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 1,
+            peer_track_count: true,
+        };
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            // Two equal-sized album directories; neither has >= library
+            // count (5), even though the sum (6) does.
+            files: vec![
+                make_file(r"Music\Album (Original)\01 - track.flac", 900, 10_000_000),
+                make_file(r"Music\Album (Original)\02 - track.flac", 900, 10_000_000),
+                make_file(r"Music\Album (Original)\03 - track.flac", 900, 10_000_000),
+                make_file(
+                    r"Music\Album (2022 Edition)\01 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Music\Album (2022 Edition)\02 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Music\Album (2022 Edition)\03 - track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+        let filtered = filter_results(&results, &cfg, Some(5), None);
+        assert!(
+            filtered.is_empty(),
+            "largest album directory has 3 tracks < library 5 → rejected up-front"
         );
     }
 }
