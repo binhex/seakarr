@@ -114,8 +114,11 @@ After `download_album` returns `downloaded: Vec<PathBuf>`:
 ```rust
 if config.library_upgrade.enabled {
     if let Some(target_path) = target_library_path {
-        // Check completeness: all filtered tracks must have downloaded
-        let expected_count = filtered.iter().map(|r| r.files.len()).sum::<usize>();
+        // Check completeness: all files from the best peer must have downloaded.
+        // download_album tries peers in ranked order and returns files from the
+        // first peer that succeeds (ranked[0] unless it failed and we fell back).
+        // The expected count is the file count from the first ranked peer.
+        let expected_count = ranked.first().map(|r| r.files.len()).unwrap_or(0);
         if downloaded.len() < expected_count {
             tracing::warn!(
                 "{artist} — {}: download incomplete ({}/{} tracks), skipping library upgrade",
@@ -150,10 +153,25 @@ fn run_library_upgrade(
 
     fs::create_dir_all(&album_dir)?;
 
-    // Copy each downloaded file to the library directory
+    // Copy each downloaded file to the library directory, applying the organize
+    // pattern for naming (same logic as the existing organize step).
     for src in downloaded {
-        let filename = src.file_name().unwrap();
-        let dest = album_dir.join(filename);
+        let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = src.extension().unwrap_or_default().to_string_lossy();
+        let track = track_number_for_organize(&stem);
+        let relative = expand_pattern(
+            &config.storage.organize_pattern,
+            artist,
+            album.unwrap_or("Unknown"),
+            &track,
+            &stem,
+            &ext,
+            "unknown",
+        );
+        let dest = album_dir.join(&relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::copy(src, &dest)?;
     }
 
@@ -303,7 +321,13 @@ fn resume_library_upgrade(
     album: &str,
     album_staging: &Path,
 ) -> Result<()> {
-    let target_path = /* resolve from config.library_paths */;
+    // Resolve target library path: the first path in library.paths that
+    // contains this album's artist/album directory. Falls back to paths[0].
+    let target_path = config.library.paths.iter()
+        .map(Path::new)
+        .find(|p| p.join(artist).join(album).is_dir())
+        .or_else(|| config.library.paths.first().map(Path::new))
+        .ok_or_else(|| SeakarrError::Config("library_upgrade: no library paths configured".into()))?;
     let album_dir = target_path.join(artist).join(album);
 
     for entry in fs::read_dir(album_staging)? {
