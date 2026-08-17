@@ -439,6 +439,7 @@ async fn run_batch_mode(
             progress.as_ref(),
             Some(&cancel),
             None, // library_track_count (batch mode: no scanner data)
+            None, // target_library_path (batch mode: no library upgrade)
         )
         .await
         {

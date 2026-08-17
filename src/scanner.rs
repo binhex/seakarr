@@ -131,10 +131,13 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
 
 /// Determine which albums need upgrading based on filter config.
 /// An album is flagged if ANY track is below quality thresholds or in a non-allowed format.
+/// Returns (artist, album, track_count, library_root) — the library root path
+/// is threaded to the runner so auto-mode can copy upgrades back to the
+/// directory the album was found in.
 pub fn find_albums_to_upgrade(
     albums: &[ScannedAlbum],
     config: &FilterConfig,
-) -> Vec<(String, String, usize)> {
+) -> Vec<(String, String, usize, PathBuf)> {
     let allowed_set: HashSet<String> = config
         .allowed_extensions
         .iter()
@@ -162,7 +165,14 @@ pub fn find_albums_to_upgrade(
 
             false
         })
-        .map(|a| (a.artist.clone(), a.album.clone(), a.track_count))
+        .map(|a| {
+            (
+                a.artist.clone(),
+                a.album.clone(),
+                a.track_count,
+                a.path.clone(),
+            )
+        })
         .collect()
 }
 
@@ -249,6 +259,36 @@ mod tests {
         assert_eq!(to_upgrade[0].0, "Artist1");
         assert_eq!(to_upgrade[0].1, "Album1");
         assert_eq!(to_upgrade[0].2, 3); // track_count
+    }
+
+    #[test]
+    fn test_find_albums_to_upgrade_returns_library_path() {
+        let dir = TempDir::new().unwrap();
+        // Create Artist/Album with an ogg track — ogg is not in the allowed
+        // [flac] list, so the album is flagged for upgrade and must carry its
+        // origin library root path for the runner to copy upgrades back to.
+        let album_dir = dir.path().join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let config = crate::config::FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 3,
+            peer_track_count: true,
+        };
+
+        let to_upgrade = find_albums_to_upgrade(&albums, &config);
+        assert_eq!(to_upgrade.len(), 1);
+        assert_eq!(to_upgrade[0].0, "Artist");
+        assert_eq!(to_upgrade[0].1, "Album");
+        assert_eq!(to_upgrade[0].2, 1); // track_count
+        assert_eq!(to_upgrade[0].3, dir.path().to_path_buf()); // library root
     }
 
     #[test]

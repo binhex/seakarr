@@ -61,6 +61,7 @@ async fn test_full_pipeline_manual_mode() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
+        None, // target_library_path (manual mode: no library upgrade)
     )
     .await;
 
@@ -94,6 +95,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
+        None, // target_library_path (manual mode: no library upgrade)
     )
     .await;
 

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -58,6 +58,10 @@ fn track_number_for_organize(stem: &str) -> String {
 }
 
 /// Process a single album: search → filter rank → download → organize → notify.
+/// When `target_library_path` is provided and `library_upgrade.enabled` is on
+/// (auto mode only), a completed download is copied into the origin library
+/// directory instead of the generic organize step, and the album completes
+/// early (the organize block below is bypassed).
 #[allow(clippy::too_many_arguments)]
 pub async fn process_album(
     client: &dyn SoulseekClient,
@@ -69,6 +73,7 @@ pub async fn process_album(
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
     library_track_count: Option<usize>,
+    target_library_path: Option<&Path>,
 ) -> Result<AlbumOutcome> {
     // Skip if already processed
     if let Some(a) = album {
@@ -299,6 +304,91 @@ pub async fn process_album(
         }
     };
 
+    // Library upgrade (auto mode only, when enabled)
+    if config.library_upgrade.enabled {
+        if let Some(target_path) = target_library_path {
+            // Completeness gate: all files from the best peer must have downloaded
+            let expected_count = ranked.first().map(|r| r.files.len()).unwrap_or(0);
+            if downloaded.len() < expected_count {
+                tracing::warn!(
+                    "{artist} - {}: download incomplete ({}/{} tracks), skipping library upgrade",
+                    album.unwrap_or("?"),
+                    downloaded.len(),
+                    expected_count,
+                );
+                return Ok(AlbumOutcome::Failed {
+                    reason: "incomplete download, library upgrade skipped".into(),
+                });
+            }
+            match organizer::copy_to_library(
+                &downloaded,
+                target_path,
+                &config.storage.organize_pattern,
+                artist,
+                album.unwrap_or("Unknown"),
+            ) {
+                Ok(dests) => {
+                    if config.library_upgrade.delete_lesser_quality {
+                        match organizer::delete_lesser_quality_files(
+                            target_path,
+                            artist,
+                            album.unwrap_or("Unknown"),
+                            &dests,
+                        ) {
+                            Ok(count) if count > 0 => {
+                                tracing::info!(
+                                    "{artist} - {}: deleted {count} lesser-quality file(s)",
+                                    album.unwrap_or("?")
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    "{artist} - {}: failed to delete lesser-quality files: {e}",
+                                    album.unwrap_or("?")
+                                );
+                            }
+                        }
+                    }
+                    if let Err(e) = std::fs::remove_dir_all(&album_staging) {
+                        tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
+                    }
+                    if let Some(a) = album {
+                        db.mark_album_processed(artist, a, "success")?;
+                    }
+                    let track_count = downloaded.len();
+                    if let Err(e) = notifier::notify_success(
+                        &config.notifications.urls,
+                        artist,
+                        album.unwrap_or("Unknown"),
+                        track_count,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "{artist} - {}: notification failed: {e}",
+                            album.unwrap_or("(all)")
+                        );
+                    }
+                    tracing::info!(
+                        "Completed: {artist} - {} ({track_count} tracks)",
+                        album.unwrap_or("(all)")
+                    );
+                    return Ok(AlbumOutcome::Downloaded { track_count });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "{artist} - {}: library upgrade failed: {e}",
+                        album.unwrap_or("?")
+                    );
+                    return Ok(AlbumOutcome::Failed {
+                        reason: format!("library upgrade failed: {e}"),
+                    });
+                }
+            }
+        }
+    }
+
     // Organize (if enabled)
     let mut organize_ok = true;
     if config.storage.organize && !config.library.paths.is_empty() {
@@ -430,6 +520,11 @@ pub async fn run_auto_mode(
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
 
+    // Recover any interrupted library upgrades from previous runs
+    if let Err(e) = organizer::recover_interrupted_upgrades(config, db, staging_dir) {
+        tracing::warn!("Library upgrade recovery scan failed: {e}");
+    }
+
     let progress = if is_interactive() {
         Some(Arc::new(ProgressDisplay::new()))
     } else {
@@ -443,10 +538,10 @@ pub async fn run_auto_mode(
 
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
-    let targets_vec: Vec<(String, String, usize)> = targets_with_counts;
+    let targets_vec: Vec<(String, String, usize, PathBuf)> = targets_with_counts;
     let mut futures_vec = Vec::new();
 
-    for (artist, album, track_count) in &targets_vec {
+    for (artist, album, track_count, library_path) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
         let cancel = cancel.clone();
@@ -470,6 +565,7 @@ pub async fn run_auto_mode(
                     progress.as_deref(),
                     Some(&cancel),
                     Some(library_track_count),
+                    Some(library_path),
                 )
                 .await;
                 (artist, album, result)
@@ -554,6 +650,7 @@ pub async fn run_manual_mode(
         progress_ref,
         Some(&cancel),
         None, // library_track_count (manual mode: no scanner data)
+        None, // target_library_path (manual mode: no library upgrade)
     )
     .await;
     match &result {
@@ -658,6 +755,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -694,6 +792,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
             None,
@@ -750,6 +849,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
             None,
@@ -818,6 +918,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
             None,
@@ -896,6 +997,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
             None,
@@ -1029,6 +1131,7 @@ mod tests {
             &config,
             &db,
             staging.path(),
+            None,
             None,
             None,
             None,

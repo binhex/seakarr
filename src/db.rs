@@ -191,6 +191,19 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Return the current status of an album's processing run, or None when
+    /// the album is not tracked in the database.
+    pub fn get_album_status(&self, artist: &str, album: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status FROM processed_albums WHERE artist = ?1 AND album = ?2")?;
+        let mut rows = stmt.query_map(params![artist, album], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn get_processed_albums(&self) -> Result<Vec<ProcessedAlbum>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, artist, album, status, attempts, last_error, first_seen, last_tried
@@ -383,6 +396,21 @@ mod tests {
             .unwrap();
         assert!(db.is_album_processed("Artist", "Album").unwrap());
         assert!(!db.is_album_processed("Artist", "Other").unwrap());
+    }
+
+    #[test]
+    fn test_get_album_status() {
+        let db = test_db();
+        db.migrate().unwrap();
+
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
+        let status = db.get_album_status("Artist", "Album").unwrap();
+        assert_eq!(status, Some("success".to_string()));
+
+        // Untracked albums return None.
+        let missing = db.get_album_status("Nobody", "Nothing").unwrap();
+        assert_eq!(missing, None);
     }
 
     #[test]
