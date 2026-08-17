@@ -78,6 +78,21 @@ pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
             let final_album = tag_album.unwrap_or(album);
 
             let key = (final_artist.clone(), final_album.clone());
+            // The album's real location inside the library: the directory ABOVE
+            // the artist/album folders. For a standard <root>/Artist/Album
+            // layout this is the library root itself; for nested layouts (e.g.
+            // <root>/Genre/Artist/Album) it is <root>/Genre. Threaded to the
+            // runner so the library upgrade copies new files back into the
+            // exact directory the album was found in — not the root of the
+            // library path.
+            let album_location = components
+                .get(..components.len().saturating_sub(3))
+                .map(|extra| {
+                    extra
+                        .iter()
+                        .fold(lib_path.to_path_buf(), |acc, c| acc.join(c))
+                })
+                .unwrap_or_else(|| lib_path.to_path_buf());
             albums
                 .entry(key)
                 .and_modify(|a| {
@@ -91,7 +106,7 @@ pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
                     }
                 })
                 .or_insert_with(|| ScannedAlbum {
-                    path: lib_path.to_path_buf(),
+                    path: album_location,
                     artist: final_artist,
                     album: final_album,
                     track_count: 1,
@@ -131,9 +146,11 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
 
 /// Determine which albums need upgrading based on filter config.
 /// An album is flagged if ANY track is below quality thresholds or in a non-allowed format.
-/// Returns (artist, album, track_count, library_root) — the library root path
-/// is threaded to the runner so auto-mode can copy upgrades back to the
-/// directory the album was found in.
+/// Returns (artist, album, track_count, library_location) — the directory the
+/// album was found in (for a standard <root>/Artist/Album layout this is the
+/// library root; for nested layouts it is the directory above the artist
+/// folder) is threaded to the runner so auto-mode copies upgrades back into
+/// the album's real location.
 pub fn find_albums_to_upgrade(
     albums: &[ScannedAlbum],
     config: &FilterConfig,
@@ -289,6 +306,46 @@ mod tests {
         assert_eq!(to_upgrade[0].1, "Album");
         assert_eq!(to_upgrade[0].2, 1); // track_count
         assert_eq!(to_upgrade[0].3, dir.path().to_path_buf()); // library root
+    }
+
+    #[test]
+    fn test_find_albums_to_upgrade_preserves_nested_album_location() {
+        let dir = TempDir::new().unwrap();
+        // Nested library layout: <root>/Pop/Alesha Dixon/The Alesha Show/01 - Track.ogg
+        // The album's real location is one level below the library root (inside
+        // the "Pop" genre subdirectory). The path returned for the upgrade must
+        // be the directory ABOVE the artist folder (<root>/Pop), NOT the library
+        // root — otherwise the upgrade copy lands at the root of the library
+        // path instead of where the album actually lives.
+        let album_dir = dir
+            .path()
+            .join("Pop")
+            .join("Alesha Dixon")
+            .join("The Alesha Show");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let config = crate::config::FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 3,
+            peer_track_count: true,
+        };
+
+        let to_upgrade = find_albums_to_upgrade(&albums, &config);
+        assert_eq!(to_upgrade.len(), 1);
+        assert_eq!(to_upgrade[0].0, "Pop"); // dir-derived artist (no tags in fake bytes)
+        assert_eq!(to_upgrade[0].1, "Alesha Dixon"); // dir-derived album
+        assert_eq!(to_upgrade[0].2, 1); // track_count
+                                        // The upgrade target must be the directory above the artist folder
+                                        // (<root>/Pop), not the library root — this is what preserves the
+                                        // album's real location inside the library.
+        assert_eq!(to_upgrade[0].3, dir.path().join("Pop"));
     }
 
     #[test]

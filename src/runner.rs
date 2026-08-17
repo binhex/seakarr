@@ -1180,6 +1180,85 @@ mod tests {
         assert_eq!(rows[0].status, "success");
     }
 
+    // Regression guard: a library album nested inside a genre subdirectory
+    // (e.g. <root>/Pop/Alesha Dixon/The Alesha Show/) must be upgraded IN
+    // PLACE — the copied files land at the album's real location below the
+    // library root, not at the root of the library path. Real-world case:
+    // the Alesha Dixon album was copied to .../Albums/Pop/Alesha Dixon/...
+    // instead of .../Albums/Pop/Pop/Alesha Dixon/...
+    #[tokio::test]
+    async fn test_auto_mode_upgrade_preserves_nested_library_location() {
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Music\Pop\Alesha Dixon\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+
+        let mut config = make_test_config();
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = false;
+        let tmp = TempDir::new().unwrap();
+        // Library layout: <tmp>/Pop/Alesha Dixon/The Alesha Show/01 - track.mp3
+        // (mp3 is not in the allowed [flac] list, so the album is flagged for
+        // upgrade). The album lives inside the "Pop" genre subdirectory.
+        let album_dir = tmp
+            .path()
+            .join("Pop")
+            .join("Alesha Dixon")
+            .join("The Alesha Show");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("01 - track.mp3"), b"fake mp3 data").unwrap();
+        config.library.paths = vec![tmp.path().to_string_lossy().into()];
+
+        // Pre-seed the per-album staging dir: the mock client reports the
+        // download as complete without creating file content, so the staging
+        // files must already exist for copy_to_library to succeed.
+        let staging = TempDir::new().unwrap();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let album_staging = staging.path().join("Pop--Alesha Dixon");
+        std::fs::create_dir_all(&album_staging).unwrap();
+        std::fs::write(album_staging.join("01 - track.flac"), b"fake flac").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let result = run_auto_mode(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            &config,
+            &db,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // The upgraded FLAC must land at the album's REAL location inside the
+        // genre subdirectory — <tmp>/Pop/Pop/Alesha Dixon/01 - track.flac —
+        // mirroring the user's `.../Albums/Pop/Pop/Alesha Dixon/The Alesha Show/`
+        // case. It must NOT land at the library root (<tmp>/Pop/Alesha Dixon/...).
+        let expected = tmp
+            .path()
+            .join("Pop")
+            .join("Pop")
+            .join("Alesha Dixon")
+            .join("01 - track.flac");
+        assert!(
+            expected.exists(),
+            "upgrade must copy into the album's real location inside the library: {expected:?}"
+        );
+        let wrong = tmp
+            .path()
+            .join("Pop")
+            .join("Alesha Dixon")
+            .join("01 - track.flac");
+        assert!(
+            !wrong.exists(),
+            "upgrade must NOT copy to the root of the library path: {wrong:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_process_album_returns_failed_when_download_exhausted() {
         let client = Arc::new(MockClient::new());
