@@ -19,6 +19,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub pid: PidConfig,
     pub notifications: NotificationConfig,
+    pub library_upgrade: LibraryUpgradeConfig,
     pub daemon: DaemonConfig,
 }
 
@@ -168,6 +169,14 @@ pub struct PidConfig {
 pub struct NotificationConfig {
     #[serde(default)]
     pub urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryUpgradeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub delete_lesser_quality: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +378,11 @@ impl Default for NotificationConfig {
         Config::default().notifications
     }
 }
+impl Default for LibraryUpgradeConfig {
+    fn default() -> Self {
+        Config::default().library_upgrade
+    }
+}
 impl Default for DaemonConfig {
     fn default() -> Self {
         Config::default().daemon
@@ -503,6 +517,11 @@ impl Config {
                 "soulseek.max_peers must be at least 1".into(),
             ));
         }
+        if self.library_upgrade.enabled && self.library.paths.is_empty() {
+            return Err(SeakarrError::Config(
+                "library_upgrade.enabled requires at least one library.paths entry".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -577,6 +596,10 @@ impl Default for Config {
                 file: default_pid_file(),
             },
             notifications: NotificationConfig { urls: vec![] },
+            library_upgrade: LibraryUpgradeConfig {
+                enabled: false,
+                delete_lesser_quality: false,
+            },
             daemon: DaemonConfig {
                 enabled: false,
                 rescan_interval_mins: default_rescan_interval(),
@@ -905,5 +928,45 @@ soulseek:
         assert_eq!(config.soulseek.listen_port, 8080);
         // Non-overridden values stay from YAML
         assert_eq!(config.download.concurrent, 5);
+    }
+
+    #[test]
+    fn test_library_upgrade_defaults_false() {
+        let config = Config::default();
+        assert!(!config.library_upgrade.enabled);
+        assert!(!config.library_upgrade.delete_lesser_quality);
+    }
+
+    #[test]
+    fn test_library_upgrade_from_yaml() {
+        let yaml = r#"
+library_upgrade:
+  enabled: true
+  delete_lesser_quality: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.library_upgrade.enabled);
+        assert!(config.library_upgrade.delete_lesser_quality);
+    }
+
+    #[test]
+    fn test_library_upgrade_requires_library_paths() {
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("library.paths"), "got: {err}");
+    }
+
+    #[test]
+    fn test_library_upgrade_valid_with_paths() {
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec!["/music".into()];
+        assert!(config.validate().is_ok());
     }
 }
