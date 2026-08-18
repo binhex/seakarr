@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::time::{timeout, Duration};
+
+use regex::Regex;
 
 use indicatif::ProgressBar;
 
@@ -328,17 +330,21 @@ async fn download_once(
 ///
 /// Ties are broken by lexicographic key order for determinism.
 pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInfo> {
-    let mut groups: std::collections::HashMap<&str, Vec<&'a FileInfo>> = Default::default();
+    let mut groups: std::collections::HashMap<String, Vec<&'a FileInfo>> = Default::default();
     for f in files {
         // rsplit_once gives the full parent path (everything before the
         // last separator), not just the immediate directory name.
-        let dir = f
+        let parent = f
             .name
             .rsplit_once(['/', '\\'])
             .map(|(parent, _basename)| parent)
             .filter(|p| !p.is_empty())
             .unwrap_or("<root>");
-        groups.entry(dir).or_default().push(f);
+        // Strip disc/CD designators so the discs of a multi-disc album
+        // collapse into a single group (CD 01 + CD 02 of the same album
+        // download together). Different albums keep distinct keys.
+        let key = album_group_key(parent);
+        groups.entry(key).or_default().push(f);
     }
     // Deterministic tie-breaking: prefer the larger group; on equal size
     // prefer lexicographically earlier key so the same album wins on
@@ -348,6 +354,62 @@ pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInf
         .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| bk.cmp(ak)))
         .map(|(_, v)| v)
         .unwrap_or_default()
+}
+
+/// Grouping key for a file's parent directory, with trailing disc/CD
+/// designators removed so the discs of a multi-disc album collapse into a
+/// single group. Handles both dedicated disc subfolders ("...\\CD 01") and
+/// embedded markers in the album folder name ("Gold (Disc 1)"). Only the
+/// disc designator is stripped — a genuinely different album name keeps a
+/// distinct key and is never merged in.
+fn album_group_key(parent: &str) -> String {
+    // Split the parent into (grandparent, leaf) on the last separator.
+    let Some(sep_idx) = parent.rfind(['/', '\\']) else {
+        return parent.to_string();
+    };
+    let (grandparent, leaf) = (&parent[..sep_idx], &parent[sep_idx + 1..]);
+    let sep = &parent[sep_idx..sep_idx + 1];
+
+    // Dedicated disc folder as the leaf, e.g. "...\\CD 01": key = grandparent.
+    if is_disc_folder(leaf) {
+        return grandparent.to_string();
+    }
+    // Embedded disc marker in the leaf, e.g. "Gold (Disc 1)": key = parent
+    // with the marker stripped from the leaf.
+    if let Some(stripped) = strip_embedded_disc_marker(leaf) {
+        return format!("{grandparent}{sep}{stripped}");
+    }
+
+    parent.to_string()
+}
+
+/// True when the directory name is a dedicated disc designator, e.g.
+/// "CD 01", "CD1", "Disc 2", "disc 02" (case-insensitive).
+fn is_disc_folder(leaf: &str) -> bool {
+    let lower = leaf.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("cd")
+        .or_else(|| lower.strip_prefix("disc"))
+        .map(str::trim)
+        .unwrap_or("");
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Strip a trailing embedded disc marker from an album folder name, e.g.
+/// "Gold (Disc 1)" -> "Gold", "Album - CD 2" -> "Album", "Gold [Disc 1]"
+/// -> "Gold". Returns None when no marker is present or the marker is the
+/// whole name (a dedicated disc folder, handled by [`is_disc_folder`]).
+fn strip_embedded_disc_marker(leaf: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:[\s(\[-])(?:cd|disc)\s*\d+\s*[)\]]?$").expect("valid disc-marker regex")
+    });
+    let m = re.find(leaf)?;
+    let prefix = leaf[..m.start()].trim_end_matches([' ', '-', '–', '—', '(', '[', '\t']);
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(prefix.to_string())
 }
 
 pub async fn download_album(
@@ -430,11 +492,34 @@ pub async fn download_album(
         let mut failed = false;
 
         for file in &filtered_files {
+            // Extract the disc subdirectory from the file's parent path
+            // so tracks from different CDs land in separate staging
+            // subdirectories (preventing collisions for same-named
+            // files across discs, e.g. "01 - Track.flac" on both
+            // CD 01 and CD 02 of a multi-disc album).
+            let disc_leaf = file
+                .name
+                .rsplit_once(['/', '\\'])
+                .and_then(|(parent, _basename)| {
+                    parent.rsplit_once(['/', '\\']).map(|(_, leaf)| leaf)
+                })
+                .unwrap_or("");
+            // Only create a disc subdirectory when the leaf is a dedicated
+            // disc designator (CD 01, CD 02, Disc 1, etc.). For albums
+            // without disc folders the leaf is the album name and the
+            // staging dir is already correct — no extra nesting needed.
+            let disc_dir = if !disc_leaf.is_empty() && is_disc_folder(disc_leaf) {
+                staging_dir.join(disc_leaf)
+            } else {
+                staging_dir.to_path_buf()
+            };
+            std::fs::create_dir_all(&disc_dir)?;
+
             match download_file(
                 client,
                 file,
                 &candidate.username,
-                staging_dir,
+                &disc_dir,
                 config,
                 progress,
                 cancel,
@@ -1251,33 +1336,33 @@ mod tests {
             files: vec![
                 // Small album: 2 files
                 make_file(
-                    "Music\\Abba\\Gold (Disc 1)\\01 - track.flac",
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-16- One of Us.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 1)\\02 - track.flac",
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-17- The Name of the Game (edit).flac",
                     900,
                     10_000_000,
                 ),
                 // Large album: 4 files — should be selected
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\01 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\01. summer night city.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\02 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\02. angeleyes.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\03 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\03. chiquitita.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\04 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\04. does your mother know.flac",
                     900,
                     10_000_000,
                 ),
@@ -1310,12 +1395,12 @@ mod tests {
         assert_eq!(
             downloaded.len(),
             4,
-            "should download the larger group (Disc 2), got {downloaded:?}"
+            "should download the larger album (More ABBA Gold), got {downloaded:?}"
         );
-        // All downloaded files must be from Disc 2
+        // All downloaded files must be from the larger album
         assert!(
-            downloaded.iter().all(|n| n.contains("Disc 2")),
-            "expected all files from Disc 2, got {downloaded:?}"
+            downloaded.iter().all(|n| n.contains("More ABBA Gold")),
+            "expected all files from More ABBA Gold, got {downloaded:?}"
         );
     }
 
@@ -1333,33 +1418,33 @@ mod tests {
             files: vec![
                 // Small album: 2 files
                 make_file(
-                    "Music\\Abba\\Gold (Disc 1)\\01 - track.flac",
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-16- One of Us.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 1)\\02 - track.flac",
+                    "Musikk\\Abba\\[1992] Gold_ Greatest Hits\\01-17- The Name of the Game (edit).flac",
                     900,
                     10_000_000,
                 ),
                 // Large album: 4 files — should be selected
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\01 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\01. summer night city.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\02 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\02. angeleyes.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\03 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\03. chiquitita.flac",
                     900,
                     10_000_000,
                 ),
                 make_file(
-                    "Music\\Abba\\Gold (Disc 2)\\04 - track.flac",
+                    "Musikk\\Abba\\[1993] More ABBA Gold\\04. does your mother know.flac",
                     900,
                     10_000_000,
                 ),
@@ -1392,12 +1477,192 @@ mod tests {
         assert_eq!(
             downloaded.len(),
             4,
-            "should download the larger group (Disc 2), got {downloaded:?}"
+            "should download the larger album (More ABBA Gold), got {downloaded:?}"
         );
-        // All downloaded files must be from Disc 2
+        // All downloaded files must be from the larger album
         assert!(
-            downloaded.iter().all(|n| n.contains("Disc 2")),
-            "expected all files from Disc 2, got {downloaded:?}"
+            downloaded.iter().all(|n| n.contains("More ABBA Gold")),
+            "expected all files from More ABBA Gold, got {downloaded:?}"
+        );
+    }
+
+    // Regression for the Michael Bolton "The Essential Michael Bolton"
+    // case: a peer shares a multi-CD album with one subfolder per disc
+    // (e.g. "...\FLAC (16bit-44.1kHz)\CD 01\*.flac" and
+    // "...\FLAC (16bit-44.1kHz)\CD 02\*.flac"). The previous grouping
+    // keyed on the full parent path, so CD 01 and CD 02 were treated as
+    // separate albums and only the larger disc was downloaded — losing
+    // half the album. ALL discs of the same album must download together.
+    #[tokio::test]
+    async fn download_album_downloads_all_discs_of_multi_disc_album() {
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // CD 01 — 3 files
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 01\\01 - One.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 01\\02 - Two.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 01\\03 - Three.flac",
+                    900,
+                    10_000_000,
+                ),
+                // CD 02 — 4 files (larger disc; previously selected alone)
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 02\\01 - Four.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 02\\02 - Five.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 02\\03 - Six.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Michael Bolton\\The Essential Michael Bolton\\CD 02\\04 - Seven.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            downloaded.len(),
+            7,
+            "all discs of the multi-CD album must download together, got {downloaded:?}"
+        );
+        // Files from BOTH discs are present.
+        assert!(
+            downloaded.iter().any(|n| n.contains("CD 01"))
+                && downloaded.iter().any(|n| n.contains("CD 02")),
+            "expected files from both CD 01 and CD 02, got {downloaded:?}"
+        );
+    }
+
+    // Disc markers embedded in the album folder name ("Gold (Disc 1)" /
+    // "Gold (Disc 2)") are the SAME album and must merge into one group.
+    // A DIFFERENT album under the same artist ("More ABBA Gold") must NOT
+    // be merged in — only discs of the same album group together.
+    #[tokio::test]
+    async fn download_album_merges_same_album_discs_but_not_different_albums() {
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // Gold (Disc 1) — 3 files
+                make_file("Music\\Abba\\Gold (Disc 1)\\01 - One.flac", 900, 10_000_000),
+                make_file("Music\\Abba\\Gold (Disc 1)\\02 - Two.flac", 900, 10_000_000),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\03 - Three.flac",
+                    900,
+                    10_000_000,
+                ),
+                // Gold (Disc 2) — 4 files (same album; must merge)
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\01 - Four.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\02 - Five.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file("Music\\Abba\\Gold (Disc 2)\\03 - Six.flac", 900, 10_000_000),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\04 - Seven.flac",
+                    900,
+                    10_000_000,
+                ),
+                // A different album — must NOT be merged with Gold
+                make_file(
+                    "Music\\Abba\\More ABBA Gold\\01 - Track.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\More ABBA Gold\\02 - Track.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = client
+            .download_filenames
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            downloaded.len(),
+            7,
+            "both Gold discs (7 files) must download together, More ABBA Gold excluded, got {downloaded:?}"
+        );
+        assert!(
+            downloaded.iter().all(|n| n.contains("Gold (Disc")),
+            "expected only files from Gold (Disc 1)/(Disc 2), got {downloaded:?}"
         );
     }
 
@@ -1631,6 +1896,69 @@ mod tests {
         assert!(
             !dir.path().exists(),
             "staging dir must be removed after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_disc_downloads_into_per_disc_subdirectories() {
+        // Regression: when a peer shares a multi-CD album, tracks from
+        // different discs must land in separate subdirectories inside the
+        // staging folder — not all dumped into the same flat directory.
+        // Same-named files from different discs (e.g. "01 - Track.flac"
+        // from both CD 01 and CD 02) would previously collide, losing
+        // tracks.
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                // CD 01 — 2 files
+                make_file("Music\\Album\\CD 01\\01 - Track.flac", 900, 10_000_000),
+                make_file("Music\\Album\\CD 01\\02 - Track.flac", 900, 10_000_000),
+                // CD 02 — 2 files with SAME names (collision risk)
+                make_file("Music\\Album\\CD 02\\01 - Track.flac", 900, 10_000_000),
+                make_file("Music\\Album\\CD 02\\02 - Track.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = result.unwrap();
+        assert_eq!(
+            downloaded.len(),
+            4,
+            "all 4 files from both discs must download (no collision), got {downloaded:?}"
+        );
+        // CD 01 files must be in a CD 01 subdirectory
+        assert!(
+            downloaded
+                .iter()
+                .any(|p| p.to_string_lossy().contains("CD 01")),
+            "CD 01 files must be in a CD 01 subdirectory, got {downloaded:?}"
+        );
+        // CD 02 files must be in a CD 02 subdirectory
+        assert!(
+            downloaded
+                .iter()
+                .any(|p| p.to_string_lossy().contains("CD 02")),
+            "CD 02 files must be in a CD 02 subdirectory, got {downloaded:?}"
         );
     }
 }

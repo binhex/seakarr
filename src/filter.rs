@@ -104,7 +104,7 @@ pub fn filter_results(
             if passing.is_empty() {
                 return false;
             }
-            if !crate::tracks::files_have_contiguous_tracks(&passing) {
+            if !files_have_contiguous_tracks_per_directory(&passing) {
                 // Distinguish the two rejection causes for operators.
                 let any_numbered = passing
                     .iter()
@@ -113,7 +113,7 @@ pub fn filter_results(
                     "result from {} rejected: {}",
                     r.username,
                     if any_numbered {
-                        "non-contiguous track numbers"
+                        "non-contiguous track numbers in one or more directories"
                     } else {
                         "no parseable track numbers"
                     }
@@ -154,6 +154,33 @@ pub fn filter_results(
         })
         .cloned()
         .collect()
+}
+
+/// Check that every directory group in `files` carries contiguous track
+/// numbers on its own. A peer's SearchResult can span multiple album
+/// directories (multi-disc albums: "CD 01" + "CD 02" subfolders, or
+/// embedded markers like "Gold (Disc 1)" / "Gold (Disc 2)"). Each disc
+/// must be complete independently — a gap in one disc (e.g. CD 01 missing
+/// tracks 11 and 13) must not be masked by another disc carrying those
+/// numbers. Files are grouped by their raw parent directory, and each
+/// group must pass [`crate::tracks::files_have_contiguous_tracks`].
+fn files_have_contiguous_tracks_per_directory(files: &[&FileInfo]) -> bool {
+    let mut groups: std::collections::HashMap<&str, Vec<&FileInfo>> = Default::default();
+    for f in files {
+        // Raw parent directory (everything before the last separator).
+        // Deliberately NOT run through album_group_key: discs must stay
+        // separate so each is validated on its own.
+        let dir = f
+            .name
+            .rsplit_once(['/', '\\'])
+            .map(|(parent, _basename)| parent)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("<root>");
+        groups.entry(dir).or_default().push(f);
+    }
+    groups
+        .values()
+        .all(|g| crate::tracks::files_have_contiguous_tracks(g))
 }
 
 pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> bool {
@@ -915,6 +942,57 @@ mod tests {
         assert!(
             filtered.is_empty(),
             "3 tracks < library 5 with contiguous_tracks ON → rejected"
+        );
+    }
+
+    #[test]
+    fn test_contiguity_rejects_gap_in_any_disc_of_multi_disc_album() {
+        // Regression for the Michael Bolton "The Essential Michael Bolton"
+        // case: a multi-disc album where CD 01 is missing tracks 11 and 13
+        // but CD 02 carries them. The old contiguity check ran across ALL
+        // files (both discs) and deduplicated track numbers, so the merged
+        // set 01..16 had no gaps and the gapped disc was accepted. Each
+        // disc must be contiguous on its own — a gap in ANY disc rejects
+        // the whole result.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 1,
+            peer_track_count: false,
+        };
+        let files = |disc: &str, nums: &[u32]| -> Vec<FileInfo> {
+            nums.iter()
+                .map(|n| {
+                    make_file(
+                        &format!(
+                            "Music\\Michael Bolton\\The Essential Michael Bolton\\{disc}\\{n:02} - track.flac"
+                        ),
+                        900,
+                        10_000_000,
+                    )
+                })
+                .collect()
+        };
+        let mut all = files("CD 01", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16]);
+        all.extend(files(
+            "CD 02",
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        ));
+
+        let results = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: all,
+        }];
+        let filtered = filter_results(&results, &cfg, None, None);
+        assert!(
+            filtered.is_empty(),
+            "CD 01 has gaps (11, 13 missing) — must be rejected even though CD 02 carries them"
         );
     }
 
