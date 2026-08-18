@@ -159,13 +159,15 @@ pub fn filter_results(
 /// Check that every directory group in `files` carries contiguous track
 /// numbers on its own. A peer's SearchResult can span multiple album
 /// directories (multi-disc albums: "CD 01" + "CD 02" subfolders, or
-/// embedded markers like "Gold (Disc 1)" / "Gold (Disc 2)"). Each disc
-/// must be complete independently — a gap in one disc (e.g. CD 01 missing
-/// tracks 11 and 13) must not be masked by another disc carrying those
-/// numbers. Files are grouped by their raw parent directory, and each
-/// group must pass [`crate::tracks::files_have_contiguous_tracks`].
+/// embedded markers like "Gold (Disc 1)" / "Gold (Disc 2)", or DISC-TRACK
+/// filenames like "1-01 - Title.flac"). Each disc must be complete
+/// independently — a gap in one disc (e.g. CD 01 missing tracks 11 and 13)
+/// must not be masked by another disc carrying those numbers. Files are
+/// grouped by their raw parent directory AND disc number, and each group
+/// must pass [`crate::tracks::files_have_contiguous_tracks`].
 fn files_have_contiguous_tracks_per_directory(files: &[&FileInfo]) -> bool {
-    let mut groups: std::collections::HashMap<&str, Vec<&FileInfo>> = Default::default();
+    let mut groups: std::collections::HashMap<(String, Option<u32>), Vec<&FileInfo>> =
+        Default::default();
     for f in files {
         // Raw parent directory (everything before the last separator).
         // Deliberately NOT run through album_group_key: discs must stay
@@ -175,8 +177,15 @@ fn files_have_contiguous_tracks_per_directory(files: &[&FileInfo]) -> bool {
             .rsplit_once(['/', '\\'])
             .map(|(parent, _basename)| parent)
             .filter(|p| !p.is_empty())
-            .unwrap_or("<root>");
-        groups.entry(dir).or_default().push(f);
+            .unwrap_or("<root>")
+            .to_string();
+        // Sub-group by disc number for DISC-TRACK filenames so that a
+        // flat directory holding "1-01..1-16" and "2-01..2-16" files
+        // validates each disc independently — CD 02 must not mask a gap
+        // in CD 01. Standard filenames have no disc number (None) and
+        // group together per directory.
+        let disc = crate::tracks::disc_number_from_filename(&f.name);
+        groups.entry((dir, disc)).or_default().push(f);
     }
     groups
         .values()
@@ -985,6 +994,60 @@ mod tests {
 
         let results = vec![SearchResult {
             username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: all,
+        }];
+        let filtered = filter_results(&results, &cfg, None, None);
+        assert!(
+            filtered.is_empty(),
+            "CD 01 has gaps (11, 13 missing) — must be rejected even though CD 02 carries them"
+        );
+    }
+
+    #[test]
+    fn test_contiguity_rejects_gap_in_flat_disc_track_album() {
+        // Regression: a peer shares a multi-disc album in a SINGLE flat
+        // directory with DISC-TRACK filenames (e.g. "1-01 - Title.flac",
+        // "2-01 - Title.flac"). CD 01 (disc "1-") is missing tracks 11
+        // and 13, but CD 02 (disc "2-") is complete. The per-directory
+        // grouping puts all files in one group; with CD 02 filling the
+        // gaps, the combined track set appears contiguous. Each disc
+        // must be validated independently — a gap in any disc rejects
+        // the whole result.
+        let cfg = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bitrate: None,
+            min_bitdepth: None,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 1,
+            peer_track_count: false,
+        };
+        // All files in ONE directory, DISC-TRACK naming:
+        // "<disc>-<track> - Title.flac"
+        let files = |disc: &str, nums: &[u32]| -> Vec<FileInfo> {
+            nums.iter()
+                .map(|n| {
+                    make_file(
+                        &format!(
+                            "Music\\Michael Bolton - The Essential Michael Bolton\\{disc}-{n:02} - track.flac"
+                        ),
+                        900,
+                        10_000_000,
+                    )
+                })
+                .collect()
+        };
+        let mut all = files("1", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16]);
+        all.extend(files(
+            "2",
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        ));
+
+        let results = vec![SearchResult {
+            username: "peer1".into(),
             speed: 500,
             slots: 1,
             files: all,

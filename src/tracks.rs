@@ -43,6 +43,28 @@ pub fn track_number_from_filename(name: &str) -> Option<u32> {
     })
 }
 
+/// Extract the disc number from a DISC-TRACK filename (e.g.
+/// "1-11 - Title.flac" → disc 1, "2-16 - Title.flac" → disc 2).
+/// Returns `None` when the filename does not use the DISC-TRACK
+/// convention (e.g. "01 - Title.flac", "Title.flac").
+pub(crate) fn disc_number_from_filename(name: &str) -> Option<u32> {
+    let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let tokens: Vec<&str> = basename
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    if tokens.len() >= 2
+        && tokens[0].len() <= 3
+        && tokens[0].chars().all(|c| c.is_ascii_digit())
+        && tokens[1].len() <= 3
+        && tokens[1].chars().all(|c| c.is_ascii_digit())
+    {
+        tokens[0].parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
 /// Check that a set of files carries contiguous track numbers.
 ///
 /// Collects the track number of every file, requires at least one, then
@@ -237,5 +259,23 @@ mod tests {
             Some(1)
         );
         assert_eq!(track_number_from_filename("11 - Steel Bars.flac"), Some(11));
+    }
+
+    #[test]
+    fn test_extract_disc_from_disc_track_format() {
+        // DISC-TRACK filenames: the first numeric token is the disc number.
+        assert_eq!(
+            disc_number_from_filename("1-01 - Soul Provider.flac"),
+            Some(1)
+        );
+        assert_eq!(disc_number_from_filename("1-11 - Steel Bars.flac"), Some(1));
+        assert_eq!(
+            disc_number_from_filename("2-16 - Thats What Love Is All About.flac"),
+            Some(2)
+        );
+        // Standard filenames have no disc number.
+        assert_eq!(disc_number_from_filename("01 - Soul Provider.flac"), None);
+        assert_eq!(disc_number_from_filename("11 - Steel Bars.flac"), None);
+        assert_eq!(disc_number_from_filename("Soul Provider.flac"), None);
     }
 }
