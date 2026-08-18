@@ -632,7 +632,7 @@ impl SoulseekClient for RealClient {
         tokio::task::spawn_blocking(move || {
             // Keep _download_handle alive for the entire bridge lifetime.
             let _keep = &_download_handle;
-            tracing::info!("Bridge started for {bridge_filename} from {bridge_username}");
+            tracing::debug!("Bridge started for {bridge_filename} from {bridge_username}");
             // Evaluate once: isatty is a syscall per call, and the
             // interactive/non-interactive decision does not change mid-transfer.
             let interactive = is_interactive();
