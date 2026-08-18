@@ -270,7 +270,7 @@ async fn download_once(
                     bar.finish_and_clear();
                 }
                 let dest = dir.join(basename);
-                tracing::info!("Download completed: {basename}");
+                tracing::info!("Download completed: {basename} -> {}", dest.display());
                 return Ok(dest);
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
