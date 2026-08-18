@@ -645,6 +645,18 @@ pub async fn run_manual_mode(
     // cleans the album's staging dir.
     let cancel = Arc::new(AtomicBool::new(false));
     let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+    // Derive library track count from the configured library paths
+    // when available, so the peer_track_count filter can reject peers
+    // with fewer tracks than the library even in manual mode.
+    let derived_library_count = album.and_then(|a| {
+        if config.library.paths.is_empty() {
+            return None;
+        }
+        search::get_library_track_filenames(&config.library.paths, artist, a)
+            .ok()
+            .filter(|tracks| !tracks.is_empty())
+            .map(|tracks| tracks.len())
+    });
     let result = process_album(
         client,
         artist,
@@ -654,7 +666,7 @@ pub async fn run_manual_mode(
         staging_dir,
         progress_ref,
         Some(&cancel),
-        None, // library_track_count (manual mode: no scanner data)
+        derived_library_count,
         None, // target_library_path (manual mode: no library upgrade)
     )
     .await;

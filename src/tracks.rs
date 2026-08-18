@@ -9,17 +9,38 @@ use crate::client::FileInfo;
 /// years. Covers leading numbering ("04_Cure for Me.flac") and mid-filename
 /// numbering ("Linkin Park - Hybrid Theory - 11 - Cure for the Itch.flac").
 /// Returns `None` when no such token exists.
+///
+/// For DISC-TRACK filenames (e.g. "1-11 - Title.flac", "2-16 - Title.flac"),
+/// the first numeric token is the disc number and the second is the track
+/// number. When the first two alphanumeric tokens are both 1–3 digit numbers,
+/// the first is skipped and the second (track number) is returned.
 pub fn track_number_from_filename(name: &str) -> Option<u32> {
     let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
-    basename
+    let tokens: Vec<&str> = basename
         .split(|c: char| !c.is_alphanumeric())
         .filter(|tok| !tok.is_empty())
-        .find_map(|tok| {
-            if tok.len() > 3 || !tok.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            tok.parse::<u32>().ok()
-        })
+        .collect();
+
+    // For DISC-TRACK filenames (e.g. "1-11 - Title.flac"), the first
+    // numeric token is the disc number and the second is the track
+    // number. Skip the disc number and return the track number.
+    let start = if tokens.len() >= 2
+        && tokens[0].len() <= 3
+        && tokens[0].chars().all(|c| c.is_ascii_digit())
+        && tokens[1].len() <= 3
+        && tokens[1].chars().all(|c| c.is_ascii_digit())
+    {
+        1
+    } else {
+        0
+    };
+
+    tokens[start..].iter().find_map(|tok| {
+        if tok.len() > 3 || !tok.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        tok.parse::<u32>().ok()
+    })
 }
 
 /// Check that a set of files carries contiguous track numbers.
@@ -190,5 +211,31 @@ mod tests {
             track_number_from_filename("Maroon 5 - 03 - Maps.flac"),
             Some(5)
         );
+    }
+
+    #[test]
+    fn test_extract_track_from_disc_track_format() {
+        // DISC-TRACK filenames: "1-01 - Title.flac", "1-11 - Title.flac",
+        // "2-16 - Title.flac". The first numeric token is the disc number,
+        // the second is the track number. track_number_from_filename should
+        // return the TRACK number, not the disc number.
+        assert_eq!(
+            track_number_from_filename("1-01 - Soul Provider.flac"),
+            Some(1)
+        );
+        assert_eq!(
+            track_number_from_filename("1-11 - Steel Bars.flac"),
+            Some(11)
+        );
+        assert_eq!(
+            track_number_from_filename("2-16 - Thats What Love Is All About.flac"),
+            Some(16)
+        );
+        // Standard format still works: "01 - Song.flac" → 1
+        assert_eq!(
+            track_number_from_filename("01 - Soul Provider.flac"),
+            Some(1)
+        );
+        assert_eq!(track_number_from_filename("11 - Steel Bars.flac"), Some(11));
     }
 }
