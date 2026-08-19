@@ -326,8 +326,9 @@ fn release_pid_lock(pid_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Daemon loop: run an auto-mode scan cycle, then sleep until the next cycle
-/// or shut down gracefully on SIGINT/SIGTERM.
+/// Daemon loop: run a scan cycle (dispatching on the configured search
+/// mode), then sleep until the next cycle or shut down gracefully on
+/// SIGINT/SIGTERM.
 async fn run_daemon(
     client: &dyn SoulseekClient,
     config: &Config,
@@ -339,7 +340,7 @@ async fn run_daemon(
 
     loop {
         tracing::info!("Daemon: starting scan cycle...");
-        if let Err(e) = runner::run_auto_mode(client, config, db).await {
+        if let Err(e) = run_daemon_cycle(client, config, db).await {
             tracing::error!("Scan cycle failed: {e}");
         }
 
@@ -371,6 +372,37 @@ async fn run_daemon(
                 _ = tokio::time::sleep(interval) => {}
             }
         }
+    }
+}
+
+/// Run ONE daemon scan cycle, dispatching on the configured search mode.
+///
+/// The daemon loop must respect the same mode + criteria as a one-shot run:
+/// manual mode searches the configured artist/album, batch mode processes
+/// the configured batch file, auto mode scans the library. Previously the
+/// daemon hardcoded auto mode, silently ignoring `--mode manual --artist X
+/// --album Y` (or `--mode batch --batch-file F`).
+async fn run_daemon_cycle(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+) -> Result<()> {
+    let mode = config.search.default_mode.as_str();
+    match mode {
+        "manual" => {
+            let artist = non_empty(&config.search.manual.artist).ok_or_else(|| {
+                SeakarrError::Config("--artist required for manual mode (daemon)".into())
+            })?;
+            let album = non_empty(&config.search.manual.album);
+            runner::run_manual_mode(client, artist, album, config, db).await
+        }
+        "batch" => {
+            let batch_path = non_empty(&config.search.batch.file_path).ok_or_else(|| {
+                SeakarrError::Config("--batch-file required for batch mode (daemon)".into())
+            })?;
+            run_batch_mode(client, batch_path, config, db).await
+        }
+        _ => runner::run_auto_mode(client, config, db).await,
     }
 }
 
@@ -469,6 +501,48 @@ async fn run_batch_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seakarr::client::MockClient;
+    use seakarr::db::Database;
+    use tempfile::TempDir;
+
+    // Regression: `--daemon --mode manual --artist X --album Y` must honour
+    // the manual criteria instead of running an auto-mode library scan.
+    // Previously run_daemon hardcoded run_auto_mode every cycle, so the
+    // artist/album were silently ignored and arbitrary albums downloaded.
+    #[tokio::test]
+    async fn daemon_cycle_honours_manual_mode_artist_album() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.soulseek.username = "test".into();
+        config.soulseek.password = "test".into();
+        config.download.concurrent = 2;
+        config.download.min_upload_speed_kbps = 0; // disabled
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls = vec![];
+        config.filters.min_tracks = 0;
+        config.search.default_mode = "manual".into();
+        config.search.manual.artist = "Michael Bolton".into();
+        config.search.manual.album = "The Essential Michael Bolton".into();
+        config.daemon.enabled = true;
+        // Empty library paths: auto mode would fail with
+        // "library.paths is empty", proving manual mode ran instead.
+        config.library.paths = vec![];
+        let staging = TempDir::new().unwrap();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_daemon_cycle(&client, &config, &db)
+            .await
+            .expect("daemon cycle must succeed in manual mode");
+
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries.iter().any(|q| q.contains("Michael Bolton")),
+            "manual-mode daemon cycle must search for the requested artist, got queries: {queries:?}"
+        );
+    }
 
     // Regression: seakarr must exit after a run completes even when a
     // blocking task (e.g. the download status bridge) is still running.

@@ -488,6 +488,17 @@ impl Config {
         if let Some(ref v) = cli.mode {
             self.search.default_mode = v.clone();
         }
+        // Persist manual/batch criteria into config so the daemon loop
+        // (which only sees Config, never the CLI) can honour them.
+        if let Some(ref v) = cli.artist {
+            self.search.manual.artist = v.clone();
+        }
+        if let Some(ref v) = cli.album {
+            self.search.manual.album = v.clone();
+        }
+        if let Some(ref v) = cli.batch_file {
+            self.search.batch.file_path = v.clone();
+        }
         if cli.daemon {
             self.daemon.enabled = true;
         }
@@ -1225,5 +1236,49 @@ library_upgrade:
         config.library_upgrade.enabled = true;
         config.library.paths = vec!["/music".into()];
         assert!(config.validate().is_ok());
+    }
+
+    // Regression: `--daemon --mode manual --artist X --album Y` must keep
+    // the manual criteria reachable from the daemon loop. merge_cli stores
+    // mode/daemon but must ALSO persist artist/album/batch_file into the
+    // config sections so run_daemon (which only sees Config, never the CLI)
+    // can honour the requested search criteria.
+    #[test]
+    fn merge_cli_persists_manual_and_batch_criteria() {
+        let mut config = Config::default();
+        config.merge_cli(CliOverrides {
+            log_level: None,
+            log_path: None,
+            db_path: None,
+            pid_path: None,
+            library_path: None,
+            soulseek_user: None,
+            soulseek_password: None,
+            listen_port: None,
+            mode: Some("manual".into()),
+            batch_file: None,
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+            daemon: true,
+            test: false,
+        });
+
+        assert_eq!(config.search.default_mode, "manual");
+        assert_eq!(config.search.manual.artist, "Michael Bolton");
+        assert_eq!(config.search.manual.album, "The Essential Michael Bolton");
+        assert!(config.daemon.enabled);
+
+        // Batch criteria must survive as well.
+        let mut config = Config::default();
+        config.merge_cli(CliOverrides {
+            mode: Some("batch".into()),
+            batch_file: Some("/tmp/albums.txt".into()),
+            artist: None,
+            album: None,
+            daemon: true,
+            ..Default::default()
+        });
+        assert_eq!(config.search.default_mode, "batch");
+        assert_eq!(config.search.batch.file_path, "/tmp/albums.txt");
     }
 }
