@@ -462,7 +462,7 @@ impl Config {
     /// Merge CLI overrides onto config values. CLI takes precedence.
     pub fn merge_cli(&mut self, cli: CliOverrides) {
         if let Some(ref v) = cli.log_level {
-            self.logging.level = v.clone();
+            self.logging.level = v.to_uppercase();
         }
         if let Some(ref v) = cli.log_path {
             self.logging.path = v.clone();
@@ -1001,6 +1001,32 @@ soulseek:
         assert_eq!(config.soulseek.listen_port, 8080);
         // Non-overridden values stay from YAML
         assert_eq!(config.download.concurrent, 5);
+    }
+
+    // Regression: --log-level must be case-insensitive so "debug" works
+    // the same as "DEBUG".
+    #[test]
+    fn test_merge_cli_log_level_case_insensitive() {
+        let mut config = Config::default();
+        config.merge_cli(CliOverrides {
+            log_level: Some("debug".into()),
+            ..Default::default()
+        });
+        assert_eq!(config.logging.level, "DEBUG");
+
+        let mut config = Config::default();
+        config.merge_cli(CliOverrides {
+            log_level: Some("info".into()),
+            ..Default::default()
+        });
+        assert_eq!(config.logging.level, "INFO");
+
+        let mut config = Config::default();
+        config.merge_cli(CliOverrides {
+            log_level: Some("Debug".into()),
+            ..Default::default()
+        });
+        assert_eq!(config.logging.level, "DEBUG");
     }
 
     #[test]
