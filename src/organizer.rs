@@ -198,7 +198,19 @@ pub fn copy_to_library(
             .unwrap_or_else(|| "01".to_string());
         let title = strip_leading_track_token(&stem);
         let relative = expand_pattern(pattern, artist, album, &track, title, &ext, "unknown");
-        let dest = library_root.join(&relative);
+        let mut dest = library_root.join(&relative);
+        // Preserve the CD XX structure for multi-disc albums: when a source
+        // file lives in a disc subdirectory under staging (e.g.
+        // ".../CD 01/01 - Track.flac"), keep that disc subdirectory under the
+        // album so same-named tracks from different discs do not collide.
+        if let Some(disc) = disc_subdir(src) {
+            dest = match dest.parent() {
+                Some(parent) => parent
+                    .join(&disc)
+                    .join(dest.file_name().unwrap_or_default()),
+                None => PathBuf::from(&disc).join(dest.file_name().unwrap_or_default()),
+            };
+        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -206,6 +218,39 @@ pub fn copy_to_library(
         dests.push(dest);
     }
     Ok(dests)
+}
+
+/// Return the disc subdirectory component of a staging source path, if the
+/// file was downloaded into a dedicated disc folder (e.g. "CD 01", "CD 02",
+/// "Disc 1"). Walks the parent components and returns the deepest disc-folder
+/// component. Files flattened directly into the album staging root return
+/// `None` so their destination is unchanged.
+fn disc_subdir(src: &Path) -> Option<String> {
+    let mut current = src.parent();
+    while let Some(dir) = current {
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if is_disc_folder(name) {
+                // Return the innermost (deepest) disc folder — the one
+                // closest to the file. Do not keep walking upward.
+                return Some(name.to_string());
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// True when a directory name is a dedicated disc designator, e.g. "CD 01",
+/// "CD1", "Disc 2", "disc 02" (case-insensitive). Mirrors the logic in
+/// download.rs so the destination can be grouped identically to staging.
+fn is_disc_folder(leaf: &str) -> bool {
+    let lower = leaf.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("cd")
+        .or_else(|| lower.strip_prefix("disc"))
+        .map(str::trim)
+        .unwrap_or("");
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Delete audio files in the album directory that are lower quality than the
@@ -225,10 +270,13 @@ pub fn delete_lesser_quality_files(
         .join(sanitize_component(album));
 
     // Files that were just copied in are the new quality baseline — skip them.
-    let new_filenames: HashSet<String> = new_files
+    // Use relative paths (from album_dir) so files in disc subdirectories
+    // (e.g. "CD 01/01 - Track.flac") are distinguished from flat files
+    // with the same basename (e.g. "01 - Track.flac").
+    let new_relpaths: HashSet<String> = new_files
         .iter()
-        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-        .map(String::from)
+        .filter_map(|p| p.strip_prefix(&album_dir).ok())
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
 
     // Best score among the newly downloaded files; 0 with no new files so
@@ -239,26 +287,41 @@ pub fn delete_lesser_quality_files(
         .max()
         .unwrap_or(0);
 
-    let mut deleted = 0;
-    for entry in fs::read_dir(&album_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    // Recursively walk the album directory so files inside disc
+    // subdirectories (CD 01/, CD 02/) are considered for deletion too.
+    fn walk_delete(
+        dir: &Path,
+        album_dir: &Path,
+        new_relpaths: &HashSet<String>,
+        new_best_score: u64,
+    ) -> Result<u32> {
+        let mut count: u32 = 0;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                count += walk_delete(&path, album_dir, new_relpaths, new_best_score)?;
+                continue;
+            }
+            if !is_audio_file(&path) {
+                continue; // cover.jpg, info.nfo, logs, cuesheets are preserved.
+            }
+            let rel = path
+                .strip_prefix(album_dir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if new_relpaths.contains(&rel) {
+                continue;
+            }
+            let existing_score = file_quality_score(&path).unwrap_or(0);
+            if existing_score < new_best_score {
+                fs::remove_file(&path)?;
+                count += 1;
+            }
         }
-        if !is_audio_file(&path) {
-            continue; // cover.jpg, info.nfo, logs, cuesheets are preserved.
-        }
-        let name = path.file_name().and_then(|n| n.to_str());
-        if name.is_some_and(|n| new_filenames.contains(n)) {
-            continue;
-        }
-        let existing_score = file_quality_score(&path).unwrap_or(0);
-        if existing_score < new_best_score {
-            fs::remove_file(&path)?;
-            deleted += 1;
-        }
+        Ok(count)
     }
+    let deleted = walk_delete(&album_dir, &album_dir, &new_relpaths, new_best_score)?;
     Ok(deleted)
 }
 
@@ -318,34 +381,52 @@ pub fn resume_library_upgrade(
         .join(sanitize_component(album));
     fs::create_dir_all(&album_dir)?;
 
-    for entry in fs::read_dir(album_staging)? {
-        let entry = entry?;
-        let src = entry.path();
-        if !src.is_file() {
-            continue;
-        }
-        let dest = album_dir.join(src.file_name().unwrap());
-        if dest.exists() {
-            if file_hash(&src)? == file_hash(&dest)? {
-                continue; // already copied correctly
+    // Walk the staging directory recursively so files inside disc
+    // subdirectories (CD 01/, CD 02/) are copied as well, preserving the
+    // CD XX structure under the album directory. A recursive walk is
+    // required because multi-disc albums keep each disc in its own folder.
+    // Returns the destination paths of all files copied or verified identical,
+    // so the caller can pass them as the protection set to
+    // delete_lesser_quality_files.
+    fn walk(src_root: &Path, dest_root: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(src_root)? {
+            let entry = entry?;
+            let src = entry.path();
+            // Use entry.file_type() instead of src.is_dir() so we do not
+            // follow symlinks — a symlink cycle inside staging would cause
+            // unbounded recursion (stack overflow).
+            if entry.file_type()?.is_dir() {
+                // Recurse into the subdirectory, mapping it 1:1 onto the
+                // destination so CD 01/ stays CD 01/. Create the matching
+                // destination directory so the copy has a parent to land in.
+                let dest_dir = dest_root.join(entry.file_name());
+                fs::create_dir_all(&dest_dir)?;
+                walk(&src, &dest_dir, copied)?;
+            } else {
+                let dest = dest_root.join(entry.file_name());
+                if dest.exists() {
+                    if file_hash(&src)? == file_hash(&dest)? {
+                        copied.push(dest);
+                        continue; // already copied correctly
+                    }
+                    // Corrupt/truncated partial copy: replace it.
+                    fs::remove_file(&dest)?;
+                }
+                fs::copy(&src, &dest)?;
+                copied.push(dest);
             }
-            // Corrupt/truncated partial copy: replace it.
-            fs::remove_file(&dest)?;
         }
-        fs::copy(&src, &dest)?;
+        Ok(())
     }
+    let mut copied = Vec::new();
+    walk(album_staging, &album_dir, &mut copied)?;
 
     // Clean up staging — absence of the staging dir signals a completed run.
     fs::remove_dir_all(album_staging)?;
 
     // Delete lesser-quality files (if enabled).
     if config.library_upgrade.delete_lesser_quality {
-        let new_files: Vec<PathBuf> = fs::read_dir(&album_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| is_audio_file(p))
-            .collect();
-        delete_lesser_quality_files(library_root, artist, album, &new_files)?;
+        delete_lesser_quality_files(library_root, artist, album, &copied)?;
     }
     Ok(())
 }
@@ -627,6 +708,60 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_to_library_preserves_multi_disc_subdirectories() {
+        // Regression: when a multi-CD album is downloaded into staging, each
+        // disc lands in its own CD XX subdirectory. Copying to the library
+        // must preserve that structure so same-named tracks from different
+        // discs (e.g. "01 - Track.flac" on both CD 01 and CD 02) do not
+        // collide in a single flat album directory.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        // Staging layout mirrors download.rs: Artist--Album/CD 01/...,
+        // Artist--Album/CD 02/...
+        let cd1_dir = staging.path().join("CD 01");
+        let cd2_dir = staging.path().join("CD 02");
+        fs::create_dir_all(&cd1_dir).unwrap();
+        fs::create_dir_all(&cd2_dir).unwrap();
+
+        let cd1_t1 = cd1_dir.join("01 - Track.flac");
+        let cd1_t2 = cd1_dir.join("02 - Track.flac");
+        let cd2_t1 = cd2_dir.join("01 - Track.flac");
+        let cd2_t2 = cd2_dir.join("02 - Track.flac");
+        fs::write(&cd1_t1, b"cd1 track1").unwrap();
+        fs::write(&cd1_t2, b"cd1 track2").unwrap();
+        fs::write(&cd2_t1, b"cd2 track1").unwrap();
+        fs::write(&cd2_t2, b"cd2 track2").unwrap();
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        let files = vec![
+            cd1_t1.clone(),
+            cd1_t2.clone(),
+            cd2_t1.clone(),
+            cd2_t2.clone(),
+        ];
+        copy_to_library(&files, library.path(), pattern, "Test Artist", "Test Album").unwrap();
+
+        // Each disc's tracks must land in its own subdirectory under the album.
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/CD 01/01 - Track.flac")
+            .exists());
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/CD 01/02 - Track.flac")
+            .exists());
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/CD 02/01 - Track.flac")
+            .exists());
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/CD 02/02 - Track.flac")
+            .exists());
+    }
+
+    #[test]
     fn test_delete_lesser_quality_removes_worse_files() {
         let dir = TempDir::new().unwrap();
         let library_root = dir.path();
@@ -740,6 +875,39 @@ mod tests {
 
         let content = fs::read_to_string(&dest).unwrap();
         assert_eq!(content, "same content");
+        assert!(!staging.path().exists());
+    }
+
+    #[test]
+    fn test_resume_library_upgrade_preserves_multi_disc_subdirectories() {
+        // Regression: an interrupted library upgrade of a multi-CD album
+        // must restore the CD XX subdirectory structure, not flatten all
+        // discs into a single album directory.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        // Staging layout mirrors download.rs: CD 01/... and CD 02/...
+        let cd1_dir = staging.path().join("CD 01");
+        let cd2_dir = staging.path().join("CD 02");
+        fs::create_dir_all(&cd1_dir).unwrap();
+        fs::create_dir_all(&cd2_dir).unwrap();
+
+        let cd1_t1 = cd1_dir.join("01 - Track.flac");
+        let cd2_t1 = cd2_dir.join("01 - Track.flac");
+        fs::write(&cd1_t1, b"cd1 content").unwrap();
+        fs::write(&cd2_t1, b"cd2 content").unwrap();
+
+        let config = Config::default();
+        resume_library_upgrade(&config, staging.path(), library.path(), "Artist", "Album").unwrap();
+
+        assert!(library
+            .path()
+            .join("Artist/Album/CD 01/01 - Track.flac")
+            .exists());
+        assert!(library
+            .path()
+            .join("Artist/Album/CD 02/01 - Track.flac")
+            .exists());
         assert!(!staging.path().exists());
     }
 
