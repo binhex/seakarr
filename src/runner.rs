@@ -494,7 +494,7 @@ pub async fn run_auto_mode(
     let targets_with_counts = scanner::find_albums_to_upgrade(&albums, &config.filters);
     for album in &albums {
         let fmt_str: Vec<&str> = album.formats.iter().map(|f| f.as_str()).collect();
-        tracing::info!(
+        tracing::debug!(
             "  {artist} — {album} ({tracks} tracks, formats: {formats}, bitrate: {bitrate:?})",
             artist = album.artist,
             album = album.album,
