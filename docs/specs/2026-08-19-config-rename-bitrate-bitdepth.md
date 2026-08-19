@@ -66,12 +66,12 @@ The `reconcile_config_file()` function needs a migration step before the merge t
 ```rust
 fn reconcile_config_file(config_file: &Path, contents: &str) -> Result<()> {
     // ... existing logic to parse file ...
-    
+
     // Migration: rename min_bitrate → min_bit_rate, min_bitdepth → min_bit_depth
     // Preserves existing values (e.g., min_bitrate: 320 becomes min_bit_rate: 320)
     migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate");
     migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth");
-    
+
     let merged = merge_with_defaults(&default_value, &file_value);
     // ... rest of existing logic ...
 }

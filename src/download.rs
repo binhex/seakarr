@@ -278,8 +278,8 @@ async fn download_once(
                 let dest = dir.join(basename);
                 tracing::info!("Download completed: {basename} -> {}", dest.display());
 
-                // Post-download quality verification: when min_bitrate or
-                // min_bitdepth is set and the peer did not provide the
+                // Post-download quality verification: when min_bit_rate or
+                // min_bit_depth is set and the peer did not provide the
                 // metadata in the search result, verify the actual file
                 // quality (lofty) before accepting it. A verification
                 // failure is treated like any other download failure — the
@@ -332,7 +332,7 @@ async fn download_once(
 }
 
 /// Verify that a downloaded file meets the configured quality requirements.
-/// Called after download completes when `min_bitrate` or `min_bitdepth` is
+/// Called after download completes when `min_bit_rate` or `min_bit_depth` is
 /// set and the peer did not provide the metadata in the search result.
 ///
 /// Returns Ok(()) when the file passes, when verification is not needed
@@ -347,32 +347,30 @@ pub(crate) fn verify_downloaded_quality(
 ) -> Result<()> {
     // Bitrate check (lossy files only). The peer didn't provide bitrate
     // (attribs key 0) — read the actual bitrate from the file.
-    if let Some(min_br) = filters.min_bitrate {
-        if !file.attribs.contains_key(&0) {
-            if let Some(actual_br) = crate::organizer::extract_bitrate(path) {
-                if actual_br < min_br {
-                    return Err(SeakarrError::Download(format!(
-                        "bitrate {actual_br} kbps below minimum {min_br} kbps"
-                    )));
-                }
+    if filters.min_bit_rate > 0 && !file.attribs.contains_key(&0) {
+        if let Some(actual_br) = crate::organizer::extract_bitrate(path) {
+            if actual_br < filters.min_bit_rate {
+                return Err(SeakarrError::Download(format!(
+                    "bitrate {actual_br} kbps below minimum {} kbps",
+                    filters.min_bit_rate
+                )));
             }
-            // extract_bitrate None → unparseable or lossless: skip.
         }
+        // extract_bitrate None → unparseable or lossless: skip.
     }
 
     // Bitdepth check (lossless files only). The peer didn't provide
     // bitdepth (attribs key 5) — read the actual bit depth from the file.
-    if let Some(min_bd) = filters.min_bitdepth {
-        if !file.attribs.contains_key(&5) {
-            if let Some(actual_bd) = crate::organizer::extract_bitdepth(path) {
-                if actual_bd < min_bd {
-                    return Err(SeakarrError::Download(format!(
-                        "bitdepth {actual_bd} below minimum {min_bd}"
-                    )));
-                }
+    if filters.min_bit_depth > 0 && !file.attribs.contains_key(&5) {
+        if let Some(actual_bd) = crate::organizer::extract_bitdepth(path) {
+            if actual_bd < filters.min_bit_depth {
+                return Err(SeakarrError::Download(format!(
+                    "bitdepth {actual_bd} below minimum {}",
+                    filters.min_bit_depth
+                )));
             }
-            // extract_bitdepth None → unparseable or lossy: skip.
         }
+        // extract_bitdepth None → unparseable or lossy: skip.
     }
 
     Ok(())
@@ -2104,8 +2102,8 @@ mod tests {
         let config = default_dl_config();
         // No minimums configured → no post-download verification runs.
         let filters = FilterConfig {
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             ..default_filter_config_test()
         };
 
@@ -2136,8 +2134,8 @@ mod tests {
         let file = make_file("track.mp3", 320, 10_000_000);
         let config = default_dl_config();
         let filters = FilterConfig {
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             ..default_filter_config_test()
         };
 
@@ -2177,8 +2175,8 @@ mod tests {
             attribs: HashMap::new(),
         };
         let filters = FilterConfig {
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             ..default_filter_config_test()
         };
 
@@ -2203,8 +2201,8 @@ mod tests {
             attribs: HashMap::new(), // peer did NOT provide bitdepth
         };
         let filters = FilterConfig {
-            min_bitrate: None,
-            min_bitdepth: Some(24),
+            min_bit_rate: 0,
+            min_bit_depth: 24,
             ..default_filter_config_test()
         };
 

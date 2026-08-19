@@ -172,10 +172,10 @@ pub fn find_albums_to_upgrade(
 
             // Check: bitrate below minimum? Treat unknown bitrate (None)
             // as needing upgrade — we can't verify quality without tags.
-            if let Some(min_br) = config.min_bitrate {
+            if config.min_bit_rate > 0 {
                 match a.min_bitrate {
                     None => return true, // unknown quality → flags whole album
-                    Some(album_min) if album_min < min_br => return true,
+                    Some(album_min) if album_min < config.min_bit_rate => return true,
                     _ => {}
                 }
             }
@@ -260,8 +260,8 @@ mod tests {
 
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -291,8 +291,8 @@ mod tests {
         let albums = scan_library(&library_paths(dir.path())).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -328,8 +328,8 @@ mod tests {
         let albums = scan_library(&library_paths(dir.path())).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -362,8 +362,8 @@ mod tests {
 
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,

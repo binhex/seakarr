@@ -99,8 +99,10 @@ pub struct BatchConfig {
 pub struct FilterConfig {
     #[serde(default = "default_extensions")]
     pub allowed_extensions: Vec<String>,
-    pub min_bitrate: Option<u32>,
-    pub min_bitdepth: Option<u32>,
+    #[serde(default)]
+    pub min_bit_rate: u32, // default: 0 (disabled). >0 = minimum kbps for lossy files
+    #[serde(default)]
+    pub min_bit_depth: u32, // default: 0 (disabled). >0 = minimum bit depth for lossless files
     #[serde(default)]
     pub exclude_words: Vec<String>,
     #[serde(default)]
@@ -416,9 +418,20 @@ impl Config {
 
         let contents = fs::read_to_string(&config_file)
             .map_err(|e| SeakarrError::Config(format!("failed to read {config_file:?}: {e}")))?;
-        let config: Config = serde_yaml::from_str(&contents)
-            .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
         Self::reconcile_config_file(&config_file, &contents)?;
+        // Re-read after migration: reconcile_config_file may have migrated
+        // old keys (e.g. min_bitrate → min_bit_rate) on disk. Parsing the
+        // original contents would silently drop the old keys (unknown to
+        // serde) and default the new keys to 0, disabling quality filters
+        // for the entire first run. Re-reading the migrated file ensures
+        // the returned config reflects the current on-disk state.
+        let migrated = fs::read_to_string(&config_file).map_err(|e| {
+            SeakarrError::Config(format!(
+                "failed to re-read {config_file:?} after migration: {e}"
+            ))
+        })?;
+        let config: Config = serde_yaml::from_str(&migrated)
+            .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
         Ok(config)
     }
 
@@ -432,11 +445,18 @@ impl Config {
             serde_yaml::to_value(Config::default()).map_err(|e| {
                 SeakarrError::Config(format!("failed to serialize default config: {e}"))
             })?;
-        let file_value: serde_yaml::Value = serde_yaml::from_str(contents)
+        let mut file_value: serde_yaml::Value = serde_yaml::from_str(contents)
             .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
 
+        // Migration: rename config keys that changed between versions.
+        // Preserves existing values (e.g., min_bitrate: 320 becomes
+        // min_bit_rate: 320). If the old key was null, it becomes 0,
+        // matching the new u32-with-0-disabled semantics.
+        let renamed = migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate")
+            | migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth");
+
         let merged = merge_with_defaults(&default_value, &file_value);
-        if merged == file_value {
+        if merged == file_value && !renamed {
             return Ok(());
         }
 
@@ -576,6 +596,54 @@ impl Config {
     }
 }
 
+/// Rename a key within a YAML section, preserving the value.
+/// If the old key exists and is not null, its value is copied to the new key.
+/// If the old key exists and is null, the new key is set to 0 (disabled).
+/// The old key is always removed if present.
+/// If the old key is missing, nothing happens (merge_with_defaults will add
+/// the new key with its default).
+///
+/// Returns `true` if a rename occurred (old key was present), `false` otherwise.
+fn migrate_rename(
+    config: &mut serde_yaml::Value,
+    section: &str,
+    old_key: &str,
+    new_key: &str,
+) -> bool {
+    let serde_yaml::Value::Mapping(root) = config else {
+        return false;
+    };
+    let Some(serde_yaml::Value::Mapping(sec)) =
+        root.get_mut(serde_yaml::Value::String(section.into()))
+    else {
+        return false;
+    };
+
+    let old_key_yaml = serde_yaml::Value::String(old_key.into());
+    let new_key_yaml = serde_yaml::Value::String(new_key.into());
+
+    // Remove the old key and get its value
+    let old_val = sec.remove(&old_key_yaml);
+
+    match old_val {
+        Some(serde_yaml::Value::Null) => {
+            // null → 0 (disabled)
+            sec.insert(new_key_yaml, serde_yaml::Value::Number(0.into()));
+            true
+        }
+        Some(val) => {
+            // Preserve the value under the new key
+            sec.insert(new_key_yaml, val);
+            true
+        }
+        None => {
+            // Old key not present — nothing to migrate.
+            // merge_with_defaults will add the new key with its default (0).
+            false
+        }
+    }
+}
+
 /// Recursively merge a parsed config file value over the current schema
 /// defaults. Every key present in the defaults is kept (file value wins when
 /// present, default added when missing); keys present in the file but absent
@@ -634,8 +702,8 @@ impl Default for Config {
             },
             filters: FilterConfig {
                 allowed_extensions: default_extensions(),
-                min_bitrate: None,
-                min_bitdepth: None,
+                min_bit_rate: 0,
+                min_bit_depth: 0,
                 exclude_words: vec![],
                 include_locked: false,
                 contiguous_tracks: default_true(),
@@ -721,8 +789,8 @@ search:
 
 filters:
   allowed_extensions: ["flac"]
-  min_bitrate: null
-  min_bitdepth: null
+  min_bit_rate: 0
+  min_bit_depth: 0
   exclude_words: []
   include_locked: false
   contiguous_tracks: true
@@ -1119,6 +1187,103 @@ soulseek:
     }
 
     #[test]
+    fn test_load_migrates_old_filter_keys_to_new_names() {
+        // Regression: Config::load() must return migrated values (not 0)
+        // when the config file contains old key names (min_bitrate/min_bitdepth)
+        // that were renamed to min_bit_rate/min_bit_depth. The migration
+        // rewrites the on-disk file and Config::load() re-reads it.
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+soulseek:
+  username: test
+  password: test
+filters:
+  allowed_extensions: [flac]
+  min_bitrate: 320
+  min_bitdepth: 24
+  exclude_words: []
+  include_locked: false
+  contiguous_tracks: true
+  min_tracks: 3
+  peer_track_count: true
+search:
+  default_mode: auto
+  timeout_secs: 10
+  response_limit: 25
+  type: global
+  delay_secs: 1.0
+  block_threshold: 50
+  block_pause_secs: 300
+  search_title_match: 70
+  manual:
+    artist: ""
+    album: ""
+  batch:
+    file_path: ""
+download:
+  concurrent: 3
+  max_queue_length: 0
+  max_start_time_secs: 120
+  max_queue_time_secs: 1800
+  min_upload_speed_kbps: 0
+  speed_check_wait_secs: 0
+  timeout_secs: 300
+  max_download_time_mins: 120
+  max_retries: 3
+  retry_delay_secs: 30
+storage:
+  staging_dir: /tmp/staging
+  organize: true
+  organize_pattern: "%artist%/%album%/%track% - %title%.%ext%"
+logging:
+  level: INFO
+  path: ""
+daemon:
+  enabled: false
+  interval_secs: 3600
+library:
+  paths: []
+  scan_on_startup: true
+library_upgrade:
+  enabled: false
+  delete_lesser_quality: false
+notifications:
+  urls: []
+"#;
+        fs::write(dir.path().join("seakarr.yml"), yaml).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert_eq!(
+            config.filters.min_bit_rate, 320,
+            "Config::load must return migrated min_bit_rate from old min_bitrate key"
+        );
+        assert_eq!(
+            config.filters.min_bit_depth, 24,
+            "Config::load must return migrated min_bit_depth from old min_bitdepth key"
+        );
+
+        // Verify the on-disk file was migrated
+        let contents = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(
+            contents.contains("min_bit_rate: 320"),
+            "migrated file must contain min_bit_rate: 320"
+        );
+        assert!(
+            contents.contains("min_bit_depth: 24"),
+            "migrated file must contain min_bit_depth: 24"
+        );
+        assert!(
+            !contents.contains("min_bitrate:"),
+            "old key min_bitrate must be removed from migrated file"
+        );
+        assert!(
+            !contents.contains("min_bitdepth:"),
+            "old key min_bitdepth must be removed from migrated file"
+        );
+    }
+
+    #[test]
     fn test_load_migrates_nested_missing_entries() {
         let dir = TempDir::new().unwrap();
         // Section present but missing some NESTED keys (simulates a schema change
@@ -1306,5 +1471,157 @@ library_upgrade:
         });
         assert_eq!(config.search.default_mode, "batch");
         assert_eq!(config.search.batch.file_path, "/tmp/albums.txt");
+    }
+
+    // ── migrate_rename tests ──
+
+    #[test]
+    fn test_filter_config_min_bit_rate_default_is_zero() {
+        let config = Config::default();
+        assert_eq!(
+            config.filters.min_bit_rate, 0,
+            "min_bit_rate default should be 0 (disabled)"
+        );
+    }
+
+    #[test]
+    fn test_filter_config_min_bit_depth_default_is_zero() {
+        let config = Config::default();
+        assert_eq!(
+            config.filters.min_bit_depth, 0,
+            "min_bit_depth default should be 0 (disabled)"
+        );
+    }
+
+    #[test]
+    fn test_filter_config_from_yaml_parses_min_bit_rate() {
+        let yaml = r#"
+soulseek:
+  username: test
+  password: test
+filters:
+  min_bit_rate: 320
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.filters.min_bit_rate, 320);
+    }
+
+    #[test]
+    fn test_filter_config_from_yaml_parses_min_bit_depth() {
+        let yaml = r#"
+soulseek:
+  username: test
+  password: test
+filters:
+  min_bit_depth: 24
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.filters.min_bit_depth, 24);
+    }
+
+    #[test]
+    fn test_reconcile_migrates_min_bitrate_to_min_bit_rate() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("seakarr.yml");
+        fs::write(
+            &config_file,
+            r#"
+soulseek:
+  username: test
+  password: test
+filters:
+  min_bitrate: 320
+  min_bitdepth: 16
+"#,
+        )
+        .unwrap();
+
+        Config::reconcile_config_file(&config_file, &fs::read_to_string(&config_file).unwrap())
+            .unwrap();
+
+        let contents = fs::read_to_string(&config_file).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        let filters = config.get("filters").unwrap();
+
+        assert_eq!(
+            filters["min_bit_rate"].as_u64().unwrap(),
+            320,
+            "min_bitrate: 320 must become min_bit_rate: 320"
+        );
+        assert_eq!(
+            filters["min_bit_depth"].as_u64().unwrap(),
+            16,
+            "min_bitdepth: 16 must become min_bit_depth: 16"
+        );
+        assert!(
+            filters.get("min_bitrate").is_none(),
+            "old key min_bitrate must be removed"
+        );
+        assert!(
+            filters.get("min_bitdepth").is_none(),
+            "old key min_bitdepth must be removed"
+        );
+    }
+
+    #[test]
+    fn test_migrate_rename_preserves_value() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+filters:
+  min_bitrate: 320
+"#,
+        )
+        .unwrap();
+        migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
+        let filters = config.get("filters").unwrap();
+        assert_eq!(filters["min_bit_rate"].as_u64().unwrap(), 320);
+    }
+
+    #[test]
+    fn test_migrate_rename_null_becomes_zero() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+filters:
+  min_bitrate: null
+"#,
+        )
+        .unwrap();
+        migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
+        let filters = config.get("filters").unwrap();
+        // null → 0 (disabled)
+        assert_eq!(filters["min_bit_rate"].as_u64().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn test_migrate_rename_missing_key() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+filters:
+  allowed_extensions: [flac]
+"#,
+        )
+        .unwrap();
+        migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
+        let filters = config.get("filters").unwrap();
+        // No old key → new key not added (merge_with_defaults will add it)
+        assert!(filters.get("min_bit_rate").is_none());
+    }
+
+    #[test]
+    fn test_migrate_rename_removes_old_key() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+filters:
+  min_bitrate: 320
+"#,
+        )
+        .unwrap();
+        migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
+        let filters = config.get("filters").unwrap();
+        assert!(
+            filters.get("min_bitrate").is_none(),
+            "old key must be removed"
+        );
+        assert!(filters.get("min_bit_rate").is_some(), "new key must exist");
     }
 }

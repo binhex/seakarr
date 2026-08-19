@@ -206,9 +206,9 @@ pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> boo
     // and the peer provides bitrate, reject files below the minimum. When the
     // peer does NOT provide bitrate, let the file pass — it will be verified
     // post-download using actual file metadata (lofty).
-    if let Some(min_br) = config.min_bitrate {
+    if config.min_bit_rate > 0 {
         if let Some(&file_br) = file.attribs.get(&0) {
-            if file_br < min_br {
+            if file_br < config.min_bit_rate {
                 return false;
             }
         }
@@ -217,9 +217,9 @@ pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> boo
     // Bitdepth check (key 5 = bit depth). Same semantics as the bitrate
     // check: reject only when the peer PROVIDES a bitdepth below the
     // minimum; a missing bitdepth passes and is verified post-download.
-    if let Some(min_bd) = config.min_bitdepth {
+    if config.min_bit_depth > 0 {
         if let Some(&file_bd) = file.attribs.get(&5) {
-            if file_bd < min_bd {
+            if file_bd < config.min_bit_depth {
                 return false;
             }
         }
@@ -333,15 +333,15 @@ pub fn rank_candidates(
                 },
                 None => 1.0,
             };
-            let bitrate_bonus = if let Some(min_br) = config.min_bitrate {
+            let bitrate_bonus = if config.min_bit_rate > 0 {
                 let max_br = r
                     .files
                     .iter()
                     .filter_map(|f| f.attribs.get(&0))
                     .max()
                     .unwrap_or(&0);
-                if *max_br >= min_br {
-                    1.0 + (*max_br as f64 - min_br as f64) / 1000.0
+                if *max_br >= config.min_bit_rate {
+                    1.0 + (*max_br as f64 - config.min_bit_rate as f64) / 1000.0
                 } else {
                     0.0
                 }
@@ -386,8 +386,8 @@ mod tests {
     fn default_filter_config() -> FilterConfig {
         FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn test_filter_by_min_bitrate() {
         let cfg = FilterConfig {
-            min_bitrate: Some(320),
+            min_bit_rate: 320,
             ..default_filter_config()
         };
         let results = vec![
@@ -454,8 +454,8 @@ mod tests {
         // min_bitrate is set: quality is verified post-download using the
         // actual file metadata rather than rejected at search time.
         let cfg = FilterConfig {
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             ..default_filter_config()
         };
         let file = FileInfo {
@@ -474,8 +474,8 @@ mod tests {
         // A file with NO bitdepth attribute (key 5) must PASS when
         // min_bitdepth is set: quality is verified post-download.
         let cfg = FilterConfig {
-            min_bitrate: None,
-            min_bitdepth: Some(16),
+            min_bit_rate: 0,
+            min_bit_depth: 16,
             ..default_filter_config()
         };
         let file = FileInfo {
@@ -493,8 +493,8 @@ mod tests {
     fn test_filter_still_rejects_low_bitrate_when_provided() {
         // When the peer DOES provide a bitrate below the min, reject.
         let cfg = FilterConfig {
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             ..default_filter_config()
         };
         let mut attribs = HashMap::new();
@@ -514,8 +514,8 @@ mod tests {
     fn test_filter_still_rejects_low_bitdepth_when_provided() {
         // When the peer DOES provide a bitdepth below the min, reject.
         let cfg = FilterConfig {
-            min_bitrate: None,
-            min_bitdepth: Some(24),
+            min_bit_rate: 0,
+            min_bit_depth: 24,
             ..default_filter_config()
         };
         let mut attribs = HashMap::new();
@@ -877,8 +877,8 @@ mod tests {
         // Peer has 3 filtered files, library has 5 → rejected.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -904,8 +904,8 @@ mod tests {
         // Peer has 5 filtered files, library has 5 → passes.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -933,8 +933,8 @@ mod tests {
         // Peer has 7 filtered files, library has 5 → passes.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -965,8 +965,8 @@ mod tests {
         // library has 5.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -992,8 +992,8 @@ mod tests {
         // library_track_count: None (batch/manual mode) → check skipped.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -1025,8 +1025,8 @@ mod tests {
         // (all other peer_track_count tests use contiguous_tracks: false).
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -1061,8 +1061,8 @@ mod tests {
         // the whole result.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -1113,8 +1113,8 @@ mod tests {
         // the whole result.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -1162,8 +1162,8 @@ mod tests {
         // only 1 track (so the peer would have passed the library check).
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -1203,8 +1203,8 @@ mod tests {
         // the library track count.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -1411,9 +1411,9 @@ pub fn summarize_rejections(
             // the peer PROVIDES a bitrate below the minimum. Missing
             // bitrate metadata passes the filter and is verified
             // post-download — it is not a rejection.
-            if let Some(min_br) = config.min_bitrate {
+            if config.min_bit_rate > 0 {
                 if let Some(&file_br) = f.attribs.get(&0) {
-                    if file_br < min_br {
+                    if file_br < config.min_bit_rate {
                         summary.bitrate_rejected += 1;
                         continue;
                     }
@@ -1423,9 +1423,9 @@ pub fn summarize_rejections(
             // bitrate check: reject only when the peer PROVIDES a bitdepth
             // below the minimum. Missing bitdepth passes the filter and is
             // verified post-download — it is not a rejection.
-            if let Some(min_bd) = config.min_bitdepth {
+            if config.min_bit_depth > 0 {
                 if let Some(&file_bd) = f.attribs.get(&5) {
-                    if file_bd < min_bd {
+                    if file_bd < config.min_bit_depth {
                         summary.bitdepth_rejected += 1;
                         continue;
                     }
@@ -1516,8 +1516,8 @@ mod rejection_summary_tests {
     fn default_filter_config() -> FilterConfig {
         FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: true,
@@ -1659,8 +1659,8 @@ mod rejection_summary_tests {
         // rejection: missing metadata passes pre-download filtering and is
         // verified post-download, mirroring file_passes_filters semantics.
         let cfg = FilterConfig {
-            min_bitrate: Some(320),
-            min_bitdepth: None,
+            min_bit_rate: 320,
+            min_bit_depth: 0,
             ..default_filter_config()
         };
         let results = vec![make_result(
@@ -1685,8 +1685,8 @@ mod rejection_summary_tests {
         // When min_bitdepth is set and the peer PROVIDES a bitdepth below
         // the minimum, it must be counted as a bitdepth rejection.
         let cfg = FilterConfig {
-            min_bitrate: None,
-            min_bitdepth: Some(24),
+            min_bit_rate: 0,
+            min_bit_depth: 24,
             ..default_filter_config()
         };
         let mut attribs = HashMap::new();
@@ -1721,8 +1721,8 @@ mod rejection_summary_tests {
         // Library has 5 tracks, peer has 3 → peer_track_count gate rejects.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
@@ -1750,8 +1750,8 @@ mod rejection_summary_tests {
         // Library has 5 tracks, peer has 3, but peer_track_count=false → passes.
         let cfg = FilterConfig {
             allowed_extensions: vec!["flac".into()],
-            min_bitrate: None,
-            min_bitdepth: None,
+            min_bit_rate: 0,
+            min_bit_depth: 0,
             exclude_words: vec![],
             include_locked: false,
             contiguous_tracks: false,
