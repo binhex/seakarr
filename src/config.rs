@@ -33,7 +33,7 @@ pub struct SoulseekConfig {
     pub login_retries: u32,
     #[serde(default = "default_login_retry_delay")]
     pub login_retry_delay_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,

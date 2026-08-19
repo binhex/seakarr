@@ -205,11 +205,10 @@ async fn download_once(
         let poll_timeout = Duration::from_secs(1);
         let msg = timeout(poll_timeout, handle.status_rx.recv()).await;
 
-        // Any message from the peer resets the deadline — the transfer
-        // is alive. Only the Err (poll timeout) arm checks the deadline.
-        if msg.is_ok() {
-            deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
-        }
+        // Only InProgress resets the deadline — actual data is flowing.
+        // Queued/Paused states do NOT reset: a peer that stays queued
+        // beyond timeout_secs should be abandoned. The Err (poll timeout)
+        // arm checks the deadline.
 
         match msg {
             Ok(Some(DownloadStatus::InProgress {
@@ -217,6 +216,8 @@ async fn download_once(
                 bytes_downloaded,
                 total_bytes,
             })) => {
+                // Data is flowing — reset the wall-clock deadline.
+                deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
                 if transfer_start.is_none() {
                     transfer_start = Some(tokio::time::Instant::now());
                     // Create the progress bar only once the transfer has

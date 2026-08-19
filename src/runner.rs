@@ -90,8 +90,8 @@ pub async fn process_album(
     // containing "01 - Intro.flac").
     let album_slug = format!(
         "{}--{}",
-        artist.replace('/', "-"),
-        album.unwrap_or("unknown").replace('/', "-")
+        artist.replace(['/', '\\'], "-"),
+        album.unwrap_or("unknown").replace(['/', '\\'], "-")
     );
     let album_staging = staging_dir.join(&album_slug);
     // Note: album_staging directory is created by download_album, only when

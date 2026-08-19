@@ -1341,17 +1341,25 @@ pub fn summarize_rejections(
 
         // Contiguity check (only if enabled and we have files)
         // — matches filter_results check order (contiguity before library gate)
+        // Must use per-directory contiguity (same as filter_results) so
+        // multi-disc albums with per-disc track numbering are validated
+        // correctly.
         if config.contiguous_tracks
             && !passing_files.is_empty()
-            && !crate::tracks::files_have_contiguous_tracks(&passing_files)
+            && !files_have_contiguous_tracks_per_directory(&passing_files)
         {
             summary.non_contiguous += 1;
             continue;
         }
 
         // Library track count check (auto mode only)
+        // Must mirror filter_results: use the largest album group's
+        // length, not the flat file count, so multi-folder shares and
+        // multi-disc albums are scored consistently.
         if let Some(lib_count) = library_track_count {
-            if config.peer_track_count && passing_files.len() < lib_count {
+            if config.peer_track_count
+                && crate::download::largest_album_group(&passing_files).len() < lib_count
+            {
                 summary.peer_track_count_rejected += 1;
                 continue;
             }
