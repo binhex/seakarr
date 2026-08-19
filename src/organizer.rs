@@ -346,6 +346,40 @@ fn file_quality_score(path: &Path) -> Option<u64> {
     }
 }
 
+/// Extract the actual bitrate (kbps) of an audio file using lofty. Returns
+/// None when the file cannot be parsed (e.g. junk bytes), the extension is
+/// not recognised, or the format is lossless (bitrate is not a meaningful
+/// quality metric for lossless formats — use [`extract_bitdepth`] instead).
+pub fn extract_bitrate(path: &Path) -> Option<u32> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    let format = format_from_extension(ext)?;
+    match format {
+        AudioFormat::Lossy => {
+            let tagged_file = lofty::probe::Probe::open(path).ok()?.read().ok()?;
+            let props = tagged_file.properties();
+            props.audio_bitrate().filter(|&br| br > 0)
+        }
+        AudioFormat::Lossless => None,
+    }
+}
+
+/// Extract the actual bit depth of an audio file using lofty. Returns None
+/// when the file cannot be parsed (e.g. junk bytes), the extension is not
+/// recognised, or the format is lossy (bit depth is not applicable to lossy
+/// formats — use [`extract_bitrate`] instead).
+pub fn extract_bitdepth(path: &Path) -> Option<u32> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    let format = format_from_extension(ext)?;
+    match format {
+        AudioFormat::Lossless => {
+            let tagged_file = lofty::probe::Probe::open(path).ok()?.read().ok()?;
+            let props = tagged_file.properties();
+            props.bit_depth().map(|b| b as u32)
+        }
+        AudioFormat::Lossy => None,
+    }
+}
+
 /// Compute the SHA-256 hash of a file's contents, used to detect corrupt or
 /// truncated partial copies during recovery.
 pub fn file_hash(path: &Path) -> Result<String> {
@@ -676,6 +710,40 @@ mod tests {
     #[test]
     fn test_sanitize_component_is_public() {
         assert_eq!(sanitize_component("A/B"), "A-B");
+    }
+
+    // ── Post-download verification helpers ──
+
+    #[test]
+    fn test_extract_bitdepth_from_lossless_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.flac");
+        write_real_flac(&path);
+        assert_eq!(extract_bitdepth(&path), Some(16));
+    }
+
+    #[test]
+    fn test_extract_bitrate_from_lossless_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.flac");
+        write_real_flac(&path);
+        assert_eq!(extract_bitrate(&path), None);
+    }
+
+    #[test]
+    fn test_extract_bitdepth_returns_none_for_unparseable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("junk.flac");
+        fs::write(&path, b"not a real flac").unwrap();
+        assert_eq!(extract_bitdepth(&path), None);
+    }
+
+    #[test]
+    fn test_extract_bitrate_returns_none_for_unparseable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("junk.flac");
+        fs::write(&path, b"not a real flac").unwrap();
+        assert_eq!(extract_bitrate(&path), None);
     }
 
     #[test]

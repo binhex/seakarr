@@ -59,12 +59,14 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
 /// The progress bar is created lazily on the first `InProgress` status —
 /// before that point no bar renders. Pass `None` for `progress` to skip
 /// the bar entirely.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_file(
     client: &dyn SoulseekClient,
     file: &FileInfo,
     username: &str,
     dir: &Path,
     config: &DownloadConfig,
+    filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<PathBuf> {
@@ -112,7 +114,7 @@ pub async fn download_file(
             }
         }
         match download_once(
-            client, file, basename, username, dir, config, progress, cancel,
+            client, file, basename, username, dir, config, filters, progress, cancel,
         )
         .await
         {
@@ -161,6 +163,7 @@ async fn download_once(
     username: &str,
     dir: &Path,
     config: &DownloadConfig,
+    filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<PathBuf> {
@@ -274,6 +277,20 @@ async fn download_once(
                 }
                 let dest = dir.join(basename);
                 tracing::info!("Download completed: {basename} -> {}", dest.display());
+
+                // Post-download quality verification: when min_bitrate or
+                // min_bitdepth is set and the peer did not provide the
+                // metadata in the search result, verify the actual file
+                // quality (lofty) before accepting it. A verification
+                // failure is treated like any other download failure — the
+                // caller (download_album) cleans up the staging dir and
+                // tries the next candidate.
+                if let Err(e) = verify_downloaded_quality(&dest, file, filters) {
+                    tracing::warn!("Quality verification failed for {basename}: {e}");
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(e);
+                }
+
                 return Ok(dest);
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
@@ -312,6 +329,53 @@ async fn download_once(
             }
         }
     }
+}
+
+/// Verify that a downloaded file meets the configured quality requirements.
+/// Called after download completes when `min_bitrate` or `min_bitdepth` is
+/// set and the peer did not provide the metadata in the search result.
+///
+/// Returns Ok(()) when the file passes, when verification is not needed
+/// (no minimum configured, or the peer already provided the metadata and
+/// the pre-download filter checked it), or when the file cannot be parsed
+/// (skip — can't verify what we can't read). Returns Err when the actual
+/// quality is below the configured minimum.
+pub(crate) fn verify_downloaded_quality(
+    path: &Path,
+    file: &FileInfo,
+    filters: &crate::config::FilterConfig,
+) -> Result<()> {
+    // Bitrate check (lossy files only). The peer didn't provide bitrate
+    // (attribs key 0) — read the actual bitrate from the file.
+    if let Some(min_br) = filters.min_bitrate {
+        if !file.attribs.contains_key(&0) {
+            if let Some(actual_br) = crate::organizer::extract_bitrate(path) {
+                if actual_br < min_br {
+                    return Err(SeakarrError::Download(format!(
+                        "bitrate {actual_br} kbps below minimum {min_br} kbps"
+                    )));
+                }
+            }
+            // extract_bitrate None → unparseable or lossless: skip.
+        }
+    }
+
+    // Bitdepth check (lossless files only). The peer didn't provide
+    // bitdepth (attribs key 5) — read the actual bit depth from the file.
+    if let Some(min_bd) = filters.min_bitdepth {
+        if !file.attribs.contains_key(&5) {
+            if let Some(actual_bd) = crate::organizer::extract_bitdepth(path) {
+                if actual_bd < min_bd {
+                    return Err(SeakarrError::Download(format!(
+                        "bitdepth {actual_bd} below minimum {min_bd}"
+                    )));
+                }
+            }
+            // extract_bitdepth None → unparseable or lossy: skip.
+        }
+    }
+
+    Ok(())
 }
 
 /// Download all files for an album from the best candidate, with fallback.
@@ -522,6 +586,7 @@ pub async fn download_album(
                 &candidate.username,
                 &disc_dir,
                 config,
+                filters,
                 progress,
                 cancel,
             )
@@ -911,7 +976,17 @@ mod tests {
         );
         let config = default_dl_config();
 
-        let result = download_file(&client, &file, "peer", dir.path(), &config, None, None).await;
+        let result = download_file(
+            &client,
+            &file,
+            "peer",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok());
 
         let wire_name = client
@@ -941,6 +1016,7 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
+            &default_filter_config_test(),
             Some(&display),
             None,
         )
@@ -1060,6 +1136,7 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
+            &default_filter_config_test(),
             None,
             None,
         )
@@ -1097,6 +1174,7 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
+            &default_filter_config_test(),
             None,
             None,
         )
@@ -1136,6 +1214,7 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
+            &default_filter_config_test(),
             None,
             Some(&cancel),
         )
@@ -1169,6 +1248,7 @@ mod tests {
             "testuser",
             dir.path(),
             &config,
+            &default_filter_config_test(),
             None,
             None,
         )
@@ -1190,8 +1270,17 @@ mod tests {
         let file = make_file("track.flac", 900, 10_000_000);
         let config = default_dl_config();
 
-        let result =
-            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -1756,8 +1845,17 @@ mod tests {
         config.min_upload_speed_kbps = 200; // require >200 KB/s
         config.speed_check_wait_secs = 0;
 
-        let result =
-            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
         // Should detect slow speed and return error
         assert!(result.is_err());
     }
@@ -1774,8 +1872,17 @@ mod tests {
         config.max_retries = 2;
         config.retry_delay_secs = 0;
 
-        let result =
-            download_file(&client, &file, "testuser", dir.path(), &config, None, None).await;
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -1960,6 +2067,156 @@ mod tests {
                 .iter()
                 .any(|p| p.to_string_lossy().contains("CD 02")),
             "CD 02 files must be in a CD 02 subdirectory, got {downloaded:?}"
+        );
+    }
+
+    // ── Post-download quality verification ──
+
+    /// Minimal valid FLAC (same bytes as organizer.rs's write_real_flac):
+    /// "fLaC" marker + STREAMINFO block with 44100 Hz, stereo, 16-bit —
+    /// parseable by lofty.
+    fn write_real_flac(path: &Path) {
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend_from_slice(b"fLaC");
+        // STREAMINFO metadata block header: last-block flag (0x80) + type 0,
+        // content length 34 (0x22).
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        // min/max block size (4096).
+        bytes.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        // min/max frame size (unknown = 0).
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        // 20-bit sample rate (44100) | channels-1 (1) | bits-per-sample-1 (15)
+        // | top 4 bits of total samples (0).
+        bytes.extend_from_slice(&0x0AC4_42F0u32.to_be_bytes());
+        // Remaining 32 bits of the 36-bit total sample count (44100).
+        bytes.extend_from_slice(&0x0000_AC44u32.to_be_bytes());
+        // MD5 signature of unencoded audio (unknown = zeros).
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert_eq!(bytes.len(), 42);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_download_skips_verification_when_min_not_set() {
+        let client = MockClient::new();
+        let dir = TempDir::new().unwrap();
+        let file = make_file("track.flac", 900, 10_000_000);
+        let config = default_dl_config();
+        // No minimums configured → no post-download verification runs.
+        let filters = FilterConfig {
+            min_bitrate: None,
+            min_bitdepth: None,
+            ..default_filter_config_test()
+        };
+
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            &filters,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "download must succeed with no minimums configured: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_skips_verification_when_peer_provides_metadata() {
+        let client = MockClient::new();
+        let dir = TempDir::new().unwrap();
+        // Peer provides bitrate metadata (attribs key 0 = 320) — the
+        // pre-download filter already checked it, so no post-download
+        // verification may run.
+        let file = make_file("track.mp3", 320, 10_000_000);
+        let config = default_dl_config();
+        let filters = FilterConfig {
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            ..default_filter_config_test()
+        };
+
+        let result = download_file(
+            &client,
+            &file,
+            "testuser",
+            dir.path(),
+            &config,
+            &filters,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "download must succeed when the peer provided the metadata: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_fails_fast_on_bitrate_failure() {
+        // verify_downloaded_quality on a real lossless FLAC: min_bitrate
+        // only applies to lossy formats, so extract_bitrate returns None
+        // (lossless) and the file passes. A genuine low-bitrate lossy MP3
+        // is not feasible to generate in a unit test — see final report.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("track.flac");
+        write_real_flac(&path);
+
+        // Peer did NOT provide bitrate metadata (empty attribs) — the
+        // post-download verification must kick in and pass the lossless
+        // file.
+        let file = FileInfo {
+            name: "track.flac".into(),
+            size: 10_000_000,
+            attribs: HashMap::new(),
+        };
+        let filters = FilterConfig {
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            ..default_filter_config_test()
+        };
+
+        let result = verify_downloaded_quality(&path, &file, &filters);
+        assert!(
+            result.is_ok(),
+            "lossless file must pass the min_bitrate verification: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_rejects_low_bitdepth_when_min_set() {
+        // A real 16-bit FLAC must fail verification when min_bitdepth is
+        // set to 24 — the actual bitdepth (16) is below the minimum.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("track.flac");
+        write_real_flac(&path);
+
+        let file = FileInfo {
+            name: "track.flac".into(),
+            size: 10_000_000,
+            attribs: HashMap::new(), // peer did NOT provide bitdepth
+        };
+        let filters = FilterConfig {
+            min_bitrate: None,
+            min_bitdepth: Some(24),
+            ..default_filter_config_test()
+        };
+
+        let result = verify_downloaded_quality(&path, &file, &filters);
+        assert!(
+            result.is_err(),
+            "16-bit FLAC must fail min_bitdepth=24 verification"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("bitdepth") && err_msg.contains("below minimum"),
+            "error must mention bitdepth and minimum, got: {err_msg}"
         );
     }
 }

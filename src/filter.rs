@@ -202,15 +202,28 @@ pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> boo
     {
         return false;
     }
-    // Bitrate check (key 0 = bitrate in kbps). An absent bitrate attribute
-    // means we cannot verify the file's quality — reject it when a minimum
-    // is configured, to avoid downloading files of unknown provenance.
+    // Bitrate check (key 0 = bitrate in kbps). When a minimum is configured
+    // and the peer provides bitrate, reject files below the minimum. When the
+    // peer does NOT provide bitrate, let the file pass — it will be verified
+    // post-download using actual file metadata (lofty).
     if let Some(min_br) = config.min_bitrate {
-        match file.attribs.get(&0) {
-            None => return false,
-            Some(&file_br) if file_br < min_br => return false,
-            _ => {}
+        if let Some(&file_br) = file.attribs.get(&0) {
+            if file_br < min_br {
+                return false;
+            }
         }
+        // attribs.get(&0) == None → pass (verify post-download)
+    }
+    // Bitdepth check (key 5 = bit depth). Same semantics as the bitrate
+    // check: reject only when the peer PROVIDES a bitdepth below the
+    // minimum; a missing bitdepth passes and is verified post-download.
+    if let Some(min_bd) = config.min_bitdepth {
+        if let Some(&file_bd) = file.attribs.get(&5) {
+            if file_bd < min_bd {
+                return false;
+            }
+        }
+        // attribs.get(&5) == None → pass (verify post-download)
     }
     // Excluded words check
     let lower_name = file.name.to_lowercase();
@@ -433,6 +446,89 @@ mod tests {
         let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
+    }
+
+    #[test]
+    fn test_filter_passes_missing_bitrate_when_min_set() {
+        // A file with NO bitrate attribute (key 0) must PASS when
+        // min_bitrate is set: quality is verified post-download using the
+        // actual file metadata rather than rejected at search time.
+        let cfg = FilterConfig {
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            ..default_filter_config()
+        };
+        let file = FileInfo {
+            name: "01 - Track.flac".into(),
+            size: 10_000_000,
+            attribs: HashMap::new(), // no bitrate attribute
+        };
+        assert!(
+            file_passes_filters(&file, &cfg),
+            "file with missing bitrate should pass when min_bitrate is set"
+        );
+    }
+
+    #[test]
+    fn test_filter_passes_missing_bitdepth_when_min_set() {
+        // A file with NO bitdepth attribute (key 5) must PASS when
+        // min_bitdepth is set: quality is verified post-download.
+        let cfg = FilterConfig {
+            min_bitrate: None,
+            min_bitdepth: Some(16),
+            ..default_filter_config()
+        };
+        let file = FileInfo {
+            name: "01 - Track.flac".into(),
+            size: 10_000_000,
+            attribs: HashMap::new(), // no bitdepth attribute
+        };
+        assert!(
+            file_passes_filters(&file, &cfg),
+            "file with missing bitdepth should pass when min_bitdepth is set"
+        );
+    }
+
+    #[test]
+    fn test_filter_still_rejects_low_bitrate_when_provided() {
+        // When the peer DOES provide a bitrate below the min, reject.
+        let cfg = FilterConfig {
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            ..default_filter_config()
+        };
+        let mut attribs = HashMap::new();
+        attribs.insert(0, 128u32); // bitrate = 128 kbps < 320
+        let file = FileInfo {
+            name: "01 - Track.flac".into(),
+            size: 5_000_000,
+            attribs,
+        };
+        assert!(
+            !file_passes_filters(&file, &cfg),
+            "file with bitrate below min must still be rejected"
+        );
+    }
+
+    #[test]
+    fn test_filter_still_rejects_low_bitdepth_when_provided() {
+        // When the peer DOES provide a bitdepth below the min, reject.
+        let cfg = FilterConfig {
+            min_bitrate: None,
+            min_bitdepth: Some(24),
+            ..default_filter_config()
+        };
+        let mut attribs = HashMap::new();
+        attribs.insert(5, 16u32); // bitdepth = 16 < 24
+        let file = FileInfo {
+            name: "01 - Track.flac".into(),
+            size: 30_000_000,
+            attribs,
+        };
+        assert!(
+            !file_passes_filters(&file, &cfg),
+            "file with bitdepth below min must still be rejected"
+        );
     }
 
     #[test]
@@ -1168,6 +1264,8 @@ pub struct FilterRejectionSummary {
     pub peer_track_count_rejected: usize,
     /// Files rejected by bitrate check
     pub bitrate_rejected: usize,
+    /// Files rejected by bitdepth check
+    pub bitdepth_rejected: usize,
     /// Files rejected by excluded words
     pub words_rejected: usize,
     /// Results rejected because no file path contains the album name
@@ -1183,6 +1281,7 @@ impl FilterRejectionSummary {
             || self.below_min_tracks > 0
             || self.peer_track_count_rejected > 0
             || self.bitrate_rejected > 0
+            || self.bitdepth_rejected > 0
             || self.words_rejected > 0
             || self.album_mismatch > 0
     }
@@ -1237,6 +1336,9 @@ impl FilterRejectionSummary {
         }
         if self.bitrate_rejected > 0 {
             parts.push(format!("{} below min bitrate", self.bitrate_rejected));
+        }
+        if self.bitdepth_rejected > 0 {
+            parts.push(format!("{} below min bitdepth", self.bitdepth_rejected));
         }
         if self.words_rejected > 0 {
             parts.push(format!(
@@ -1304,18 +1406,29 @@ pub fn summarize_rejections(
                 *ext_counts.entry(ext.clone()).or_insert(0) += 1;
                 continue;
             }
-            // Bitrate check
+            // Bitrate check (key 0 = bitrate in kbps). Mirrors
+            // file_passes_filters: only count as a bitrate rejection when
+            // the peer PROVIDES a bitrate below the minimum. Missing
+            // bitrate metadata passes the filter and is verified
+            // post-download — it is not a rejection.
             if let Some(min_br) = config.min_bitrate {
-                match f.attribs.get(&0) {
-                    None => {
+                if let Some(&file_br) = f.attribs.get(&0) {
+                    if file_br < min_br {
                         summary.bitrate_rejected += 1;
                         continue;
                     }
-                    Some(&file_br) if file_br < min_br => {
-                        summary.bitrate_rejected += 1;
+                }
+            }
+            // Bitdepth check (key 5 = bit depth). Same semantics as the
+            // bitrate check: reject only when the peer PROVIDES a bitdepth
+            // below the minimum. Missing bitdepth passes the filter and is
+            // verified post-download — it is not a rejection.
+            if let Some(min_bd) = config.min_bitdepth {
+                if let Some(&file_bd) = f.attribs.get(&5) {
+                    if file_bd < min_bd {
+                        summary.bitdepth_rejected += 1;
                         continue;
                     }
-                    _ => {}
                 }
             }
             // Excluded words
@@ -1538,6 +1651,61 @@ mod rejection_summary_tests {
         let summary = summarize_rejections(&results, &cfg, None, None);
         assert!(!summary.has_rejections());
         assert_eq!(summary.summary_line(), "no rejections");
+    }
+
+    #[test]
+    fn test_summary_does_not_count_missing_bitrate_as_rejection() {
+        // A file with NO bitrate attribute must not be counted as a bitrate
+        // rejection: missing metadata passes pre-download filtering and is
+        // verified post-download, mirroring file_passes_filters semantics.
+        let cfg = FilterConfig {
+            min_bitrate: Some(320),
+            min_bitdepth: None,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![FileInfo {
+                name: "01 - Track.flac".into(),
+                size: 10_000_000,
+                attribs: HashMap::new(), // missing bitrate attribute
+            }],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None, None);
+        assert_eq!(
+            summary.bitrate_rejected, 0,
+            "missing bitrate must not count as a bitrate rejection"
+        );
+    }
+
+    #[test]
+    fn test_summary_counts_provided_low_bitdepth_as_rejection() {
+        // When min_bitdepth is set and the peer PROVIDES a bitdepth below
+        // the minimum, it must be counted as a bitdepth rejection.
+        let cfg = FilterConfig {
+            min_bitrate: None,
+            min_bitdepth: Some(24),
+            ..default_filter_config()
+        };
+        let mut attribs = HashMap::new();
+        attribs.insert(5, 16u32); // bitdepth = 16 < 24
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![FileInfo {
+                name: "01 - Track.flac".into(),
+                size: 30_000_000,
+                attribs,
+            }],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None, None);
+        assert_eq!(
+            summary.bitdepth_rejected, 1,
+            "peer-provided bitdepth below min must count as a bitdepth rejection"
+        );
     }
 
     #[test]
