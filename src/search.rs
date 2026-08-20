@@ -32,8 +32,12 @@ pub async fn search_album(
     album: Option<&str>,
     timeout_secs: u64,
 ) -> Result<Vec<SearchResult>> {
+    // Trim the assembled query: when artist is empty (album-only search) the
+    // artist-album join would otherwise produce a leading space
+    // ("<artist> <album>" -> " Musicology"), which would be sent verbatim to
+    // Soulseek. Trimming keeps the album-only query clean ("Musicology").
     let query = match album {
-        Some(a) if !a.is_empty() => format!("{artist} {a}"),
+        Some(a) if !a.is_empty() => format!("{artist} {a}").trim().to_string(),
         _ => artist.to_string(),
     };
     search_raw(client, &query, timeout_secs).await
@@ -46,15 +50,51 @@ pub struct SearchOutcome {
 }
 
 /// Search for an album by artist + album name.
-/// Returns the primary search results directly — no fallback.
+///
+/// Tier 1 runs the primary "Artist Album" search. If it returns nothing,
+/// Tier 2 falls back to an album-name-only search (artist `""`), keeping
+/// only results whose file paths match the artist via
+/// [`path_matches_artist`]. If both tiers come up empty, an empty outcome is
+/// returned.
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
     album: Option<&str>,
     timeout_secs: u64,
 ) -> Result<SearchOutcome> {
+    // Tier 1: primary "Artist Album" search
     let results = search_album(client, artist, album, timeout_secs).await?;
-    Ok(SearchOutcome { results })
+    if !results.is_empty() {
+        return Ok(SearchOutcome { results });
+    }
+
+    // Tier 2: album-only search (when primary returns nothing)
+    if let Some(album_name) = album {
+        if !album_name.trim().is_empty() {
+            let album_results = search_album(client, "", Some(album_name), timeout_secs).await?;
+            // Filter by artist match using existing path_matches_artist,
+            // and prune each result's files to only artist-matching ones
+            // so we don't download tracks from a different artist's
+            // same-named album directory.
+            let mut artist_matches: Vec<SearchResult> = album_results
+                .into_iter()
+                .filter(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)))
+                .collect();
+            for result in &mut artist_matches {
+                result
+                    .files
+                    .retain(|f| path_matches_artist(&f.name, artist));
+            }
+            if !artist_matches.is_empty() {
+                return Ok(SearchOutcome {
+                    results: artist_matches,
+                });
+            }
+        }
+    }
+
+    // Both tiers returned nothing
+    Ok(SearchOutcome { results: vec![] })
 }
 
 /// Audio file extensions collected by [`get_library_track_filenames`].
@@ -112,6 +152,28 @@ pub fn clean_track_title(filename: &str) -> String {
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns true if the track name is generic/meaningless for search purposes.
+/// Generic names produce garbage queries that match unrelated albums.
+pub fn is_generic_track_name(name: &str) -> bool {
+    let cleaned = clean_track_title(name);
+    if cleaned.is_empty() {
+        return true;
+    }
+    // Patterns that indicate generic/meaningless track names. Each keyword
+    // (optionally followed by a track number) must span the whole cleaned
+    // name, so multi-word real titles are not misclassified: "CD Track 1",
+    // "Track1", "Audio 2", "Recording 5", "Untitled", "Unknown" and bare
+    // numbers ("01", "42") are generic, while "hello", "musicology",
+    // "i miss" are not. Edge case: tracks literally titled "Untitled 2"
+    // or "Unknown 1" will be filtered — accepted trade-off.
+    static GENERIC_PATTERNS: OnceLock<Regex> = OnceLock::new();
+    let re = GENERIC_PATTERNS.get_or_init(|| {
+        Regex::new(r"(?i)^((untitled|unknown|cd\s*track|track|audio|recording)(\s*\d+)?|\d+)$")
+            .expect("valid generic pattern regex")
+    });
+    re.is_match(&cleaned)
 }
 
 /// Build the Soulseek query for the fallback track search.
@@ -274,8 +336,18 @@ pub async fn search_by_title(
     timeout_secs: u64,
     match_threshold_pct: u32,
 ) -> Result<Vec<SearchResult>> {
+    // Filter out generic track names before building the query
+    let non_generic: Vec<String> = library_filenames
+        .iter()
+        .filter(|f| !is_generic_track_name(f))
+        .cloned()
+        .collect();
+    if non_generic.is_empty() {
+        // All tracks have generic names — can't build a meaningful query
+        return Ok(Vec::new());
+    }
     // Clean titles — preserves order from sorted filenames for the query.
-    let clean_titles: Vec<String> = library_filenames
+    let clean_titles: Vec<String> = non_generic
         .iter()
         .map(|filename| clean_track_title(filename))
         .filter(|t| !t.is_empty())
@@ -356,7 +428,6 @@ pub fn record_search(
 
 /// Common articles that carry no discriminating power when matching an
 /// artist against a file path ("The Beatles" must match "Beatles").
-#[cfg(test)]
 const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 
 /// Check whether a share-relative file path matches the artist, word-level.
@@ -366,6 +437,10 @@ const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 /// remaining word must appear as a case-insensitive substring of the path.
 /// If no words remain (artist is all stop-words), the full lowercased
 /// artist name is matched as a substring instead.
+///
+/// Used by the album-only fallback tier of
+/// [`search_album_with_fallback`] to verify that a search result actually
+/// belongs to the target artist.
 ///
 /// Known accepted risk: substring-per-word means "Prince" also matches
 /// "Princess". Degenerate artists widen the window further, e.g.:
@@ -377,10 +452,6 @@ const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 /// Accented characters are compared literally ("Tiësto" ≠ "Tiesto") — a
 /// false negative, not a false positive. Downstream quality filters still
 /// apply.
-///
-/// Retained for test coverage — no production callers after the album-only
-/// fallback was removed.
-#[cfg(test)]
 pub fn path_matches_artist(path: &str, artist: &str) -> bool {
     if artist.trim().is_empty() {
         return false;
@@ -536,12 +607,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_search_when_artist_empty() {
+    async fn test_album_only_fallback_never_matches_when_artist_empty() {
+        // An empty artist can never pass path_matches_artist, so even though
+        // the album-only tier fires (album present, primary empty), it must
+        // produce nothing. Two queries run: primary ("Album") + album-only
+        // (also "Album").
         let client = MockClient::new();
-        let _outcome = search_album_with_fallback(&client, "", Some("Album"), 15)
+        let outcome = search_album_with_fallback(&client, "", Some("Album"), 15)
             .await
             .unwrap();
-        assert_eq!(client.search_queries.lock().unwrap().len(), 1);
+        assert!(outcome.results.is_empty());
+        assert_eq!(client.search_queries.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -554,7 +630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_primary_empty_returns_empty_outcome() {
+    async fn test_primary_empty_album_only_fallback_returns_match() {
         let client = MockClient::new();
         client.search_results_by_query.lock().unwrap().insert(
             "History".into(),
@@ -569,15 +645,19 @@ mod tests {
                 )],
             }],
         );
-        // The primary query "Michael Jackson History" has no map entry,
-        // so it returns empty. With no fallback, the outcome is empty.
+        // The primary query "Michael Jackson History" has no map entry, so
+        // it returns empty. The album-only tier then searches "History",
+        // whose result path matches "Michael Jackson", so it is returned.
 
         let outcome = search_album_with_fallback(&client, "Michael Jackson", Some("History"), 15)
             .await
             .unwrap();
-        assert_eq!(outcome.results.len(), 0);
+        assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
-        assert_eq!(queries, vec!["Michael Jackson History".to_string()]);
+        assert_eq!(
+            queries,
+            vec!["Michael Jackson History".to_string(), "History".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -599,12 +679,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_single_query_when_disabled() {
+    async fn test_two_queries_when_primary_empty_and_album_present() {
+        // Both tiers run when the primary search is empty and an album is
+        // present: the primary "Artist Album" and the album-only "Album"
+        // query. With no results for either, the outcome is empty.
         let client = MockClient::new();
-        let _outcome = search_album_with_fallback(&client, "Artist", Some("Album"), 15)
+        let outcome = search_album_with_fallback(&client, "Artist", Some("Album"), 15)
             .await
             .unwrap();
-        assert_eq!(client.search_queries.lock().unwrap().len(), 1);
+        assert!(outcome.results.is_empty());
+        assert_eq!(client.search_queries.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -907,6 +991,165 @@ mod tests {
             results[0].files[0].name,
             "Gorillaz - Tomorrow Comes Today.mp3"
         );
+    }
+
+    // ── is_generic_track_name ──
+
+    #[test]
+    fn test_is_generic_track_name_cd_track() {
+        // "CD Track N" / "CD TrackN" (with or without space) are generic.
+        assert!(is_generic_track_name("CD Track 1.mp3"));
+        assert!(is_generic_track_name("CD Track 01.flac"));
+        assert!(is_generic_track_name("CD Track1.mp3"));
+        assert!(is_generic_track_name("cd track 5.mp3"));
+    }
+
+    #[test]
+    fn test_is_generic_track_name_track() {
+        // Bare "Track N" / "TrackN" are generic.
+        assert!(is_generic_track_name("Track 1.mp3"));
+        assert!(is_generic_track_name("Track1.mp3"));
+        assert!(is_generic_track_name("track 5.mp3"));
+    }
+
+    #[test]
+    fn test_is_generic_track_name_other_patterns() {
+        // Other meaningless names: untitled, unknown, audio/recording N, and
+        // bare numbers.
+        assert!(is_generic_track_name("Untitled.mp3"));
+        assert!(is_generic_track_name("Unknown.flac"));
+        assert!(is_generic_track_name("Audio 1.mp3"));
+        assert!(is_generic_track_name("Recording 5.flac"));
+        assert!(is_generic_track_name("01.mp3"));
+        assert!(is_generic_track_name("42.flac"));
+    }
+
+    #[test]
+    fn test_is_generic_track_name_non_generic() {
+        // Real titles must never be flagged as generic.
+        assert!(!is_generic_track_name("Tomorrow Comes Today.mp3"));
+        assert!(!is_generic_track_name("Musicology.flac"));
+        assert!(!is_generic_track_name("01 - Hello.mp3"));
+        assert!(!is_generic_track_name("Cafés.flac"));
+        assert!(!is_generic_track_name("I Miss You.mp3"));
+    }
+
+    // ── album-only fallback ──
+
+    #[tokio::test]
+    async fn test_album_only_fallback_when_primary_empty() {
+        let client = MockClient::new();
+        // Primary "Prince Musicology" has no map entry -> empty (blocked
+        // artist). Album-only "Musicology" returns a result whose file path
+        // contains "Prince".
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // Both tiers ran in order. The album-only query is "Musicology" —
+        // not " Musicology" (leading space must be trimmed).
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec!["Prince Musicology".to_string(), "Musicology".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_album_only_fallback_filters_by_artist() {
+        let client = MockClient::new();
+        // Album-only "Musicology" returns a result whose path has the WRONG
+        // artist — it must be filtered out by the artist check.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Some Other Artist/Musicology/01 - Track.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_album_only_fallback_skips_when_album_empty() {
+        let client = MockClient::new();
+        // No search results -> primary comes up empty. Album is None, so the
+        // album-only tier is skipped -> still empty and only 1 query issued.
+        let outcome = search_album_with_fallback(&client, "Prince", None, 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["Prince".to_string()]);
+    }
+
+    // ── generic-name filtering in search_by_title ──
+
+    #[tokio::test]
+    async fn test_search_by_title_skips_generic_names() {
+        let client = MockClient::new();
+        let library = vec!["CD Track 1.mp3".to_string(), "CD Track 2.mp3".to_string()];
+        let results = search_by_title(&client, &library, "", 15, 100)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+        // No query may be issued for all-generic libraries.
+        assert!(client.search_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_by_title_uses_non_generic_names() {
+        let client = MockClient::new();
+        // Mixed library: a generic "CD Track 1" plus a real "01 - Musicology".
+        // The real track must drive the query ("musicology"), not a generic.
+        let library = vec![
+            "CD Track 1.mp3".to_string(),
+            "01 - Musicology.mp3".to_string(),
+        ];
+        client.search_results_by_query.lock().unwrap().insert(
+            "musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let results = search_by_title(&client, &library, "", 15, 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["musicology".to_string()]);
     }
 
     // (SearchOutcome tests removed with fallback)

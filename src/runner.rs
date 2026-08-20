@@ -143,61 +143,75 @@ pub async fn process_album(
         if let Some(album_name) = album {
             match search::get_library_track_filenames(&config.library.paths, artist, album_name) {
                 Ok(lib_filenames) if !lib_filenames.is_empty() => {
-                    title_search_attempted = true;
                     let title_start = std::time::Instant::now();
-                    // Pre-search context: the bare "Searching for X" log from
-                    // the Soulseek lib otherwise gives no clue that this is a
-                    // track-title fallback (and for which album). Log it up
-                    // front so the user can tie the query to the album.
-                    tracing::info!(
-                        "{artist} — {album_name}: no usable primary results, falling back to track-title search"
-                    );
-                    match search::search_by_title(
-                        client,
-                        &lib_filenames,
-                        artist,
-                        config.search.timeout_secs,
-                        config.search.search_title_match,
-                    )
-                    .await
-                    {
-                        Ok(title_results) => {
-                            tracing::info!(
-                                "{artist} — {album_name}: title-search fallback found {} result(s)",
-                                title_results.len(),
-                            );
-                            if !title_results.is_empty() {
-                                total_results = title_results.iter().map(|r| r.files.len()).sum();
-                                total_users = title_results.len();
-                                filtered = filter::filter_results(
-                                    &title_results,
-                                    &config.filters,
-                                    library_track_count,
-                                    // The track-name fallback tier is never
-                                    // album-gated: we could not find the
-                                    // album by name, so rejecting on album
-                                    // would leave us with nothing.
-                                    None,
+                    // Drop meaningless track names ("CD Track N", "Track N",
+                    // "01", ...) so a library of generic names doesn't build a
+                    // garbage query that matches unrelated albums.
+                    let non_generic: Vec<String> = lib_filenames
+                        .iter()
+                        .filter(|f| !search::is_generic_track_name(f))
+                        .cloned()
+                        .collect();
+                    if non_generic.is_empty() {
+                        tracing::info!(
+                            "{artist} — {album_name}: all track names are generic, skipping title-search fallback"
+                        );
+                    } else {
+                        title_search_attempted = true;
+                        // the Soulseek lib otherwise gives no clue that this is a
+                        // track-title fallback (and for which album). Log it up
+                        // front so the user can tie the query to the album.
+                        tracing::info!(
+                            "{artist} — {album_name}: no usable primary results, falling back to track-title search"
+                        );
+                        match search::search_by_title(
+                            client,
+                            &non_generic,
+                            artist,
+                            config.search.timeout_secs,
+                            config.search.search_title_match,
+                        )
+                        .await
+                        {
+                            Ok(title_results) => {
+                                tracing::info!(
+                                    "{artist} — {album_name}: title-search fallback found {} result(s)",
+                                    title_results.len(),
                                 );
-                                last_filtered_results = title_results.clone();
+                                if !title_results.is_empty() {
+                                    total_results =
+                                        title_results.iter().map(|r| r.files.len()).sum();
+                                    total_users = title_results.len();
+                                    filtered = filter::filter_results(
+                                        &title_results,
+                                        &config.filters,
+                                        library_track_count,
+                                        // The track-name fallback tier is never
+                                        // album-gated: we could not find the
+                                        // album by name, so rejecting on album
+                                        // would leave us with nothing.
+                                        None,
+                                    );
+                                    last_filtered_results = title_results.clone();
+                                }
+                                let title_duration_ms = title_start.elapsed().as_millis() as u64;
+                                if let Err(e) = search::record_search(
+                                    artist,
+                                    Some(album_name),
+                                    title_results.len(),
+                                    title_duration_ms,
+                                    db,
+                                ) {
+                                    tracing::warn!(
+                                        "{artist} — {album_name}: failed to record title-search history: {e}"
+                                    );
+                                }
                             }
-                            let title_duration_ms = title_start.elapsed().as_millis() as u64;
-                            if let Err(e) = search::record_search(
-                                artist,
-                                Some(album_name),
-                                title_results.len(),
-                                title_duration_ms,
-                                db,
-                            ) {
+                            Err(e) => {
                                 tracing::warn!(
-                                    "{artist} — {album_name}: failed to record title-search history: {e}"
+                                    "{artist} — {album_name}: title-search fallback failed: {e}"
                                 );
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "{artist} — {album_name}: title-search fallback failed: {e}"
-                            );
                         }
                     }
                 }
@@ -791,22 +805,9 @@ mod tests {
     #[tokio::test]
     async fn test_primary_search_issues_single_query() {
         let client = Arc::new(MockClient::new());
-        // The primary search for "Test Artist Test Album" returns 0 results.
-        // No fallback should be triggered — exactly one query must be issued.
-        client.search_results_by_query.lock().unwrap().insert(
-            "Test Album".into(),
-            vec![SearchResult {
-                username: "user1".into(),
-                speed: 500,
-                slots: 1,
-                files: vec![make_file(
-                    r"Music\Test Artist\Test Album\01 - track.flac",
-                    900,
-                    10_000_000,
-                )],
-            }],
-        );
-
+        // With no album, only the artist-only primary search runs. The
+        // album-only fallback tier requires an album, so exactly one query
+        // is issued and, with no results, the album fails with no results.
         let config = make_test_config();
         let db = Database::open_in_memory().unwrap();
         let staging = TempDir::new().unwrap();
@@ -814,7 +815,7 @@ mod tests {
         let result = process_album(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
-            Some("Test Album"),
+            None,
             &config,
             &db,
             staging.path(),
@@ -831,11 +832,7 @@ mod tests {
         }
 
         let queries = client.search_queries.lock().unwrap().clone();
-        assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
-
-        let rows = db.get_processed_albums().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "failed");
+        assert_eq!(queries, vec!["Test Artist".to_string()]);
     }
 
     // When the primary search returns results but all are rejected by filters
@@ -1032,11 +1029,15 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        // Two tiers ran in order: primary, title search.
+        // Three queries ran: primary, album-only fallback, title search.
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
-            vec!["Adele 25".to_string(), "i miss you".to_string()]
+            vec![
+                "Adele 25".to_string(),
+                "25".to_string(),
+                "i miss you".to_string()
+            ]
         );
 
         // Both title-matching library tracks were downloaded.
@@ -1062,6 +1063,108 @@ mod tests {
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "success");
+    }
+
+    // Regression: when the local library holds only generic track names
+    // ("CD Track N", "Track N", ...), the title-search fallback must be
+    // skipped entirely — it could never build a meaningful query. Only the
+    // album searches run (primary + album-only), never a track-title query.
+    #[tokio::test]
+    async fn test_title_search_skips_when_all_tracks_generic() {
+        let client = Arc::new(MockClient::new());
+        // Primary "Prince The Very Best Of Prince" and album-only
+        // "The Very Best Of Prince" return nothing (no map entries, empty
+        // static results). The library has only generic names, so the
+        // title-search tier must not issue a query.
+        let mut config = make_test_config();
+        config.search.search_title_match = 70;
+        let tmp = TempDir::new().unwrap();
+        let album_dir = tmp.path().join("Prince").join("The Very Best Of Prince");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("CD Track 1.mp3"), b"fake mp3").unwrap();
+        std::fs::write(album_dir.join("CD Track 2.mp3"), b"fake mp3").unwrap();
+        config.library.paths = vec![tmp.path().to_string_lossy().into()];
+
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Prince",
+            Some("The Very Best Of Prince"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
+
+        // Only the two album searches ran (primary + album-only) — no
+        // track-title query was issued for the all-generic library.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince The Very Best Of Prince".to_string(),
+                "The Very Best Of Prince".to_string()
+            ]
+        );
+    }
+
+    // End-to-end fallback hierarchy: primary "Prince Musicology" is empty
+    // (blocked artist), the album-only tier searches "Musicology" and finds
+    // a result whose path matches "Prince", and the download succeeds.
+    #[tokio::test]
+    async fn test_album_only_fallback_fires_when_primary_empty() {
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Prince",
+            Some("Musicology"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+
+        // Both searches were attempted: primary then album-only.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec!["Prince Musicology".to_string(), "Musicology".to_string()]
+        );
     }
 
     // ── Log-capture harness ──
