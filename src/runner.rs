@@ -145,6 +145,13 @@ pub async fn process_album(
                 Ok(lib_filenames) if !lib_filenames.is_empty() => {
                     title_search_attempted = true;
                     let title_start = std::time::Instant::now();
+                    // Pre-search context: the bare "Searching for X" log from
+                    // the Soulseek lib otherwise gives no clue that this is a
+                    // track-title fallback (and for which album). Log it up
+                    // front so the user can tie the query to the album.
+                    tracing::info!(
+                        "{artist} — {album_name}: no usable primary results, falling back to track-title search"
+                    );
                     match search::search_by_title(
                         client,
                         &lib_filenames,
@@ -702,6 +709,7 @@ mod tests {
     use crate::db::Database;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
@@ -1054,6 +1062,106 @@ mod tests {
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "success");
+    }
+
+    // ── Log-capture harness ──
+
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<String>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Regression: when primary and album-only searches return nothing and
+    // the title-search fallback fires, the bare "Searching for X" line from
+    // the soulseek lib must be preceded by a clear, contextual log line that
+    // names the artist/album and says we're falling back to a track-title
+    // search. Without it a user can't tell what "Searching for tomorrow
+    // comes today" even refers to.
+    #[tokio::test]
+    async fn test_title_search_fallback_logs_contextual_message() {
+        let buf = Arc::new(Mutex::new(String::new()));
+        let writer = CapturingWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = Arc::new(MockClient::new());
+        // Library track "01 - I Miss You.mp3" cleans to "i miss you", the
+        // alphabetically-first title and thus the search query. The mock has
+        // results ONLY for this query, so the primary search is empty.
+        client.search_results_by_query.lock().unwrap().insert(
+            "i miss you".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(r"Music\user1\25\01 - I Miss You.flac", 900, 10_000_000),
+                    make_file(r"Music\user1\25\02 - Hello.flac", 900, 10_000_000),
+                ],
+            }],
+        );
+
+        let mut config = make_test_config();
+        config.search.search_title_match = 70;
+        let tmp = TempDir::new().unwrap();
+        let album_dir = tmp.path().join("Adele").join("25");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("01 - I Miss You.mp3"), b"fake mp3").unwrap();
+        std::fs::write(album_dir.join("02 - Hello.mp3"), b"fake mp3").unwrap();
+        config.library.paths = vec![tmp.path().to_string_lossy().into()];
+
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Adele",
+            Some("25"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+
+        drop(_guard);
+        let captured = buf.lock().unwrap().clone();
+        assert!(
+            captured.contains("falling back to track-title search"),
+            "expected a contextual fallback log line, got:\n{captured}"
+        );
+        assert!(
+            captured.contains("Adele"),
+            "expected the fallback log line to name the artist,\n{captured}"
+        );
     }
 
     #[tokio::test]
