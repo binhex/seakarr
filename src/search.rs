@@ -262,10 +262,11 @@ fn collect_audio_filenames(dir: &std::path::Path) -> Vec<String> {
 /// [`get_library_track_filenames`]) becomes the search query, stripped of
 /// the artist name via [`fallback_track_query`] so the query isn't blocked
 /// by Soulseek's artist filter. Each result's files are pruned to those
-/// whose cleaned basename (last path component) matches one of the library
-/// titles exactly, and a result survives only when the number of matching
-/// files is at least `ceil(len(titles) * threshold / 100)`. An empty
-/// library short-circuits to an empty result set without touching the network.
+/// whose cleaned basename (last path component) contains at least one
+/// library title as a substring, and a result survives only when the
+/// number of distinct matched titles is at least
+/// `ceil(len(titles) * threshold / 100)`. An empty library short-circuits
+/// to an empty result set without touching the network.
 pub async fn search_by_title(
     client: &dyn SoulseekClient,
     library_filenames: &[String],
@@ -299,21 +300,41 @@ pub async fn search_by_title(
         .saturating_mul(match_threshold_pct as usize)
         .div_ceil(100);
     let mut results = search_raw(client, &query, timeout_secs).await?;
-    // Keep only files whose cleaned basename matches a distinct library
-    // title, and keep the result only if enough distinct titles matched.
+    // Keep only files whose cleaned basename contains at least one distinct
+    // library title as a substring, and keep the result only if enough
+    // distinct titles matched. Substring containment (rather than exact
+    // equality) is required because real peer filenames embed extra
+    // metadata — artist/album names — so "Gorillaz - Tomorrow Comes
+    // Today.mp3" cleans to "gorillaz tomorrow comes today", which is a
+    // superset of the library title "tomorrow comes today". Exact equality
+    // rejected these and made the title-search fallback return 0 results
+    // despite Soulseek returning plenty of matches.
+    //
+    // Matching iterates library titles (not files) so that (a) every title
+    // that appears as a substring in any file is counted (deterministic,
+    // no HashSet-iteration-order dependence) and (b) a single file can
+    // satisfy multiple titles when titles overlap as substrings.
     results.retain_mut(|result| {
-        let mut matched_titles = std::collections::HashSet::new();
-        result.files.retain_mut(|file| {
-            let basename = file.name.rsplit(['/', '\\']).next().unwrap_or_default();
+        let cleaned_titles: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| {
+                let basename = f.name.rsplit(['/', '\\']).next().unwrap_or_default();
+                clean_track_title(basename)
+            })
+            .collect();
+        let matched = library_titles
+            .iter()
+            .filter(|lib| cleaned_titles.iter().any(|t| t.contains(lib.as_str())))
+            .count();
+        result.files.retain(|f| {
+            let basename = f.name.rsplit(['/', '\\']).next().unwrap_or_default();
             let title = clean_track_title(basename);
-            if library_titles.contains(&title) {
-                matched_titles.insert(title);
-                true
-            } else {
-                false
-            }
+            library_titles
+                .iter()
+                .any(|lib| title.contains(lib.as_str()))
         });
-        matched_titles.len() >= required
+        matched >= required
     });
     Ok(results)
 }
@@ -847,6 +868,44 @@ mod tests {
         assert_eq!(
             results[0].files[0].name,
             r"Music\Artist\Album\01 - Cafés.mp3"
+        );
+    }
+
+    // Regression: real Soulseek peer filenames usually embed the artist
+    // name (e.g. "Gorillaz - Tomorrow Comes Today.mp3"), which after
+    // clean_track_title becomes "gorillaz tomorrow comes today" — a
+    // SUPERSET of the library title "tomorrow comes today". Exact-equality
+    // matching (library_titles.contains(&title)) rejects these, so the
+    // title-search fallback returned 0 results even though the underlying
+    // Soulseek search finds plenty of matches. Matching must use substring
+    // containment: a library title matches when it appears within the
+    // cleaned peer filename.
+    #[tokio::test]
+    async fn test_search_by_title_matches_peer_filename_with_artist_prefix() {
+        let client = MockClient::new();
+        let library = vec!["01 - Tomorrow Comes Today.mp3".to_string()];
+        client.search_results_by_query.lock().unwrap().insert(
+            "tomorrow comes today".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    // Artist-embedded peer filename — the common real case.
+                    make_file("Gorillaz - Tomorrow Comes Today.mp3", 900, 10_000_000),
+                ],
+            }],
+        );
+
+        let results = search_by_title(&client, &library, "Gorillaz", 15, 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].username, "user1");
+        assert_eq!(results[0].files.len(), 1);
+        assert_eq!(
+            results[0].files[0].name,
+            "Gorillaz - Tomorrow Comes Today.mp3"
         );
     }
 
