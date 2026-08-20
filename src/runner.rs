@@ -148,6 +148,7 @@ pub async fn process_album(
                     match search::search_by_title(
                         client,
                         &lib_filenames,
+                        artist,
                         config.search.timeout_secs,
                         config.search.search_title_match,
                     )

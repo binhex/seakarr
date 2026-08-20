@@ -98,7 +98,12 @@ pub fn clean_track_title(filename: &str) -> String {
     let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
     let no_track_number = track_number_re().replace(stem, "");
     let no_brackets = bracket_re().replace_all(&no_track_number, " ");
-    let normalized: String = no_brackets
+    // Treat common separators (underscore, hyphen, plus) as word boundaries
+    // so tokens stay separate ("Prince_-_Musicology" → "prince musicology",
+    // not the smeared "princemusicology"). Without this the artist name
+    // cannot be removed and the fallback query stays blocked.
+    let separated = no_brackets.replace(['_', '-', '+'], " ");
+    let normalized: String = separated
         .nfkd()
         .filter(|c| c.is_ascii())
         .collect::<String>()
@@ -107,6 +112,49 @@ pub fn clean_track_title(filename: &str) -> String {
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build the Soulseek query for the fallback track search.
+///
+/// Cleans the library track filename (see [`clean_track_title`]) and strips
+/// the artist name tokens so the resulting query searches by track name only.
+/// This is essential because Soulseek blocks certain artists from being
+/// found: including the artist in the query reproduces the same block that
+/// the artist+album search hit, so the whole fallback would fail. Returns an
+/// empty string when nothing remains after removing the artist.
+///
+/// The artist is split into alphanumeric words and each is removed from the
+/// cleaned title (which is already lowercased/ascii-normalized). If the
+/// cleaned title equals the artist (e.g. a title that is only the artist
+/// name), the track number/album tokens are not present so it collapses to
+/// empty — the caller treats that as "cannot build a track query".
+pub fn fallback_track_query(filename: &str, artist: &str) -> String {
+    let cleaned = clean_track_title(filename);
+    if cleaned.is_empty() || artist.trim().is_empty() {
+        return cleaned;
+    }
+    // Artist alphanumeric words, normalized the same way as clean_track_title
+    // (NFKD + ASCII filter + lowercase + separator→space + split_whitespace)
+    // so tokens match regardless of accented characters, separator style, or
+    // embedded punctuation (e.g. "D'Angelo" → "dangelo", matching the
+    // cleaned title's single token).
+    let artist_tokens: std::collections::HashSet<String> = artist
+        .replace(['_', '-', '+'], " ")
+        .nfkd()
+        .filter(|c| c.is_ascii())
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let words: Vec<&str> = cleaned
+        .split_whitespace()
+        .filter(|w| !artist_tokens.contains(*w))
+        .collect();
+    words.join(" ")
 }
 
 /// List the audio filenames (not full paths) inside
@@ -211,15 +259,17 @@ fn collect_audio_filenames(dir: &std::path::Path) -> Vec<String> {
 ///
 /// Every library filename is normalized with [`clean_track_title`]; the
 /// alphabetically-first title (the library list is sorted by
-/// [`get_library_track_filenames`]) becomes the search query. Each result's
-/// files are pruned to those whose cleaned basename (last path component)
-/// matches one of the library titles exactly, and a result survives only
-/// when the number of matching files is at least
-/// `ceil(len(titles) * threshold / 100)`. An empty library short-circuits
-/// to an empty result set without touching the network.
+/// [`get_library_track_filenames`]) becomes the search query, stripped of
+/// the artist name via [`fallback_track_query`] so the query isn't blocked
+/// by Soulseek's artist filter. Each result's files are pruned to those
+/// whose cleaned basename (last path component) matches one of the library
+/// titles exactly, and a result survives only when the number of matching
+/// files is at least `ceil(len(titles) * threshold / 100)`. An empty
+/// library short-circuits to an empty result set without touching the network.
 pub async fn search_by_title(
     client: &dyn SoulseekClient,
     library_filenames: &[String],
+    artist: &str,
     timeout_secs: u64,
     match_threshold_pct: u32,
 ) -> Result<Vec<SearchResult>> {
@@ -235,8 +285,12 @@ pub async fn search_by_title(
     // Dedup for counting threshold — a mixed-format library (flac + mp3)
     // would otherwise inflate the denominator and double-count matches.
     let library_titles: std::collections::HashSet<String> = clean_titles.iter().cloned().collect();
-    // Search by the alphabetically-first cleaned title.
-    let query = &clean_titles[0];
+    // Search by the alphabetically-first cleaned title, stripped of the
+    // artist name so the query isn't blocked by Soulseek's artist filter.
+    // Use clean_titles[0] (already cleaned/filtered) rather than the raw
+    // library_filenames[0], so a file whose title cleans to empty (e.g.
+    // "01.mp3") doesn't short-circuit the whole fallback.
+    let query = fallback_track_query(&clean_titles[0], artist);
     if query.is_empty() {
         return Ok(Vec::new());
     }
@@ -244,7 +298,7 @@ pub async fn search_by_title(
         .len()
         .saturating_mul(match_threshold_pct as usize)
         .div_ceil(100);
-    let mut results = search_raw(client, query, timeout_secs).await?;
+    let mut results = search_raw(client, &query, timeout_secs).await?;
     // Keep only files whose cleaned basename matches a distinct library
     // title, and keep the result only if enough distinct titles matched.
     results.retain_mut(|result| {
@@ -551,6 +605,32 @@ mod tests {
         assert_eq!(clean_track_title("7.On The Floor.mp3"), "on the floor");
     }
 
+    // ── fallback_track_query ──
+
+    #[test]
+    fn test_fallback_track_query_excludes_artist_name() {
+        // Regression: the fallback track search must NOT include the artist
+        // name, because Soulseek blocks certain artists from being found.
+        // Searching "prince musicology..." is just as blocked as searching
+        // "prince musicology". The query must be the track name only.
+        let q = fallback_track_query("Prince_-_Musicology_2004_01_Musicology.mp3", "Prince");
+        assert!(
+            !q.to_lowercase().contains("prince"),
+            "fallback query must not contain the artist name, got: {q}"
+        );
+        assert!(!q.is_empty(), "fallback query must not be empty");
+        // The known track title should survive as the searchable token.
+        assert!(q.to_lowercase().contains("musicology"), "got: {q}");
+    }
+
+    #[test]
+    fn test_fallback_track_query_uses_clean_track_title() {
+        // Simple filename where the artist is not embedded: just the track
+        // title survives the clean, and the query equals that title.
+        let q = fallback_track_query("01 - Musicology.mp3", "Prince");
+        assert_eq!(q, "musicology");
+    }
+
     #[test]
     fn test_clean_track_title_removes_brackets_keeps_contents() {
         assert_eq!(
@@ -657,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_by_title_empty_library_returns_empty_without_searching() {
         let client = MockClient::new();
-        let results = search_by_title(&client, &[], 15, 100).await.unwrap();
+        let results = search_by_title(&client, &[], "", 15, 100).await.unwrap();
         assert!(results.is_empty());
         assert!(client.search_queries.lock().unwrap().is_empty());
     }
@@ -695,7 +775,9 @@ mod tests {
         );
 
         // 100% of 2 titles = 2 matching files required: only "full" passes.
-        let results = search_by_title(&client, &library, 15, 100).await.unwrap();
+        let results = search_by_title(&client, &library, "", 15, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].username, "full");
         let names: Vec<&str> = results[0]
@@ -727,7 +809,9 @@ mod tests {
         );
 
         // 50% of 2 titles = 1 matching file required; non-matching files are pruned.
-        let results = search_by_title(&client, &library, 15, 50).await.unwrap();
+        let results = search_by_title(&client, &library, "", 15, 50)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         let names: Vec<&str> = results[0]
             .files
@@ -755,7 +839,9 @@ mod tests {
             }],
         );
 
-        let results = search_by_title(&client, &library, 15, 100).await.unwrap();
+        let results = search_by_title(&client, &library, "", 15, 100)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].files.len(), 1);
         assert_eq!(
