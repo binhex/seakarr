@@ -1029,12 +1029,14 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        // Three queries ran: primary, album-only fallback, title search.
+        // Four queries ran: primary, lowercase fallback, album-only
+        // fallback, title search.
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
             vec![
                 "Adele 25".to_string(),
+                "adele 25".to_string(),
                 "25".to_string(),
                 "i miss you".to_string()
             ]
@@ -1107,13 +1109,15 @@ mod tests {
             other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
         }
 
-        // Only the two album searches ran (primary + album-only) — no
-        // track-title query was issued for the all-generic library.
+        // Only the three album searches ran (primary + lowercase fallback +
+        // album-only) — no track-title query was issued for the all-generic
+        // library.
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
             vec![
                 "Prince The Very Best Of Prince".to_string(),
+                "prince the very best of prince".to_string(),
                 "The Very Best Of Prince".to_string()
             ]
         );
@@ -1159,11 +1163,69 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
 
-        // Both searches were attempted: primary then album-only.
+        // Three searches were attempted: primary, lowercase fallback, then
+        // album-only.
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
-            vec!["Prince Musicology".to_string(), "Musicology".to_string()]
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
+            ]
+        );
+    }
+
+    // End-to-end lowercase fallback: primary "Prince Musicology" is empty
+    // (blocked artist), the lowercase fallback searches "prince musicology"
+    // and finds a result whose path matches "Prince", and the download
+    // succeeds without reaching the album-only tier.
+    #[tokio::test]
+    async fn test_lowercase_fallback_fires_when_primary_empty() {
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "prince musicology".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Prince",
+            Some("Musicology"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+
+        // Two searches were attempted: primary then lowercase fallback — the
+        // album-only tier never fired because lowercase found results.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string()
+            ]
         );
     }
 
@@ -1198,7 +1260,13 @@ mod tests {
     // names the artist/album and says we're falling back to a track-title
     // search. Without it a user can't tell what "Searching for tomorrow
     // comes today" even refers to.
-    #[tokio::test]
+    //
+    // Uses a global default subscriber (not thread-local set_default) so the
+    // async process_album work is captured regardless of which runtime thread
+    // runs it. A thread-local set_default only captures logs emitted on the
+    // thread that called it, which is unreliable when #[tokio::test]'s async
+    // body runs on a different/runtime thread.
+    #[tokio::test(flavor = "current_thread")]
     async fn test_title_search_fallback_logs_contextual_message() {
         let buf = Arc::new(Mutex::new(String::new()));
         let writer = CapturingWriter(buf.clone());
@@ -1208,7 +1276,11 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Use a global default so all threads' tracing calls are captured.
+        // This is the only test in the suite that installs a subscriber, so
+        // it is safe to set the process-wide default here.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("global tracing subscriber must be set exactly once");
 
         let client = Arc::new(MockClient::new());
         // Library track "01 - I Miss You.mp3" cleans to "i miss you", the
@@ -1255,7 +1327,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        drop(_guard);
         let captured = buf.lock().unwrap().clone();
         assert!(
             captured.contains("falling back to track-title search"),

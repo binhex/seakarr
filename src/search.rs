@@ -51,24 +51,52 @@ pub struct SearchOutcome {
 
 /// Search for an album by artist + album name.
 ///
-/// Tier 1 runs the primary "Artist Album" search. If it returns nothing,
-/// Tier 2 falls back to an album-name-only search (artist `""`), keeping
-/// only results whose file paths match the artist via
-/// [`path_matches_artist`]. If both tiers come up empty, an empty outcome is
-/// returned.
+/// Tier 1a runs the primary "Artist Album" search (original casing). If it
+/// returns nothing, Tier 1b retries with the same query lowercased (Soulseek
+/// returns different result sets per casing, and lowercase queries tend to be
+/// lower quality, so original casing is always preferred). Tier 1b is skipped
+/// when the artist is empty (Tier 2 handles album-only searches with artist
+/// verification) or when the query is already lowercase (no new information).
+/// If both casing variants return nothing, Tier 2 falls back to an
+/// album-name-only search (artist `""`), keeping only results whose file
+/// paths match the artist via [`path_matches_artist`]. If all tiers come up
+/// empty, an empty outcome is returned.
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
     album: Option<&str>,
     timeout_secs: u64,
 ) -> Result<SearchOutcome> {
-    // Tier 1: primary "Artist Album" search
+    // Tier 1a: primary "Artist Album" search (original casing)
     let results = search_album(client, artist, album, timeout_secs).await?;
     if !results.is_empty() {
         return Ok(SearchOutcome { results });
     }
 
-    // Tier 2: album-only search (when primary returns nothing)
+    // Tier 1b: lowercase fallback (when original casing returned nothing)
+    // Soulseek returns different result sets for different query casing;
+    // lowercase queries tend to return lower-quality results (MP3s), so
+    // we try the original casing first and only fall back to lowercase
+    // when it returned zero raw results. Skip when artist is empty
+    // (Tier 2 handles album-only searches with artist verification) or
+    // when the query is already lowercase (no new information).
+    if let Some(album_name) = album {
+        if !album_name.trim().is_empty() && !artist.trim().is_empty() {
+            let artist_lower = artist.to_lowercase();
+            let album_lower = album_name.to_lowercase();
+            if artist_lower != artist || album_lower != album_name {
+                let lower_results =
+                    search_album(client, &artist_lower, Some(&album_lower), timeout_secs).await?;
+                if !lower_results.is_empty() {
+                    return Ok(SearchOutcome {
+                        results: lower_results,
+                    });
+                }
+            }
+        }
+    }
+
+    // Tier 2: album-only search (when both casing variants returned nothing)
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() {
             let album_results = search_album(client, "", Some(album_name), timeout_secs).await?;
@@ -93,7 +121,7 @@ pub async fn search_album_with_fallback(
         }
     }
 
-    // Both tiers returned nothing
+    // All tiers returned nothing
     Ok(SearchOutcome { results: vec![] })
 }
 
@@ -610,8 +638,8 @@ mod tests {
     async fn test_album_only_fallback_never_matches_when_artist_empty() {
         // An empty artist can never pass path_matches_artist, so even though
         // the album-only tier fires (album present, primary empty), it must
-        // produce nothing. Two queries run: primary ("Album") + album-only
-        // (also "Album").
+        // produce nothing. Two queries run: primary ("Album") and album-only
+        // (also "Album"). Tier 1b is skipped because artist is empty.
         let client = MockClient::new();
         let outcome = search_album_with_fallback(&client, "", Some("Album"), 15)
             .await
@@ -646,8 +674,10 @@ mod tests {
             }],
         );
         // The primary query "Michael Jackson History" has no map entry, so
-        // it returns empty. The album-only tier then searches "History",
-        // whose result path matches "Michael Jackson", so it is returned.
+        // it returns empty, as does the lowercase fallback
+        // "michael jackson history". The album-only tier then searches
+        // "History", whose result path matches "Michael Jackson", so it is
+        // returned.
 
         let outcome = search_album_with_fallback(&client, "Michael Jackson", Some("History"), 15)
             .await
@@ -656,7 +686,11 @@ mod tests {
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
-            vec!["Michael Jackson History".to_string(), "History".to_string()]
+            vec![
+                "Michael Jackson History".to_string(),
+                "michael jackson history".to_string(),
+                "History".to_string()
+            ]
         );
     }
 
@@ -679,16 +713,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_two_queries_when_primary_empty_and_album_present() {
-        // Both tiers run when the primary search is empty and an album is
-        // present: the primary "Artist Album" and the album-only "Album"
-        // query. With no results for either, the outcome is empty.
+    async fn test_all_tiers_run_when_primary_empty_and_album_present() {
+        // All tiers run when the primary search is empty and an album is
+        // present: the primary "Artist Album", the lowercase fallback
+        // "artist album", and the album-only "Album" query. With no results
+        // for any of them, the outcome is empty.
         let client = MockClient::new();
         let outcome = search_album_with_fallback(&client, "Artist", Some("Album"), 15)
             .await
             .unwrap();
         assert!(outcome.results.is_empty());
-        assert_eq!(client.search_queries.lock().unwrap().len(), 2);
+        assert_eq!(client.search_queries.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1040,8 +1075,9 @@ mod tests {
     async fn test_album_only_fallback_when_primary_empty() {
         let client = MockClient::new();
         // Primary "Prince Musicology" has no map entry -> empty (blocked
-        // artist). Album-only "Musicology" returns a result whose file path
-        // contains "Prince".
+        // artist), as does the lowercase fallback "prince musicology".
+        // Album-only "Musicology" returns a result whose file path contains
+        // "Prince".
         client.search_results_by_query.lock().unwrap().insert(
             "Musicology".into(),
             vec![SearchResult {
@@ -1060,12 +1096,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.results.len(), 1);
-        // Both tiers ran in order. The album-only query is "Musicology" —
-        // not " Musicology" (leading space must be trimmed).
+        // All three tiers ran in order. The album-only query is "Musicology"
+        // — not " Musicology" (leading space must be trimmed).
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
             queries,
-            vec!["Prince Musicology".to_string(), "Musicology".to_string()]
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
+            ]
         );
     }
 
@@ -1105,6 +1145,143 @@ mod tests {
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Prince".to_string()]);
+    }
+
+    // ── lowercase casing fallback ──
+
+    #[tokio::test]
+    async fn test_lowercase_fallback_when_primary_empty() {
+        let client = MockClient::new();
+        // Primary "Prince Musicology" has no map entry -> empty (blocked
+        // artist). Lowercase "prince musicology" returns results.
+        client.search_results_by_query.lock().unwrap().insert(
+            "prince musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // Both tiers ran: original casing + lowercase fallback.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_fallback_skipped_when_primary_has_results() {
+        let client = MockClient::new();
+        // Primary "Prince Musicology" returns results. Lowercase fallback
+        // must NOT be attempted.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Prince Musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // Only the original casing query was issued — no lowercase fallback.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["Prince Musicology".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_album_only_tier_after_both_casings_fail() {
+        let client = MockClient::new();
+        // Both casing variants return nothing. Album-only "Musicology"
+        // returns a result whose path matches "Prince".
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // Three queries ran: original casing, lowercase, album-only.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_fallback_skipped_when_already_lowercase() {
+        let client = MockClient::new();
+        // Both artist and album are already lowercase. Tier 1a
+        // ("prince musicology") returns empty. Tier 1b must be skipped
+        // because the lowercased query would be byte-identical to the
+        // Tier 1a query (no new information). Tier 2 (album-only
+        // "musicology") returns a result whose path matches "Prince".
+        // Without the skip, Tier 1b would issue a duplicate "prince
+        // musicology" query (3 total). With the skip, only 2 queries run.
+        client.search_results_by_query.lock().unwrap().insert(
+            "musicology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/Musicology/01 - Musicology.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "prince", Some("musicology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // Two queries ran: Tier 1a ("prince musicology") and Tier 2
+        // ("musicology"). Tier 1b was skipped because lowercasing
+        // would produce the same query as Tier 1a.
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec!["prince musicology".to_string(), "musicology".to_string()]
+        );
     }
 
     // ── generic-name filtering in search_by_title ──
