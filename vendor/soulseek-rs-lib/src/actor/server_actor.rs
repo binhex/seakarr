@@ -599,11 +599,12 @@ impl ServerActor {
         }
     }
 
-    /// Hand an operation to the client loop, logging a dead channel rather
-    /// than unwinding the actor.
+    /// Hand an operation to the client loop. A failure means the ops loop is
+    /// gone (reconnect or shutdown dropped the receiver) — normal teardown,
+    /// so it is logged at debug rather than spamming an error.
     fn forward_to_client(&self, operation: ClientOperation) {
         if let Err(e) = self.client_channel.send(operation) {
-            error!("[server] Error forwarding to client: {}", e);
+            debug!("[server] client gone, dropping operation: {}", e);
         }
     }
 
@@ -666,7 +667,7 @@ impl ServerActor {
             token,
             query,
         }) {
-            error!("[server] forward IncomingSearch: {}", e);
+            debug!("[server] client gone, dropping IncomingSearch: {}", e);
         }
     }
 
@@ -739,7 +740,7 @@ impl ServerActor {
     /// Forward a chat-room event to the client operations loop.
     fn forward_room_event(&self, event: RoomEvent) {
         if let Err(e) = self.client_channel.send(ClientOperation::RoomEvent(event)) {
-            error!("[server] Error forwarding room event to client: {}", e);
+            debug!("[server] client gone, dropping room event: {}", e);
         }
     }
 

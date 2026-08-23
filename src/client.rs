@@ -256,10 +256,43 @@ const USER_INFO_TIMEOUT_SECS: u64 = 10;
 pub struct RealClient {
     /// The connected soulseek client, set by `login()`.
     inner: tokio::sync::Mutex<Option<Arc<Client>>>,
+    /// Credentials captured by the last successful `login()`, used by
+    /// `reconnect_if_needed()` after a session loss.
+    reconnect_settings: tokio::sync::Mutex<Option<ReconnectSettings>>,
+    /// Single-flight lock around reconnects: only one caller re-runs the
+    /// login sequence for a lost session; concurrent callers re-check the
+    /// session state once the lock is free instead of each logging in.
+    reconnect_lock: tokio::sync::Mutex<()>,
+    /// When the last reconnect attempt failed (`Some(timestamp)` = transient,
+    /// retried after [`RECONNECT_COOLDOWN`]; `None` timestamp = permanent,
+    /// e.g. credential rejection, never auto-retried) and the reason. Inside
+    /// the cooldown (or permanently) operations fail fast instead of
+    /// re-running the login sequence.
+    reconnect_failed: tokio::sync::Mutex<Option<(Option<Instant>, String)>>,
+    /// The configured peer-connection cap, re-applied to the fresh client
+    /// after a reconnect (the vendored default would otherwise silently
+    /// replace it). Kept as `usize` to exactly match the vendored
+    /// `Client::set_max_peers` signature (no truncation on 64-bit).
+    max_peers: std::sync::atomic::AtomicUsize,
     /// Total connect+login attempts per `login()` call.
     login_retries: u32,
     /// Base delay between login attempts; doubled after every failure.
     login_retry_delay_secs: u64,
+}
+
+/// How long a failed reconnect is "remembered". Inside this window,
+/// operations fail fast with the recorded reason instead of re-running the
+/// login sequence; once it elapses, a reconnect is attempted again.
+const RECONNECT_COOLDOWN: StdDuration = StdDuration::from_secs(60);
+
+/// Login credentials captured at login time, used to reconnect transparently
+/// after the server session is lost.
+#[derive(Clone)]
+struct ReconnectSettings {
+    username: String,
+    password: String,
+    server: String,
+    listen_port: u16,
 }
 
 impl RealClient {
@@ -275,6 +308,10 @@ impl RealClient {
     pub fn with_login_retries(retries: u32, delay_secs: u64) -> Self {
         RealClient {
             inner: tokio::sync::Mutex::new(None),
+            reconnect_settings: tokio::sync::Mutex::new(None),
+            reconnect_lock: tokio::sync::Mutex::new(()),
+            reconnect_failed: tokio::sync::Mutex::new(None),
+            max_peers: std::sync::atomic::AtomicUsize::new(0),
             login_retries: retries.max(1),
             login_retry_delay_secs: delay_secs,
         }
@@ -290,10 +327,149 @@ impl RealClient {
             .ok_or_else(|| SeakarrError::Client("not connected: call login() first".into()))
     }
 
+    /// Reconnect transparently when the server session has been lost.
+    ///
+    /// Idempotent: returns immediately while the session is alive. After a
+    /// `Disconnected` loss it re-logins with the credentials captured at
+    /// login time and swaps in the fresh client. Reconnects are
+    /// single-flight (concurrent callers wait for the in-flight attempt and
+    /// re-check), and a failed reconnect is negative-cached for
+    /// [`RECONNECT_COOLDOWN`]: within that window operations fail fast with
+    /// the recorded reason instead of re-running the login sequence, and once
+    /// it elapses a reconnect is attempted again (a transient outage does not
+    /// permanently brick the session).
+    ///
+    /// A `Displaced` loss (another login took this username) is deliberately
+    /// NOT reconnected: re-logging in would evict the other session and can
+    /// start a reconnect ping-pong between clients. It surfaces as
+    /// [`SeakarrError::Displaced`] instead, with the loss reason.
+    async fn reconnect_if_needed(&self) -> Result<()> {
+        let loss = self.connected_client().await?.session_loss();
+        let Some(loss) = loss else {
+            return Ok(());
+        };
+
+        // Another session owns this account now. Reconnecting would evict it
+        // and could ping-pong the account; surface the loss reason as its own
+        // error type so callers can distinguish "displaced" from a network
+        // drop. Checked before the negative cache: a stale reconnect failure
+        // must not mask the takeover reason.
+        if loss == ::soulseek_rs::types::SessionLoss::Displaced {
+            return Err(SeakarrError::Displaced {
+                reason: loss.to_string(),
+            });
+        }
+
+        // Negative cache: if the last reconnect failed recently (within
+        // RECONNECT_COOLDOWN), fail fast with the recorded reason rather than
+        // re-running the full multi-attempt login sequence per call. Once the
+        // cooldown elapses, the cache is treated as expired and a reconnect is
+        // attempted again below (a transient outage must not permanently
+        // brick the session).
+        //
+        // NOTE: the guard is dropped at the end of this statement (the value
+        // is cloned); never re-acquire this mutex inside an `if let` whose
+        // scrutinee opened it — the guard outlives the block body and
+        // self-deadlocks.
+        let cached = self.reconnect_failed.lock().await.clone();
+        if let Some((failed_at, reason)) = cached {
+            let fresh = failed_at.is_none_or(|at| at.elapsed() < RECONNECT_COOLDOWN);
+            if fresh {
+                return Err(SeakarrError::Disconnected { reason });
+            }
+        }
+
+        // Single-flight: only one caller reconnects; the rest re-check the
+        // session state once the in-flight attempt finishes.
+        let _guard = self.reconnect_lock.lock().await;
+        if self.connected_client().await?.session_loss().is_none() {
+            return Ok(());
+        }
+        // Re-check the negative cache under the lock: callers that queued
+        // before the in-flight attempt failed must not each re-run the full
+        // login sequence (thundering herd). Expired entries are cleared so the
+        // retry below actually proceeds; permanent entries (None timestamp)
+        // always fail fast.
+        let cached = self.reconnect_failed.lock().await.clone();
+        if let Some((failed_at, reason)) = cached {
+            let fresh = failed_at.is_none_or(|at| at.elapsed() < RECONNECT_COOLDOWN);
+            if fresh {
+                return Err(SeakarrError::Disconnected { reason });
+            }
+            // Dropped the read guard above; a fresh short-lived guard here
+            // clears the expired entry without re-entering a held lock.
+            self.reconnect_failed.lock().await.take();
+        }
+
+        let settings = self
+            .reconnect_settings
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| SeakarrError::Disconnected {
+                reason: "no stored login settings to reconnect with".into(),
+            })?;
+        // Stop the old client's listener BEFORE the new connect() so its
+        // socket (and the configured port) is released: otherwise
+        // Listen::bind races the old listener, falls back to an ephemeral
+        // port, and the reconnected client silently advertises the wrong
+        // port. We keep the old (dead) client in `inner` so a failed
+        // reconnect still leaves a client whose session_loss() is observable,
+        // keeping the negative-cache / cooldown retry path reachable.
+        tracing::warn!("Soulseek session lost ({loss:?}); reconnecting...");
+        if let Ok(old) = self.connected_client().await {
+            // The join inside stop_listener can block up to ~10s if the
+            // accept loop is parked on a full handshake semaphore; run it off
+            // the async worker so it doesn't stall the runtime.
+            let _ = tokio::task::spawn_blocking(move || old.stop_listener()).await;
+        }
+        match self
+            .login(
+                &settings.username,
+                &settings.password,
+                &settings.server,
+                settings.listen_port,
+            )
+            .await
+        {
+            Ok(()) => {
+                // Reconnected: clear the negative cache so future operations
+                // use the fresh session, and re-apply the configured peer cap
+                // (login() creates a fresh client with the vendored default).
+                *self.reconnect_failed.lock().await = None;
+                let cap = self.max_peers.load(std::sync::atomic::Ordering::Relaxed);
+                if cap > 0 {
+                    if let Ok(client) = self.connected_client().await {
+                        client.set_max_peers(cap);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let reason = format!("reconnect failed: {e}");
+                // Credential rejection is permanent (credentials won't change
+                // while the process runs): store a None timestamp so it is
+                // never auto-retried. Network/other failures are transient.
+                let is_auth = matches!(&e, SeakarrError::Auth { .. });
+                let stamp = if is_auth { None } else { Some(Instant::now()) };
+                *self.reconnect_failed.lock().await = Some((stamp, reason.clone()));
+                // Preserve the credential-rejection signal instead of
+                // flattening everything into Disconnected.
+                match e {
+                    SeakarrError::Auth { .. } => Err(e),
+                    _ => Err(SeakarrError::Disconnected { reason }),
+                }
+            }
+        }
+    }
+
     /// Set the maximum number of simultaneous peer connections.
     /// Delegates to the vendored library's `Client::set_max_peers` which
-    /// enforces a floor of 1.
+    /// enforces a floor of 1. Stored so a reconnected client re-applies the
+    /// same cap (the vendored default would otherwise take over).
     pub async fn set_max_peers(&self, max_peers: usize) -> Result<()> {
+        self.max_peers
+            .store(max_peers.max(1), std::sync::atomic::Ordering::Relaxed);
         let client = self.connected_client().await?;
         client.set_max_peers(max_peers);
         Ok(())
@@ -507,6 +683,16 @@ impl SoulseekClient for RealClient {
     ) -> Result<()> {
         let address = parse_server_address(server)?;
         let mut last_reason = "login failed".to_string();
+        // Whether any failure was a credential rejection (the server's login
+        // verdict said no) vs a network/timeout failure. A credential
+        // rejection is permanent (credentials won't change while the process
+        // runs), while a network failure is transient. Sticky (OR'd), so a
+        // mixed auth-then-network sequence still classifies as permanent.
+        let mut last_was_auth = false;
+        // The reason of the attempt that *caused* the auth classification, so
+        // the returned Auth error doesn't carry a later network attempt's
+        // misleading reason (e.g. "Operation timed out") in mixed sequences.
+        let mut auth_reason: Option<String> = None;
         let enable_listen = listen_port > 0;
 
         for attempt in 0..self.login_retries {
@@ -530,14 +716,30 @@ impl SoulseekClient for RealClient {
                 client.login().map(|logged_in| (client, logged_in))
             })
             .await
-            .map_err(|e| SeakarrError::Auth {
-                attempts: attempt + 1,
-                reason: format!("login task panicked: {e}"),
+            .map_err(|e| SeakarrError::Disconnected {
+                reason: format!("login task failed: {e}"),
             })?;
 
             match result {
                 Ok((client, true)) => {
+                    // Assigning a fresh client drops the previous Arc while the
+                    // `inner` guard is held on the async worker. Today that
+                    // drop's `Client::drop` -> `stop_listener()` is a no-op
+                    // (startup login has no prior client; the reconnect path
+                    // already stopped the old listener), so it cannot stall.
+                    // Keep it that way: any future direct re-login path must
+                    // release the old Arc off-lock before re-assigning.
                     *self.inner.lock().await = Some(Arc::new(client));
+                    *self.reconnect_settings.lock().await = Some(ReconnectSettings {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                        server: server.to_string(),
+                        listen_port,
+                    });
+                    // A successful (re)login means the connection is healthy
+                    // again: clear any stale negative cache so future session
+                    // losses can reconnect.
+                    *self.reconnect_failed.lock().await = None;
                     if enable_listen {
                         tracing::info!("[listener] enabled on port {listen_port}");
                     } else {
@@ -547,8 +749,30 @@ impl SoulseekClient for RealClient {
                 }
                 Ok((_, false)) => {
                     last_reason = "the server rejected the login".to_string();
+                    last_was_auth = true;
+                    auth_reason = Some(last_reason.clone());
                 }
-                Err(e) => last_reason = e.to_string(),
+                Err(e) => {
+                    last_reason = e.to_string();
+                    // The vendored actor reports credential rejection as
+                    // `Err(SoulseekRs::AuthenticationFailed)` (never `Ok(false)`),
+                    // while network/timeout failures surface as other `Err`
+                    // variants (Timeout, NotConnected, NetworkError). OR (not
+                    // overwrite) so a credential rejection on ANY attempt is
+                    // remembered — a mixed auth-then-network sequence still
+                    // classifies as permanent, not transient.
+                    if matches!(&e, ::soulseek_rs::error::SoulseekRs::AuthenticationFailed) {
+                        last_was_auth = true;
+                        auth_reason = Some(last_reason.clone());
+                    }
+                    // Limitation: a ban/version rejection that the server
+                    // signals by dropping the connection (rather than an
+                    // explicit `AuthenticationFailed` verdict) surfaces as
+                    // Timeout/ConnectionClosed and is therefore classified
+                    // transient, so it retries every cooldown period. The
+                    // vendored actor does not distinguish these, so this is a
+                    // documented (not silent) behavior.
+                }
             }
 
             if attempt + 1 < self.login_retries {
@@ -559,13 +783,24 @@ impl SoulseekClient for RealClient {
             }
         }
 
-        Err(SeakarrError::Auth {
-            attempts: self.login_retries,
-            reason: last_reason,
-        })
+        // Credential rejection and network failure are fundamentally
+        // different: the former will not change without new credentials, the
+        // latter is transient. Return distinct variants so the reconnect
+        // path can cache them differently.
+        if last_was_auth {
+            Err(SeakarrError::Auth {
+                attempts: self.login_retries,
+                reason: auth_reason.unwrap_or(last_reason),
+            })
+        } else {
+            Err(SeakarrError::Disconnected {
+                reason: last_reason,
+            })
+        }
     }
 
     async fn search(&self, query: &str, timeout_secs: u64) -> Result<Vec<SearchResult>> {
+        self.reconnect_if_needed().await?;
         let client = self.connected_client().await?;
         let query_owned = query.to_string();
         let query_for_task = query_owned.clone();
@@ -575,7 +810,15 @@ impl SoulseekClient for RealClient {
         })
         .await
         .map_err(|e| SeakarrError::Client(format!("search task panicked: {e}")))?
-        .map_err(|e| SeakarrError::Client(format!("search '{query_owned}' failed: {e}")))?;
+        .map_err(|e| match e {
+            // A session loss between the reconnect check and the send (e.g.
+            // displaced concurrently) surfaces as NotConnected; map it to the
+            // caller-facing Disconnected so retry/abort logic sees one shape.
+            ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
+                reason: format!("server connection lost while searching '{query_owned}'"),
+            },
+            e => SeakarrError::Client(format!("search '{query_owned}' failed: {e}")),
+        })?;
 
         Ok(results
             .into_iter()
@@ -589,6 +832,7 @@ impl SoulseekClient for RealClient {
         username: &str,
         dir: &Path,
     ) -> Result<DownloadHandle> {
+        self.reconnect_if_needed().await?;
         let client = self.connected_client().await?;
         let filename = file.name.clone();
         let username_owned = username.to_string();
@@ -605,10 +849,20 @@ impl SoulseekClient for RealClient {
         })
         .await
         .map_err(|e| SeakarrError::Download(format!("download task panicked: {e}")))?
-        .map_err(|e| {
-            SeakarrError::Download(format!(
-                "failed to queue download of '{filename}' from '{username_owned}': {e}"
-            ))
+        .map_err(|e| match e {
+            // Symmetric with search(): a session loss between the reconnect
+            // check and the queue surfaces as NotConnected; map it to the
+            // caller-facing Disconnected so retry/abort logic sees one shape.
+            ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
+                reason: format!(
+                    "server connection lost while queueing download of '{filename}' from '{username_owned}'"
+                ),
+            },
+            e => {
+                SeakarrError::Download(format!(
+                    "failed to queue download of '{filename}' from '{username_owned}': {e}"
+                ))
+            }
         })?;
 
         // Bridge the crate's std mpsc status channel onto a tokio channel, and
@@ -678,6 +932,7 @@ impl SoulseekClient for RealClient {
     }
 
     async fn user_info(&self, username: &str) -> Result<UserInfo> {
+        self.reconnect_if_needed().await?;
         let client = self.connected_client().await?;
         let username_owned = username.to_string();
         let username_for_task = username_owned.clone();
@@ -701,10 +956,18 @@ impl SoulseekClient for RealClient {
             })
             .await
             .map_err(|e| SeakarrError::Client(format!("user info task panicked: {e}")))?
-            .map_err(|e| {
-                SeakarrError::Client(format!(
+            .map_err(|e| match e {
+                // Symmetric with search(): a session loss between the
+                // reconnect check and the request surfaces as NotConnected;
+                // map it to the caller-facing Disconnected.
+                ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
+                    reason: format!(
+                        "server connection lost while requesting user info for '{username_owned}'"
+                    ),
+                },
+                e => SeakarrError::Client(format!(
                     "user info request for '{username_owned}' failed: {e}"
-                ))
+                )),
             })?;
 
         Ok(UserInfo {
@@ -717,6 +980,7 @@ impl SoulseekClient for RealClient {
 #[cfg(test)]
 mod real_client_tests {
     use super::*;
+    use ::soulseek_rs::types::SessionLoss;
     use std::collections::HashMap;
 
     // Compile-time proof that the trait's `Send + Sync` supertrait holds.
@@ -724,6 +988,200 @@ mod real_client_tests {
     fn real_client_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RealClient>();
+    }
+
+    // The Disconnected error (surfaced when a reconnect after session loss
+    // fails) carries a clear, caller-visible reason.
+    #[test]
+    fn disconnected_error_displays_reason() {
+        let err = SeakarrError::Disconnected {
+            reason: "the connection to the server dropped".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "server connection lost: the connection to the server dropped"
+        );
+    }
+
+    // Characterisation guard: reconnection must not mask the normal
+    // not-logged-in error path for a fresh client.
+    #[tokio::test]
+    async fn search_without_login_still_errors_not_connected() {
+        let client = RealClient::new();
+        let err = client.search("query", 1).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not connected: call login() first"));
+    }
+
+    // Build a RealClient whose inner client has the given session loss
+    // recorded, with no stored reconnect settings. Uses the vendored crate's
+    // test-only `record_session_loss` hook so reconnect paths can be exercised
+    // without a live Soulseek connection.
+    async fn real_client_with_loss(loss: SessionLoss) -> RealClient {
+        let client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        client.record_session_loss(loss);
+        let rc = RealClient::new();
+        *rc.inner.lock().await = Some(Arc::new(client));
+        rc
+    }
+
+    // A live session must not trigger any reconnect work.
+    #[tokio::test]
+    async fn reconnect_if_needed_is_noop_when_session_alive() {
+        let client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        let rc = RealClient::new();
+        *rc.inner.lock().await = Some(Arc::new(client));
+
+        assert!(rc.reconnect_if_needed().await.is_ok());
+        // No reconnect was attempted, so no failure is cached.
+        assert!(rc.reconnect_failed.lock().await.is_none());
+    }
+
+    // A displaced session (another login owns the account) must fail fast with
+    // the Displaced variant, never reconnecting (which would ping-pong the
+    // account between clients).
+    #[tokio::test]
+    async fn displaced_session_returns_displaced_error() {
+        let rc = real_client_with_loss(SessionLoss::Displaced).await;
+
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Displaced { .. }));
+        // No reconnect was attempted: the negative cache stays clear.
+        assert!(rc.reconnect_failed.lock().await.is_none());
+    }
+
+    // A previously failed reconnect must be negative-cached: the next
+    // operation fails fast with the recorded reason instead of re-running the
+    // full multi-attempt login sequence — as long as the cooldown has not
+    // elapsed.
+    #[tokio::test]
+    async fn failed_reconnect_is_negative_cached() {
+        let rc = real_client_with_loss(SessionLoss::Disconnected).await;
+        *rc.reconnect_failed.lock().await = Some((
+            Some(Instant::now()),
+            "reconnect failed: server unreachable".into(),
+        ));
+
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Disconnected { .. }));
+        assert_eq!(
+            err.to_string(),
+            "server connection lost: reconnect failed: server unreachable"
+        );
+    }
+
+    // A failed reconnect inside the cooldown window keeps failing fast with
+    // the recorded reason — the storm-prevention behaviour from earlier
+    // rounds.
+    #[tokio::test]
+    async fn fresh_reconnect_failure_fails_fast_during_cooldown() {
+        let rc = real_client_with_loss(SessionLoss::Disconnected).await;
+        *rc.reconnect_failed.lock().await =
+            Some((Some(Instant::now()), "reconnect failed: server down".into()));
+
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Disconnected { .. }));
+        assert_eq!(
+            err.to_string(),
+            "server connection lost: reconnect failed: server down"
+        );
+        // The cache must survive the fast-fail: a later call inside the same
+        // window still fails fast.
+        assert!(rc.reconnect_failed.lock().await.is_some());
+    }
+
+    // After the cooldown elapses, a reconnect must be attempted again (the
+    // daemon must recover from a transient outage without a restart). The
+    // stale cached reason must not short-circuit the attempt.
+    #[tokio::test]
+    async fn expired_reconnect_failure_allows_retry_after_cooldown() {
+        let rc = real_client_with_loss(SessionLoss::Disconnected).await;
+        // A failure recorded well beyond the (60s) cooldown window.
+        *rc.reconnect_failed.lock().await = Some((
+            Some(Instant::now() - StdDuration::from_secs(2 * 60)),
+            "reconnect failed: long ago".into(),
+        ));
+
+        // The cache is expired, so the code must proceed into the reconnect
+        // branch. With no stored settings it fails with the "no stored login
+        // settings" error — proving the stale reason was NOT returned and the
+        // retry path was entered.
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Disconnected { .. }));
+        assert!(err
+            .to_string()
+            .contains("no stored login settings to reconnect with"));
+    }
+
+    // A credential-rejection (Auth) failure must never auto-retry: the
+    // credentials cannot change while the process runs, so re-running the full
+    // login sequence every cooldown is pure waste (and, per finding, leaks
+    // threads). A Permanent failure fails fast forever, until an explicit
+    // successful login clears it.
+    #[tokio::test]
+    async fn auth_failure_is_permanent_and_never_retried() {
+        let rc = real_client_with_loss(SessionLoss::Disconnected).await;
+        // None timestamp => permanent (Auth) failure: never auto-retried.
+        *rc.reconnect_failed.lock().await = Some((
+            None,
+            "reconnect failed: soulseek authentication failed".into(),
+        ));
+
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Disconnected { .. }));
+        assert!(err.to_string().contains("soulseek authentication failed"));
+        // The permanent entry survives: no retry, no clear.
+        assert!(rc.reconnect_failed.lock().await.is_some());
+    }
+
+    // set_max_peers must preserve the full usize cap across reconnects: a
+    // value above u32::MAX must not truncate in the stored atomic.
+    #[tokio::test]
+    async fn set_max_peers_preserves_large_cap_without_truncation() {
+        let client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        let rc = RealClient::new();
+        *rc.inner.lock().await = Some(Arc::new(client));
+
+        rc.set_max_peers(usize::MAX).await.unwrap();
+
+        assert_eq!(
+            rc.max_peers.load(std::sync::atomic::Ordering::Relaxed),
+            usize::MAX
+        );
+    }
+
+    // A disconnected session with no stored credentials reaches the reconnect
+    // branch and fails with the "no stored login settings" error — proving the
+    // code enters the reconnect path rather than silently succeeding.
+    #[tokio::test]
+    async fn disconnected_without_settings_fails_disconnected() {
+        let rc = real_client_with_loss(SessionLoss::Disconnected).await;
+
+        let err = rc.reconnect_if_needed().await.unwrap_err();
+        assert!(matches!(err, SeakarrError::Disconnected { .. }));
+        assert!(err
+            .to_string()
+            .contains("no stored login settings to reconnect with"));
+    }
+
+    // download() must run the reconnect guard before touching the network:
+    // on a displaced session it fails with Displaced, not a download error.
+    #[tokio::test]
+    async fn download_on_displaced_session_returns_displaced() {
+        let rc = real_client_with_loss(SessionLoss::Displaced).await;
+        let file = FileInfo {
+            name: "01 - track.flac".into(),
+            size: 10_000,
+            attribs: HashMap::new(),
+        };
+
+        let err = rc
+            .download(&file, "peer", std::path::Path::new("/tmp"))
+            .await
+            .err()
+            .expect("displaced session must fail download");
+        assert!(matches!(err, SeakarrError::Displaced { .. }));
     }
 
     // Regression guard: a stalled transfer (no status updates arriving) must

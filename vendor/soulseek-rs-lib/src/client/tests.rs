@@ -103,6 +103,44 @@ fn test_client_pause_and_resume_download() {
 }
 
 #[test]
+fn stop_listener_is_idempotent_and_safe_to_drop() {
+    // A client that never connected has no listener thread, so
+    // stop_listener() must be a no-op that just sets the shutdown flag. Two
+    // calls (explicit-call then the implicit one from Drop) must not panic or
+    // double-join: the JoinHandle is taken (guard.take()) on first use.
+    let client = Client::new("u", "p");
+    client.stop_listener();
+    assert!(
+        client
+            .listener_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    client.stop_listener();
+    drop(client);
+}
+
+#[test]
+fn stop_listener_does_not_stop_the_ops_loop() {
+    // Releasing the port for a reconnect must NOT also kill the ops loop:
+    // the old client's still-alive peer actors keep forwarding search results
+    // and disconnect notices to it until the client is actually dropped.
+    // Sharing one flag here closed the ops receiver during reconnect, which
+    // made every still-connected peer spam "sending on a closed channel".
+    let client = Client::new("u", "p");
+    client.stop_listener();
+    assert!(
+        client
+            .listener_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert!(
+        !client
+            .ops_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[test]
 fn download_without_a_connection_resolves_failed() {
     // A client that never connected has no server handle and no peer registry,
     // so it cannot open a connection to the peer: the download must resolve to
@@ -417,7 +455,12 @@ fn upload_speed_is_reported_only_while_running() {
 fn a_clean_disconnect_keeps_queued_uploads_an_error_drops_them() {
     let client = Client::new("test-user", "test-password");
     let (ops, ops_rx) = mpsc::channel();
-    Client::listen_to_client_operations(ops_rx, client.context.clone(), "me".to_string());
+    Client::listen_to_client_operations(
+        ops_rx,
+        client.context.clone(),
+        "me".to_string(),
+        Arc::new(AtomicBool::new(false)),
+    );
 
     client.context.write().unwrap().enqueue_upload(
         "amy",
@@ -538,7 +581,12 @@ fn an_expired_broker_connect_fails_the_queued_downloads() {
             .insert(7, ("ghost".to_string(), Instant::now()));
     }
     let (_ops_tx, ops_rx) = mpsc::channel();
-    Client::listen_to_client_operations(ops_rx, client.context, "u".to_string());
+    Client::listen_to_client_operations(
+        ops_rx,
+        client.context.clone(),
+        "u".to_string(),
+        Arc::new(AtomicBool::new(false)),
+    );
 
     let status = receiver.recv_timeout(Duration::from_secs(5));
     assert!(
@@ -564,7 +612,12 @@ fn a_replayed_transfer_response_does_not_start_a_second_transfer() {
     ));
 
     let (ops_tx, ops_rx) = mpsc::channel();
-    Client::listen_to_client_operations(ops_rx, client.context, "u".to_string());
+    Client::listen_to_client_operations(
+        ops_rx,
+        client.context.clone(),
+        "u".to_string(),
+        Arc::new(AtomicBool::new(false)),
+    );
 
     let peer = Peer::new(
         "peer".to_string(),

@@ -113,16 +113,21 @@ impl Client {
             let client_sender = listen_sender;
             let context = self.context.clone();
             let own_username = self.username.clone();
+            let shutdown = self.listener_shutdown.clone();
 
-            thread::spawn(move || {
-                Listen::serve(&listener, client_sender, context, own_username);
+            let handle = thread::spawn(move || {
+                Listen::serve(&listener, client_sender, context, own_username, shutdown);
             });
+            if let Ok(mut guard) = self.listener_thread.lock() {
+                *guard = Some(handle);
+            }
         }
 
         Self::listen_to_client_operations(
             message_reader,
             self.context.clone(),
             self.username.clone(),
+            self.ops_shutdown.clone(),
         );
 
         Ok(())

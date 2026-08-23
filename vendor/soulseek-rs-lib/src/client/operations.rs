@@ -1,8 +1,8 @@
 use super::{
-    Arc, Client, ClientContext, ClientOperation, ConnectionType, Download, DownloadPeer,
-    DownloadStatus, Duration, Instant, Peer, PeerMessage, PeerRegistry, Receiver, RwLock,
-    RwLockExt, ServerMessage, build_search_response, debug, error, info, mpsc, next_connect_token,
-    thread, trace, warn,
+    Arc, AtomicBool, Client, ClientContext, ClientOperation, ConnectionType, Download,
+    DownloadPeer, DownloadStatus, Duration, Instant, Ordering, Peer, PeerMessage, PeerRegistry,
+    Receiver, RwLock, RwLockExt, ServerMessage, build_search_response, debug, error, info, mpsc,
+    next_connect_token, thread, trace, warn,
 };
 use crate::message::server::MessageFactory;
 
@@ -13,10 +13,14 @@ impl Client {
         reader: Receiver<ClientOperation>,
         client_context: Arc<RwLock<ClientContext>>,
         own_username: String,
+        shutdown: Arc<AtomicBool>,
     ) {
         thread::spawn(move || {
             let mut last_sweep = Instant::now();
             loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 let next = reader.recv_timeout(CONNECT_SWEEP_INTERVAL);
                 if last_sweep.elapsed() >= CONNECT_SWEEP_INTERVAL {
                     last_sweep = Instant::now();

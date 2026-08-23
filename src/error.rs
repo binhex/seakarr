@@ -8,6 +8,12 @@ pub enum SeakarrError {
     #[error("soulseek authentication failed after {attempts} attempts: {reason}")]
     Auth { attempts: u32, reason: String },
 
+    #[error("server connection lost: {reason}")]
+    Disconnected { reason: String },
+
+    #[error("another login took over this username: {reason}")]
+    Displaced { reason: String },
+
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 

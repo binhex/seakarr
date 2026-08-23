@@ -21,6 +21,11 @@ use crate::{DownloadStatus, debug, error, info, trace, warn};
 /// retrying flat out spins a core and floods the log.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How long to sleep between non-blocking accept polls when nothing is
+/// pending. Short enough that shutdown is observed promptly, long enough not
+/// to spin.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 const PEER_INIT_MESSAGE_CODE: u8 = 1;
 
 /// How long an accepted peer gets to send its peer-init handshake.
@@ -487,6 +492,7 @@ impl Listen {
         client_sender: Sender<ClientOperation>,
         client_context: Arc<RwLock<ClientContext>>,
         own_username: String,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
     ) {
         info!("[listener] listening on {:?}", listener.local_addr());
 
@@ -497,28 +503,46 @@ impl Listen {
         };
         let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
 
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                error!(
-                    "[listener] Failed to accept connection: {}",
-                    stream.unwrap_err()
-                );
-                // Running out of file descriptors does not clear by the next
-                // instruction, and retrying flat out turns one exhausted
-                // moment into a spinning core and thousands of identical log
-                // lines. Pause long enough for something to be released.
-                std::thread::sleep(ACCEPT_BACKOFF);
-                continue;
-            };
+        // Non-blocking accept so the shutdown flag is observed promptly: a
+        // blocking `incoming()` loop would not notice a dropped Client until
+        // the next peer connection, leaking the socket (and port) for the
+        // process lifetime.
+        if let Err(e) = listener.set_nonblocking(true) {
+            error!("[listener] failed to set non-blocking: {}", e);
+            return;
+        }
 
-            let permit = handshakes.acquire();
-            let context = context.clone();
-            // One thread per connection: the peer-init handshake blocks, and a
-            // peer that is slow to send one must not stop us accepting anybody
-            // else — a wedged accept loop makes us unreachable to every peer.
-            thread::spawn(move || {
-                handle_incoming_connection(stream, context, permit);
-            });
+        loop {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    let permit = handshakes.acquire();
+                    let context = context.clone();
+                    // One thread per connection: the peer-init handshake
+                    // blocks, and a peer that is slow to send one must not
+                    // stop us accepting anybody else — a wedged accept loop
+                    // makes us unreachable to every peer.
+                    thread::spawn(move || {
+                        handle_incoming_connection(stream, context, permit);
+                    });
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Nothing pending. Brief sleep so the loop re-checks the
+                    // shutdown flag without spinning a core.
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
+                Err(e) => {
+                    error!("[listener] Failed to accept connection: {}", e);
+                    // Running out of file descriptors does not clear by the
+                    // next instruction, and retrying flat out turns one
+                    // exhausted moment into a spinning core and thousands of
+                    // identical log lines. Pause long enough for something to
+                    // be released.
+                    std::thread::sleep(ACCEPT_BACKOFF);
+                }
+            }
         }
     }
 }

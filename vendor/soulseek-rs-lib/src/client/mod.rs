@@ -627,6 +627,21 @@ pub struct Client {
     server_handle: Option<ActorHandle<ServerMessage>>,
     context: Arc<RwLock<ClientContext>>,
     session: SessionWatch,
+    /// Stops the accept loop so the listener thread closes its socket instead
+    /// of leaking it for the process lifetime (and holding the configured
+    /// port). Set by [`Client::stop_listener`] (reconnect) and by `Drop`.
+    listener_shutdown: Arc<AtomicBool>,
+    /// Stops the client-ops loop (`listen_to_client_operations`). Separate
+    /// from [`Self::listener_shutdown`] so releasing the port on reconnect
+    /// does NOT also kill the ops loop: the old client's still-alive peer
+    /// actors keep forwarding to it (without "closed channel" spam) until the
+    /// client is actually dropped.
+    ops_shutdown: Arc<AtomicBool>,
+    /// Handle to the listener thread, joined on drop (and on
+    /// [`Client::stop_listener`]) so the socket is guaranteed released before
+    /// a reconnected client re-binds the port. Interior mutability lets
+    /// `&self` methods take and join it once.
+    listener_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Client {
@@ -649,6 +664,9 @@ impl Client {
             context: Arc::new(RwLock::new(ClientContext::new())),
             server_handle: None,
             session: SessionWatch::default(),
+            listener_shutdown: Arc::new(AtomicBool::new(false)),
+            ops_shutdown: Arc::new(AtomicBool::new(false)),
+            listener_thread: std::sync::Mutex::new(None),
         }
     }
 
@@ -673,6 +691,36 @@ impl Client {
     #[must_use]
     pub fn session_loss(&self) -> Option<SessionLoss> {
         self.session.loss()
+    }
+
+    /// Records a session loss on this client.
+    ///
+    /// Test support only: lets an embedding crate exercise reconnect paths
+    /// without a live Soulseek connection. Production code never calls this —
+    /// the server actor records losses through the shared [`SessionWatch`].
+    #[doc(hidden)]
+    pub fn record_session_loss(&self, loss: SessionLoss) {
+        self.session.record(loss);
+    }
+
+    /// Stop the listener thread and release its socket (and the configured
+    /// port). Idempotent: subsequent calls are no-ops. Used before a
+    /// reconnect so the fresh client can re-bind the configured port instead
+    /// of silently falling back to an ephemeral one.
+    ///
+    /// This does NOT stop the client-ops loop: the old client is kept in
+    /// place only for `session_loss()` observability while the reconnect
+    /// runs, and its still-alive peer actors keep forwarding search results
+    /// and disconnect notices to the ops loop (harmlessly) rather than
+    /// spamming "closed channel" errors. The ops loop is stopped separately
+    /// on [`Client::drop`].
+    pub fn stop_listener(&self) {
+        self.listener_shutdown.store(true, Ordering::Relaxed);
+        if let Ok(mut guard) = self.listener_thread.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
     }
 
     /// The directories whose files are currently shared with other peers.
@@ -785,6 +833,25 @@ impl Client {
                 file_count,
             ),
         )
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Stop the server actor first so it can report any final peer state
+        // to the ops loop before that loop winds down.
+        if let Some(handle) = self.server_handle.take() {
+            let _ = handle.stop();
+        }
+
+        // Release the listener socket (and configured port).
+        self.stop_listener();
+
+        // Signal the ops loop to exit. It observes the flag within
+        // CONNECT_SWEEP_INTERVAL (1s) and drops the ops receiver, which is
+        // what lets still-alive peer actors notice the client is gone (their
+        // sends fail silently — see `PeerActor::forward_to_client`).
+        self.ops_shutdown.store(true, Ordering::Relaxed);
     }
 }
 

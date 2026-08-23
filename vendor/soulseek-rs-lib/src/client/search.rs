@@ -46,12 +46,25 @@ impl Client {
     ) -> Result<Vec<SearchResult>> {
         self.send_search(query, false)?;
         Self::collect_for(timeout, cancel_flag);
-        Ok(self.get_search_results(query))
+        let results = self.get_search_results(query);
+        // A session lost during the collect window must not surface as
+        // silently-empty results — indistinguishable from "no matches" — but
+        // it must also not discard results that DID arrive before the drop.
+        // Only fail fast when the window ended with nothing collected.
+        if results.is_empty() && self.session_loss().is_some() {
+            return Err(SoulseekRs::NotConnected);
+        }
+        Ok(results)
     }
 
     /// Register `query` and put its search on the wire. Returns as soon as the
     /// message is queued; nothing has answered yet.
     fn send_search(&self, query: &str, wishlist: bool) -> Result<()> {
+        // Fail fast if the session is already lost: the actor stays alive after
+        // a disconnect and would otherwise queue the search forever.
+        if self.session_loss().is_some() {
+            return Err(SoulseekRs::NotConnected);
+        }
         info!("Searching for {}", query);
 
         let Some(handle) = &self.server_handle else {
@@ -166,5 +179,94 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::ActorHandle;
+    use crate::client::ClientSettings;
+    use crate::types::SessionLoss;
+
+    // Regression guard: after a session loss the client must fail fast on
+    // search instead of queueing it in the still-alive server actor (which
+    // silently burns the full search timeout and returns nothing).
+    #[test]
+    fn send_search_returns_not_connected_after_session_loss() {
+        let mut client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        // Simulate a connection that was established and then lost: the actor
+        // handle exists (as after connect()), but the session is recorded lost.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        client.server_handle = Some(ActorHandle { sender: tx });
+        client.session.record(SessionLoss::Disconnected);
+
+        assert!(matches!(
+            client.send_search("some query", false),
+            Err(SoulseekRs::NotConnected)
+        ));
+    }
+
+    // A session lost DURING the collect window (after send_search succeeds)
+    // must surface as an error, not as silently-empty results. Without the
+    // post-collect check, search_with_cancel burns the full timeout and
+    // returns Ok(vec![]) — indistinguishable from "no matches".
+    #[test]
+    fn search_with_cancel_surfaces_loss_during_collect_window() {
+        let mut client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        client.server_handle = Some(ActorHandle { sender: tx });
+        let client = Arc::new(client);
+
+        // Record the loss shortly after send_search has queued the search,
+        // while collect_for is still sleeping in its window.
+        let loss_client = Arc::clone(&client);
+        let loss_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            loss_client.session.record(SessionLoss::Disconnected);
+        });
+
+        let result =
+            client.search_with_cancel("some query", std::time::Duration::from_millis(200), None);
+        loss_thread.join().unwrap();
+
+        assert!(matches!(result, Err(SoulseekRs::NotConnected)));
+    }
+
+    // A session lost DURING the window but AFTER results arrived must still
+    // return the collected results, not discard them. Discarding already-
+    // collected data is a correctness regression; the loss check only exists
+    // to distinguish "no matches" from "session lost".
+    #[test]
+    fn search_with_cancel_preserves_partial_results_on_mid_window_loss() {
+        let mut client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        client.server_handle = Some(ActorHandle { sender: tx });
+        let client = Arc::new(client);
+
+        let loss_client = Arc::clone(&client);
+        let loss_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // One peer's answer arrived before the drop.
+            if let Ok(mut ctx) = loss_client.context.write_safe()
+                && let Some(search) = ctx.searches.get_mut("some query")
+            {
+                search.results.push(SearchResult {
+                    token: 0,
+                    files: Vec::new(),
+                    slots: 1,
+                    speed: 100,
+                    username: "peer".into(),
+                });
+            }
+            loss_client.session.record(SessionLoss::Disconnected);
+        });
+
+        let result =
+            client.search_with_cancel("some query", std::time::Duration::from_millis(200), None);
+        loss_thread.join().unwrap();
+
+        // The partial result must survive the mid-window loss.
+        assert!(matches!(&result, Ok(results) if results.len() == 1));
     }
 }
