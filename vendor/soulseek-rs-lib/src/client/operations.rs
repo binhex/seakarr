@@ -33,6 +33,30 @@ impl Client {
                 };
                 match operation {
                     ClientOperation::ConnectToPeer(peer) => {
+                        // Shared per-second budget with the listener: during
+                        // an ultra-broad search the server brokered hundreds
+                        // of result-delivery relays, and every dial we fire
+                        // feeds the connection storm that got the server
+                        // connection reset. Excess P dials are dropped — the
+                        // results they would have carried are redundant once
+                        // the budget is met. Transfer (F) connections are
+                        // user-driven downloads and bypass the cap.
+                        if matches!(peer.connection_type, ConnectionType::P) {
+                            let admitted = match client_context.read_safe() {
+                                Ok(ctx) => ctx.peer_connection_limiter.try_acquire(),
+                                Err(e) => {
+                                    error!("[client] ConnectToPeer limiter read: {}", e);
+                                    false
+                                }
+                            };
+                            if !admitted {
+                                debug!(
+                                    "[client] connection rate limit reached; dropping dial to {}",
+                                    peer.username
+                                );
+                                continue;
+                            }
+                        }
                         if matches!(peer.connection_type, ConnectionType::F) {
                             let client_context_clone = client_context.clone();
                             let own_username_clone = own_username.clone();

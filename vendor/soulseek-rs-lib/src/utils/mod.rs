@@ -1,5 +1,6 @@
 #[macro_use]
 pub mod logger;
+pub mod connection_limiter;
 pub mod lock;
 pub mod md5;
 pub mod path;

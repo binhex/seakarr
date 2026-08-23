@@ -5,6 +5,7 @@ use crate::types::{
     ClientVersion, DownloadMetadata, DownloadStatus, RoomEvent, RoomInfo, SessionLoss,
     SessionWatch, UserInfo, UserPresence, UserStats, UserStatus,
 };
+use crate::utils::connection_limiter::{ConnectionLimiter, DEFAULT_MAX_CONNECTIONS_PER_SECOND};
 use crate::utils::logger;
 use crate::{
     Transfer,
@@ -289,6 +290,10 @@ pub struct ClientContext {
     /// a token we sent in a ConnectToPeer to the peer we expect back.
     pending_connect_tokens: HashMap<u32, (String, Instant)>,
     max_peers: Arc<AtomicUsize>,
+    /// Per-second admission budget shared by the listener (inbound) and the
+    /// client operations loop (outbound dials) so an ultra-broad search
+    /// cannot turn the server's brokered relays into a connection storm.
+    pub peer_connection_limiter: Arc<ConnectionLimiter>,
     /// Files we share with peers (read-only after connect).
     pub shares: Arc<Shares>,
     /// The directories the current share index was built from.
@@ -383,6 +388,9 @@ impl ClientContext {
             private_messages: Vec::new(),
             pending_connect_tokens: HashMap::new(),
             max_peers: Arc::new(AtomicUsize::new(DEFAULT_MAX_PEERS)),
+            peer_connection_limiter: Arc::new(ConnectionLimiter::new(
+                DEFAULT_MAX_CONNECTIONS_PER_SECOND,
+            )),
             shares: Arc::new(Shares::empty()),
             shared_directories: Vec::new(),
             peer_addresses: HashMap::new(),

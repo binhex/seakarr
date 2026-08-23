@@ -114,9 +114,17 @@ impl Client {
             let context = self.context.clone();
             let own_username = self.username.clone();
             let shutdown = self.listener_shutdown.clone();
+            let peer_connection_limiter = ctx.peer_connection_limiter.clone();
 
             let handle = thread::spawn(move || {
-                Listen::serve(&listener, client_sender, context, own_username, shutdown);
+                Listen::serve(
+                    &listener,
+                    client_sender,
+                    context,
+                    own_username,
+                    shutdown,
+                    peer_connection_limiter,
+                );
             });
             if let Ok(mut guard) = self.listener_thread.lock() {
                 *guard = Some(handle);

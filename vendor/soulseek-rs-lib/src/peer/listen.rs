@@ -10,6 +10,7 @@ use crate::client::{Client, ClientContext, ClientOperation};
 use crate::message::{Message, MessageReader};
 use crate::peer::{ConnectionType, DownloadPeer, Peer};
 use crate::types::Download;
+use crate::utils::connection_limiter::ConnectionLimiter;
 use crate::utils::lock::RwLockExt;
 use crate::utils::semaphore::{Permit, Semaphore};
 use crate::{DownloadStatus, debug, error, info, trace, warn};
@@ -493,6 +494,7 @@ impl Listen {
         client_context: Arc<RwLock<ClientContext>>,
         own_username: String,
         shutdown: Arc<std::sync::atomic::AtomicBool>,
+        peer_connection_limiter: Arc<ConnectionLimiter>,
     ) {
         info!("[listener] listening on {:?}", listener.local_addr());
 
@@ -518,6 +520,24 @@ impl Listen {
             }
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    // Per-second admission budget from the shared limiter: an
+                    // ultra-broad search brings hundreds of redundant
+                    // result-delivery connections at once, and every accepted
+                    // socket costs a thread, a handshake and registry churn —
+                    // enough traffic by itself that the server (or the local
+                    // network path) resets the connection. Excess peers are
+                    // dropped before the handshake thread is spawned. The type
+                    // is unknown until the handshake, so a rare inbound
+                    // transfer or PierceFirewall dial-back is also gated here;
+                    // the remote peer (or a later user action / broker-token
+                    // expiry path) re-attempts it.
+                    if !peer_connection_limiter.try_acquire() {
+                        debug!(
+                            "[listener] connection rate limit reached; dropping \
+                             incoming connection"
+                        );
+                        continue;
+                    }
                     let permit = handshakes.acquire();
                     let context = context.clone();
                     // One thread per connection: the peer-init handshake
