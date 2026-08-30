@@ -11,6 +11,7 @@ pub mod formatting;
 pub mod notifier;
 pub mod organizer;
 pub mod progress;
+pub mod reliable;
 pub mod report;
 pub mod runner;
 pub mod scanner;

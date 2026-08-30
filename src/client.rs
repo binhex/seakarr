@@ -93,6 +93,9 @@ pub struct MockClient {
     pub last_download_filename: Mutex<Option<String>>,
     /// Every filename passed to `download()`, in call order.
     pub download_filenames: Mutex<Vec<String>>,
+    /// When true, `download()` reports a transfer failure instead of
+    /// completing — lets tests exercise retry/fallback/eviction paths.
+    pub download_fails: Mutex<bool>,
 }
 
 impl MockClient {
@@ -105,6 +108,7 @@ impl MockClient {
             login_should_fail: Mutex::new(false),
             last_download_filename: Mutex::new(None),
             download_filenames: Mutex::new(vec![]),
+            download_fails: Mutex::new(false),
         }
     }
 
@@ -182,9 +186,18 @@ impl SoulseekClient for MockClient {
         let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let speed = *self.download_speed.lock().unwrap();
         let total = 10_000_000u64;
+        let download_fails = *self.download_fails.lock().unwrap();
 
         // Simulate download progress in a background task
         tokio::spawn(async move {
+            if download_fails {
+                let _ = status_tx
+                    .send(DownloadStatus::Failed {
+                        reason: "transfer failed".into(),
+                    })
+                    .await;
+                return;
+            }
             for i in 1..=5 {
                 if cancel_rx.try_recv().is_ok() {
                     let _ = status_tx

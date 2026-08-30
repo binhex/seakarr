@@ -75,6 +75,8 @@ pub struct SearchConfig {
     pub block_pause_secs: u64,
     #[serde(default = "default_search_title_match")]
     pub search_title_match: u32,
+    #[serde(default = "default_true")]
+    pub prefer_reliable_peer: bool,
     #[serde(default)]
     pub manual: ManualConfig,
     #[serde(default)]
@@ -697,6 +699,7 @@ impl Default for Config {
                 block_threshold: default_block_threshold(),
                 block_pause_secs: default_block_pause(),
                 search_title_match: default_search_title_match(),
+                prefer_reliable_peer: default_true(),
                 manual: ManualConfig::default(),
                 batch: BatchConfig::default(),
             },
@@ -786,6 +789,7 @@ search:
   block_threshold: 5
   block_pause_secs: 300
   search_title_match: 70
+  prefer_reliable_peer: true
 
 filters:
   allowed_extensions: ["flac"]
@@ -962,6 +966,18 @@ search:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.search.search_title_match, 0);
+    }
+
+    #[test]
+    fn search_prefers_reliable_peer_by_default() {
+        let cfg: SearchConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.prefer_reliable_peer);
+    }
+
+    #[test]
+    fn search_prefer_reliable_peer_can_be_disabled() {
+        let cfg: SearchConfig = serde_yaml::from_str("prefer_reliable_peer: false").unwrap();
+        assert!(!cfg.prefer_reliable_peer);
     }
 
     #[test]

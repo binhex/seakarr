@@ -504,6 +504,23 @@ pub fn path_matches_artist(path: &str, artist: &str) -> bool {
     distinctive.iter().all(|w| normalised.contains(w.as_str()))
 }
 
+/// Move results from `peer` to the front of the ranked list, preserving the
+/// relative order of the rest. Used to prefer a previously-reliable peer so
+/// the downloader tries it first. A no-op when `peer` produced no results.
+pub fn promote_peer(results: Vec<SearchResult>, peer: &str) -> Vec<SearchResult> {
+    let mut front = Vec::with_capacity(results.len());
+    let mut rest = Vec::with_capacity(results.len());
+    for r in results {
+        if r.username.eq_ignore_ascii_case(peer) {
+            front.push(r);
+        } else {
+            rest.push(r);
+        }
+    }
+    front.extend(rest);
+    front
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +1344,36 @@ mod tests {
         assert_eq!(results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["musicology".to_string()]);
+    }
+
+    // ── promote_peer ──
+
+    #[test]
+    fn promote_peer_moves_matches_to_the_front_preserving_order() {
+        let mk = |u: &str| crate::client::SearchResult {
+            username: u.to_string(),
+            speed: 0,
+            slots: 0,
+            files: Vec::new(),
+        };
+        let results = vec![mk("a"), mk("b"), mk("c"), mk("b")];
+        let promoted = promote_peer(results, "b");
+        let names: Vec<String> = promoted.iter().map(|r| r.username.clone()).collect();
+        assert_eq!(names, vec!["b", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn promote_peer_returns_unchanged_when_peer_absent() {
+        let mk = |u: &str| crate::client::SearchResult {
+            username: u.to_string(),
+            speed: 0,
+            slots: 0,
+            files: Vec::new(),
+        };
+        let results = vec![mk("a"), mk("c")];
+        let promoted = promote_peer(results, "zzz");
+        let names: Vec<String> = promoted.iter().map(|r| r.username.clone()).collect();
+        assert_eq!(names, vec!["a", "c"]);
     }
 
     // (SearchOutcome tests removed with fallback)

@@ -48,6 +48,24 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
     }
 }
 
+/// How an album download completed, so the runner can tell a clean first-
+/// candidate success (a "reliable" peer) from one that needed fallback or
+/// retries.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DownloadStats {
+    /// 1-based count of candidates examined before success (equals the
+    /// candidate list length when every candidate failed). In practice every
+    /// ranked candidate carries downloadable files (the caller filters them),
+    /// so an examined candidate is also an attempted one.
+    pub candidates_tried: usize,
+    /// True when at least one file was retried after a failed attempt.
+    pub retried: bool,
+    /// True when the FIRST candidate failed with a transfer-level error.
+    /// The runner keys eviction on this rather than the aggregate error,
+    /// which belongs to the last candidate examined, not the preferred one.
+    pub first_candidate_transfer_failed: bool,
+}
+
 /// Download a single file from a specific user, monitoring speed.
 ///
 /// Retries the same peer up to `config.max_retries` times on failure,
@@ -69,6 +87,7 @@ pub async fn download_file(
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
+    retried: &mut bool,
 ) -> Result<PathBuf> {
     // Validate the remote name for traversal safety, but pass the FULL
     // share-relative path to the crate: the Soulseek QueueUpload wire
@@ -99,6 +118,7 @@ pub async fn download_file(
     let mut last_err: Option<SeakarrError> = None;
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
+            *retried = true;
             if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                 return Err(SeakarrError::Download("download cancelled by user".into()));
             }
@@ -475,6 +495,7 @@ fn strip_embedded_disc_marker(leaf: &str) -> Option<String> {
     Some(prefix.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_album(
     client: &dyn SoulseekClient,
     candidates: &[SearchResult],
@@ -483,12 +504,17 @@ pub async fn download_album(
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
+    stats: &mut DownloadStats,
 ) -> Result<Vec<PathBuf>> {
+    let mut candidates_tried = 0usize;
+    let mut retried = false;
+    let mut first_candidate_transfer_failed = false;
     let mut last_err: Option<SeakarrError> = None;
 
     // Try each candidate in ranked order; staging dir is created on demand
     // only when a candidate has valid files to download.
     for candidate in candidates {
+        candidates_tried += 1;
         // Check cancellation between candidates — avoid queuing network
         // requests to the next peer after the user pressed Ctrl+C.
         // Clean the staging dir before returning so no partial downloads
@@ -587,6 +613,7 @@ pub async fn download_album(
                 filters,
                 progress,
                 cancel,
+                &mut retried,
             )
             .await
             {
@@ -604,6 +631,9 @@ pub async fn download_album(
                         file.name,
                         candidate.username
                     );
+                    if candidates_tried == 1 && matches!(&e, SeakarrError::Download(_)) {
+                        first_candidate_transfer_failed = true;
+                    }
                     last_err = Some(e);
                     failed = true;
                     break; // Move to next candidate
@@ -612,6 +642,9 @@ pub async fn download_album(
         }
 
         if !failed {
+            stats.candidates_tried = candidates_tried;
+            stats.retried = retried;
+            stats.first_candidate_transfer_failed = first_candidate_transfer_failed;
             return Ok(downloaded);
         }
 
@@ -637,6 +670,9 @@ pub async fn download_album(
         }
     }
 
+    stats.candidates_tried = candidates_tried;
+    stats.retried = retried;
+    stats.first_candidate_transfer_failed = first_candidate_transfer_failed;
     Err(last_err.unwrap_or_else(|| SeakarrError::Download("all candidates exhausted".into())))
 }
 
@@ -983,6 +1019,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1017,6 +1054,7 @@ mod tests {
             &default_filter_config_test(),
             Some(&display),
             None,
+            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1057,6 +1095,7 @@ mod tests {
                     &default_filter_config_test(),
                     Some(display.as_ref()),
                     None,
+                    &mut DownloadStats::default(),
                 )
                 .await
             }
@@ -1137,6 +1176,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
 
@@ -1175,6 +1215,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
 
@@ -1215,6 +1256,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             Some(&cancel),
+            &mut false,
         )
         .await;
 
@@ -1249,6 +1291,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
 
@@ -1277,6 +1320,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1319,6 +1363,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1384,6 +1429,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1469,6 +1515,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1551,6 +1598,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1643,6 +1691,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1732,6 +1781,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1810,6 +1860,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -1852,6 +1903,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
         // Should detect slow speed and return error
@@ -1879,6 +1931,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut false,
         )
         .await;
         assert!(result.is_err());
@@ -1906,6 +1959,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
         assert!(result.is_ok());
@@ -1946,6 +2000,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
         assert!(result.is_err());
@@ -1990,6 +2045,7 @@ mod tests {
             &filter_config,
             None,
             Some(&cancelled),
+            &mut DownloadStats::default(),
         )
         .await;
         assert!(result.is_err(), "download_album must abort when cancelled");
@@ -2042,6 +2098,7 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
+            &mut DownloadStats::default(),
         )
         .await;
 
@@ -2116,6 +2173,7 @@ mod tests {
             &filters,
             None,
             None,
+            &mut false,
         )
         .await;
         assert!(
@@ -2148,6 +2206,7 @@ mod tests {
             &filters,
             None,
             None,
+            &mut false,
         )
         .await;
         assert!(

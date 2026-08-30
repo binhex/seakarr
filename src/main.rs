@@ -447,6 +447,7 @@ async fn run_batch_mode(
     // its staging dir is cleaned by download_album.
     let cancel = Arc::new(AtomicBool::new(false));
     let _listener = seakarr::runner::spawn_cancel_listener(Arc::clone(&cancel));
+    let reliable_peers = seakarr::reliable::ReliablePeers::new();
 
     for line in &lines {
         // Check cancellation between batch lines — stop processing
@@ -466,6 +467,7 @@ async fn run_batch_mode(
             artist,
             album,
             config,
+            &reliable_peers,
             db,
             staging_dir,
             progress.as_ref(),
