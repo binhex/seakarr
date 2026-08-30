@@ -75,8 +75,8 @@ pub struct SearchConfig {
     pub block_pause_secs: u64,
     #[serde(default = "default_search_title_match")]
     pub search_title_match: u32,
-    #[serde(default = "default_true")]
-    pub prefer_reliable_peer: bool,
+    #[serde(default = "default_true", alias = "prefer_reliable_peer")]
+    pub peer_reputation: bool,
     #[serde(default)]
     pub manual: ManualConfig,
     #[serde(default)]
@@ -455,7 +455,13 @@ impl Config {
         // min_bit_rate: 320). If the old key was null, it becomes 0,
         // matching the new u32-with-0-disabled semantics.
         let renamed = migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate")
-            | migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth");
+            | migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth")
+            | migrate_rename(
+                &mut file_value,
+                "search",
+                "prefer_reliable_peer",
+                "peer_reputation",
+            );
 
         let merged = merge_with_defaults(&default_value, &file_value);
         if merged == file_value && !renamed {
@@ -699,7 +705,7 @@ impl Default for Config {
                 block_threshold: default_block_threshold(),
                 block_pause_secs: default_block_pause(),
                 search_title_match: default_search_title_match(),
-                prefer_reliable_peer: default_true(),
+                peer_reputation: default_true(),
                 manual: ManualConfig::default(),
                 batch: BatchConfig::default(),
             },
@@ -789,7 +795,7 @@ search:
   block_threshold: 5
   block_pause_secs: 300
   search_title_match: 70
-  prefer_reliable_peer: true
+  peer_reputation: true
 
 filters:
   allowed_extensions: ["flac"]
@@ -969,15 +975,15 @@ search:
     }
 
     #[test]
-    fn search_prefers_reliable_peer_by_default() {
+    fn search_peer_reputation_enabled_by_default() {
         let cfg: SearchConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(cfg.prefer_reliable_peer);
+        assert!(cfg.peer_reputation);
     }
 
     #[test]
-    fn search_prefer_reliable_peer_can_be_disabled() {
-        let cfg: SearchConfig = serde_yaml::from_str("prefer_reliable_peer: false").unwrap();
-        assert!(!cfg.prefer_reliable_peer);
+    fn search_peer_reputation_can_be_disabled() {
+        let cfg: SearchConfig = serde_yaml::from_str("peer_reputation: false").unwrap();
+        assert!(!cfg.peer_reputation);
     }
 
     #[test]
@@ -1639,5 +1645,31 @@ filters:
             "old key must be removed"
         );
         assert!(filters.get("min_bit_rate").is_some(), "new key must exist");
+    }
+
+    #[test]
+    fn test_migrate_rename_prefer_reliable_peer_preserves_value() {
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+search:
+  prefer_reliable_peer: false
+"#,
+        )
+        .unwrap();
+        migrate_rename(
+            &mut config,
+            "search",
+            "prefer_reliable_peer",
+            "peer_reputation",
+        );
+        let search = config.get("search").unwrap();
+        assert!(
+            search.get("prefer_reliable_peer").is_none(),
+            "old key must be removed"
+        );
+        assert!(
+            !search["peer_reputation"].as_bool().unwrap(),
+            "the explicit opt-out must be preserved, not flipped to the default true"
+        );
     }
 }

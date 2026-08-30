@@ -48,25 +48,26 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
     }
 }
 
-/// How an album download completed, so the runner can tell a clean first-
-/// candidate success (a "reliable" peer) from one that needed fallback or
-/// retries.
-#[derive(Debug, Default, Clone, Copy)]
+/// A single track's outcome, for peer-reputation recording.
+#[derive(Debug, Default, Clone)]
+pub struct TrackRecord {
+    pub username: String,
+    /// Measured transfer speed in KiB/s (bytes/sec ÷ 1024); 0 when the track failed.
+    pub speed_kbps: f64,
+    pub success: bool,
+}
+
+/// Per-track outcomes collected during an album download, consumed by the
+/// runner to update peer reputation.
+#[derive(Debug, Default, Clone)]
 pub struct DownloadStats {
-    /// 1-based count of candidates examined before success (equals the
-    /// candidate list length when every candidate failed). In practice every
-    /// ranked candidate carries downloadable files (the caller filters them),
-    /// so an examined candidate is also an attempted one.
-    pub candidates_tried: usize,
-    /// True when at least one file was retried after a failed attempt.
-    pub retried: bool,
-    /// True when the FIRST candidate failed with a transfer-level error.
-    /// The runner keys eviction on this rather than the aggregate error,
-    /// which belongs to the last candidate examined, not the preferred one.
-    pub first_candidate_transfer_failed: bool,
+    pub tracks: Vec<TrackRecord>,
 }
 
 /// Download a single file from a specific user, monitoring speed.
+///
+/// Returns the destination path plus the final EMA-smoothed transfer speed
+/// in KiB/s (0.0 when no InProgress sample was observed).
 ///
 /// Retries the same peer up to `config.max_retries` times on failure,
 /// waiting `config.retry_delay_secs` between attempts, before surfacing the
@@ -87,8 +88,7 @@ pub async fn download_file(
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
-    retried: &mut bool,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, f64)> {
     // Validate the remote name for traversal safety, but pass the FULL
     // share-relative path to the crate: the Soulseek QueueUpload wire
     // message must quote the path exactly as the peer shared it (e.g.
@@ -118,7 +118,6 @@ pub async fn download_file(
     let mut last_err: Option<SeakarrError> = None;
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
-            *retried = true;
             if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                 return Err(SeakarrError::Download("download cancelled by user".into()));
             }
@@ -138,7 +137,7 @@ pub async fn download_file(
         )
         .await
         {
-            Ok(path) => return Ok(path),
+            Ok((path, speed_kbps)) => return Ok((path, speed_kbps)),
             Err(e) => {
                 // If the cancel flag is set, the error is from a user-
                 // initiated abort — surface it immediately, don't retry.
@@ -174,7 +173,9 @@ fn ema_update(current: Option<f64>, new_value: f64, alpha: f64) -> f64 {
 
 /// Single download attempt for `download_file` (no retry loop). Queues the
 /// transfer and polls status until success, failure, timeout, or cancel.
-/// The `basename` parameter must be pre-validated by the caller.
+/// Returns the destination path plus the final EMA-smoothed transfer speed
+/// in KiB/s (0.0 when no InProgress sample was observed). The `basename`
+/// parameter must be pre-validated by the caller.
 #[allow(clippy::too_many_arguments)]
 async fn download_once(
     client: &dyn SoulseekClient,
@@ -186,7 +187,7 @@ async fn download_once(
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, f64)> {
     let mut handle = match client.download(file, username, dir).await {
         Ok(h) => h,
         Err(e) => return Err(e),
@@ -311,7 +312,7 @@ async fn download_once(
                     return Err(e);
                 }
 
-                return Ok(dest);
+                return Ok((dest, speed_ema.unwrap_or(0.0) / 1024.0)); // KiB/s
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 if let Some(bar) = &bar {
@@ -506,15 +507,11 @@ pub async fn download_album(
     cancel: Option<&Arc<AtomicBool>>,
     stats: &mut DownloadStats,
 ) -> Result<Vec<PathBuf>> {
-    let mut candidates_tried = 0usize;
-    let mut retried = false;
-    let mut first_candidate_transfer_failed = false;
     let mut last_err: Option<SeakarrError> = None;
 
     // Try each candidate in ranked order; staging dir is created on demand
     // only when a candidate has valid files to download.
     for candidate in candidates {
-        candidates_tried += 1;
         // Check cancellation between candidates — avoid queuing network
         // requests to the next peer after the user pressed Ctrl+C.
         // Clean the staging dir before returning so no partial downloads
@@ -613,12 +610,16 @@ pub async fn download_album(
                 filters,
                 progress,
                 cancel,
-                &mut retried,
             )
             .await
             {
-                Ok(path) => {
+                Ok((path, speed_kbps)) => {
                     downloaded.push(path);
+                    stats.tracks.push(TrackRecord {
+                        username: candidate.username.clone(),
+                        speed_kbps,
+                        success: true,
+                    });
                 }
                 Err(e) => {
                     // download_file already retried this file on the same
@@ -631,9 +632,11 @@ pub async fn download_album(
                         file.name,
                         candidate.username
                     );
-                    if candidates_tried == 1 && matches!(&e, SeakarrError::Download(_)) {
-                        first_candidate_transfer_failed = true;
-                    }
+                    stats.tracks.push(TrackRecord {
+                        username: candidate.username.clone(),
+                        speed_kbps: 0.0,
+                        success: false,
+                    });
                     last_err = Some(e);
                     failed = true;
                     break; // Move to next candidate
@@ -642,9 +645,6 @@ pub async fn download_album(
         }
 
         if !failed {
-            stats.candidates_tried = candidates_tried;
-            stats.retried = retried;
-            stats.first_candidate_transfer_failed = first_candidate_transfer_failed;
             return Ok(downloaded);
         }
 
@@ -670,9 +670,6 @@ pub async fn download_album(
         }
     }
 
-    stats.candidates_tried = candidates_tried;
-    stats.retried = retried;
-    stats.first_candidate_transfer_failed = first_candidate_transfer_failed;
     Err(last_err.unwrap_or_else(|| SeakarrError::Download("all candidates exhausted".into())))
 }
 
@@ -1019,7 +1016,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1054,7 +1050,6 @@ mod tests {
             &default_filter_config_test(),
             Some(&display),
             None,
-            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1176,7 +1171,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
 
@@ -1215,7 +1209,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
 
@@ -1256,7 +1249,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             Some(&cancel),
-            &mut false,
         )
         .await;
 
@@ -1291,7 +1283,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
 
@@ -1320,7 +1311,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
         assert!(result.is_ok());
@@ -1903,7 +1893,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
         // Should detect slow speed and return error
@@ -1931,7 +1920,6 @@ mod tests {
             &default_filter_config_test(),
             None,
             None,
-            &mut false,
         )
         .await;
         assert!(result.is_err());
@@ -2173,7 +2161,6 @@ mod tests {
             &filters,
             None,
             None,
-            &mut false,
         )
         .await;
         assert!(
@@ -2206,7 +2193,6 @@ mod tests {
             &filters,
             None,
             None,
-            &mut false,
         )
         .await;
         assert!(

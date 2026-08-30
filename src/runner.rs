@@ -57,18 +57,51 @@ fn track_number_for_organize(stem: &str) -> String {
         .unwrap_or_else(|| "01".to_string())
 }
 
+/// Record every track's measured speed + success/failure into the peer
+/// reputation store. Failures are logged and ignored — reputation bookkeeping
+/// never fails an album.
+fn record_track_reputation(db: &Database, stats: &download::DownloadStats) {
+    for track in &stats.tracks {
+        if let Err(e) = db.update_peer_reputation(&track.username, track.speed_kbps, track.success)
+        {
+            tracing::warn!(
+                "failed to record peer reputation for {}: {e}",
+                track.username
+            );
+        }
+    }
+}
+
+/// The peer that got furthest in the download: the last track recorded, which
+/// belongs to the candidate that either completed the album or failed last.
+fn furthest_peer(stats: &download::DownloadStats) -> Option<&str> {
+    stats.tracks.last().map(|t| t.username.as_str())
+}
+
+/// Record a single album-level failure for `peer`, used to demote a peer that
+/// served an incomplete album or failed the whole album.
+fn record_album_failure(db: &Database, peer: &str) {
+    if let Err(e) = db.update_peer_reputation(peer, 0.0, false) {
+        tracing::warn!("failed to record peer reputation for {peer}: {e}");
+    }
+}
+
 /// Process a single album: search → filter rank → download → organize → notify.
 /// When `target_library_path` is provided and `library_upgrade.enabled` is on
 /// (auto mode only), a completed download is copied into the origin library
 /// directory instead of the generic organize step, and the album completes
 /// early (the organize block below is bypassed).
+///
+/// When `config.search.peer_reputation` is on, the peer reputation map is
+/// loaded from the DB before ranking (measured speed + reliability factor
+/// blend in [`filter::rank_candidates`]) and each track's outcome is recorded
+/// back to the DB after a successful download.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_album(
     client: &dyn SoulseekClient,
     artist: &str,
     album: Option<&str>,
     config: &Config,
-    reliable_peers: &crate::reliable::ReliablePeers,
     db: &Database,
     staging_dir: &Path,
     progress: Option<&ProgressDisplay>,
@@ -98,19 +131,6 @@ pub async fn process_album(
     // Note: album_staging directory is created by download_album, only when
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
-
-    // Prefer a previously-reliable peer for this artist, if known and enabled.
-    let preferred_peer = if config.search.prefer_reliable_peer {
-        reliable_peers.get(artist)
-    } else {
-        None
-    };
-    if let Some(peer) = &preferred_peer {
-        tracing::info!(
-            "Searching {artist} — {}, preferring reliable peer {peer}...",
-            album.unwrap_or("(all)")
-        );
-    }
 
     // Search for artist + album.
     let search_start = std::time::Instant::now();
@@ -303,7 +323,15 @@ pub async fn process_album(
     // fallback fired, the album name is not a meaningful discriminator (we
     // searched by track title because the album name search failed).
     let rank_album = if title_search_attempted { None } else { album };
-    let ranked = filter::rank_candidates(&filtered, &config.filters, rank_album);
+    // Load the peer reputation map (measured speed + reliability) before
+    // ranking. On a DB error we proceed with an empty map — reputation never
+    // blocks a search.
+    let reputation = if config.search.peer_reputation {
+        db.get_reputation_map().unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let ranked = filter::rank_candidates(&filtered, &config.filters, rank_album, &reputation);
     tracing::info!(
         "{artist} — {}: {total_results} files from {total_users} users, {} users passed filters, best: {} (speed={})",
         album.unwrap_or("(all)"),
@@ -311,22 +339,6 @@ pub async fn process_album(
         ranked.first().map(|r| r.username.as_str()).unwrap_or("?"),
         ranked.first().map(|r| r.speed).unwrap_or(0),
     );
-    // Prefer a previously-reliable peer (recorded on an earlier clean
-    // download of the same artist) by moving it to the front of the ranked
-    // list — a no-op when it produced no results this time.
-    let ranked = if let Some(peer) = preferred_peer.as_deref() {
-        search::promote_peer(ranked, peer)
-    } else {
-        ranked
-    };
-
-    // Peer-accounting inputs for the reliable-peer feature. Usernames are
-    // compared case-insensitively — Soulseek identities are not case-distinct.
-    let winner = ranked.first().map(|r| r.username.clone());
-    let preferred_was_first = match (&winner, preferred_peer.as_deref()) {
-        (Some(w), Some(p)) => w.eq_ignore_ascii_case(p),
-        _ => false,
-    };
 
     // Download
     let mut stats = download::DownloadStats::default();
@@ -342,22 +354,25 @@ pub async fn process_album(
     )
     .await
     {
-        Ok(files) => files,
+        Ok(files) => {
+            // Record per-track outcomes as soon as they are known, so the
+            // measured speed + reliability land regardless of what happens
+            // downstream (completeness gate, library upgrade, organize).
+            if config.search.peer_reputation {
+                record_track_reputation(db, &stats);
+            }
+            files
+        }
         Err(e) => {
-            // A user abort (Ctrl+C) is not evidence against the peer; only a
-            // transfer-level failure by the peer we actually preferred should
-            // drop it (local I/O and session drops are not the peer's fault).
             let is_cancelled = cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
-            // The preferred peer's transfer failure is tracked by the download
-            // path itself (the aggregate error here is the last candidate's).
-            let peer_failed = stats.first_candidate_transfer_failed;
-            if config.search.prefer_reliable_peer
-                && !is_cancelled
-                && preferred_was_first
-                && peer_failed
-            {
-                if let Some(peer) = &winner {
-                    reliable_peers.evict_if(artist, peer);
+            // A user abort (Ctrl+C) is not the peer's fault and records nothing.
+            // Otherwise record per-track outcomes plus one album-level failure
+            // for the peer that got furthest, so a consistently-failing peer
+            // accumulates negative reputation and sinks in the ranking.
+            if config.search.peer_reputation && !is_cancelled {
+                record_track_reputation(db, &stats);
+                if let Some(peer) = furthest_peer(&stats).map(str::to_string) {
+                    record_album_failure(db, &peer);
                 }
             }
             let reason = if is_cancelled {
@@ -385,10 +400,12 @@ pub async fn process_album(
             let expected_count = library_track_count
                 .unwrap_or_else(|| ranked.first().map(|r| r.files.len()).unwrap_or(0));
             if downloaded.len() < expected_count {
-                // The preferred peer served an incomplete album — drop it.
-                if config.search.prefer_reliable_peer && preferred_was_first {
-                    if let Some(peer) = &winner {
-                        reliable_peers.evict_if(artist, peer);
+                // The serving peer delivered an incomplete album — record an
+                // album-level failure for it (per-track outcomes were already
+                // recorded) so it sinks instead of being re-picked next cycle.
+                if config.search.peer_reputation {
+                    if let Some(peer) = furthest_peer(&stats).map(str::to_string) {
+                        record_album_failure(db, &peer);
                     }
                 }
                 tracing::warn!(
@@ -455,17 +472,6 @@ pub async fn process_album(
                         "Completed: {artist} - {} ({track_count} tracks)",
                         album.unwrap_or("(all)")
                     );
-                    if config.search.prefer_reliable_peer {
-                        if stats.candidates_tried == 1 && !stats.retried {
-                            if let Some(peer) = &winner {
-                                reliable_peers.record(artist, peer);
-                            }
-                        } else if preferred_was_first {
-                            if let Some(peer) = &winner {
-                                reliable_peers.evict_if(artist, peer);
-                            }
-                        }
-                    }
                     return Ok(AlbumOutcome::Downloaded { track_count });
                 }
                 Err(e) => {
@@ -560,19 +566,6 @@ pub async fn process_album(
         "Completed: {artist} — {} ({track_count} tracks)",
         album.unwrap_or("(all)")
     );
-    if config.search.prefer_reliable_peer {
-        if stats.candidates_tried == 1 && !stats.retried {
-            if let Some(peer) = &winner {
-                reliable_peers.record(artist, peer);
-            }
-        } else if preferred_was_first {
-            // The preferred peer was tried first but needed a fallback or
-            // retry — it is no longer reliable.
-            if let Some(peer) = &winner {
-                reliable_peers.evict_if(artist, peer);
-            }
-        }
-    }
     Ok(AlbumOutcome::Downloaded { track_count })
 }
 
@@ -644,16 +637,12 @@ pub async fn run_auto_mode(
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
     let targets_vec: Vec<(String, String, usize, PathBuf)> = targets_with_counts;
-    let reliable_peers = crate::reliable::ReliablePeers::new();
     let mut futures_vec = Vec::new();
 
     for (artist, album, track_count, library_path) in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
         let cancel = cancel.clone();
-        // Reborrow: each iteration's `async move` future captures the
-        // reference (Copy) rather than moving the shared map itself.
-        let reliable_peers = &reliable_peers;
         let artist = artist.clone();
         let album = album.clone();
         let library_track_count = *track_count;
@@ -669,7 +658,6 @@ pub async fn run_auto_mode(
                     &artist,
                     Some(&album),
                     config,
-                    reliable_peers,
                     db,
                     staging_dir,
                     progress.as_deref(),
@@ -762,13 +750,11 @@ pub async fn run_manual_mode(
             .filter(|tracks| !tracks.is_empty())
             .map(|tracks| tracks.len())
     });
-    let reliable_peers = crate::reliable::ReliablePeers::new();
     let result = process_album(
         client,
         artist,
         album,
         config,
-        &reliable_peers,
         db,
         staging_dir,
         progress_ref,
@@ -875,7 +861,6 @@ mod tests {
             "Test Artist",
             Some("Test Album"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -886,6 +871,126 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+    }
+
+    #[tokio::test]
+    async fn test_peer_reputation_recorded() {
+        let client = Arc::new(MockClient::new());
+        let peer_a = MockClient::mock_search_result(
+            "peerA",
+            100_000,
+            1,
+            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
+        );
+        {
+            let mut by_query = client.search_results_by_query.lock().unwrap();
+            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
+        }
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        // First album: downloads cleanly -> records peerA as reliable + fast.
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Album One"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rep = db.get_reputation_map().unwrap();
+        assert!(rep.contains_key("peera"));
+        assert_eq!(rep["peera"].successful, 1);
+    }
+
+    #[tokio::test]
+    async fn test_peer_reputation_disabled_records_nothing() {
+        let client = Arc::new(MockClient::new());
+        let peer_a = MockClient::mock_search_result(
+            "peerA",
+            100_000,
+            1,
+            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
+        );
+        {
+            let mut by_query = client.search_results_by_query.lock().unwrap();
+            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
+        }
+        let mut config = make_test_config();
+        config.search.peer_reputation = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Album One"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_reputation_map().unwrap().is_empty(),
+            "peer_reputation: false must not record anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_download_records_failure_reputation() {
+        let client = Arc::new(MockClient::new());
+        let peer_a = MockClient::mock_search_result(
+            "peerA",
+            100_000,
+            1,
+            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
+        );
+        {
+            let mut by_query = client.search_results_by_query.lock().unwrap();
+            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
+        }
+        *client.download_fails.lock().unwrap() = true;
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Album One"),
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A failing peer must be recorded as a failure (0 successes, >=1 total).
+        let rep = db.get_reputation_map().unwrap();
+        assert!(rep.contains_key("peera"));
+        assert_eq!(rep["peera"].successful, 0);
+        assert!(
+            rep["peera"].total_downloads >= 1,
+            "a failed download must record a failure"
+        );
     }
 
     #[tokio::test]
@@ -903,7 +1008,6 @@ mod tests {
             "Test Artist",
             None,
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -920,225 +1024,6 @@ mod tests {
 
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Test Artist".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_reliable_peer_is_preferred_for_second_album_of_same_artist() {
-        let client = Arc::new(MockClient::new());
-        let peer_a = MockClient::mock_search_result(
-            "peerA",
-            100, // slower — would lose the default speed ranking
-            1,
-            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
-        );
-        let peer_a2 = MockClient::mock_search_result(
-            "peerA",
-            100,
-            1,
-            vec![(r"Test Artist\Album Two\a-1.flac", 10_000_000, 900)],
-        );
-        let peer_b = MockClient::mock_search_result(
-            "peerB",
-            10_000, // faster — would win without the preference
-            1,
-            vec![(r"Test Artist\Album Two\b-1.flac", 10_000_000, 900)],
-        );
-        {
-            let mut by_query = client.search_results_by_query.lock().unwrap();
-            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
-            by_query.insert("Test Artist Album Two".to_string(), vec![peer_a2, peer_b]);
-        }
-
-        let config = make_test_config();
-        let db = Database::open_in_memory().unwrap();
-        let staging = TempDir::new().unwrap();
-        let reliable = crate::reliable::ReliablePeers::new();
-
-        // First album: only peerA has it; a clean first-candidate win records
-        // peerA as the reliable peer for this artist.
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album One"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(reliable.get("Test Artist").as_deref(), Some("peerA"));
-
-        // Second album: peerB is faster and would be ranked first, but the
-        // recorded peerA must be promoted to the front and downloaded first.
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album Two"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let filenames = client.download_filenames.lock().unwrap();
-        let second_album: Vec<&String> = filenames
-            .iter()
-            .filter(|f| f.contains("Album Two"))
-            .collect();
-        assert!(
-            !second_album.is_empty() && second_album.iter().all(|f| f.contains("a-1.flac")),
-            "the reliable peer must be downloaded first for the second album, got {filenames:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_failed_preferred_peer_is_evicted() {
-        let client = Arc::new(MockClient::new());
-        let peer_a = MockClient::mock_search_result(
-            "peerA",
-            100,
-            1,
-            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
-        );
-        let peer_a2 = MockClient::mock_search_result(
-            "peerA",
-            100,
-            1,
-            vec![(r"Test Artist\Album Two\02.flac", 10_000_000, 900)],
-        );
-        {
-            let mut by_query = client.search_results_by_query.lock().unwrap();
-            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
-            by_query.insert("Test Artist Album Two".to_string(), vec![peer_a2]);
-        }
-
-        let config = make_test_config();
-        let db = Database::open_in_memory().unwrap();
-        let staging = TempDir::new().unwrap();
-        let reliable = crate::reliable::ReliablePeers::new();
-
-        // First album downloads cleanly and records peerA.
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album One"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(reliable.get("Test Artist").as_deref(), Some("peerA"));
-
-        // Second album: the preferred peer now fails its transfer, so the
-        // album download errors and peerA must be evicted.
-        *client.download_fails.lock().unwrap() = true;
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album Two"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            reliable.get("Test Artist").is_none(),
-            "a preferred peer that fails must be evicted"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cancellation_does_not_evict_preferred_peer() {
-        let client = Arc::new(MockClient::new());
-        let peer_a = MockClient::mock_search_result(
-            "peerA",
-            100,
-            1,
-            vec![(r"Test Artist\Album One\01.flac", 10_000_000, 900)],
-        );
-        let peer_a2 = MockClient::mock_search_result(
-            "peerA",
-            100,
-            1,
-            vec![(r"Test Artist\Album Two\02.flac", 10_000_000, 900)],
-        );
-        {
-            let mut by_query = client.search_results_by_query.lock().unwrap();
-            by_query.insert("Test Artist Album One".to_string(), vec![peer_a]);
-            by_query.insert("Test Artist Album Two".to_string(), vec![peer_a2]);
-        }
-
-        let config = make_test_config();
-        let db = Database::open_in_memory().unwrap();
-        let staging = TempDir::new().unwrap();
-        let reliable = crate::reliable::ReliablePeers::new();
-
-        // First album downloads cleanly and records peerA.
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album One"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(reliable.get("Test Artist").as_deref(), Some("peerA"));
-
-        // Second album: the user cancels, so the download aborts. Cancellation
-        // is not evidence against the peer, so peerA must survive.
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        process_album(
-            client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Test Artist",
-            Some("Album Two"),
-            &config,
-            &reliable,
-            &db,
-            staging.path(),
-            None,
-            Some(&cancel),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            reliable.get("Test Artist").as_deref(),
-            Some("peerA"),
-            "cancellation must not evict the preferred peer"
-        );
     }
 
     // When the primary search returns results but all are rejected by filters
@@ -1176,7 +1061,6 @@ mod tests {
             "Test Artist",
             Some("Test Album"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1246,7 +1130,6 @@ mod tests {
             "Test Artist",
             Some("Test Album"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1326,7 +1209,6 @@ mod tests {
             "Adele",
             Some("25"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1404,7 +1286,6 @@ mod tests {
             "Prince",
             Some("The Very Best Of Prince"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1462,7 +1343,6 @@ mod tests {
             "Prince",
             Some("Musicology"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1517,7 +1397,6 @@ mod tests {
             "Prince",
             Some("Musicology"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1628,7 +1507,6 @@ mod tests {
             "Adele",
             Some("25"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1732,7 +1610,6 @@ mod tests {
             "Test Artist",
             Some("Test Album"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,
@@ -1899,7 +1776,6 @@ mod tests {
             "Test Artist",
             Some("Test Album"),
             &config,
-            &crate::reliable::ReliablePeers::new(),
             &db,
             staging.path(),
             None,

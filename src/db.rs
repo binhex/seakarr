@@ -43,7 +43,6 @@ pub struct PeerReputation {
     pub total_downloads: u32,
     pub successful: u32,
     pub avg_speed_kbps: f64,
-    pub preferred: bool,
 }
 
 /// Input data for enqueueing a download into the persistent queue.
@@ -114,8 +113,8 @@ impl Database {
                 total_downloads INTEGER NOT NULL DEFAULT 0,
                 successful      INTEGER NOT NULL DEFAULT 0,
                 avg_speed_kbps  REAL NOT NULL DEFAULT 0.0,
-                last_seen       TEXT NOT NULL DEFAULT (datetime('now')),
-                preferred       INTEGER NOT NULL DEFAULT 0
+                speed_samples   INTEGER NOT NULL DEFAULT 0,
+                last_seen       TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS search_history (
@@ -164,6 +163,15 @@ impl Database {
                 processed_at TEXT
             );",
         )?;
+
+        // Add speed_samples to peer_reputation for databases created before
+        // this column existed (fresh DBs get it from CREATE TABLE above). The
+        // duplicate-column error on an up-to-date DB is expected and ignored.
+        let _ = self.conn.execute(
+            "ALTER TABLE peer_reputation ADD COLUMN speed_samples INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         Ok(())
     }
 
@@ -276,35 +284,45 @@ impl Database {
         speed_kbps: f64,
         success: bool,
     ) -> Result<()> {
+        let username = username.to_lowercase();
         self.conn.execute(
-            "INSERT INTO peer_reputation (username, total_downloads, successful, avg_speed_kbps, last_seen)
-             VALUES (?1, 1, ?2, ?3, datetime('now'))
+            "INSERT INTO peer_reputation (username, total_downloads, successful, avg_speed_kbps, speed_samples, last_seen)
+             VALUES (?1, 1, ?2, ?3, CASE WHEN ?2 = 1 AND ?3 > 0.0 THEN 1 ELSE 0 END, datetime('now'))
              ON CONFLICT(username) DO UPDATE SET
                total_downloads = total_downloads + 1,
                successful = successful + ?2,
-               avg_speed_kbps = (avg_speed_kbps * total_downloads + ?3) / (total_downloads + 1),
+               avg_speed_kbps = CASE WHEN ?2 = 1 AND ?3 > 0.0
+                 THEN (avg_speed_kbps * speed_samples + ?3) / (speed_samples + 1)
+                 ELSE avg_speed_kbps END,
+               speed_samples = speed_samples + CASE WHEN ?2 = 1 AND ?3 > 0.0 THEN 1 ELSE 0 END,
                last_seen = datetime('now')",
             params![username, if success { 1 } else { 0 }, speed_kbps],
         )?;
         Ok(())
     }
 
-    pub fn get_preferred_peers(&self) -> Result<Vec<PeerReputation>> {
+    pub fn get_reputation_map(&self) -> Result<std::collections::HashMap<String, PeerReputation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT username, total_downloads, successful, avg_speed_kbps, preferred
-             FROM peer_reputation ORDER BY avg_speed_kbps DESC",
+            "SELECT username, total_downloads, successful, avg_speed_kbps
+             FROM peer_reputation",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(PeerReputation {
-                username: row.get(0)?,
-                total_downloads: row.get::<_, u32>(1)?,
-                successful: row.get::<_, u32>(2)?,
-                avg_speed_kbps: row.get(3)?,
-                preferred: row.get::<_, bool>(4)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                PeerReputation {
+                    username: row.get(0)?,
+                    total_downloads: row.get::<_, u32>(1)?,
+                    successful: row.get::<_, u32>(2)?,
+                    avg_speed_kbps: row.get(3)?,
+                },
+            ))
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (name, rep) = row?;
+            map.insert(name, rep);
+        }
+        Ok(map)
     }
 }
 
@@ -443,10 +461,27 @@ mod tests {
         db.update_peer_reputation("fastuser", 500.0, true).unwrap();
         db.update_peer_reputation("fastuser", 600.0, true).unwrap();
 
-        let peers = db.get_preferred_peers().unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].username, "fastuser");
+        let map = db.get_reputation_map().unwrap();
+        assert_eq!(map.len(), 1);
+        let peer = &map["fastuser"];
+        assert_eq!(peer.username, "fastuser");
         // Avg speed should be updated: (500 + 600) / 2 = 550
-        assert!((peers[0].avg_speed_kbps - 550.0).abs() < 1.0);
+        assert!((peer.avg_speed_kbps - 550.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_get_reputation_map_returns_indexed_peers() {
+        let db = test_db();
+        db.update_peer_reputation("alice", 500.0, true).unwrap();
+        db.update_peer_reputation("alice", 700.0, true).unwrap();
+        db.update_peer_reputation("bob", 300.0, false).unwrap();
+
+        let map = db.get_reputation_map().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["alice"].total_downloads, 2);
+        assert_eq!(map["alice"].successful, 2);
+        assert_eq!(map["alice"].avg_speed_kbps, 600.0); // (500 + 700) / 2
+        assert_eq!(map["bob"].total_downloads, 1);
+        assert_eq!(map["bob"].successful, 0);
     }
 }

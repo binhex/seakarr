@@ -313,17 +313,47 @@ fn album_match_strength(result: &SearchResult, album: &str) -> u8 {
     best
 }
 
-/// Rank candidates by score: speed × slot_bonus × bitrate_bonus × album_bonus.
-/// Higher score = better candidate.
+/// Rank candidates by score: speed × slot_bonus × bitrate_bonus × album_bonus
+/// × reliability_factor. Higher score = better candidate.
+///
+/// When `reputation` holds a peer with a download history, the advertised
+/// speed is blended toward the peer's measured average speed (weight grows
+/// with download count) and a Laplace-smoothed reliability factor in
+/// [0.7, 1.3] is applied — error-prone peers are demoted. Peers without a
+/// record are scored on advertised speed alone (neutral).
 pub fn rank_candidates(
     results: &[SearchResult],
     config: &FilterConfig,
     album: Option<&str>,
+    reputation: &std::collections::HashMap<String, crate::db::PeerReputation>,
 ) -> Vec<SearchResult> {
     let mut scored: Vec<(f64, &SearchResult)> = results
         .iter()
         .map(|r| {
-            let speed_score = r.speed as f64;
+            let advertised_bps = r.speed as f64;
+            // Soulseek usernames are case-insensitive; keys are stored lowercase.
+            let rep = reputation.get(&r.username.to_lowercase());
+            // Blend toward the measured speed as the peer's history grows.
+            // avg_speed_kbps is KiB/s (bytes/sec ÷ 1024), hence * 1024.0 back
+            // to bytes/sec to match the advertised-speed unit.
+            let effective_speed = match rep {
+                Some(rep) if rep.total_downloads > 0 => {
+                    let measured_bps = rep.avg_speed_kbps * 1024.0;
+                    let w = rep.total_downloads as f64 / (rep.total_downloads as f64 + 3.0);
+                    advertised_bps * (1.0 - w) + measured_bps * w
+                }
+                _ => advertised_bps,
+            };
+            // Laplace-smoothed success rate -> bounded factor, asymptotically
+            // [0.7, 1.3] (centred 1.0 at a 50/50 history).
+            let reliability_factor = match rep {
+                Some(rep) => {
+                    let r = (rep.successful as f64 + 1.5) / (rep.total_downloads as f64 + 3.0);
+                    0.7 + 0.6 * r
+                }
+                None => 1.0,
+            };
+            let speed_score = effective_speed;
             let slot_bonus = if r.slots > 0 { 1.5 } else { 1.0 };
             let album_bonus = match album {
                 Some(name) => match album_match_strength(r, name) {
@@ -348,7 +378,7 @@ pub fn rank_candidates(
             } else {
                 1.0
             };
-            let score = speed_score * slot_bonus * bitrate_bonus * album_bonus;
+            let score = speed_score * slot_bonus * bitrate_bonus * album_bonus * reliability_factor;
             (score, r)
         })
         .collect();
@@ -381,6 +411,94 @@ mod tests {
             slots,
             files,
         }
+    }
+
+    fn rep(
+        username: &str,
+        total: u32,
+        successful: u32,
+        avg_kbps: f64,
+    ) -> crate::db::PeerReputation {
+        crate::db::PeerReputation {
+            username: username.to_string(),
+            total_downloads: total,
+            successful,
+            avg_speed_kbps: avg_kbps,
+        }
+    }
+
+    #[test]
+    fn rank_prefers_measured_fast_reliable_peer() {
+        // Advertised speeds: slow A (1 MB/s), fast B (10 MB/s). A has a strong
+        // measured record (50 MB/s + 100% success); B is unknown.
+        let mut results = vec![
+            crate::client::SearchResult {
+                username: "A".into(),
+                speed: 1_000_000,
+                slots: 1,
+                files: vec![],
+            },
+            crate::client::SearchResult {
+                username: "B".into(),
+                speed: 10_000_000,
+                slots: 1,
+                files: vec![],
+            },
+        ];
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), rep("a", 20, 20, 50_000.0)); // 50 MB/s, 100% success
+
+        results = rank_candidates(&results, &FilterConfig::default(), None, &map);
+
+        assert_eq!(
+            results[0].username, "A",
+            "measured-reliable peer A must outrank faster-but-unknown B"
+        );
+    }
+
+    #[test]
+    fn rank_demotes_error_prone_peer() {
+        // A and B identical advertised speed; A has 100% failure history.
+        let mut results = vec![
+            crate::client::SearchResult {
+                username: "A".into(),
+                speed: 5_000_000,
+                slots: 1,
+                files: vec![],
+            },
+            crate::client::SearchResult {
+                username: "B".into(),
+                speed: 5_000_000,
+                slots: 1,
+                files: vec![],
+            },
+        ];
+        let mut map = std::collections::HashMap::new();
+        map.insert("a".to_string(), rep("a", 10, 0, 0.0)); // 100% failure
+        map.insert("b".to_string(), rep("b", 10, 10, 5_000.0));
+
+        results = rank_candidates(&results, &FilterConfig::default(), None, &map);
+
+        assert_eq!(
+            results[0].username, "B",
+            "error-prone peer A must rank below clean B"
+        );
+    }
+
+    #[test]
+    fn rank_unknown_peer_is_neutral() {
+        let results = vec![crate::client::SearchResult {
+            username: "A".into(),
+            speed: 5_000_000,
+            slots: 1,
+            files: vec![],
+        }];
+        let map = std::collections::HashMap::new();
+        let ranked = rank_candidates(&results, &FilterConfig::default(), None, &map);
+        assert_eq!(
+            ranked[0].username, "A",
+            "unknown peer must still be returned"
+        );
     }
 
     fn default_filter_config() -> FilterConfig {
@@ -579,7 +697,7 @@ mod tests {
             ),
         ];
 
-        let ranked = rank_candidates(&results, &cfg, None);
+        let ranked = rank_candidates(&results, &cfg, None, &HashMap::new());
         assert_eq!(ranked[0].username, "fast"); // highest speed
         assert_eq!(ranked[1].username, "medium");
         assert_eq!(ranked[2].username, "slow");
@@ -1902,7 +2020,12 @@ mod rejection_summary_tests {
             )],
         );
 
-        let ranked = rank_candidates(&[deep_match, folder_match], &cfg, Some("S Club"));
+        let ranked = rank_candidates(
+            &[deep_match, folder_match],
+            &cfg,
+            Some("S Club"),
+            &HashMap::new(),
+        );
         assert_eq!(
             ranked[0].username, "foldermatch",
             "folder-level album match must outrank deep path match"
@@ -1935,7 +2058,7 @@ mod rejection_summary_tests {
             )],
         );
 
-        let ranked = rank_candidates(&[a, b], &cfg, None);
+        let ranked = rank_candidates(&[a, b], &cfg, None, &HashMap::new());
         assert_eq!(ranked[0].username, "a", "no album → input order kept");
     }
 

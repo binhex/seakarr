@@ -14,10 +14,10 @@ Automated Soulseek music downloader with library quality upgrading.
   text file of `artist - album` lines to download a curated wantlist.
 - **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
   free upload slots. Reject files with no free upload slots and path-traversal names.
-- **Reliable-peer preference** — when an album downloads cleanly (first candidate, no retries), the
-  winning peer is remembered and preferred for the next album by the same artist, biasing downloads
-  toward proven-good sources. Controlled by `search.prefer_reliable_peer` (default `true`). The
-  preference is in-memory and per-run (it does not persist across restarts or daemon rescan cycles).
+- **Peer reputation** — remembers each peer's measured download speed and success rate (in SQLite), and ranks
+  search results by a blend of advertised and measured speed plus a reliability factor, so fast, reliable peers
+  are preferred and error-prone or throttling peers are demoted — regardless of what you search for. Controlled
+  by `search.peer_reputation` (default `true`).
 - **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
   stall timeout with cancel, per-file retries with configurable count and delay, and candidate fallback
   (try the next ranked peer once retries are exhausted).
@@ -160,7 +160,7 @@ A default config is created automatically on first run. The file is divided into
 | `manual.artist` | Artist for manual mode (used when `--artist` is not passed). | `""` |
 | `manual.album` | Album for manual mode (optional, used when `--album` is not passed). | `""` |
 | `batch.file_path` | Path to the batch text file (used when `--batch-file` is not passed). | `""` |
-| `prefer_reliable_peer` | Reuse a peer that served a clean download for the same artist on the next search. Set to `false` to always use the plain ranked search. | `true` |
+| `peer_reputation` | Blend measured speed + reliability into search ranking. Set to `false` to rank by advertised speed only. | `true` |
 
 ### `filters`
 
@@ -245,7 +245,8 @@ Seakarr has three operating modes:
 4. **Filter & rank** — filters results by extension, bitrate, excluded words, and free upload slots;
    when `filters.contiguous_tracks` is enabled, results whose downloadable track numbers have gaps
    (or none at all) are discounted.
-   Ranks candidates by `speed × slot_bonus × bitrate_bonus`.
+   Ranks candidates by `speed × slot_bonus × bitrate_bonus × reliability_factor` (reliability and measured-speed
+   reputation adjust the advertised speed).
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer speed in real time. If the
    speed drops below `min_upload_speed_kbps`, the transfer is cancelled and the next candidate is tried.
    Per-album stall timeout guards against unresponsive peers. Per-file retries with configurable count
