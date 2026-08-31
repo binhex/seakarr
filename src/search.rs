@@ -49,6 +49,42 @@ pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
 }
 
+/// Normalize an artist/album name for the punctuation-tolerant search tier.
+///
+/// Case is preserved (the lowercase tier covers that axis); accented
+/// characters are folded to ASCII via NFKD ("Tiësto" -> "Tiesto").
+/// Characters with no ASCII NFKD decomposition (e.g. dotless i, CJK,
+/// Cyrillic) are dropped, so a name made entirely of them normalises to
+/// the empty string (callers must guard on that). The ampersand and plus
+/// become the word "and"; tight punctuation (period, comma, apostrophe,
+/// double-quote, backtick) is removed so letters join ("S.P.Y." -> "SPY",
+/// "D'Angelo" -> "DAngelo"); separators (hyphen, underscore, slash,
+/// backslash, and brackets) become spaces ("In-The-Skys" -> "In The Skys",
+/// "AC/DC" -> "AC DC"). Whitespace is collapsed and trimmed.
+pub fn normalize_search_term(input: &str) -> String {
+    let folded: String = input
+        .nfkd()
+        .map(|c| {
+            if c.is_whitespace() || matches!(c, '\u{2010}'..='\u{2015}' | '\u{00B7}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .filter(|c| c.is_ascii())
+        .collect();
+    let mut out = String::with_capacity(folded.len() + 8);
+    for c in folded.chars() {
+        match c {
+            '&' | '+' => out.push_str(" and "),
+            '.' | ',' | '\'' | '"' | '`' => {}
+            '-' | '_' | '/' | '\\' | '(' | ')' | '[' | ']' | '{' | '}' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Search for an album by artist + album name.
 ///
 /// Tier 1a runs the primary "Artist Album" search (original casing). If it
@@ -57,10 +93,12 @@ pub struct SearchOutcome {
 /// lower quality, so original casing is always preferred). Tier 1b is skipped
 /// when the artist is empty (Tier 2 handles album-only searches with artist
 /// verification) or when the query is already lowercase (no new information).
-/// If both casing variants return nothing, Tier 2 falls back to an
-/// album-name-only search (artist `""`), keeping only results whose file
-/// paths match the artist via [`path_matches_artist`]. If all tiers come up
-/// empty, an empty outcome is returned.
+/// If both casing variants return nothing, Tier 1c retries with punctuation
+/// normalised via [`normalize_search_term`] (case preserved; skipped when
+/// normalisation changes nothing). If all of those return nothing, Tier 2
+/// falls back to an album-name-only search (artist `""`), keeping only results
+/// whose file paths match the artist via [`path_matches_artist`]. If all
+/// tiers come up empty, an empty outcome is returned.
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
@@ -116,7 +154,47 @@ pub async fn search_album_with_fallback(
         }
     }
 
-    // Tier 2: album-only search (when both casing variants returned nothing)
+    // Tier 1c: punctuation-normalised fallback (when both casing variants
+    // returned nothing). Peers often list names with different punctuation
+    // ("S.P.Y." vs "SPY", "Guns & Roses" vs "Guns and Roses"), so a query
+    // sent verbatim misses them. Case is preserved (the lowercase tier
+    // already covered that axis); skip when normalisation changes nothing
+    // (the query would be byte-identical to Tier 1a).
+    if let Some(album_name) = album {
+        if !album_name.trim().is_empty() && !artist.trim().is_empty() {
+            let artist_norm = normalize_search_term(artist);
+            let album_norm = normalize_search_term(album_name);
+            // Skip when normalisation wiped a name (pure punctuation or
+            // non-ASCII without an ASCII decomposition): an empty term would
+            // either duplicate Tier 2's album-only query without the
+            // path_matches_artist verification, or send an empty query to
+            // the wire. Also skip when normalisation only collapsed
+            // whitespace or changed nothing (the query would be
+            // token-identical to Tier 1a).
+            let artist_collapsed = artist.split_whitespace().collect::<Vec<_>>().join(" ");
+            let album_collapsed = album_name.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !artist_norm.is_empty()
+                && !album_norm.is_empty()
+                && (artist_norm != artist_collapsed || album_norm != album_collapsed)
+            {
+                tracing::info!(
+                    "Searching for Artist + Album punctuation-normalised ({} {})",
+                    artist_norm,
+                    album_norm
+                );
+                let norm_results =
+                    search_album(client, &artist_norm, Some(&album_norm), timeout_secs).await?;
+                if !norm_results.is_empty() {
+                    return Ok(SearchOutcome {
+                        results: norm_results,
+                    });
+                }
+            }
+        }
+    }
+
+    // Tier 2: album-only search (when the casing and punctuation variants
+    // returned nothing)
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() {
             tracing::info!("Searching for Album ({})", album_name.trim());
@@ -767,6 +845,95 @@ mod tests {
         assert_eq!(clean_track_title("7.On The Floor.mp3"), "on the floor");
     }
 
+    // ── normalize_search_term ──
+
+    #[test]
+    fn test_normalize_search_term_joins_periods() {
+        assert_eq!(normalize_search_term("S.P.Y."), "SPY");
+    }
+
+    #[test]
+    fn test_normalize_search_term_full_album() {
+        assert_eq!(
+            normalize_search_term("S.P.Y. - In The Skys"),
+            "SPY In The Skys"
+        );
+    }
+
+    #[test]
+    fn test_normalize_search_term_ampersand_to_and() {
+        assert_eq!(normalize_search_term("Guns & Roses"), "Guns and Roses");
+    }
+
+    #[test]
+    fn test_normalize_search_term_plus_to_and() {
+        assert_eq!(normalize_search_term("A+B"), "A and B");
+    }
+
+    #[test]
+    fn test_normalize_search_term_empty_output() {
+        // Pure punctuation and pure non-ASCII inputs normalise to nothing.
+        assert_eq!(normalize_search_term("..."), "");
+        assert_eq!(normalize_search_term("   "), "");
+        assert_eq!(normalize_search_term("周杰倫"), "");
+    }
+
+    #[test]
+    fn test_normalize_search_term_non_ascii_whitespace_and_dash() {
+        // Non-ASCII whitespace (NEL U+0085, NBSP U+00A0) must separate tokens.
+        assert_eq!(normalize_search_term("A\u{0085}B"), "A B");
+        assert_eq!(
+            normalize_search_term("Guns\u{00A0}N\u{00A0}Roses"),
+            "Guns N Roses"
+        );
+        // Smart dashes and middot must separate, not fuse.
+        assert_eq!(normalize_search_term("Skys\u{2014}Vol 2"), "Skys Vol 2");
+        assert_eq!(normalize_search_term("A\u{00B7}B"), "A B");
+    }
+
+    #[test]
+    fn test_normalize_search_term_separators() {
+        assert_eq!(normalize_search_term("AC-DC"), "AC DC");
+        assert_eq!(normalize_search_term("AC/DC"), "AC DC");
+    }
+
+    #[test]
+    fn test_normalize_search_term_brackets_and_underscore() {
+        assert_eq!(
+            normalize_search_term("In_The-Skys (Deluxe)"),
+            "In The Skys Deluxe"
+        );
+    }
+
+    #[test]
+    fn test_normalize_search_term_apostrophe_joins() {
+        assert_eq!(normalize_search_term("D'Angelo"), "DAngelo");
+    }
+
+    #[test]
+    fn test_normalize_search_term_accent_fold() {
+        assert_eq!(normalize_search_term("Tiësto"), "Tiesto");
+        assert_eq!(normalize_search_term("Café"), "Cafe");
+    }
+
+    #[test]
+    fn test_normalize_search_term_preserves_case() {
+        assert_eq!(normalize_search_term("Spy In The Skys"), "Spy In The Skys");
+    }
+
+    #[test]
+    fn test_normalize_search_term_no_change_passthrough() {
+        assert_eq!(normalize_search_term("Musicology"), "Musicology");
+    }
+
+    #[test]
+    fn test_normalize_search_term_collapses_whitespace() {
+        assert_eq!(
+            normalize_search_term("  Guns   &   Roses  "),
+            "Guns and Roses"
+        );
+    }
+
     // ── fallback_track_query ──
 
     #[test]
@@ -1303,6 +1470,225 @@ mod tests {
         assert_eq!(
             queries,
             vec!["prince musicology".to_string(), "musicology".to_string()]
+        );
+    }
+
+    // ── punctuation fallback ──
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_fires_when_normalisation_changes() {
+        let client = MockClient::new();
+        // Tier 1a "S.P.Y. In The Skys" and Tier 1b "s.p.y. in the skys" have
+        // no map entries -> empty. Tier 1c normalises to "SPY In The Skys".
+        client.search_results_by_query.lock().unwrap().insert(
+            "SPY In The Skys".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "SPY/In The Skys/01 - Track.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(&client, "S.P.Y.", Some("In The Skys"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].username, "peer1");
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "S.P.Y. In The Skys".to_string(),
+                "s.p.y. in the skys".to_string(),
+                "SPY In The Skys".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_skipped_when_normalisation_empty() {
+        let client = MockClient::new();
+        // A punctuation-only artist normalises to "". Tier 1c must be
+        // skipped (an empty term would duplicate Tier 2's album-only query
+        // without artist verification), so only 3 queries run: 1a, 1b, 2.
+        let outcome = search_album_with_fallback(&client, "...", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "... Musicology".to_string(),
+                "... musicology".to_string(),
+                "Musicology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_skipped_when_only_whitespace_differs() {
+        let client = MockClient::new();
+        // Artist has a double space; normalisation only collapses whitespace,
+        // so the query would be token-identical to Tier 1a. Tier 1c must skip
+        // (3 queries: 1a, 1b, 2).
+        let outcome = search_album_with_fallback(&client, "Guns  N  Roses", Some("Spaghetti"), 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Guns  N  Roses Spaghetti".to_string(),
+                "guns  n  roses spaghetti".to_string(),
+                "Spaghetti".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_album_only_punctuation() {
+        let client = MockClient::new();
+        // Artist is clean, album has a hyphen. Tier 1c fires with the
+        // normalised album after 1a/1b come up empty.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Prince Music ology".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file("Prince/Music ology/01.flac", 900, 30_000_000)],
+            }],
+        );
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Music-ology"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Music-ology".to_string(),
+                "prince music-ology".to_string(),
+                "Prince Music ology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_skipped_when_album_normalises_empty() {
+        let client = MockClient::new();
+        // Album is pure non-ASCII, normalising to "". Tier 1c must skip (an
+        // empty album term would duplicate Tier 2's album-only query).
+        let outcome = search_album_with_fallback(&client, "Prince", Some("周杰倫"), 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince 周杰倫".to_string(),
+                "prince 周杰倫".to_string(),
+                "周杰倫".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_falls_through_to_album_only() {
+        let client = MockClient::new();
+        // Tier 1c ("SPY In The Skys") returns nothing; Tier 2 ("In The Skys")
+        // finds an artist-verified result. Verify 1c fires first, then 2.
+        client.search_results_by_query.lock().unwrap().insert(
+            "In The Skys".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "SPY/In The Skys/01 - Track.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+        let outcome = search_album_with_fallback(&client, "S.P.Y.", Some("In The Skys"), 15)
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "S.P.Y. In The Skys".to_string(),
+                "s.p.y. in the skys".to_string(),
+                "SPY In The Skys".to_string(),
+                "In The Skys".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_skipped_when_no_punctuation() {
+        let client = MockClient::new();
+        // "Prince" + "Musicology" has no punctuation: Tier 1c normalisation
+        // is a no-op and must be skipped. Tier 1a, 1b, and album-only run.
+        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_punctuation_fallback_ampersand() {
+        let client = MockClient::new();
+        client.search_results_by_query.lock().unwrap().insert(
+            "Guns and Roses Appetite for Destruction".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Guns N Roses/Appetite for Destruction/01.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(
+            &client,
+            "Guns & Roses",
+            Some("Appetite for Destruction"),
+            15,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Guns & Roses Appetite for Destruction".to_string(),
+                "guns & roses appetite for destruction".to_string(),
+                "Guns and Roses Appetite for Destruction".to_string()
+            ]
         );
     }
 
