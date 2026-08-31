@@ -52,7 +52,9 @@ async fn drain_transfer(rx: &mut tokio::sync::mpsc::Receiver<DownloadStatus>, ti
 #[derive(Debug, Default, Clone)]
 pub struct TrackRecord {
     pub username: String,
-    /// Measured transfer speed in KiB/s (bytes/sec ÷ 1024); 0 when the track failed.
+    /// Effective transfer throughput in KiB/s (bytes downloaded ÷ transfer
+    /// time, including retries, excluding queue wait); 0 when the track
+    /// failed or produced no measurable speed sample.
     pub speed_kbps: f64,
     pub success: bool,
 }
@@ -66,8 +68,11 @@ pub struct DownloadStats {
 
 /// Download a single file from a specific user, monitoring speed.
 ///
-/// Returns the destination path plus the final EMA-smoothed transfer speed
-/// in KiB/s (0.0 when no InProgress sample was observed).
+/// Returns the destination path plus the effective transfer throughput in
+/// KiB/s (bytes downloaded ÷ transfer time, excluding queue wait but
+/// including retry delays). 0.0 is returned when no measurable transfer time
+/// was observed (e.g. a zero-byte file or a transfer with no progress
+/// samples), so the sample is excluded from the running average.
 ///
 /// Retries the same peer up to `config.max_retries` times on failure,
 /// waiting `config.retry_delay_secs` between attempts, before surfacing the
@@ -115,6 +120,11 @@ pub async fn download_file(
     // when the retry opens a new connection to the same peer+file. Both
     // threads write to the same .part file (O_APPEND). The default 30 s
     // delay makes this negligible; lower values risk interleaved writes.
+    // Effective-transfer-time accumulator: the recorded throughput excludes
+    // queue wait (a busy-but-fast peer is not demoted) but includes every
+    // retry_delay_secs sleep and the final transfer's real duration, so a
+    // peer that needs retries is demoted by the time it costs.
+    let mut transfer_time = std::time::Duration::ZERO;
     let mut last_err: Option<SeakarrError> = None;
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
@@ -126,6 +136,7 @@ pub async fn download_file(
                 config.max_retries
             );
             tokio::time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
+            transfer_time += Duration::from_secs(config.retry_delay_secs);
             // Re-check after the delay — a SIGINT during sleep must not
             // fall through to queueing another download.
             if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
@@ -137,10 +148,23 @@ pub async fn download_file(
         )
         .await
         {
-            Ok((path, speed_kbps)) => return Ok((path, speed_kbps)),
+            Ok((path, elapsed)) => {
+                transfer_time += elapsed;
+                // A transfer with no measurable duration (no InProgress sample,
+                // e.g. a zero-byte file or a protocol edge) yields no speed
+                // sample — record 0.0 so the DB's >0.0 guard excludes it,
+                // rather than inflating the average via the 1ms floor.
+                let throughput = if transfer_time.is_zero() {
+                    0.0
+                } else {
+                    let bytes = std::fs::metadata(&path)
+                        .map(|m| m.len())
+                        .unwrap_or(file.size);
+                    effective_throughput_kib_s(bytes, transfer_time)
+                };
+                return Ok((path, throughput));
+            }
             Err(e) => {
-                // If the cancel flag is set, the error is from a user-
-                // initiated abort — surface it immediately, don't retry.
                 if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                     return Err(e);
                 }
@@ -171,11 +195,19 @@ fn ema_update(current: Option<f64>, new_value: f64, alpha: f64) -> f64 {
     }
 }
 
+/// Effective transfer throughput: downloaded bytes over total wall-clock time,
+/// in KiB/s. Elapsed is floored at 1 ms so a near-instant transfer can't
+/// divide by zero.
+fn effective_throughput_kib_s(bytes: u64, elapsed: std::time::Duration) -> f64 {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    bytes as f64 / secs / 1024.0
+}
+
 /// Single download attempt for `download_file` (no retry loop). Queues the
 /// transfer and polls status until success, failure, timeout, or cancel.
-/// Returns the destination path plus the final EMA-smoothed transfer speed
-/// in KiB/s (0.0 when no InProgress sample was observed). The `basename`
-/// parameter must be pre-validated by the caller.
+/// Returns the destination path plus the transfer duration (first InProgress
+/// to completion). The `basename` parameter must be pre-validated by the
+/// caller.
 #[allow(clippy::too_many_arguments)]
 async fn download_once(
     client: &dyn SoulseekClient,
@@ -187,7 +219,7 @@ async fn download_once(
     filters: &crate::config::FilterConfig,
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<(PathBuf, f64)> {
+) -> Result<(PathBuf, std::time::Duration)> {
     let mut handle = match client.download(file, username, dir).await {
         Ok(h) => h,
         Err(e) => return Err(e),
@@ -312,7 +344,12 @@ async fn download_once(
                     return Err(e);
                 }
 
-                return Ok((dest, speed_ema.unwrap_or(0.0) / 1024.0)); // KiB/s
+                return Ok((
+                    dest,
+                    transfer_start
+                        .map(|ts| ts.elapsed())
+                        .unwrap_or(std::time::Duration::ZERO),
+                ));
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 if let Some(bar) = &bar {
@@ -775,6 +812,117 @@ mod tests {
         assert!(
             (ema - 2_890_000.0).abs() < 0.01,
             "expected ~2_890_000, got {ema}"
+        );
+    }
+
+    #[test]
+    fn effective_throughput_computes_bytes_per_wall_second() {
+        use std::time::Duration;
+        // 1024 bytes over 1 second = 1 KiB/s
+        assert!((effective_throughput_kib_s(1024, Duration::from_secs(1)) - 1.0).abs() < 1e-9);
+        // 1024 bytes over 2 seconds = 0.5 KiB/s
+        assert!((effective_throughput_kib_s(1024, Duration::from_secs(2)) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_throughput_guards_against_zero_elapsed() {
+        use std::time::Duration;
+        // Zero elapsed must not divide by zero; the 1ms floor yields a finite value.
+        assert!(effective_throughput_kib_s(1024, Duration::ZERO).is_finite());
+    }
+
+    /// A transfer that completes without any InProgress sample must record a
+    /// 0.0 throughput (excluded from the running average), not an inflated
+    /// value from the 1ms floor.
+    #[tokio::test]
+    async fn test_completed_without_inprogress_records_zero_throughput() {
+        use std::sync::Arc;
+        let client = Arc::new(ControllableClient::new());
+        let dir = TempDir::new().unwrap();
+        let file = make_file("Music\\Artist\\Album\\01.flac", 900, 10_000_000);
+        let config = default_dl_config();
+
+        // Once download() is called, push a bare Completed (no InProgress).
+        let pusher = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                while !client.download_called.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                let tx = client.status_tx.lock().unwrap().clone().unwrap();
+                tx.send(DownloadStatus::Completed).await.unwrap();
+            })
+        };
+
+        let (_, speed) = download_file(
+            &*client,
+            &file,
+            "peer",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        pusher.await.unwrap();
+
+        assert_eq!(
+            speed, 0.0,
+            "a transfer with no InProgress sample must record 0.0 throughput"
+        );
+    }
+
+    /// A download that needs a retry must record a lower throughput than the
+    /// same bytes delivered cleanly, because the retry_delay_secs sleep counts.
+    #[tokio::test]
+    async fn test_retried_download_records_lower_throughput() {
+        let dir = TempDir::new().unwrap();
+        let file = make_file("Music\\Artist\\Album\\01 - Track.flac", 900, 10_000_000);
+        let mut config = default_dl_config();
+        config.retry_delay_secs = 1;
+        config.max_retries = 2;
+
+        // Clean: no failures, no retry delay.
+        let clean_client = RetryClient::new(0);
+        let (_, clean_speed) = download_file(
+            &clean_client,
+            &file,
+            "peer",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // One failure then success: the 1s retry delay is added to the clock.
+        let retried_client = RetryClient::new(1);
+        let (_, retried_speed) = download_file(
+            &retried_client,
+            &file,
+            "peer",
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            retried_client.call_count(),
+            2,
+            "one retry must be attempted"
+        );
+        assert!(
+            retried_speed < clean_speed / 2.0,
+            "a retried download must record a much lower throughput \
+             (retried {retried_speed} vs clean {clean_speed})"
         );
     }
 

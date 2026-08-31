@@ -14,10 +14,11 @@ Automated Soulseek music downloader with library quality upgrading.
   text file of `artist - album` lines to download a curated wantlist.
 - **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
   free upload slots. Reject files with no free upload slots and path-traversal names.
-- **Peer reputation** — remembers each peer's measured download speed and success rate (in SQLite), and ranks
-  search results by a blend of advertised and measured speed plus a reliability factor, so fast, reliable peers
-  are preferred and error-prone or throttling peers are demoted — regardless of what you search for. Controlled
-  by `search.peer_reputation` (default `true`).
+- **Peer reputation** — remembers each peer's effective throughput (bytes ÷ transfer time: retry delays plus
+  the final transfer, excluding queue wait) and success rate (in SQLite), and ranks search results by a blend
+  of advertised and measured throughput plus a reliability factor, so fast, reliable peers are preferred and
+  slow or error-prone peers are demoted — regardless of what you search for. Controlled by
+  `search.peer_reputation` (default `true`).
 - **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
   stall timeout with cancel, per-file retries with configurable count and delay, and candidate fallback
   (try the next ranked peer once retries are exhausted).
