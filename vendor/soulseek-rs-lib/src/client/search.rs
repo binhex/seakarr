@@ -1,6 +1,6 @@
 use super::{
     Arc, AtomicBool, Client, DEFAULT_WISHLIST_INTERVAL, Duration, HashMap, Instant, Ordering,
-    Result, RwLockExt, Search, SearchResult, ServerMessage, SoulseekRs, info, md5, sleep,
+    Result, RwLockExt, Search, SearchResult, ServerMessage, SoulseekRs, debug, info, md5, sleep,
 };
 
 impl Client {
@@ -65,7 +65,7 @@ impl Client {
         if self.session_loss().is_some() {
             return Err(SoulseekRs::NotConnected);
         }
-        info!("Searching for {}", query);
+        debug!("Searching for {}", query);
 
         let Some(handle) = &self.server_handle else {
             return Err(SoulseekRs::NotConnected);

@@ -68,6 +68,21 @@ pub async fn search_album_with_fallback(
     timeout_secs: u64,
 ) -> Result<SearchOutcome> {
     // Tier 1a: primary "Artist Album" search (original casing)
+    if let Some(a) = album.filter(|a| !a.trim().is_empty()) {
+        if artist.trim().is_empty() {
+            tracing::info!("Searching for Album ({})", a.trim());
+        } else {
+            tracing::info!(
+                "Searching for Artist + Album ({} {})",
+                artist.trim(),
+                a.trim()
+            );
+        }
+    } else {
+        // Album is absent or blank: search_album sends the artist string
+        // as-is, so echo it un-trimmed to match the wire.
+        tracing::info!("Searching for Artist ({artist})");
+    }
     let results = search_album(client, artist, album, timeout_secs).await?;
     if !results.is_empty() {
         return Ok(SearchOutcome { results });
@@ -85,6 +100,11 @@ pub async fn search_album_with_fallback(
             let artist_lower = artist.to_lowercase();
             let album_lower = album_name.to_lowercase();
             if artist_lower != artist || album_lower != album_name {
+                tracing::info!(
+                    "Searching for Artist + Album lowercase ({} {})",
+                    artist_lower.trim(),
+                    album_lower.trim()
+                );
                 let lower_results =
                     search_album(client, &artist_lower, Some(&album_lower), timeout_secs).await?;
                 if !lower_results.is_empty() {
@@ -99,6 +119,7 @@ pub async fn search_album_with_fallback(
     // Tier 2: album-only search (when both casing variants returned nothing)
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() {
+            tracing::info!("Searching for Album ({})", album_name.trim());
             let album_results = search_album(client, "", Some(album_name), timeout_secs).await?;
             // Filter by artist match using existing path_matches_artist,
             // and prune each result's files to only artist-matching ones
@@ -399,6 +420,7 @@ pub async fn search_by_title(
         .len()
         .saturating_mul(match_threshold_pct as usize)
         .div_ceil(100);
+    tracing::info!("Searching by track title ({query})");
     let mut results = search_raw(client, &query, timeout_secs).await?;
     // Keep only files whose cleaned basename contains at least one distinct
     // library title as a substring, and keep the result only if enough
