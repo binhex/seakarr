@@ -1,4 +1,5 @@
 use crate::client::{SearchResult, SoulseekClient};
+use crate::config::FilterConfig;
 use crate::error::Result;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -85,26 +86,72 @@ pub fn normalize_search_term(input: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Search for an album by artist + album name.
+/// Returns true when `results` contain at least one result that passes the
+/// full filter pipeline — i.e. when the tier produced a downloadable result
+/// set. The cascade continues to the next tier when a tier returns non-empty
+/// but unusable results.
+fn tier_has_usable_results(
+    results: &[SearchResult],
+    filters: &FilterConfig,
+    library_track_count: Option<usize>,
+    album: Option<&str>,
+) -> bool {
+    !crate::filter::filter_results(results, filters, library_track_count, album).is_empty()
+}
+
+/// Run a fallback-tier search, treating errors as "no results" so a
+/// transient timeout/disconnect on a lower tier does not abort the whole
+/// album. The primary tier still propagates errors via `?`.
+async fn search_fallback_tier(
+    client: &dyn SoulseekClient,
+    query_artist: &str,
+    query_album: Option<&str>,
+    timeout_secs: u64,
+) -> Vec<SearchResult> {
+    match search_album(client, query_artist, query_album, timeout_secs).await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::warn!("fallback search failed, skipping tier: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Search for an album by artist + album name, stopping at the first tier
+/// whose results survive the full filter pipeline
+/// ([`crate::filter::filter_results`]).
 ///
-/// Tier 1a runs the primary "Artist Album" search (original casing). If it
-/// returns nothing, Tier 1b retries with the same query lowercased (Soulseek
-/// returns different result sets per casing, and lowercase queries tend to be
-/// lower quality, so original casing is always preferred). Tier 1b is skipped
-/// when the artist is empty (Tier 2 handles album-only searches with artist
-/// verification) or when the query is already lowercase (no new information).
-/// If both casing variants return nothing, Tier 1c retries with punctuation
-/// normalised via [`normalize_search_term`] (case preserved; skipped when
-/// normalisation changes nothing). If all of those return nothing, Tier 2
-/// falls back to an album-name-only search (artist `""`), keeping only results
-/// whose file paths match the artist via [`path_matches_artist`]. If all
-/// tiers come up empty, an empty outcome is returned.
+/// Tier 1a runs the primary "Artist Album" search (original casing). Tier 1b
+/// retries lowercased (Soulseek returns different result sets per casing, and
+/// lowercase tends to be lower quality, so original casing is preferred);
+/// skipped when the artist is empty or the query is already lowercase.
+/// Tier 1c retries with punctuation normalised via [`normalize_search_term`]
+/// (case preserved; skipped when normalisation changes nothing). Tier 2 falls
+/// back to an album-name-only search (artist `""`), keeping only results whose
+/// file paths match the artist via [`path_matches_artist`].
+///
+/// A tier is accepted only when it yields at least one result that passes the
+/// filters (extension, bitrate, slots, min tracks, contiguity, album gate).
+/// When a tier returns non-empty but unusable results, the cascade continues
+/// to the next tier. If no tier yields usable results, the first non-empty
+/// tier's results are returned so the caller's rejection summary and
+/// title-search fallback still have data. An empty outcome is returned when
+/// no tier produces any results (including the album-only tier matching no
+/// artist).
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
     album: Option<&str>,
     timeout_secs: u64,
+    filters: &FilterConfig,
+    library_track_count: Option<usize>,
 ) -> Result<SearchOutcome> {
+    // The first tier whose raw results were non-empty but did not survive
+    // filtering. Returned when no tier yields a usable (filter-passing)
+    // result set, so the caller's rejection summary and title-search
+    // fallback still have data to work with.
+    let mut fallback: Option<Vec<SearchResult>> = None;
+
     // Tier 1a: primary "Artist Album" search (original casing)
     if let Some(a) = album.filter(|a| !a.trim().is_empty()) {
         if artist.trim().is_empty() {
@@ -117,22 +164,17 @@ pub async fn search_album_with_fallback(
             );
         }
     } else {
-        // Album is absent or blank: search_album sends the artist string
-        // as-is, so echo it un-trimmed to match the wire.
         tracing::info!("Searching for Artist ({artist})");
     }
     let results = search_album(client, artist, album, timeout_secs).await?;
     if !results.is_empty() {
-        return Ok(SearchOutcome { results });
+        if tier_has_usable_results(&results, filters, library_track_count, album) {
+            return Ok(SearchOutcome { results });
+        }
+        fallback = Some(results);
     }
 
-    // Tier 1b: lowercase fallback (when original casing returned nothing)
-    // Soulseek returns different result sets for different query casing;
-    // lowercase queries tend to return lower-quality results (MP3s), so
-    // we try the original casing first and only fall back to lowercase
-    // when it returned zero raw results. Skip when artist is empty
-    // (Tier 2 handles album-only searches with artist verification) or
-    // when the query is already lowercase (no new information).
+    // Tier 1b: lowercase fallback (when original casing was not usable)
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() && !artist.trim().is_empty() {
             let artist_lower = artist.to_lowercase();
@@ -144,33 +186,29 @@ pub async fn search_album_with_fallback(
                     album_lower.trim()
                 );
                 let lower_results =
-                    search_album(client, &artist_lower, Some(&album_lower), timeout_secs).await?;
+                    search_fallback_tier(client, &artist_lower, Some(&album_lower), timeout_secs)
+                        .await;
                 if !lower_results.is_empty() {
-                    return Ok(SearchOutcome {
-                        results: lower_results,
-                    });
+                    if tier_has_usable_results(&lower_results, filters, library_track_count, album)
+                    {
+                        return Ok(SearchOutcome {
+                            results: lower_results,
+                        });
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(lower_results);
+                    }
                 }
             }
         }
     }
 
-    // Tier 1c: punctuation-normalised fallback (when both casing variants
-    // returned nothing). Peers often list names with different punctuation
-    // ("S.P.Y." vs "SPY", "Guns & Roses" vs "Guns and Roses"), so a query
-    // sent verbatim misses them. Case is preserved (the lowercase tier
-    // already covered that axis); skip when normalisation changes nothing
-    // (the query would be byte-identical to Tier 1a).
+    // Tier 1c: punctuation-normalised fallback (when the casing variants
+    // were not usable). Peers often list names with different punctuation.
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() && !artist.trim().is_empty() {
             let artist_norm = normalize_search_term(artist);
             let album_norm = normalize_search_term(album_name);
-            // Skip when normalisation wiped a name (pure punctuation or
-            // non-ASCII without an ASCII decomposition): an empty term would
-            // either duplicate Tier 2's album-only query without the
-            // path_matches_artist verification, or send an empty query to
-            // the wire. Also skip when normalisation only collapsed
-            // whitespace or changed nothing (the query would be
-            // token-identical to Tier 1a).
             let artist_collapsed = artist.split_whitespace().collect::<Vec<_>>().join(" ");
             let album_collapsed = album_name.split_whitespace().collect::<Vec<_>>().join(" ");
             if !artist_norm.is_empty()
@@ -183,26 +221,29 @@ pub async fn search_album_with_fallback(
                     album_norm
                 );
                 let norm_results =
-                    search_album(client, &artist_norm, Some(&album_norm), timeout_secs).await?;
+                    search_fallback_tier(client, &artist_norm, Some(&album_norm), timeout_secs)
+                        .await;
                 if !norm_results.is_empty() {
-                    return Ok(SearchOutcome {
-                        results: norm_results,
-                    });
+                    if tier_has_usable_results(&norm_results, filters, library_track_count, album) {
+                        return Ok(SearchOutcome {
+                            results: norm_results,
+                        });
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(norm_results);
+                    }
                 }
             }
         }
     }
 
     // Tier 2: album-only search (when the casing and punctuation variants
-    // returned nothing)
+    // were not usable)
     if let Some(album_name) = album {
         if !album_name.trim().is_empty() {
             tracing::info!("Searching for Album ({})", album_name.trim());
-            let album_results = search_album(client, "", Some(album_name), timeout_secs).await?;
-            // Filter by artist match using existing path_matches_artist,
-            // and prune each result's files to only artist-matching ones
-            // so we don't download tracks from a different artist's
-            // same-named album directory.
+            let album_results =
+                search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
             let mut artist_matches: Vec<SearchResult> = album_results
                 .into_iter()
                 .filter(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)))
@@ -213,15 +254,23 @@ pub async fn search_album_with_fallback(
                     .retain(|f| path_matches_artist(&f.name, artist));
             }
             if !artist_matches.is_empty() {
-                return Ok(SearchOutcome {
-                    results: artist_matches,
-                });
+                if tier_has_usable_results(&artist_matches, filters, library_track_count, album) {
+                    return Ok(SearchOutcome {
+                        results: artist_matches,
+                    });
+                }
+                if fallback.is_none() {
+                    fallback = Some(artist_matches);
+                }
             }
         }
     }
 
-    // All tiers returned nothing
-    Ok(SearchOutcome { results: vec![] })
+    // No tier yielded a usable result set: return the first non-empty tier's
+    // results (today's behaviour) or empty if every tier was empty.
+    Ok(SearchOutcome {
+        results: fallback.unwrap_or_default(),
+    })
 }
 
 /// Audio file extensions collected by [`get_library_track_filenames`].
@@ -620,6 +669,19 @@ mod tests {
         }
     }
 
+    fn test_filters() -> FilterConfig {
+        FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bit_rate: 0,
+            min_bit_depth: 0,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: false,
+            min_tracks: 0,
+            peer_track_count: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_search_returns_results() {
         let client = MockClient::new();
@@ -741,9 +803,10 @@ mod tests {
         // produce nothing. Two queries run: primary ("Album") and album-only
         // (also "Album"). Tier 1b is skipped because artist is empty.
         let client = MockClient::new();
-        let outcome = search_album_with_fallback(&client, "", Some("Album"), 15)
-            .await
-            .unwrap();
+        let outcome =
+            search_album_with_fallback(&client, "", Some("Album"), 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert!(outcome.results.is_empty());
         assert_eq!(client.search_queries.lock().unwrap().len(), 2);
     }
@@ -751,9 +814,10 @@ mod tests {
     #[tokio::test]
     async fn test_no_search_when_album_blank() {
         let client = MockClient::new();
-        let _outcome = search_album_with_fallback(&client, "Artist", Some(" "), 15)
-            .await
-            .unwrap();
+        let _outcome =
+            search_album_with_fallback(&client, "Artist", Some(" "), 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert_eq!(client.search_queries.lock().unwrap().len(), 1);
     }
 
@@ -779,9 +843,16 @@ mod tests {
         // "History", whose result path matches "Michael Jackson", so it is
         // returned.
 
-        let outcome = search_album_with_fallback(&client, "Michael Jackson", Some("History"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Michael Jackson",
+            Some("History"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -797,16 +868,20 @@ mod tests {
     #[tokio::test]
     async fn test_no_fallback_when_primary_non_empty() {
         let client = MockClient::new();
+        // The primary tier's result must survive the full filter pipeline
+        // (including the album-name gate), so the cascade returns it without
+        // issuing any fallback queries.
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "user1".into(),
             speed: 500,
             slots: 1,
-            files: vec![make_file("track.flac", 900, 30_000_000)],
+            files: vec![make_file("Artist/Album/01 - Track.flac", 900, 30_000_000)],
         }];
 
-        let outcome = search_album_with_fallback(&client, "Artist", Some("Album"), 15)
-            .await
-            .unwrap();
+        let outcome =
+            search_album_with_fallback(&client, "Artist", Some("Album"), 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Artist Album".to_string()]);
@@ -819,9 +894,10 @@ mod tests {
         // "artist album", and the album-only "Album" query. With no results
         // for any of them, the outcome is empty.
         let client = MockClient::new();
-        let outcome = search_album_with_fallback(&client, "Artist", Some("Album"), 15)
-            .await
-            .unwrap();
+        let outcome =
+            search_album_with_fallback(&client, "Artist", Some("Album"), 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert!(outcome.results.is_empty());
         assert_eq!(client.search_queries.lock().unwrap().len(), 3);
     }
@@ -829,9 +905,10 @@ mod tests {
     #[tokio::test]
     async fn test_single_query_when_no_album() {
         let client = MockClient::new();
-        let _outcome = search_album_with_fallback(&client, "Artist", None, 15)
-            .await
-            .unwrap();
+        let _outcome =
+            search_album_with_fallback(&client, "Artist", None, 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert_eq!(client.search_queries.lock().unwrap().len(), 1);
     }
 
@@ -1281,9 +1358,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         // All three tiers ran in order. The album-only query is "Musicology"
         // — not " Musicology" (leading space must be trimmed).
@@ -1317,9 +1401,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(outcome.results.is_empty());
     }
 
@@ -1328,9 +1419,10 @@ mod tests {
         let client = MockClient::new();
         // No search results -> primary comes up empty. Album is None, so the
         // album-only tier is skipped -> still empty and only 1 query issued.
-        let outcome = search_album_with_fallback(&client, "Prince", None, 15)
-            .await
-            .unwrap();
+        let outcome =
+            search_album_with_fallback(&client, "Prince", None, 15, &test_filters(), None)
+                .await
+                .unwrap();
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Prince".to_string()]);
@@ -1357,9 +1449,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         // Both tiers ran: original casing + lowercase fallback.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -1391,9 +1490,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         // Only the original casing query was issued — no lowercase fallback.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -1419,9 +1525,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         // Three queries ran: original casing, lowercase, album-only.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -1459,9 +1572,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "prince", Some("musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "prince",
+            Some("musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         // Two queries ran: Tier 1a ("prince musicology") and Tier 2
         // ("musicology"). Tier 1b was skipped because lowercasing
@@ -1494,9 +1614,16 @@ mod tests {
             }],
         );
 
-        let outcome = search_album_with_fallback(&client, "S.P.Y.", Some("In The Skys"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "S.P.Y.",
+            Some("In The Skys"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].username, "peer1");
         let queries = client.search_queries.lock().unwrap().clone();
@@ -1516,9 +1643,16 @@ mod tests {
         // A punctuation-only artist normalises to "". Tier 1c must be
         // skipped (an empty term would duplicate Tier 2's album-only query
         // without artist verification), so only 3 queries run: 1a, 1b, 2.
-        let outcome = search_album_with_fallback(&client, "...", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "...",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1537,9 +1671,16 @@ mod tests {
         // Artist has a double space; normalisation only collapses whitespace,
         // so the query would be token-identical to Tier 1a. Tier 1c must skip
         // (3 queries: 1a, 1b, 2).
-        let outcome = search_album_with_fallback(&client, "Guns  N  Roses", Some("Spaghetti"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Guns  N  Roses",
+            Some("Spaghetti"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1566,9 +1707,16 @@ mod tests {
                 files: vec![make_file("Prince/Music ology/01.flac", 900, 30_000_000)],
             }],
         );
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Music-ology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Music-ology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1586,9 +1734,16 @@ mod tests {
         let client = MockClient::new();
         // Album is pure non-ASCII, normalising to "". Tier 1c must skip (an
         // empty album term would duplicate Tier 2's album-only query).
-        let outcome = search_album_with_fallback(&client, "Prince", Some("周杰倫"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("周杰倫"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1619,9 +1774,16 @@ mod tests {
                 )],
             }],
         );
-        let outcome = search_album_with_fallback(&client, "S.P.Y.", Some("In The Skys"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "S.P.Y.",
+            Some("In The Skys"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1640,9 +1802,16 @@ mod tests {
         let client = MockClient::new();
         // "Prince" + "Musicology" has no punctuation: Tier 1c normalisation
         // is a no-op and must be skipped. Tier 1a, 1b, and album-only run.
-        let outcome = search_album_with_fallback(&client, "Prince", Some("Musicology"), 15)
-            .await
-            .unwrap();
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(outcome.results.is_empty());
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(
@@ -1677,6 +1846,8 @@ mod tests {
             "Guns & Roses",
             Some("Appetite for Destruction"),
             15,
+            &test_filters(),
+            None,
         )
         .await
         .unwrap();
@@ -1688,6 +1859,157 @@ mod tests {
                 "Guns & Roses Appetite for Destruction".to_string(),
                 "guns & roses appetite for destruction".to_string(),
                 "Guns and Roses Appetite for Destruction".to_string()
+            ]
+        );
+    }
+
+    // ── filter-aware cascade continuation ──
+
+    #[tokio::test]
+    async fn test_cascade_continues_when_primary_only_mp3() {
+        let client = MockClient::new();
+        // Tier 1a returns only mp3 (rejected by the flac filter) -> cascade
+        // continues. Tier 1c returns flac and wins.
+        client.search_results_by_query.lock().unwrap().insert(
+            "S.P.Y. In The Skys".into(),
+            vec![SearchResult {
+                username: "mp3peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file("S.P.Y./In The Skys/01.mp3", 320, 8_000_000)],
+            }],
+        );
+        client.search_results_by_query.lock().unwrap().insert(
+            "SPY In The Skys".into(),
+            vec![SearchResult {
+                username: "flacpeer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "SPY/In The Skys/01 - Track.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(
+            &client,
+            "S.P.Y.",
+            Some("In The Skys"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].username, "flacpeer");
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "S.P.Y. In The Skys".to_string(),
+                "s.p.y. in the skys".to_string(),
+                "SPY In The Skys".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cascade_fallback_from_album_only_tier() {
+        let client = MockClient::new();
+        // 1a/1b empty; 1c skipped (no punctuation). Tier 2 returns an artist-
+        // matching but all-mp3 result -> rejected by the flac probe. The
+        // cascade returns Tier 2's artist-pruned result as the fallback.
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "mp3peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file("Prince/Musicology/01.mp3", 320, 8_000_000),
+                    // Wrong-artist file that path_matches_artist prunes.
+                    make_file("Other/Musicology/02.mp3", 320, 8_000_000),
+                ],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
+        // Fallback = Tier 2's artist-pruned results (1 result, 1 file).
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].files.len(), 1);
+        assert!(outcome.results[0].files[0].name.contains("Prince"));
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cascade_returns_first_tier_when_all_tiers_junk() {
+        let client = MockClient::new();
+        // Every tier returns only mp3 -> no tier passes the flac filter. The
+        // cascade must return the FIRST tier's results (today's behaviour)
+        // and still run all tiers.
+        let mp3 = |path: &str| {
+            vec![SearchResult {
+                username: "mp3peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(path, 320, 8_000_000)],
+            }]
+        };
+        client
+            .search_results_by_query
+            .lock()
+            .unwrap()
+            .insert("Prince Musicology".into(), mp3("Prince/Musicology/01.mp3"));
+        client
+            .search_results_by_query
+            .lock()
+            .unwrap()
+            .insert("prince musicology".into(), mp3("Prince/Musicology/01.mp3"));
+        client
+            .search_results_by_query
+            .lock()
+            .unwrap()
+            .insert("Musicology".into(), mp3("Prince/Musicology/01.mp3"));
+
+        let outcome = search_album_with_fallback(
+            &client,
+            "Prince",
+            Some("Musicology"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].username, "mp3peer");
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(
+            queries,
+            vec![
+                "Prince Musicology".to_string(),
+                "prince musicology".to_string(),
+                "Musicology".to_string()
             ]
         );
     }

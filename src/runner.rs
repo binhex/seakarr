@@ -134,9 +134,15 @@ pub async fn process_album(
 
     // Search for artist + album.
     let search_start = std::time::Instant::now();
-    let outcome =
-        search::search_album_with_fallback(client, artist, album, config.search.timeout_secs)
-            .await?;
+    let outcome = search::search_album_with_fallback(
+        client,
+        artist,
+        album,
+        config.search.timeout_secs,
+        &config.filters,
+        library_track_count,
+    )
+    .await?;
     let duration_ms = search_start.elapsed().as_millis() as u64;
     let history_album = album.map(str::trim);
     if let Err(e) = search::record_search(
@@ -1028,7 +1034,10 @@ mod tests {
 
     // When the primary search returns results but all are rejected by filters
     // (e.g. contiguity gate), the album must be marked as failed with
-    // "no results passed filters" — no fallback fires.
+    // "no results passed filters". The filter-aware search cascade continues
+    // past the unusable primary tier (lowercase + album-only), but no tier
+    // yields a usable share, so the first non-empty tier's results come back
+    // and are rejected by process_album's own filter pass.
     #[tokio::test]
     async fn test_results_rejected_by_filters_marks_failed() {
         let client = Arc::new(MockClient::new());
@@ -1080,9 +1089,18 @@ mod tests {
             other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
         }
 
-        // Only one search issued — no fallback.
+        // The cascade ran all tiers (primary, lowercase, album-only) because
+        // no tier survived the probe; every tier's results are gappy and were
+        // rejected by the filters inside search_album_with_fallback.
         let queries = client.search_queries.lock().unwrap().clone();
-        assert_eq!(queries, vec!["Test Artist Test Album".to_string()]);
+        assert_eq!(
+            queries,
+            vec![
+                "Test Artist Test Album".to_string(),
+                "test artist test album".to_string(),
+                "Test Album".to_string()
+            ]
+        );
 
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
