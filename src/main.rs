@@ -124,6 +124,12 @@ async fn run() -> Result<()> {
         daemon: cli.daemon,
         test: cli.test,
     };
+
+    // Validate the selected mode before any startup side effects: logging
+    // setup, the --test branch, config.validate(), database open, PID lock,
+    // and Soulseek login must all be preceded by this check so manual and
+    // batch CLI selectors can never silently enter an incompatible mode.
+    let execution_plan = seakarr::mode::resolve_execution_plan(&config, &cli_overrides)?;
     config.merge_cli(cli_overrides);
 
     // Setup logging (stdout + rolling file)
