@@ -127,8 +127,10 @@ async fn search_fallback_tier(
 /// skipped when the artist is empty or the query is already lowercase.
 /// Tier 1c retries with punctuation normalised via [`normalize_search_term`]
 /// (case preserved; skipped when normalisation changes nothing). Tier 2 falls
-/// back to an album-name-only search (artist `""`), keeping only results whose
-/// file paths match the artist via [`path_matches_artist`].
+/// back to an album-name-only search for artist+album queries (artist `""`),
+/// keeping only results whose file paths match the artist via
+/// [`path_matches_artist`]. It is skipped when the artist is already empty
+/// because Tier 1 is already an album-only search.
 ///
 /// A tier is accepted only when it yields at least one result that passes the
 /// filters (extension, bitrate, slots, min tracks, contiguity, album gate).
@@ -237,30 +239,34 @@ pub async fn search_album_with_fallback(
         }
     }
 
-    // Tier 2: album-only search (when the casing and punctuation variants
-    // were not usable)
-    if let Some(album_name) = album {
-        if !album_name.trim().is_empty() {
-            tracing::info!("Searching for Album ({})", album_name.trim());
-            let album_results =
-                search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
-            let mut artist_matches: Vec<SearchResult> = album_results
-                .into_iter()
-                .filter(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)))
-                .collect();
-            for result in &mut artist_matches {
-                result
-                    .files
-                    .retain(|f| path_matches_artist(&f.name, artist));
-            }
-            if !artist_matches.is_empty() {
-                if tier_has_usable_results(&artist_matches, filters, library_track_count, album) {
-                    return Ok(SearchOutcome {
-                        results: artist_matches,
-                    });
+    // Tier 2: album-only search for artist+album queries (when the casing and
+    // punctuation variants were not usable). Album-only input already ran this
+    // query as Tier 1, so repeating it would only duplicate network traffic.
+    if !artist.trim().is_empty() {
+        if let Some(album_name) = album {
+            if !album_name.trim().is_empty() {
+                tracing::info!("Searching for Album ({})", album_name.trim());
+                let album_results =
+                    search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
+                let mut artist_matches: Vec<SearchResult> = album_results
+                    .into_iter()
+                    .filter(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)))
+                    .collect();
+                for result in &mut artist_matches {
+                    result
+                        .files
+                        .retain(|f| path_matches_artist(&f.name, artist));
                 }
-                if fallback.is_none() {
-                    fallback = Some(artist_matches);
+                if !artist_matches.is_empty() {
+                    if tier_has_usable_results(&artist_matches, filters, library_track_count, album)
+                    {
+                        return Ok(SearchOutcome {
+                            results: artist_matches,
+                        });
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(artist_matches);
+                    }
                 }
             }
         }
@@ -798,17 +804,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_album_only_fallback_never_matches_when_artist_empty() {
-        // An empty artist can never pass path_matches_artist, so even though
-        // the album-only tier fires (album present, primary empty), it must
-        // produce nothing. Two queries run: primary ("Album") and album-only
-        // (also "Album"). Tier 1b is skipped because artist is empty.
+        // An empty artist can never pass path_matches_artist. The primary
+        // album-only query is sufficient, so the redundant album-only fallback
+        // tier must be skipped when the artist is empty.
         let client = MockClient::new();
         let outcome =
             search_album_with_fallback(&client, "", Some("Album"), 15, &test_filters(), None)
                 .await
                 .unwrap();
         assert!(outcome.results.is_empty());
-        assert_eq!(client.search_queries.lock().unwrap().len(), 2);
+        assert_eq!(
+            client.search_queries.lock().unwrap().clone(),
+            vec!["Album".to_string()]
+        );
     }
 
     #[tokio::test]

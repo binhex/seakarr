@@ -86,6 +86,21 @@ fn record_album_failure(db: &Database, peer: &str) {
     }
 }
 
+fn mark_album_processed_if_identifiable(
+    db: &Database,
+    artist: &str,
+    album: Option<&str>,
+    status: &str,
+) -> Result<()> {
+    if artist.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(album) = album {
+        db.mark_album_processed(artist, album, status)?;
+    }
+    Ok(())
+}
+
 /// Process a single album: search → filter rank → download → organize → notify.
 /// When `target_library_path` is provided and `library_upgrade.enabled` is on
 /// (auto mode only), a completed download is copied into the origin library
@@ -109,11 +124,20 @@ pub async fn process_album(
     library_track_count: Option<usize>,
     target_library_path: Option<&Path>,
 ) -> Result<AlbumOutcome> {
+    if artist.trim().is_empty() && config.storage.organize && !config.library.paths.is_empty() {
+        return Err(SeakarrError::Config(
+            "cannot organize an album-only download without an artist; provide --artist or disable storage.organize"
+                .into(),
+        ));
+    }
+
     // Skip if already processed
-    if let Some(a) = album {
-        if db.is_album_processed(artist, a)? {
-            tracing::info!("Skipping already-processed: {artist} — {a}");
-            return Ok(AlbumOutcome::Skipped);
+    if !artist.trim().is_empty() {
+        if let Some(a) = album {
+            if db.is_album_processed(artist, a)? {
+                tracing::info!("Skipping already-processed: {artist} — {a}");
+                return Ok(AlbumOutcome::Skipped);
+            }
         }
     }
 
@@ -170,13 +194,15 @@ pub async fn process_album(
     // by the cleaned title of the album's alphabetically-first library track
     // and keep only results containing the album's library track titles.
     // Only fires when the local library holds the album (enabling the title
-    // list), the title search is enabled, and an album is being processed.
+    // list), the title search is enabled, an album is being processed, and the
+    // manual target includes an artist for the library-path lookup.
     // Track whether the title-search tier actually fired
     let mut title_search_attempted = false;
 
     if filtered.is_empty()
         && config.search.search_title_match > 0
         && !config.library.paths.is_empty()
+        && !artist.trim().is_empty()
     {
         // Manual mode without --album has no album name to match — the tier
         // cannot fire and the failure falls through to the checks below.
@@ -293,9 +319,7 @@ pub async fn process_album(
                     );
                 }
             }
-            if let Some(a) = album {
-                db.mark_album_processed(artist, a, "failed")?;
-            }
+            mark_album_processed_if_identifiable(db, artist, album, "failed")?;
             return Ok(AlbumOutcome::Failed {
                 reason: "no results found".into(),
             });
@@ -318,9 +342,7 @@ pub async fn process_album(
             config.filters.allowed_extensions,
             rejection_summary.summary_line(),
         );
-        if let Some(a) = album {
-            db.mark_album_processed(artist, a, "failed")?;
-        }
+        mark_album_processed_if_identifiable(db, artist, album, "failed")?;
         return Ok(AlbumOutcome::Failed {
             reason: "no results passed filters".into(),
         });
@@ -457,9 +479,7 @@ pub async fn process_album(
                     if let Err(e) = std::fs::remove_dir_all(&album_staging) {
                         tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
                     }
-                    if let Some(a) = album {
-                        db.mark_album_processed(artist, a, "success")?;
-                    }
+                    mark_album_processed_if_identifiable(db, artist, album, "success")?;
                     let track_count = downloaded.len();
                     if let Err(e) = notifier::notify_success(
                         &config.notifications.urls,
@@ -527,13 +547,10 @@ pub async fn process_album(
         }
     }
 
-    // Mark processed — only success if organize also succeeded.
-    // When album is None (manual mode without --album), mark_album_processed
-    // is skipped (no DB row to update).
+    // Mark processed — only success if organize also succeeded. Albums without
+    // an artist are not recorded because ("", album) is not an unambiguous key.
     if organize_ok {
-        if let Some(a) = album {
-            db.mark_album_processed(artist, a, "success")?;
-        }
+        mark_album_processed_if_identifiable(db, artist, album, "success")?;
         // Remove the staging directory — files have been organized into the
         // library. Absence of the staging dir signals a completed download.
         if config.storage.organize && !config.library.paths.is_empty() {
@@ -541,8 +558,8 @@ pub async fn process_album(
                 tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
             }
         }
-    } else if let Some(a) = album {
-        db.mark_album_processed(artist, a, "failed")?;
+    } else {
+        mark_album_processed_if_identifiable(db, artist, album, "failed")?;
     }
     if !organize_ok {
         return Ok(AlbumOutcome::Failed {
@@ -715,14 +732,15 @@ pub async fn run_auto_mode(
     Ok(())
 }
 
-/// Run in manual mode: process a single search term.
+/// Run in manual mode: process a single artist and/or album search target.
 pub async fn run_manual_mode(
     client: &dyn SoulseekClient,
-    artist: &str,
+    artist: Option<&str>,
     album: Option<&str>,
     config: &Config,
     db: &Database,
 ) -> Result<()> {
+    let artist_name = artist.filter(|name| !name.trim().is_empty()).unwrap_or("");
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
 
@@ -744,21 +762,24 @@ pub async fn run_manual_mode(
     // cleans the album's staging dir.
     let cancel = Arc::new(AtomicBool::new(false));
     let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+
     // Derive library track count from the configured library paths
     // when available, so the peer_track_count filter can reject peers
     // with fewer tracks than the library even in manual mode.
-    let derived_library_count = album.and_then(|a| {
-        if config.library.paths.is_empty() {
+    // Album-only searches (no artist) have no library counterpart to
+    // derive a track count from.
+    let derived_library_count = album.and_then(|album_name| {
+        if artist_name.is_empty() || config.library.paths.is_empty() {
             return None;
         }
-        search::get_library_track_filenames(&config.library.paths, artist, a)
+        search::get_library_track_filenames(&config.library.paths, artist_name, album_name)
             .ok()
             .filter(|tracks| !tracks.is_empty())
             .map(|tracks| tracks.len())
     });
     let result = process_album(
         client,
-        artist,
+        artist_name,
         album,
         config,
         db,
@@ -770,11 +791,11 @@ pub async fn run_manual_mode(
     )
     .await;
     match &result {
-        Ok(outcome) => report.record(artist, album_display, outcome.clone()),
+        Ok(outcome) => report.record(artist_name, album_display, outcome.clone()),
         Err(e) => {
-            tracing::error!("Manual mode: {artist} — {album_display}: {e}");
+            tracing::error!("Manual mode: {artist_name} — {album_display}: {e}");
             report.record(
-                artist,
+                artist_name,
                 album_display,
                 AlbumOutcome::Failed {
                     reason: e.to_string(),
@@ -877,6 +898,109 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+    }
+
+    // Album-only manual mode: an empty artist must still reach the
+    // album-only search support (the query is issued album-only and the run
+    // succeeds), not fail on a required artist argument.
+    #[tokio::test]
+    async fn test_run_manual_mode_accepts_album_only() {
+        let client = MockClient::new();
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.library.paths.clear();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+            .await
+            .expect("album-only manual mode must run");
+
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert!(
+            queries.iter().any(|query| query == "Test Album"),
+            "album-only mode must issue an album-only query, got {queries:?}"
+        );
+        assert!(
+            db.get_processed_albums().unwrap().is_empty(),
+            "album-only runs must not create an ambiguous processed-album key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_manual_mode_album_only_skips_title_search() {
+        let client = MockClient::new();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("01 - Distinct.flac"), b"").unwrap();
+
+        let mut config = make_test_config();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+            .await
+            .expect("album-only manual mode should finish without a title fallback");
+
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert_eq!(queries, vec!["Test Album".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_album_only_mode_rejects_unsafe_organization() {
+        let client = MockClient::new();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.storage.organize = true;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        let error = run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+            .await
+            .expect_err("album-only organization must be rejected without an artist");
+        assert!(
+            matches!(&error, SeakarrError::Config(message) if message.contains("cannot organize")),
+            "expected an actionable organization error, got {error:?}"
+        );
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "unsafe album-only organization must be rejected before searching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_manual_mode_preserves_nonblank_artist_whitespace() {
+        let client = MockClient::new();
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.library.paths.clear();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(
+            &client,
+            Some(" Test Artist "),
+            Some("Test Album"),
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual mode should record a failed search without results");
+
+        let artist: String = db
+            .conn
+            .query_row(
+                "SELECT artist FROM search_history ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(artist, " Test Artist ");
     }
 
     #[tokio::test]
