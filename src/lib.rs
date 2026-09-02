@@ -8,6 +8,7 @@ pub mod download;
 pub mod error;
 pub mod filter;
 pub mod formatting;
+pub mod mode;
 pub mod notifier;
 pub mod organizer;
 pub mod progress;
