@@ -1,8 +1,8 @@
 # CLI Mode Resolution for Target Selectors
 
-**Date:** 2026-09-02  
-**Status:** Approved design; pending written-spec review  
-**Scope:** CLI mode selection, validation, and dispatch  
+**Date:** 2026-09-02
+**Status:** Approved design; pending written-spec review
+**Scope:** CLI mode selection, validation, and dispatch
 
 <!-- markdownlint-disable MD013 -->
 

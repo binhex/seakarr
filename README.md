@@ -80,6 +80,20 @@ seakarr --mode manual --artist "Pink Floyd" --album "The Wall"
 seakarr --mode batch --batch-file wantlist.txt
 ```
 
+Mode selection is explicit. `--artist` and `--album` are manual selectors, and
+`--batch-file` is a batch selector; these options do not silently override the
+configured `search.default_mode`. When the configured mode is `auto`, add
+`--mode manual` for a manual target or `--mode batch` for a batch file. Album-only
+manual searches are supported. `--test` performs the same mode and selector
+validation before structural checks, so manual mode requires a non-empty artist or
+album and batch mode requires a non-empty batch file path. To clear a configured manual
+fallback for one field, pass that selector explicitly as an empty value, such as
+`--mode manual --artist ""` together with `--album "The Wall"`. Album-only searches
+are intentionally album-name-only and are not recorded in processed-album history,
+so a later run may search or download them again. If `storage.organize` is enabled
+with library paths, album-only runs fail before searching because no artist
+destination is available.
+
 ## Options
 
 All options are optional overrides. When an option is omitted, the value from `seakarr.yml` is used.
@@ -109,11 +123,11 @@ All options are optional overrides. When an option is omitted, the value from `s
 
 | Option | Description | Default |
 | ------ | ----------- | ------- |
-| `--mode <mode>` | Override the search mode. Choices: `auto`, `manual`, `batch`. | *(from config)* |
-| `--artist <name>` | Artist for manual mode. | *(from config)* |
-| `--album <name>` | Album for manual mode (optional). | *(from config)* |
-| `--batch-file <path>` | Newline-separated `artist - album` list for batch mode. | *(from config)* |
-| `--daemon` | Run continuously with periodic library re-scan. | `false` |
+| `--mode <mode>` | Select `auto`, `manual`, or `batch`: library scan, target search, or batch file. | *(from config)* |
+| `--artist <name>` | Manual selector; may be used without `--album`. | *(from config)* |
+| `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
+| `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
+| `--daemon` | Repeat the same validated auto, manual, or batch operation each cycle. | `false` |
 
 ## Configuration
 
@@ -149,6 +163,10 @@ A default config is created automatically on first run. The file is divided into
 
 ### `search`
 
+The selected `default_mode` determines which mode-specific values are active.
+Manual values and batch paths do not infer a mode; values belonging to an inactive
+mode are ignored. CLI values take precedence over values in the selected section.
+
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `default_mode` | Default search mode. Choices: `auto`, `manual`, `batch`. | `auto` |
@@ -158,9 +176,9 @@ A default config is created automatically on first run. The file is divided into
 | `delay_secs` | Minimum gap between consecutive network searches to avoid flooding. *(Reserved for future use — not yet enforced.)* | `5.0` |
 | `block_threshold` | Consecutive zero-result searches before checking for Soulseek rate-limiting. *(Reserved for future use — not yet enforced.)* | `5` |
 | `block_pause_secs` | Pause duration when rate-limiting is detected, in seconds. *(Reserved for future use — not yet enforced.)* | `300` |
-| `manual.artist` | Artist for manual mode (used when `--artist` is not passed). | `""` |
-| `manual.album` | Album for manual mode (optional, used when `--album` is not passed). | `""` |
-| `batch.file_path` | Path to the batch text file (used when `--batch-file` is not passed). | `""` |
+| `manual.artist` | Manual artist fallback, used only in `manual` mode. | `""` |
+| `manual.album` | Manual album fallback, used only in `manual` mode. | `""` |
+| `batch.file_path` | Batch file fallback, used only in `batch` mode. | `""` |
 | `peer_reputation` | Blend measured speed + reliability into search ranking. Set to `false` to rank by advertised speed only. | `true` |
 
 ### `filters`
@@ -259,7 +277,9 @@ Seakarr has three operating modes:
 
 ### Manual mode
 
-Performs steps 3–7 above for a single artist/album specified via `--artist` (and optionally `--album`).
+Performs steps 3–7 above for a single artist and/or album. At least one target is
+required; CLI values take precedence over `search.manual.artist` and
+`search.manual.album`, and album-only searches are supported.
 
 ### Batch mode
 
@@ -268,9 +288,11 @@ success and failure counts on completion. Lines starting with `#` are treated as
 
 ### Daemon mode
 
-When `--daemon` or `daemon.enabled` is set, the automatic mode pipeline runs in a continuous loop. After
-each scan cycle, seakarr sleeps for `daemon.rescan_interval_mins` and rescans. The daemon handles SIGINT
-(Ctrl+C) and SIGTERM gracefully — the PID file is removed and the current cycle is allowed to finish.
+When `--daemon` or `daemon.enabled` is set, the same validated auto, manual, or batch
+plan runs in a continuous loop. After each cycle, seakarr sleeps for
+`daemon.rescan_interval_mins` before dispatching that unchanged plan again. The daemon
+handles SIGINT (Ctrl+C) and SIGTERM gracefully — the PID file is removed and the current
+cycle is allowed to finish.
 
 ## Development
 
