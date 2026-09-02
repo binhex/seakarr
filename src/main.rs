@@ -8,6 +8,7 @@ use seakarr::client::{RealClient, SoulseekClient};
 use seakarr::config::{CliOverrides, Config};
 use seakarr::db::Database;
 use seakarr::error::{Result, SeakarrError};
+use seakarr::mode::ExecutionPlan;
 use seakarr::runner;
 
 #[derive(Parser, Debug)]
@@ -192,55 +193,15 @@ async fn run() -> Result<()> {
     let pid_file = pid_dir.join(&config.pid.file);
     acquire_pid_lock(&pid_file)?;
 
-    // Validate search mode before dispatch
-    let mode = config.search.default_mode.as_str();
-    if !matches!(mode, "auto" | "manual" | "batch") {
-        release_pid_lock(&pid_file)?;
-        return Err(SeakarrError::Config(format!(
-            "invalid search mode '{mode}' — must be auto, manual, or batch"
-        )));
-    }
-
     if config.daemon.enabled {
         let interval_mins = config.daemon.rescan_interval_mins.max(1);
         if config.daemon.rescan_interval_mins == 0 {
             tracing::warn!("daemon.rescan_interval_mins is 0 — clamping to 1 to avoid busy-loop");
         }
-        // Use the clamped interval for the daemon loop
         let interval = tokio::time::Duration::from_secs(interval_mins * 60);
-        run_daemon(&client, &config, &db, &pid_file, interval).await
+        run_daemon(&client, &config, &db, &pid_file, interval, &execution_plan).await
     } else {
-        let result = match mode {
-            "manual" => {
-                let artist = cli
-                    .artist
-                    .as_deref()
-                    .filter(|a| !a.is_empty())
-                    .or_else(|| non_empty(&config.search.manual.artist))
-                    .ok_or_else(|| {
-                        SeakarrError::Config("--artist required for manual mode".into())
-                    })?;
-                let album: Option<&str> = cli
-                    .album
-                    .as_deref()
-                    .filter(|a| !a.is_empty())
-                    .or_else(|| non_empty(&config.search.manual.album));
-                runner::run_manual_mode(&client, artist, album, &config, &db).await
-            }
-            "batch" => {
-                let batch_path = cli
-                    .batch_file
-                    .as_deref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .or_else(|| non_empty(&config.search.batch.file_path).map(str::to_owned))
-                    .ok_or_else(|| {
-                        SeakarrError::Config("--batch-file required for batch mode".into())
-                    })?;
-                run_batch_mode(&client, &batch_path, &config, &db).await
-            }
-            _ => runner::run_auto_mode(&client, &config, &db).await,
-        };
-
+        let result = dispatch_execution_plan(&client, &execution_plan, &config, &db).await;
         release_pid_lock(&pid_file)?;
         result
     }
@@ -271,16 +232,6 @@ fn validate_for_test(config: &Config) -> Result<()> {
     }
     tracing::info!("Configuration is valid.");
     Ok(())
-}
-
-/// Returns `Some(&str)` when the value is non-empty after trimming, else `None`.
-fn non_empty(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
 }
 
 /// Write PID to file. Returns error if another instance is already running.
@@ -332,21 +283,39 @@ fn release_pid_lock(pid_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Daemon loop: run a scan cycle (dispatching on the configured search
-/// mode), then sleep until the next cycle or shut down gracefully on
-/// SIGINT/SIGTERM.
+/// Dispatch a validated execution plan to the matching runner. This is the
+/// only mode-to-runner match in the binary — both one-shot runs and daemon
+/// cycles execute the same already-validated plan with the same criteria.
+async fn dispatch_execution_plan(
+    client: &dyn SoulseekClient,
+    plan: &ExecutionPlan,
+    config: &Config,
+    db: &Database,
+) -> Result<()> {
+    match plan {
+        ExecutionPlan::Auto => runner::run_auto_mode(client, config, db).await,
+        ExecutionPlan::Manual { artist, album } => {
+            runner::run_manual_mode(client, artist.as_deref(), album.as_deref(), config, db).await
+        }
+        ExecutionPlan::Batch { file_path } => run_batch_mode(client, file_path, config, db).await,
+    }
+}
+
+/// Daemon loop: run a cycle using the validated execution plan, then sleep
+/// until the next cycle or shut down gracefully on SIGINT/SIGTERM.
 async fn run_daemon(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
     pid_file: &Path,
     interval: tokio::time::Duration,
+    plan: &ExecutionPlan,
 ) -> Result<()> {
     let mut sigterm = signal_terminate();
 
     loop {
         tracing::info!("Daemon: starting scan cycle...");
-        if let Err(e) = run_daemon_cycle(client, config, db).await {
+        if let Err(e) = run_daemon_cycle(client, config, db, plan).await {
             tracing::error!("Scan cycle failed: {e}");
         }
 
@@ -381,35 +350,17 @@ async fn run_daemon(
     }
 }
 
-/// Run ONE daemon scan cycle, dispatching on the configured search mode.
+/// Run one daemon cycle with the same validated plan used by one-shot execution.
 ///
-/// The daemon loop must respect the same mode + criteria as a one-shot run:
-/// manual mode searches the configured artist/album, batch mode processes
-/// the configured batch file, auto mode scans the library. Previously the
-/// daemon hardcoded auto mode, silently ignoring `--mode manual --artist X
-/// --album Y` (or `--mode batch --batch-file F`).
+/// Keeping dispatch centralized ensures CLI criteria are not reinterpreted and
+/// an explicit manual or batch plan cannot fall through to auto mode.
 async fn run_daemon_cycle(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
+    plan: &ExecutionPlan,
 ) -> Result<()> {
-    let mode = config.search.default_mode.as_str();
-    match mode {
-        "manual" => {
-            let artist = non_empty(&config.search.manual.artist).ok_or_else(|| {
-                SeakarrError::Config("--artist required for manual mode (daemon)".into())
-            })?;
-            let album = non_empty(&config.search.manual.album);
-            runner::run_manual_mode(client, artist, album, config, db).await
-        }
-        "batch" => {
-            let batch_path = non_empty(&config.search.batch.file_path).ok_or_else(|| {
-                SeakarrError::Config("--batch-file required for batch mode (daemon)".into())
-            })?;
-            run_batch_mode(client, batch_path, config, db).await
-        }
-        _ => runner::run_auto_mode(client, config, db).await,
-    }
+    dispatch_execution_plan(client, plan, config, db).await
 }
 
 /// Returns a SIGTERM listener on Unix, or `None` on other platforms.
@@ -511,10 +462,8 @@ mod tests {
     use seakarr::db::Database;
     use tempfile::TempDir;
 
-    // Regression: `--daemon --mode manual --artist X --album Y` must honour
-    // the manual criteria instead of running an auto-mode library scan.
-    // Previously run_daemon hardcoded run_auto_mode every cycle, so the
-    // artist/album were silently ignored and arbitrary albums downloaded.
+    // Regression: a validated manual plan must reach the manual runner with
+    // its artist and album criteria instead of being reinterpreted by the cycle.
     #[tokio::test]
     async fn daemon_cycle_honours_manual_mode_artist_album() {
         let client = MockClient::new();
@@ -538,8 +487,12 @@ mod tests {
         let staging = TempDir::new().unwrap();
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Manual {
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+        };
 
-        run_daemon_cycle(&client, &config, &db)
+        run_daemon_cycle(&client, &config, &db, &plan)
             .await
             .expect("daemon cycle must succeed in manual mode");
 
@@ -547,6 +500,74 @@ mod tests {
         assert!(
             queries.iter().any(|q| q.contains("Michael Bolton")),
             "manual-mode daemon cycle must search for the requested artist, got queries: {queries:?}"
+        );
+    }
+
+    // A validated manual plan must dispatch to the manual runner even with
+    // an empty library — the plan's own criteria drive the run, never the
+    // auto scanner.
+    #[tokio::test]
+    async fn dispatches_manual_plan_without_scanning_library() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.soulseek.username = "test".into();
+        config.soulseek.password = "test".into();
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls = vec![];
+        config.filters.min_tracks = 0;
+        config.library.paths.clear();
+        let staging = TempDir::new().unwrap();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Manual {
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+        };
+
+        dispatch_execution_plan(&client, &plan, &config, &db)
+            .await
+            .expect("manual plan must dispatch without a library");
+
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries.iter().any(|query| query.contains("Michael Bolton")),
+            "manual plan must use its artist, got queries: {queries:?}"
+        );
+    }
+
+    // A validated batch plan must dispatch to the batch runner with an empty
+    // library and process its file line.
+    #[tokio::test]
+    async fn dispatches_batch_plan_without_scanning_library() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls = vec![];
+        config.filters.min_tracks = 0;
+        config.library.paths.clear();
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let batch_path = temp.path().join("wantlist.txt");
+        std::fs::write(&batch_path, "Artist - Album\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Batch {
+            file_path: batch_path.to_string_lossy().into_owned(),
+        };
+
+        dispatch_execution_plan(&client, &plan, &config, &db)
+            .await
+            .expect("batch plan must dispatch without a library");
+
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries.iter().any(|query| query.contains("Artist")),
+            "batch plan must process its file, got queries: {queries:?}"
         );
     }
 
