@@ -76,6 +76,10 @@ seakarr --daemon
 # Manual search for a specific artist/album
 seakarr --mode manual --artist "Pink Floyd" --album "The Wall"
 
+# Reprocess an album whose previous successful download is recorded
+seakarr --mode manual --artist "Afterlife" \
+  --album "The Afterlife Lounge" --ignore-processed
+
 # Batch processing from a text file
 seakarr --mode batch --batch-file wantlist.txt
 ```
@@ -128,6 +132,20 @@ All options are optional overrides. When an option is omitted, the value from `s
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--daemon` | Repeat the same validated auto, manual, or batch operation each cycle. | `false` |
+| `--ignore-processed` | Reprocess a successful album once. | `false` |
+
+`--ignore-processed` applies to one-shot auto, manual, and batch modes. It is a
+CLI-only override: it does not persist to configuration YAML, it leaves search
+history and unrelated albums untouched, and it is intended for replacing corrupt
+or otherwise invalid downloaded files. The matching successful database record is
+deleted before the attempt; if the retry fails, the album remains eligible for
+normal future retries. In manual and batch modes, use `storage.organize: true` if
+the replacement should be moved into the library; otherwise it remains in staging.
+In auto mode, only albums selected by the existing upgrade scanner are eligible.
+The flag cannot be combined with `--daemon` (or configured daemon mode), so a
+forced reprocess is never repeated automatically on every cycle. If a forced
+search fails before completing, the album is recorded as failed and remains
+eligible for normal future retries.
 
 ## Configuration
 

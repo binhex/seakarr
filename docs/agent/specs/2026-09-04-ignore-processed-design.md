@@ -8,8 +8,8 @@ reprocessing attempt for an artist/album already marked successful in SQLite.
 ## Decisions
 
 - Flag name: `--ignore-processed`.
-- Existing database record: delete the exact artist/album row before processing.
-- Daemon mode: reject `--ignore-processed --daemon` before startup side effects.
+- Existing successful database record: delete the exact artist/album row before processing; failed records retain their attempt history.
+- Daemon mode: reject `--ignore-processed` when daemon mode is enabled, before startup side effects.
 - Scope: usable in one-shot auto, manual, and batch modes.
 - Album-only searches remain unaffected because they have no processed-album key.
 
@@ -23,10 +23,13 @@ When enabled, `process_album` deletes the exact processed-album row immediately
 before the current skip check and logs the bypass. Processing then follows the
 existing search, filtering, download, organization, notification, and status
 recording flow. A successful retry recreates the success row; a failed retry
-uses the existing failure-status behavior. Search history is not deleted.
+uses the existing failure-status behavior. Hard search errors also create a
+failed record so prior processing state is not silently lost. Search history is
+not deleted.
 
-The database deletion uses a parameterized artist/album query and does not affect
-other albums. No schema migration or configuration-file setting is needed.
+The database deletion uses a parameterized artist/album query restricted to
+`status = 'success'` and does not affect other albums. No schema migration or
+configuration-file setting is needed.
 
 ## CLI behavior
 
@@ -47,9 +50,10 @@ Ignoring already-processed record: Afterlife — The Afterlife Lounge
 Without an existing record, the flag has no special effect and processing
 continues normally. Without the flag, the current skip behavior is unchanged.
 
-`--ignore-processed --daemon` returns a configuration error before logging
-setup, database processing, PID locking, or Soulseek login. This prevents a
-forced download on every daemon cycle.
+`--ignore-processed` with daemon mode returns a configuration error before
+logging setup, database processing, PID locking, or Soulseek login. The same
+applies when daemon mode is enabled in YAML. This prevents a forced download on
+every daemon cycle.
 
 ## Mode propagation
 

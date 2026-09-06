@@ -199,6 +199,18 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Delete the successful processed-album row for the exact artist/album
+    /// pair. Returns `true` when a row was removed, `false` when none matched.
+    /// Failed records retain their attempt history; other albums, search
+    /// history, and unrelated rows are never touched.
+    pub fn delete_processed_album(&self, artist: &str, album: &str) -> Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM processed_albums WHERE artist = ?1 AND album = ?2 AND status = 'success'",
+            params![artist, album],
+        )?;
+        Ok(deleted > 0)
+    }
+
     /// Return the current status of an album's processing run, or None when
     /// the album is not tracked in the database.
     pub fn get_album_status(&self, artist: &str, album: &str) -> Result<Option<String>> {
@@ -414,6 +426,44 @@ mod tests {
             .unwrap();
         assert!(db.is_album_processed("Artist", "Album").unwrap());
         assert!(!db.is_album_processed("Artist", "Other").unwrap());
+    }
+
+    #[test]
+    fn delete_processed_album_removes_only_the_requested_pair() {
+        let db = test_db();
+        db.migrate().unwrap();
+
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
+        db.mark_album_processed("Artist", "Other", "success")
+            .unwrap();
+
+        assert!(
+            db.delete_processed_album("Artist", "Album").unwrap(),
+            "existing pair must report a deletion"
+        );
+        assert!(
+            !db.is_album_processed("Artist", "Album").unwrap(),
+            "requested pair must be removed"
+        );
+        assert!(
+            db.is_album_processed("Artist", "Other").unwrap(),
+            "other album must remain untouched"
+        );
+        db.mark_album_processed("Artist", "Failed", "failed")
+            .unwrap();
+        assert!(
+            !db.delete_processed_album("Artist", "Failed").unwrap(),
+            "failed records must retain their attempt history"
+        );
+        assert_eq!(
+            db.get_album_status("Artist", "Failed").unwrap(),
+            Some("failed".to_string())
+        );
+        assert!(
+            !db.delete_processed_album("Artist", "Missing").unwrap(),
+            "a missing pair must report no deletion"
+        );
     }
 
     #[test]

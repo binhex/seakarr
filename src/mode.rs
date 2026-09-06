@@ -44,8 +44,7 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 }
 
 fn configured_value(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
+    if value.trim().is_empty() {
         None
     } else {
         Some(value.to_owned())
@@ -56,8 +55,52 @@ fn non_empty_path(value: Option<&str>) -> Option<String> {
     non_empty(value).map(|value| value.trim().to_owned())
 }
 
+/// Format an auto-mode conflict error. When the mode came from the YAML config
+/// (not `--mode`) and that config knows its on-disk source, point the user at
+/// the exact `search.default_mode` line that caused the conflict. Otherwise
+/// keep the concise legacy message (explicit `--mode` or in-memory config).
+fn configured_mode_conflict(
+    config: &Config,
+    mode_from_cli: bool,
+    selectors: &str,
+    hint: &str,
+) -> String {
+    let (verb, selectors) = if selectors == "--batch-file" {
+        ("is", selectors)
+    } else {
+        ("are", selectors)
+    };
+    let base = format!("{selectors} {verb} incompatible with auto mode");
+    match (mode_from_cli, config.source()) {
+        (false, Some(source)) => {
+            // Omit the `:line` suffix when the line could not be located
+            // (e.g. the key is absent) — never print a meaningless `:0`.
+            let location = if source.default_mode_line > 0 {
+                format!(" in {}:{}", source.path.display(), source.default_mode_line)
+            } else {
+                format!(" in {}", source.path.display())
+            };
+            format!(
+                "{base}; search.default_mode: {}{location}; {hint}",
+                config.search.default_mode.trim()
+            )
+        }
+        _ => format!("{base}; {hint}"),
+    }
+}
+
 /// Resolve and validate the operation selected by config and CLI overrides.
 pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<ExecutionPlan> {
+    // --ignore-processed forces a reprocess on this run; combined with daemon
+    // mode it would repeat the forced download every cycle, so reject the
+    // combination before any mode resolution or startup side effects.
+    if cli.ignore_processed && (cli.daemon || config.daemon.enabled) {
+        return Err(SeakarrError::Config(
+            "--ignore-processed cannot be used with daemon mode".into(),
+        ));
+    }
+
+    let mode_from_cli = cli.mode.is_some();
     let raw_mode = cli
         .mode
         .as_deref()
@@ -106,14 +149,20 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                 ));
             }
             if has_manual_cli_selector {
-                return Err(SeakarrError::Config(
-                    "--artist/--album are incompatible with auto mode; use --mode manual".into(),
-                ));
+                return Err(SeakarrError::Config(configured_mode_conflict(
+                    config,
+                    mode_from_cli,
+                    "--artist/--album",
+                    "use --mode manual",
+                )));
             }
             if has_batch_cli_selector {
-                return Err(SeakarrError::Config(
-                    "--batch-file is incompatible with auto mode; use --mode batch".into(),
-                ));
+                return Err(SeakarrError::Config(configured_mode_conflict(
+                    config,
+                    mode_from_cli,
+                    "--batch-file",
+                    "use --mode batch",
+                )));
             }
             Ok(ExecutionPlan::Auto)
         }
@@ -147,7 +196,7 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
             }
             let file_path = match cli.batch_file.as_deref() {
                 Some(_) => cli_batch_file,
-                None => configured_value(&config.search.batch.file_path),
+                None => non_empty_path(Some(&config.search.batch.file_path)),
             };
             let Some(file_path) = file_path else {
                 return Err(SeakarrError::Config(
@@ -161,9 +210,12 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_execution_plan, ExecutionPlan, SearchMode};
-    use crate::config::{CliOverrides, Config};
+    use super::{configured_mode_conflict, resolve_execution_plan, ExecutionPlan, SearchMode};
+    use crate::config::{CliOverrides, Config, ConfigSource};
     use crate::error::SeakarrError;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn config_with_mode(mode: &str) -> Config {
         let mut config = Config::default();
@@ -204,6 +256,56 @@ mod tests {
         let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
         assert_eq!(plan, ExecutionPlan::Auto);
         assert_eq!(plan.mode(), SearchMode::Auto);
+    }
+
+    #[test]
+    fn configured_auto_manual_selector_error_identifies_yaml_source() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "search:\n  default_mode: auto\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let error = resolve_execution_plan(&config, &cli(None, Some("Artist"), None, None))
+            .unwrap_err()
+            .to_string();
+        let source = config.source().unwrap();
+        assert!(error.contains("search.default_mode: auto"), "got: {error}");
+        assert!(
+            error.contains(&source.path.to_string_lossy().to_string()),
+            "got: {error}"
+        );
+        assert!(
+            error.contains(&format!(":{}", source.default_mode_line)),
+            "got: {error}"
+        );
+        assert!(error.contains("use --mode manual"), "got: {error}");
+    }
+
+    #[test]
+    fn configured_auto_batch_selector_error_identifies_yaml_source() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "search:\n  default_mode: auto\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let error = resolve_execution_plan(&config, &cli(None, None, None, Some("wantlist.txt")))
+            .unwrap_err()
+            .to_string();
+        let source = config.source().unwrap();
+        assert!(error.contains("search.default_mode: auto"), "got: {error}");
+        assert!(
+            error.contains(&source.path.to_string_lossy().to_string()),
+            "got: {error}"
+        );
+        assert!(
+            error.contains(&format!(":{}", source.default_mode_line)),
+            "got: {error}"
+        );
+        assert!(error.contains("use --mode batch"), "got: {error}");
     }
 
     #[test]
@@ -541,5 +643,106 @@ mod tests {
             &cli(None, None, None, None),
             "must be auto, manual, or batch",
         );
+    }
+
+    #[test]
+    fn empty_cli_mode_is_rejected() {
+        // `--mode ""` trims to the empty string and must hit the invalid-mode
+        // branch rather than being treated as "unset".
+        let config = config_with_mode("auto");
+        assert_config_error(
+            &config,
+            &cli(Some(""), None, None, None),
+            "must be auto, manual, or batch",
+        );
+    }
+
+    #[test]
+    fn auto_mode_both_blank_selectors_report_blank_specific_message() {
+        // Both selectors present-but-blank must report the blank-selector
+        // message, not the generic manual/batch conflict.
+        let config = config_with_mode("auto");
+        assert_config_error(
+            &config,
+            &cli(None, Some("  "), Some("\t"), None),
+            "blank CLI selector",
+        );
+    }
+
+    #[test]
+    fn empty_string_cli_values_behave_as_blank_in_manual_mode() {
+        // `--artist ""` must be treated like any other blank value: the CLI
+        // override still wins over a configured artist, leaving album-only.
+        let mut config = config_with_mode("manual");
+        config.search.manual.artist = "Configured Artist".into();
+        let plan =
+            resolve_execution_plan(&config, &cli(Some("manual"), Some(""), Some("Album"), None))
+                .unwrap();
+        assert_eq!(
+            plan,
+            ExecutionPlan::Manual {
+                artist: None,
+                album: Some("Album".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn configured_mode_conflict_omits_zero_line_suffix() {
+        let mut config = config_with_mode("auto");
+        config.source = Some(ConfigSource {
+            path: PathBuf::from("/tmp/seakarr.yml"),
+            default_mode_line: 0,
+        });
+        let message =
+            configured_mode_conflict(&config, false, "--artist/--album", "use --mode manual");
+        assert!(message.contains("in /tmp/seakarr.yml;"));
+        assert!(!message.contains(":0"));
+    }
+
+    #[test]
+    fn configured_batch_path_is_trimmed() {
+        let mut config = config_with_mode("batch");
+        config.search.batch.file_path = " configured.txt ".into();
+        let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
+        assert_eq!(
+            plan,
+            ExecutionPlan::Batch {
+                file_path: "configured.txt".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ignore_processed_is_rejected_for_daemon_mode() {
+        // --ignore-processed must never combine with daemon mode: it would
+        // force a reprocess on every daemon cycle.
+        let config = config_with_mode("auto");
+        let mut overrides = cli(None, None, None, None);
+        overrides.daemon = true;
+        overrides.ignore_processed = true;
+
+        assert_config_error(&config, &overrides, "cannot be used with daemon mode");
+    }
+
+    #[test]
+    fn ignore_processed_is_rejected_for_configured_daemon() {
+        // The daemon flag can come from the YAML config as well; both forms
+        // must be rejected before any processing.
+        let mut config = config_with_mode("auto");
+        config.daemon.enabled = true;
+        let mut overrides = cli(None, None, None, None);
+        overrides.ignore_processed = true;
+
+        assert_config_error(&config, &overrides, "cannot be used with daemon mode");
+    }
+
+    #[test]
+    fn ignore_processed_is_allowed_for_one_shot_auto() {
+        let config = config_with_mode("auto");
+        let mut overrides = cli(None, None, None, None);
+        overrides.ignore_processed = true;
+        let plan = resolve_execution_plan(&config, &overrides).unwrap();
+        assert_eq!(plan, ExecutionPlan::Auto);
     }
 }
