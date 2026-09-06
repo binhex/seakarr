@@ -85,6 +85,8 @@ pub struct MockClient {
     pub search_results_by_query: Mutex<HashMap<String, Vec<SearchResult>>>,
     /// Every query string passed to `search()`, in call order.
     pub search_queries: Mutex<Vec<String>>,
+    /// When true, search returns a client error for failure-path tests.
+    pub search_should_fail: Mutex<bool>,
     pub download_speed: Mutex<u64>,
     pub login_should_fail: Mutex<bool>,
     /// Records the last filename passed to `download()` so tests can assert
@@ -104,6 +106,7 @@ impl MockClient {
             search_results: Mutex::new(vec![]),
             search_results_by_query: Mutex::new(HashMap::new()),
             search_queries: Mutex::new(vec![]),
+            search_should_fail: Mutex::new(false),
             download_speed: Mutex::new(1_000_000), // 1 MB/s
             login_should_fail: Mutex::new(false),
             last_download_filename: Mutex::new(None),
@@ -165,6 +168,9 @@ impl SoulseekClient for MockClient {
 
     async fn search(&self, query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
         self.search_queries.lock().unwrap().push(query.to_string());
+        if *self.search_should_fail.lock().unwrap() {
+            return Err(SeakarrError::Client("injected search failure".into()));
+        }
         if let Some(results) = self.search_results_by_query.lock().unwrap().get(query) {
             return Ok(results.clone());
         }

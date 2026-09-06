@@ -1,10 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SeakarrError};
 
 // ── Config structs (matching YAML schema) ──
+
+/// Where a loaded `Config` came from (absolute file path and the on-disk line
+/// of its `search.default_mode` entry), used to point users at the exact YAML
+/// line that caused a mode conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSource {
+    pub path: PathBuf,
+    pub default_mode_line: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)] // all sections optional in YAML; missing sections fall back to Default
@@ -21,6 +30,11 @@ pub struct Config {
     pub notifications: NotificationConfig,
     pub library_upgrade: LibraryUpgradeConfig,
     pub daemon: DaemonConfig,
+    // Populated by Config::load for on-disk configs; in-memory configs (e.g.
+    // Config::default()) have no source. Skipped by (de)serialization so it
+    // never appears in YAML output.
+    #[serde(skip)]
+    pub(crate) source: Option<ConfigSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +223,8 @@ pub struct CliOverrides {
     pub album: Option<String>,
     pub daemon: bool,
     pub test: bool,
+    /// Runtime-only: bypass the processed-album success check for this run.
+    pub ignore_processed: bool,
 }
 
 // ── Default value functions ──
@@ -395,6 +411,127 @@ impl Default for DaemonConfig {
 
 // ── Config impl ──
 
+/// Find the one-based line number of the `search.default_mode` entry within
+/// the on-disk YAML contents. Only the `search:` top-level section is
+/// inspected so a same-named key elsewhere cannot be misreported. Both block
+/// style (`search:` followed by indented keys) and flow style
+/// (`search: {default_mode: auto, ...}`) are handled. Quoted keys, spacing
+/// before colons, and inline comments are also accepted. Returns `None` when
+/// the entry is absent.
+fn find_default_mode_line(contents: &str) -> Option<usize> {
+    let document: serde_yaml::Value = serde_yaml::from_str(contents).ok()?;
+    let search = document.get("search")?.as_mapping()?;
+    if !search.contains_key(serde_yaml::Value::String("default_mode".into())) {
+        return None;
+    }
+
+    let mut in_search_section = false;
+    let mut in_flow_search = false;
+    let mut in_root_flow = false;
+    let mut search_child_indent = None;
+    for (idx, line) in contents.lines().enumerate() {
+        let line_number = idx + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if indent == 0 {
+            if let Some(search_value) = yaml_key_value_start(trimmed, "search") {
+                let search_value = search_value.trim();
+                if search_value.is_empty() || search_value.starts_with('#') {
+                    in_search_section = true;
+                    in_flow_search = false;
+                    search_child_indent = None;
+                } else if search_value.starts_with('{') {
+                    in_search_section = true;
+                    in_flow_search = true;
+                    search_child_indent = None;
+                    if flow_value_contains_key(search_value, "default_mode") {
+                        return Some(line_number);
+                    }
+                } else {
+                    in_search_section = false;
+                    in_flow_search = false;
+                    search_child_indent = None;
+                }
+            } else if trimmed.starts_with('{') {
+                in_root_flow = true;
+                if flow_value_contains_key(trimmed, "search")
+                    && flow_value_contains_key(trimmed, "default_mode")
+                {
+                    return Some(line_number);
+                }
+            } else {
+                in_search_section = false;
+                in_flow_search = false;
+                in_root_flow = false;
+                search_child_indent = None;
+            }
+            continue;
+        }
+        if in_root_flow
+            && flow_value_contains_key(trimmed, "search")
+            && flow_value_contains_key(trimmed, "default_mode")
+        {
+            return Some(line_number);
+        }
+        if in_search_section {
+            let flow_key = trimmed.trim_start_matches(',').trim();
+            if in_flow_search
+                && (yaml_key_value_start(flow_key, "default_mode").is_some()
+                    || flow_key.starts_with('{'))
+                && flow_value_contains_key(flow_key, "default_mode")
+            {
+                return Some(line_number);
+            }
+            let child_indent = search_child_indent.get_or_insert(indent);
+            if !in_flow_search
+                && *child_indent == indent
+                && yaml_key_value_start(trimmed, "default_mode").is_some()
+            {
+                return Some(line_number);
+            }
+        }
+    }
+    None
+}
+
+/// Return the value portion of a YAML key when the key is followed by a colon.
+/// This intentionally handles the simple key spellings supported by the
+/// configuration schema, including quoted keys and whitespace before `:`.
+fn yaml_key_value_start<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = line.trim_start();
+    let unquoted = line.strip_prefix(key);
+    let double_quoted_key = format!("\"{key}\"");
+    let single_quoted_key = format!("'{key}'");
+    let remainder = unquoted
+        .or_else(|| line.strip_prefix(&double_quoted_key))
+        .or_else(|| line.strip_prefix(&single_quoted_key))?;
+    let remainder = remainder.trim_start();
+    remainder.strip_prefix(':')
+}
+
+/// Check for an exact key in a YAML flow-style mapping.
+fn flow_value_contains_key(value: &str, key: &str) -> bool {
+    let mut segment_start = 0;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'') | (None, '"') => quote = Some(character),
+            (None, '{' | '}' | ',') => {
+                if yaml_key_value_start(value[segment_start..index].trim(), key).is_some() {
+                    return true;
+                }
+                segment_start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    yaml_key_value_start(value[segment_start..].trim(), key).is_some()
+}
+
 impl Config {
     /// Load config from a directory containing `seakarr.yml`.
     /// Creates a default file if none exists.
@@ -408,14 +545,13 @@ impl Config {
             })?;
             fs::create_dir_all(config_dir)
                 .map_err(|e| SeakarrError::Config(format!("failed to create config dir: {e}")))?;
-            fs::write(
-                &config_file,
-                format!(
-                    "# seakarr.yml — Seakarr Configuration\n# Auto-created on first run.\n\n{yaml}"
-                ),
-            )
-            .map_err(|e| SeakarrError::Config(format!("failed to write default config: {e}")))?;
-            return Ok(default_config);
+            let written_contents = format!(
+                "# seakarr.yml — Seakarr Configuration\n# Auto-created on first run.\n\n{yaml}"
+            );
+            fs::write(&config_file, &written_contents).map_err(|e| {
+                SeakarrError::Config(format!("failed to write default config: {e}"))
+            })?;
+            return default_config.with_source(&config_file, &written_contents);
         }
 
         let contents = fs::read_to_string(&config_file)
@@ -434,7 +570,27 @@ impl Config {
         })?;
         let config: Config = serde_yaml::from_str(&migrated)
             .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
-        Ok(config)
+        config.with_source(&config_file, &migrated)
+    }
+
+    /// Attach provenance (absolute path + `search.default_mode` line) taken
+    /// from the on-disk contents that were actually parsed, so mode-conflict
+    /// diagnostics can name the exact file and line that set the mode.
+    fn with_source(mut self, config_file: &Path, contents: &str) -> Result<Self> {
+        let path = config_file
+            .canonicalize()
+            .map_err(|e| SeakarrError::Config(format!("failed to resolve {config_file:?}: {e}")))?;
+        let default_mode_line = find_default_mode_line(contents).unwrap_or(0);
+        self.source = Some(ConfigSource {
+            path,
+            default_mode_line,
+        });
+        Ok(self)
+    }
+
+    /// Where this config was loaded from, if it came from disk.
+    pub fn source(&self) -> Option<&ConfigSource> {
+        self.source.as_ref()
     }
 
     /// Reconcile the on-disk config with the current schema: add any missing
@@ -452,8 +608,9 @@ impl Config {
 
         // Migration: rename config keys that changed between versions.
         // Preserves existing values (e.g., min_bitrate: 320 becomes
-        // min_bit_rate: 320). If the old key was null, it becomes 0,
-        // matching the new u32-with-0-disabled semantics.
+        // min_bit_rate: 320). Null legacy values are dropped so
+        // merge_with_defaults restores the schema default (0 for the u32
+        // quality keys, true for peer_reputation).
         let renamed = migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate")
             | migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth")
             | migrate_rename(
@@ -478,9 +635,7 @@ impl Config {
         })?;
         fs::write(
             config_file,
-            format!(
-                "# seakarr.yml — Seakarr Configuration\n# Auto-created on first run.\n\n{yaml}"
-            ),
+            format!("# seakarr.yml — Seakarr Configuration\n\n{yaml}"),
         )
         .map_err(|e| SeakarrError::Config(format!("failed to write migrated config: {e}")))?;
         tracing::info!("config reconciled with current schema (backup: {backup_path:?})");
@@ -568,14 +723,9 @@ impl Config {
         Ok(())
     }
 
-    /// Validate required fields. Returns Ok(()) or the first error.
-    pub fn validate(&self) -> Result<()> {
-        if self.soulseek.username.is_empty() {
-            return Err(SeakarrError::Config("soulseek.username is required".into()));
-        }
-        if self.soulseek.password.is_empty() {
-            return Err(SeakarrError::Config("soulseek.password is required".into()));
-        }
+    /// Validate configuration constraints that do not require credentials.
+    /// Shared by normal startup and `--test` mode to keep their checks in sync.
+    pub fn validate_non_credential_constraints(&self) -> Result<()> {
         let valid_levels = ["DEBUG", "INFO", "WARN", "ERROR"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
             return Err(SeakarrError::Config(format!(
@@ -600,13 +750,35 @@ impl Config {
                 "library_upgrade.enabled requires at least one library.paths entry".into(),
             ));
         }
+        if self.daemon.rescan_interval_mins > u64::MAX / 60 {
+            return Err(SeakarrError::Config(
+                "daemon.rescan_interval_mins is too large; maximum is 307445734561271883".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Validate required fields and all runtime configuration constraints.
+    /// Returns `Ok(())` or the first error.
+    pub fn validate(&self) -> Result<()> {
+        if self.soulseek.username.is_empty() {
+            return Err(SeakarrError::Config("soulseek.username is required".into()));
+        }
+        if self.soulseek.password.is_empty() {
+            return Err(SeakarrError::Config("soulseek.password is required".into()));
+        }
+        self.validate_non_credential_constraints()
     }
 }
 
 /// Rename a key within a YAML section, preserving the value.
-/// If the old key exists and is not null, its value is copied to the new key.
-/// If the old key exists and is null, the new key is set to 0 (disabled).
+/// If the old key exists and is not null, its value is copied to the new key
+/// (unless the new key is already present with a non-null value — the explicit
+/// new-format value wins over the legacy key).
+/// If the old key is null, it is dropped and the new key is left absent so
+/// merge_with_defaults restores the schema default. Inserting 0 here would
+/// produce `prefer_reliable_peer: null` → `peer_reputation: 0`, which
+/// serde_yaml cannot parse into bool, permanently breaking Config::load.
 /// The old key is always removed if present.
 /// If the old key is missing, nothing happens (merge_with_defaults will add
 /// the new key with its default).
@@ -631,25 +803,26 @@ fn migrate_rename(
     let new_key_yaml = serde_yaml::Value::String(new_key.into());
 
     // Remove the old key and get its value
-    let old_val = sec.remove(&old_key_yaml);
+    let Some(old_val) = sec.remove(&old_key_yaml) else {
+        // Old key not present — nothing to migrate.
+        // merge_with_defaults will add the new key with its default.
+        return false;
+    };
 
-    match old_val {
-        Some(serde_yaml::Value::Null) => {
-            // null → 0 (disabled)
-            sec.insert(new_key_yaml, serde_yaml::Value::Number(0.into()));
-            true
-        }
-        Some(val) => {
-            // Preserve the value under the new key
-            sec.insert(new_key_yaml, val);
-            true
-        }
-        None => {
-            // Old key not present — nothing to migrate.
-            // merge_with_defaults will add the new key with its default (0).
-            false
-        }
+    if matches!(old_val, serde_yaml::Value::Null) {
+        // null → drop the key; merge_with_defaults restores the schema
+        // default. See the doc comment above.
+        return true;
     }
+
+    // Preserve the value under the new key — unless the user already wrote
+    // an explicit new-format value. A null new value is treated as absent so
+    // the meaningful legacy value is not silently discarded.
+    let new_value_is_meaningful = sec.get(&new_key_yaml).is_some_and(|value| !value.is_null());
+    if !new_value_is_meaningful {
+        sec.insert(new_key_yaml, old_val);
+    }
+    true
 }
 
 /// Recursively merge a parsed config file value over the current schema
@@ -669,8 +842,12 @@ fn merge_with_defaults(default: &serde_yaml::Value, file: &serde_yaml::Value) ->
             }
             serde_yaml::Value::Mapping(merged)
         }
-        // Scalars, sequences, null: file value wins when present; otherwise the
+        // Scalars, sequences: file value wins when present; otherwise the
         // default (covers missing-but-defaulted values and empty lists).
+        // A present-but-null file value (e.g. a bare `filters:` section) must
+        // fall back to the default: keeping Null would rewrite the user's
+        // file into one that fails the struct parse (null mapping).
+        (_, serde_yaml::Value::Null) => default.clone(),
         (_, file_val) => file_val.clone(),
     }
 }
@@ -754,6 +931,7 @@ impl Default for Config {
                 enabled: false,
                 rescan_interval_mins: default_rescan_interval(),
             },
+            source: None,
         }
     }
 }
@@ -947,6 +1125,26 @@ daemon:
     }
 
     #[test]
+    fn load_records_absolute_path_and_default_mode_line() {
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("seakarr.yml");
+        let yaml = "soulseek:\n  username: user\n  password: pass\nsearch:\n  default_mode: auto\n";
+        fs::write(&config_file, yaml).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let source = config.source().expect("loaded config has source");
+
+        assert_eq!(source.path, config_file.canonicalize().unwrap());
+        // The reported line must point at search.default_mode in the FINAL
+        // on-disk config: reconciliation may rewrite the file, so the line is
+        // read back from disk, not from the original fixture.
+        let final_contents = fs::read_to_string(&config_file).unwrap();
+        let expected_line = find_default_mode_line(&final_contents).expect("default_mode present");
+        assert_eq!(source.default_mode_line, expected_line);
+        assert!(expected_line > 0);
+    }
+
+    #[test]
     fn test_search_title_match_defaults_70() {
         let config = Config::default();
         assert_eq!(config.search.search_title_match, 70);
@@ -1036,6 +1234,11 @@ search:
         assert_eq!(config.soulseek.server, "server.slsknet.org:2242");
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.download.concurrent, 1);
+        let source = config
+            .source()
+            .expect("auto-created config must retain source provenance");
+        assert!(source.default_mode_line > 0);
+        assert_eq!(source.path, yaml_path.canonicalize().unwrap());
         // The generated file must serialize every default key, including
         // the new filters toggle (round-trip requirement from the
         // contiguous-track-numbers spec).
@@ -1156,6 +1359,14 @@ library:
         assert!(
             migrated.contains("/media/music"),
             "migrated config must preserve user library paths, got:\n{migrated}"
+        );
+        assert!(
+            migrated.starts_with("# seakarr.yml — Seakarr Configuration\n\n"),
+            "migrated config must use the migrated-file header, got:\n{migrated}"
+        );
+        assert!(
+            !migrated.contains("Auto-created on first run"),
+            "migrated user config must not claim it was auto-created"
         );
 
         // A backup of the original must exist
@@ -1474,6 +1685,7 @@ library_upgrade:
             album: Some("The Essential Michael Bolton".into()),
             daemon: true,
             test: false,
+            ignore_processed: false,
         });
 
         assert_eq!(config.search.default_mode, "manual");
@@ -1600,7 +1812,7 @@ filters:
     }
 
     #[test]
-    fn test_migrate_rename_null_becomes_zero() {
+    fn test_migrate_rename_null_drops_key_for_schema_default() {
         let mut config: serde_yaml::Value = serde_yaml::from_str(
             r#"
 filters:
@@ -1610,8 +1822,250 @@ filters:
         .unwrap();
         migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
         let filters = config.get("filters").unwrap();
-        // null → 0 (disabled)
-        assert_eq!(filters["min_bit_rate"].as_u64().unwrap_or(0), 0);
+        // null → the key is dropped; merge_with_defaults restores the schema
+        // default (0 here, true for the bool peer_reputation key) upstream.
+        assert!(
+            filters.get("min_bitrate").is_none(),
+            "legacy key must be removed"
+        );
+        assert!(
+            filters.get("min_bit_rate").is_none(),
+            "null legacy value must not be eagerly materialised; the merge restores the default"
+        );
+    }
+
+    #[test]
+    fn test_migrate_rename_null_search_key_does_not_emit_number() {
+        // Regression: `prefer_reliable_peer: null` must NOT become
+        // `peer_reputation: 0` (an integer). serde_yaml cannot deserialize an
+        // integer into bool, so the migrated file would permanently break
+        // Config::load. The null value is dropped and merge_with_defaults
+        // restores the bool default (true).
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+search:
+  prefer_reliable_peer: null
+"#,
+        )
+        .unwrap();
+        migrate_rename(
+            &mut config,
+            "search",
+            "prefer_reliable_peer",
+            "peer_reputation",
+        );
+        let search = config.get("search").unwrap();
+        assert!(
+            search.get("prefer_reliable_peer").is_none(),
+            "legacy key must be removed"
+        );
+        assert!(
+            search.get("peer_reputation").is_none(),
+            "peer_reputation must stay absent (bool default restored by merge), got: {:?}",
+            search.get("peer_reputation")
+        );
+    }
+
+    #[test]
+    fn test_migrate_rename_new_key_wins_when_both_present() {
+        // A file with both the legacy and the new-format key must keep the
+        // user's explicit new-format value — the legacy key must not clobber it.
+        let mut config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+filters:
+  min_bit_rate: 128
+  min_bitrate: 320
+"#,
+        )
+        .unwrap();
+        migrate_rename(&mut config, "filters", "min_bitrate", "min_bit_rate");
+        let filters = config.get("filters").unwrap();
+        assert_eq!(
+            filters["min_bit_rate"].as_u64().unwrap(),
+            128,
+            "explicit new-format value must win over the legacy key"
+        );
+        assert!(
+            filters.get("min_bitrate").is_none(),
+            "legacy key must be removed"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_null_section_falls_back_to_defaults() {
+        // A bare `filters:` section (null value) must be repaired to the
+        // schema defaults instead of being rewritten as `filters: null`,
+        // which would fail the subsequent struct parse in Config::load.
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("seakarr.yml");
+        fs::write(
+            &config_file,
+            r#"
+soulseek:
+  username: test
+  password: test
+filters:
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(
+            config.filters.allowed_extensions,
+            vec!["flac"],
+            "null section must fall back to schema defaults"
+        );
+
+        let contents = fs::read_to_string(&config_file).unwrap();
+        let written: serde_yaml::Value = serde_yaml::from_str(&contents).unwrap();
+        assert!(written.get("filters").is_some());
+        assert!(
+            !written["filters"].is_null(),
+            "rewritten config must not keep a null filters section"
+        );
+    }
+
+    #[test]
+    fn test_load_null_legacy_bool_uses_bool_default() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            r#"
+soulseek:
+  username: test
+  password: test
+search:
+  prefer_reliable_peer: null
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(config.search.peer_reputation);
+        let contents = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(contents.contains("peer_reputation: true"));
+        assert!(!contents.contains("peer_reputation: 0"));
+    }
+
+    #[test]
+    fn test_load_null_new_key_preserves_legacy_value() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            r#"
+soulseek:
+  username: test
+  password: test
+search:
+  prefer_reliable_peer: false
+  peer_reputation: null
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(!config.search.peer_reputation);
+        let contents = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(contents.contains("peer_reputation: false"));
+    }
+
+    #[test]
+    fn test_find_default_mode_line_block_style() {
+        let contents = concat!(
+            "# seakarr.yml\n",
+            "soulseek:\n",
+            "  username: user\n",
+            "search:\n",
+            "  default_mode: auto\n",
+            "  timeout_secs: 15\n",
+        );
+        assert_eq!(find_default_mode_line(contents), Some(5));
+    }
+
+    #[test]
+    fn test_find_default_mode_line_crlf_and_comments() {
+        // CRLF line endings, comments, and a bracketed value must not confuse
+        // the section scanner.
+        let contents = "search:\r\n  # comment\r\n  default_mode: manual\r\n";
+        assert_eq!(find_default_mode_line(contents), Some(3));
+    }
+
+    #[test]
+    fn test_find_default_mode_line_flow_style() {
+        // A schema-complete flow-style `search:` maps the key onto one line.
+        let contents = concat!(
+            "soulseek:\n",
+            "  username: user\n",
+            "search: {default_mode: auto, timeout_secs: 15}\n",
+        );
+        assert_eq!(find_default_mode_line(contents), Some(3));
+    }
+
+    #[test]
+    fn test_find_default_mode_line_absent_returns_none() {
+        let contents = concat!("soulseek:\n", "  username: user\n");
+        assert_eq!(find_default_mode_line(contents), None);
+    }
+
+    #[test]
+    fn test_find_default_mode_line_ignores_other_sections() {
+        // A `default_mode:` key under a different top-level section must not
+        // be reported.
+        let contents = concat!(
+            "search:\n",
+            "  timeout_secs: 15\n",
+            "other:\n",
+            "  default_mode: 1\n",
+        );
+        assert_eq!(find_default_mode_line(contents), None);
+    }
+
+    #[test]
+    fn test_find_default_mode_line_accepts_valid_yaml_spacing_and_comments() {
+        let contents = concat!("search : # configure search\n", "  default_mode : auto\n",);
+        assert_eq!(find_default_mode_line(contents), Some(2));
+
+        let quoted = "\"search\": {default_mode : auto}\n";
+        assert_eq!(find_default_mode_line(quoted), Some(1));
+
+        let single_quoted = "'search': {default_mode: auto}\n";
+        assert_eq!(find_default_mode_line(single_quoted), Some(1));
+    }
+
+    #[test]
+    fn test_validate_rejects_unrepresentable_daemon_interval() {
+        let mut config = Config::default();
+        config.daemon.rescan_interval_mins = u64::MAX;
+        let error = config
+            .validate_non_credential_constraints()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("daemon.rescan_interval_mins"));
+    }
+
+    #[test]
+    fn test_find_default_mode_line_ignores_nested_values_and_handles_root_flow() {
+        let nested = concat!(
+            "search:\n",
+            "  batch:\n",
+            "    file_path: |\n",
+            "      default_mode: not_the_setting\n",
+        );
+        assert_eq!(find_default_mode_line(nested), None);
+
+        let root_flow = "{soulseek: {username: user}, search: {default_mode: auto}}\n";
+        assert_eq!(find_default_mode_line(root_flow), Some(1));
+
+        let multiline_flow = concat!(
+            "search: {\n",
+            "  batch: {file_path: \"\"},\n",
+            "    default_mode: auto\n",
+            "}\n",
+        );
+        assert_eq!(find_default_mode_line(multiline_flow), Some(3));
+
+        let quoted_fake = "search: {batch: {file_path: \"{default_mode: auto}\"}}\n";
+        assert_eq!(find_default_mode_line(quoted_fake), None);
     }
 
     #[test]

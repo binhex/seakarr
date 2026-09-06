@@ -116,6 +116,7 @@ pub async fn process_album(
     client: &dyn SoulseekClient,
     artist: &str,
     album: Option<&str>,
+    ignore_processed: bool,
     config: &Config,
     db: &Database,
     staging_dir: &Path,
@@ -131,11 +132,18 @@ pub async fn process_album(
         ));
     }
 
-    // Skip if already processed
+    // Skip if already processed — unless the user explicitly requested a
+    // reprocess via --ignore-processed, in which case the matching success
+    // record is deleted so this run can replace it (search history and other
+    // albums are untouched).
     if !artist.trim().is_empty() {
-        if let Some(a) = album {
-            if db.is_album_processed(artist, a)? {
-                tracing::info!("Skipping already-processed: {artist} — {a}");
+        if let Some(album_name) = album {
+            if ignore_processed {
+                if db.delete_processed_album(artist, album_name)? {
+                    tracing::info!("Ignoring already-processed record: {artist} — {album_name}");
+                }
+            } else if db.is_album_processed(artist, album_name)? {
+                tracing::info!("Skipping already-processed: {artist} — {album_name}");
                 return Ok(AlbumOutcome::Skipped);
             }
         }
@@ -158,7 +166,7 @@ pub async fn process_album(
 
     // Search for artist + album.
     let search_start = std::time::Instant::now();
-    let outcome = search::search_album_with_fallback(
+    let outcome = match search::search_album_with_fallback(
         client,
         artist,
         album,
@@ -166,7 +174,17 @@ pub async fn process_album(
         &config.filters,
         library_track_count,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Preserve a failed status after --ignore-processed removes a
+            // prior success record, so a hard search error cannot erase all
+            // processing state for the album.
+            mark_album_processed_if_identifiable(db, artist, album, "failed")?;
+            return Err(error);
+        }
+    };
     let duration_ms = search_start.elapsed().as_millis() as u64;
     let history_album = album.map(str::trim);
     if let Err(e) = search::record_search(
@@ -413,6 +431,7 @@ pub async fn process_album(
                 album.unwrap_or("(all)"),
                 ranked.len(),
             );
+            mark_album_processed_if_identifiable(db, artist, album, "failed")?;
             return Ok(AlbumOutcome::Failed { reason });
         }
     };
@@ -442,6 +461,7 @@ pub async fn process_album(
                     downloaded.len(),
                     expected_count,
                 );
+                mark_album_processed_if_identifiable(db, artist, album, "failed")?;
                 return Ok(AlbumOutcome::Failed {
                     reason: "incomplete download, library upgrade skipped".into(),
                 });
@@ -505,6 +525,7 @@ pub async fn process_album(
                         "{artist} - {}: library upgrade failed: {e}",
                         album.unwrap_or("?")
                     );
+                    mark_album_processed_if_identifiable(db, artist, album, "failed")?;
                     return Ok(AlbumOutcome::Failed {
                         reason: format!("library upgrade failed: {e}"),
                     });
@@ -597,6 +618,7 @@ pub async fn run_auto_mode(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
+    ignore_processed: bool,
 ) -> Result<()> {
     if config.library.paths.is_empty() {
         return Err(SeakarrError::Config(
@@ -680,6 +702,7 @@ pub async fn run_auto_mode(
                     client,
                     &artist,
                     Some(&album),
+                    ignore_processed,
                     config,
                     db,
                     staging_dir,
@@ -737,6 +760,7 @@ pub async fn run_manual_mode(
     client: &dyn SoulseekClient,
     artist: Option<&str>,
     album: Option<&str>,
+    ignore_processed: bool,
     config: &Config,
     db: &Database,
 ) -> Result<()> {
@@ -781,6 +805,7 @@ pub async fn run_manual_mode(
         client,
         artist_name,
         album,
+        ignore_processed,
         config,
         db,
         staging_dir,
@@ -887,6 +912,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -898,6 +924,173 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+    }
+
+    #[tokio::test]
+    async fn ignore_processed_bypasses_success_record_and_recreates_it() {
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "user1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        // A pre-existing successful record would normally skip this album.
+        db.mark_album_processed("Test Artist", "Test Album", "success")
+            .unwrap();
+
+        // 1) Normal path: the success record must still be honoured.
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.unwrap(), AlbumOutcome::Skipped);
+        assert!(
+            db.is_album_processed("Test Artist", "Test Album").unwrap(),
+            "normal path must not delete the success record"
+        );
+
+        // 2) --ignore-processed path: the record is deleted, the album is
+        //    processed, and a successful retry recreates the success record.
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            true,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            db.is_album_processed("Test Artist", "Test Album").unwrap(),
+            "successful reprocess must recreate the success record"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignore_processed_failed_retry_leaves_failed_status() {
+        let client = Arc::new(MockClient::new());
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        db.mark_album_processed("Test Artist", "Test Album", "success")
+            .unwrap();
+
+        // Empty search results: the forced retry must run (not skip) and
+        // record a failed status in place of the deleted success record.
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            true,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        match result.unwrap() {
+            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        }
+        assert!(
+            !db.is_album_processed("Test Artist", "Test Album").unwrap(),
+            "failed retry must not leave a success record"
+        );
+        let status = db.get_album_status("Test Artist", "Test Album").unwrap();
+        assert_eq!(status, Some("failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ignore_processed_hard_search_error_records_failure() {
+        let client = Arc::new(MockClient::new());
+        *client.search_should_fail.lock().unwrap() = true;
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        db.mark_album_processed("Test Artist", "Test Album", "success")
+            .unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            true,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            db.get_album_status("Test Artist", "Test Album").unwrap(),
+            Some("failed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ignore_processed_without_existing_record_proceeds_normally() {
+        let client = Arc::new(MockClient::new());
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            true,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Ok(AlbumOutcome::Failed { .. })));
+        assert_eq!(
+            db.get_album_status("Test Artist", "Test Album").unwrap(),
+            Some("failed".to_string())
+        );
     }
 
     // Album-only manual mode: an empty artist must still reach the
@@ -912,7 +1105,7 @@ mod tests {
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
 
-        run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+        run_manual_mode(&client, None, Some("Test Album"), false, &config, &db)
             .await
             .expect("album-only manual mode must run");
 
@@ -941,7 +1134,7 @@ mod tests {
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
 
-        run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+        run_manual_mode(&client, None, Some("Test Album"), false, &config, &db)
             .await
             .expect("album-only manual mode should finish without a title fallback");
 
@@ -960,7 +1153,7 @@ mod tests {
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
 
-        let error = run_manual_mode(&client, None, Some("Test Album"), &config, &db)
+        let error = run_manual_mode(&client, None, Some("Test Album"), false, &config, &db)
             .await
             .expect_err("album-only organization must be rejected without an artist");
         assert!(
@@ -986,6 +1179,7 @@ mod tests {
             &client,
             Some(" Test Artist "),
             Some("Test Album"),
+            false,
             &config,
             &db,
         )
@@ -1025,6 +1219,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Album One"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1063,6 +1258,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Album One"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1102,6 +1298,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Album One"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1137,6 +1334,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             None,
+            false,
             &config,
             &db,
             staging.path(),
@@ -1193,6 +1391,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1271,6 +1470,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1350,6 +1550,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Adele",
             Some("25"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1427,6 +1628,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Prince",
             Some("The Very Best Of Prince"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1484,6 +1686,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Prince",
             Some("Musicology"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1538,6 +1741,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Prince",
             Some("Musicology"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1648,6 +1852,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Adele",
             Some("25"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1686,6 +1891,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -1751,6 +1957,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
+            false,
             &config,
             &db,
             staging.path(),
@@ -1793,11 +2000,14 @@ mod tests {
         config.library.paths = vec![tmp.path().to_string_lossy().into()];
 
         let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Test Artist", "Test Album", "success")
+            .unwrap();
 
         let result = run_auto_mode(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
+            true,
         )
         .await;
         assert!(result.is_ok());
@@ -1806,6 +2016,13 @@ mod tests {
         let rows = db.get_processed_albums().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "success");
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries
+                .iter()
+                .any(|query| query == "Test Artist Test Album"),
+            "ignore_processed must let auto mode search the pre-processed target"
+        );
     }
 
     // Regression guard: a library album nested inside a genre subdirectory
@@ -1858,6 +2075,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -1917,6 +2135,7 @@ mod tests {
             client.as_ref() as &dyn crate::client::SoulseekClient,
             "Test Artist",
             Some("Test Album"),
+            false,
             &config,
             &db,
             staging.path(),

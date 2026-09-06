@@ -77,6 +77,10 @@ struct Cli {
     /// Run continuously as a daemon
     #[arg(long)]
     daemon: bool,
+
+    /// Reprocess an album even when it has a successful processed-album record
+    #[arg(long)]
+    ignore_processed: bool,
 }
 
 #[tokio::main]
@@ -124,6 +128,7 @@ async fn run() -> Result<()> {
         album: cli.album.clone(),
         daemon: cli.daemon,
         test: cli.test,
+        ignore_processed: cli.ignore_processed,
     };
 
     // Validate the selected mode before any startup side effects: logging
@@ -198,10 +203,20 @@ async fn run() -> Result<()> {
         if config.daemon.rescan_interval_mins == 0 {
             tracing::warn!("daemon.rescan_interval_mins is 0 — clamping to 1 to avoid busy-loop");
         }
-        let interval = tokio::time::Duration::from_secs(interval_mins * 60);
+        let interval =
+            tokio::time::Duration::from_secs(interval_mins.checked_mul(60).ok_or_else(|| {
+                SeakarrError::Config(
+                    "daemon.rescan_interval_mins is too large; maximum is 307445734561271883"
+                        .into(),
+                )
+            })?);
+        // --ignore-processed + daemon was rejected during mode validation, so
+        // the daemon path always dispatches with false.
         run_daemon(&client, &config, &db, &pid_file, interval, &execution_plan).await
     } else {
-        let result = dispatch_execution_plan(&client, &execution_plan, &config, &db).await;
+        let result =
+            dispatch_execution_plan(&client, &execution_plan, &config, &db, cli.ignore_processed)
+                .await;
         release_pid_lock(&pid_file)?;
         result
     }
@@ -210,21 +225,9 @@ async fn run() -> Result<()> {
 /// `--test` mode: structural validation that works even on a freshly created
 /// default config (credentials are not yet populated at that point).
 fn validate_for_test(config: &Config) -> Result<()> {
-    let valid_levels = ["DEBUG", "INFO", "WARN", "ERROR"];
-    if !valid_levels.contains(&config.logging.level.as_str()) {
-        return Err(SeakarrError::Config(format!(
-            "logging.level must be one of {valid_levels:?}, got {:?}",
-            config.logging.level
-        )));
-    }
-    // Same numeric bounds as Config::validate() so `--test` does not report
-    // "valid" for a config that would fail at real startup.
-    config.validate_download_bounds()?;
-    if config.soulseek.max_peers == 0 {
-        return Err(SeakarrError::Config(
-            "soulseek.max_peers must be at least 1".into(),
-        ));
-    }
+    // Same non-credential constraints as Config::validate() so `--test` does
+    // not report "valid" for a config that would fail at real startup.
+    config.validate_non_credential_constraints()?;
     for path in &config.library.paths {
         if !Path::new(path).exists() {
             tracing::warn!("library path does not exist: {path}");
@@ -291,13 +294,24 @@ async fn dispatch_execution_plan(
     plan: &ExecutionPlan,
     config: &Config,
     db: &Database,
+    ignore_processed: bool,
 ) -> Result<()> {
     match plan {
-        ExecutionPlan::Auto => runner::run_auto_mode(client, config, db).await,
+        ExecutionPlan::Auto => runner::run_auto_mode(client, config, db, ignore_processed).await,
         ExecutionPlan::Manual { artist, album } => {
-            runner::run_manual_mode(client, artist.as_deref(), album.as_deref(), config, db).await
+            runner::run_manual_mode(
+                client,
+                artist.as_deref(),
+                album.as_deref(),
+                ignore_processed,
+                config,
+                db,
+            )
+            .await
         }
-        ExecutionPlan::Batch { file_path } => run_batch_mode(client, file_path, config, db).await,
+        ExecutionPlan::Batch { file_path } => {
+            run_batch_mode(client, file_path, config, db, ignore_processed).await
+        }
     }
 }
 
@@ -320,32 +334,18 @@ async fn run_daemon(
         }
 
         // Wait for the next cycle time, Ctrl+C, or SIGTERM.
-        // The SIGTERM branch only exists when the signal listener was
-        // successfully registered (Unix); on non-Unix we fall through
-        // to a plain sleep.
-        if let Some(ref mut s) = sigterm {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Daemon: received SIGINT, shutting down...");
-                    release_pid_lock(pid_file)?;
-                    return Ok(());
-                }
-                _ = s.recv() => {
-                    tracing::info!("Daemon: received SIGTERM, shutting down...");
-                    release_pid_lock(pid_file)?;
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(interval) => {}
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Daemon: received SIGINT, shutting down...");
+                release_pid_lock(pid_file)?;
+                return Ok(());
             }
-        } else {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Daemon: received SIGINT, shutting down...");
-                    release_pid_lock(pid_file)?;
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(interval) => {}
+            _ = wait_for_sigterm(&mut sigterm) => {
+                tracing::info!("Daemon: received SIGTERM, shutting down...");
+                release_pid_lock(pid_file)?;
+                return Ok(());
             }
+            _ = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -360,18 +360,40 @@ async fn run_daemon_cycle(
     db: &Database,
     plan: &ExecutionPlan,
 ) -> Result<()> {
-    dispatch_execution_plan(client, plan, config, db).await
+    // Daemon cycles never carry --ignore-processed: the combination is
+    // rejected during mode validation before any dispatch.
+    dispatch_execution_plan(client, plan, config, db, false).await
 }
 
 /// Returns a SIGTERM listener on Unix, or `None` on other platforms.
 #[cfg(unix)]
-fn signal_terminate() -> Option<tokio::signal::unix::Signal> {
+type TerminateSignal = tokio::signal::unix::Signal;
+
+#[cfg(not(unix))]
+type TerminateSignal = ();
+
+#[cfg(unix)]
+fn signal_terminate() -> Option<TerminateSignal> {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()
 }
 
 #[cfg(not(unix))]
-fn signal_terminate() -> Option<tokio::signal::unix::Signal> {
+fn signal_terminate() -> Option<TerminateSignal> {
     None
+}
+
+#[cfg(unix)]
+async fn wait_for_sigterm(signal: &mut Option<TerminateSignal>) {
+    if let Some(signal) = signal {
+        let _ = signal.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm(_signal: &mut Option<TerminateSignal>) {
+    std::future::pending::<()>().await;
 }
 
 /// Batch mode: process a newline-separated list of `artist - album` lines.
@@ -380,6 +402,7 @@ async fn run_batch_mode(
     batch_path: &str,
     config: &Config,
     db: &Database,
+    ignore_processed: bool,
 ) -> Result<()> {
     let contents = std::fs::read_to_string(batch_path)?;
     let lines: Vec<&str> = contents
@@ -388,7 +411,8 @@ async fn run_batch_mode(
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
-    tracing::info!("Batch mode: {} lines to process", lines.len());
+    let line_word = if lines.len() == 1 { "line" } else { "lines" };
+    tracing::info!("Batch mode: {} {line_word} to process", lines.len());
     let staging_dir = Path::new(&config.storage.staging_dir);
     std::fs::create_dir_all(staging_dir)?;
 
@@ -416,12 +440,17 @@ async fn run_batch_mode(
         let parts: Vec<&str> = line.splitn(2, " - ").collect();
         let artist = parts[0].trim();
         let album = parts.get(1).map(|a| a.trim()).filter(|a| !a.is_empty());
+        if artist.is_empty() && album.is_none() {
+            tracing::warn!("Batch: skipping line with no artist or album");
+            continue;
+        }
         let album_display = album.unwrap_or("(all)");
 
         match seakarr::runner::process_album(
             client,
             artist,
             album,
+            ignore_processed,
             config,
             db,
             staging_dir,
@@ -527,7 +556,7 @@ mod tests {
             album: Some("The Essential Michael Bolton".into()),
         };
 
-        dispatch_execution_plan(&client, &plan, &config, &db)
+        dispatch_execution_plan(&client, &plan, &config, &db, true)
             .await
             .expect("manual plan must dispatch without a library");
 
@@ -554,20 +583,35 @@ mod tests {
         let temp = TempDir::new().unwrap();
         config.storage.staging_dir = temp.path().to_string_lossy().into();
         let batch_path = temp.path().join("wantlist.txt");
-        std::fs::write(&batch_path, "Artist - Album\n").unwrap();
+        std::fs::write(&batch_path, " - \nArtist - Album\nArtist - New Album\n").unwrap();
         let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
         let plan = ExecutionPlan::Batch {
             file_path: batch_path.to_string_lossy().into_owned(),
         };
 
-        dispatch_execution_plan(&client, &plan, &config, &db)
+        dispatch_execution_plan(&client, &plan, &config, &db, false)
             .await
-            .expect("batch plan must dispatch without a library");
+            .expect("normal batch plan must dispatch without a library");
+        let normal_queries = client.search_queries.lock().unwrap().clone();
+        assert!(
+            !normal_queries.iter().any(|query| query == "Artist Album"),
+            "normal batch processing must skip the pre-existing success record"
+        );
+
+        dispatch_execution_plan(&client, &plan, &config, &db, true)
+            .await
+            .expect("forced batch plan must dispatch without a library");
 
         let queries = client.search_queries.lock().unwrap();
         assert!(
-            queries.iter().any(|query| query.contains("Artist")),
-            "batch plan must process its file, got queries: {queries:?}"
+            queries.len() > normal_queries.len(),
+            "forced batch processing must issue additional searches"
+        );
+        assert!(
+            queries.iter().any(|query| query == "Artist Album"),
+            "forced batch processing must reprocess the pre-existing record, got queries: {queries:?}"
         );
     }
 
@@ -642,5 +686,21 @@ mod tests {
         assert_eq!(exit_code_after_run(Ok(())), 0);
         let err: Result<()> = Err(SeakarrError::Config("bad".into()));
         assert_eq!(exit_code_after_run(err), 1);
+    }
+
+    #[test]
+    fn test_validation_catches_search_title_match_overflow() {
+        let mut config = Config::default();
+        config.search.search_title_match = 101;
+        let error = validate_for_test(&config).unwrap_err().to_string();
+        assert!(error.contains("search.search_title_match"));
+    }
+
+    #[test]
+    fn test_validation_catches_library_upgrade_without_paths() {
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        let error = validate_for_test(&config).unwrap_err().to_string();
+        assert!(error.contains("library_upgrade.enabled"));
     }
 }
