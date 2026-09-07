@@ -4,6 +4,7 @@
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod discs;
 pub mod download;
 pub mod error;
 pub mod filter;

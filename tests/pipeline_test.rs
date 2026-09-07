@@ -73,6 +73,85 @@ async fn test_full_pipeline_manual_mode() {
     assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
 }
 
+/// End-to-end regression for the organize step (Finding 1 in the release
+/// review): with `storage.organize = true` and real numbered staging files,
+/// `process_album` must organise each track into the library with a CLEAN
+/// name — zero-padded track number and the leading track token stripped from
+/// the title. It must never produce the duplicated, unpadded "2 - 02 - Track
+/// Two.flac" that shipped when the manual organize path derived metadata
+/// differently from the auto-upgrade copy path.
+#[tokio::test]
+async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
+    let client = MockClient::new();
+    *client.write_files.lock().unwrap() = true; // write real files to staging
+    *client.search_results.lock().unwrap() = vec![SearchResult {
+        username: "fastuser".into(),
+        speed: 1000,
+        slots: 2,
+        files: vec![
+            make_file(
+                r"Test Artist\Test Album\02 - Track Two.flac",
+                850,
+                12_000_000,
+            ),
+            make_file(
+                r"Test Artist\Test Album\01 - Track One.flac",
+                900,
+                15_000_000,
+            ),
+        ],
+    }];
+
+    let staging = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.soulseek.username = "test".into();
+    config.soulseek.password = "test".into();
+    config.storage.staging_dir = staging.path().to_string_lossy().into();
+    config.storage.organize = true;
+    config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+    config.library.paths = vec![library.path().to_string_lossy().into()];
+    config.download.min_upload_speed_kbps = 0;
+    config.download.max_retries = 1;
+    config.notifications.urls = vec![];
+    config.filters.min_tracks = 0;
+
+    let db = Database::open_in_memory().unwrap();
+
+    let result = seakarr::runner::process_album(
+        &client,
+        "Test Artist",
+        Some("Test Album"),
+        false,
+        &config,
+        &db,
+        staging.path(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+
+    // Organised files carry clean, zero-padded names with the leading track
+    // token stripped from the title — never "1 - 01 - Track One.flac".
+    let lib_album = library.path().join("Test Artist").join("Test Album");
+    assert!(lib_album.join("01 - Track One.flac").exists());
+    assert!(lib_album.join("02 - Track Two.flac").exists());
+    // No duplicated-number artifacts from a raw-stem title.
+    assert!(!lib_album.join("2 - 02 - Track Two.flac").exists());
+    assert!(!lib_album.join("1 - 01 - Track One.flac").exists());
+
+    // The staging directory was consumed by the organize step.
+    let album_staging = staging.path().join("Test Artist--Test Album");
+    assert!(!album_staging.exists());
+
+    assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
+}
+
 #[tokio::test]
 async fn test_full_pipeline_auto_mode_no_results() {
     let client = MockClient::new();

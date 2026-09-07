@@ -497,6 +497,27 @@ fn collect_audio_filenames(dir: &std::path::Path) -> Vec<String> {
     filenames
 }
 
+/// Decide whether a cleaned library title `lib` matches a cleaned peer title
+/// `peer`, guarding against false positives on short titles.
+///
+/// Multi-word titles match as a substring — real peer filenames embed extra
+/// metadata, so "tomorrow comes today" appears inside "gorillaz tomorrow
+/// comes today", and exact equality would wrongly reject it. A single-word
+/// title, by contrast, is matched only at word boundaries so a short library
+/// title like "one" cannot match inside an unrelated word such as "someone",
+/// and a single word shorter than 4 characters is rejected outright as too
+/// ambiguous to identify a track reliably (e.g. "in", "the").
+fn lib_title_matches(peer: &str, lib: &str) -> bool {
+    if lib.split_whitespace().count() >= 2 {
+        return peer.contains(lib);
+    }
+    if lib.len() < 4 {
+        return false; // too short to be discriminating
+    }
+    peer.split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == lib)
+}
+
 /// Search Soulseek by the cleaned library track titles, keeping only
 /// results that contain at least `match_threshold_pct`% of the album's
 /// tracks.
@@ -580,14 +601,14 @@ pub async fn search_by_title(
             .collect();
         let matched = library_titles
             .iter()
-            .filter(|lib| cleaned_titles.iter().any(|t| t.contains(lib.as_str())))
+            .filter(|lib| cleaned_titles.iter().any(|t| lib_title_matches(t, lib)))
             .count();
         result.files.retain(|f| {
             let basename = f.name.rsplit(['/', '\\']).next().unwrap_or_default();
             let title = clean_track_title(basename);
             library_titles
                 .iter()
-                .any(|lib| title.contains(lib.as_str()))
+                .any(|lib| lib_title_matches(&title, lib))
         });
         matched >= required
     });
@@ -1300,6 +1321,28 @@ mod tests {
             results[0].files[0].name,
             "Gorillaz - Tomorrow Comes Today.mp3"
         );
+    }
+
+    // ── lib_title_matches (short-title false-positive guard) ──
+
+    #[test]
+    fn test_lib_title_matches_guards_against_short_title_false_positives() {
+        // Multi-word titles match as a substring (peer files embed extra
+        // artist/album metadata).
+        assert!(lib_title_matches(
+            "gorillaz tomorrow comes today",
+            "tomorrow comes today"
+        ));
+        // Single long-enough word: matches at a word boundary...
+        assert!(lib_title_matches("man on fire", "fire"));
+        assert!(lib_title_matches("fire", "fire"));
+        // ...but NOT inside a longer word ("fire" in "firefly").
+        assert!(!lib_title_matches("firefly", "fire"));
+        assert!(!lib_title_matches("someone", "one"));
+        // Single words shorter than 4 chars are rejected outright as too
+        // ambiguous, even at a word boundary ("in" as a track title).
+        assert!(!lib_title_matches("love is in the air", "in"));
+        assert!(!lib_title_matches("in", "in"));
     }
 
     // ── is_generic_track_name ──

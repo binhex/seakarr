@@ -4,6 +4,23 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SeakarrError};
 
+// Reserved (parsed-but-unwired) config keys
+//
+// The following fields are parsed, defaulted, serialized, and carried through
+// config reconciliation for backward/forward compatibility, but no production
+// code path reads them yet. They are deliberately kept (rather than deleted)
+// so existing user YAML configs keep loading without migration surprises; new
+// behaviour should wire them rather than add parallel keys.
+//
+//   LibraryConfig::scan_on_startup
+//   SearchConfig::response_limit, r#type, delay_secs,
+//                block_threshold, block_pause_secs
+//   DownloadConfig::max_queue_length, max_start_time_secs,
+//                max_queue_time_secs, max_download_time_mins,
+//                min_filtered_users, skip_retry_hours
+//
+// The README config tables mark these as reserved.
+
 // ── Config structs (matching YAML schema) ──
 
 /// Where a loaded `Config` came from (absolute file path and the on-disk line

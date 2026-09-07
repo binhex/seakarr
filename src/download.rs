@@ -1,14 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::time::{timeout, Duration};
-
-use regex::Regex;
 
 use indicatif::ProgressBar;
 
 use crate::client::{DownloadStatus, FileInfo, SearchResult, SoulseekClient};
 use crate::config::DownloadConfig;
+use crate::discs;
 use crate::error::{Result, SeakarrError};
 use crate::filter;
 use crate::formatting::format_speed;
@@ -109,11 +108,19 @@ pub async fn download_file(
     // and the loop re-checks the flag between attempts so a SIGINT during
     // the delay window is honoured as soon as the sleep completes.
     //
-    // NOTE: all failure types are retried, including non-transient ones
+    // NOTE: most failure types are retried, including non-transient ones
     // (e.g. "user declined", "could not connect"). This is intentional —
     // the retry_delay_secs penalty is the cost of a failed attempt, and
     // the candidate-list fallback provides the real diversity. Permanent
     // failures waste one delay window per retry, then fall back.
+    //
+    // The one exception is a quality-verification rejection (SeakarrError::
+    // QualityRejected): the file was downloaded and its bitrate/bitdepth
+    // found to be below the configured minimum. Re-downloading the same
+    // file from the same peer cannot change its quality, so retrying would
+    // only burn retry_delay_secs on a doomed attempt. The error is returned
+    // immediately so download_album falls through to the next ranked
+    // candidate, which may hold a better copy.
     //
     // NOTE: with very low retry_delay_secs (< ~30 s), the vendor crate's
     // transfer thread may still be winding down (30 s socket read timeout)
@@ -168,6 +175,10 @@ pub async fn download_file(
                 if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                     return Err(e);
                 }
+                // Permanent quality rejection: do not retry the same peer+file.
+                if !is_retryable(&e) {
+                    return Err(e);
+                }
                 last_err = Some(e);
             }
         }
@@ -175,6 +186,15 @@ pub async fn download_file(
     // Unreachable in practice: the loop always executes at least once
     // (max_retries >= 0), so last_err is always set on this path.
     Err(last_err.unwrap())
+}
+
+/// Classify a download error for the per-peer retry loop. A quality
+/// rejection is permanent — the same file downloaded again from the same
+/// peer has the same bitrate/bitdepth, so retrying only burns the retry
+/// delay. Every other failure (timeouts, refused transfers, dropped
+/// connections) is treated as transient and retried.
+fn is_retryable(e: &SeakarrError) -> bool {
+    !matches!(e, SeakarrError::QualityRejected(_))
 }
 
 /// Update an exponential moving average (EMA) with a new sample.
@@ -408,7 +428,7 @@ pub(crate) fn verify_downloaded_quality(
     if filters.min_bit_rate > 0 && !file.attribs.contains_key(&0) {
         if let Some(actual_br) = crate::organizer::extract_bitrate(path) {
             if actual_br < filters.min_bit_rate {
-                return Err(SeakarrError::Download(format!(
+                return Err(SeakarrError::QualityRejected(format!(
                     "bitrate {actual_br} kbps below minimum {} kbps",
                     filters.min_bit_rate
                 )));
@@ -422,7 +442,7 @@ pub(crate) fn verify_downloaded_quality(
     if filters.min_bit_depth > 0 && !file.attribs.contains_key(&5) {
         if let Some(actual_bd) = crate::organizer::extract_bitdepth(path) {
             if actual_bd < filters.min_bit_depth {
-                return Err(SeakarrError::Download(format!(
+                return Err(SeakarrError::QualityRejected(format!(
                     "bitdepth {actual_bd} below minimum {}",
                     filters.min_bit_depth
                 )));
@@ -472,7 +492,7 @@ pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInf
     // every run.
     groups
         .into_iter()
-        .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| bk.cmp(ak)))
+        .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| ak.cmp(bk)))
         .map(|(_, v)| v)
         .unwrap_or_default()
 }
@@ -492,45 +512,16 @@ fn album_group_key(parent: &str) -> String {
     let sep = &parent[sep_idx..sep_idx + 1];
 
     // Dedicated disc folder as the leaf, e.g. "...\\CD 01": key = grandparent.
-    if is_disc_folder(leaf) {
+    if discs::is_disc_folder(leaf) {
         return grandparent.to_string();
     }
     // Embedded disc marker in the leaf, e.g. "Gold (Disc 1)": key = parent
     // with the marker stripped from the leaf.
-    if let Some(stripped) = strip_embedded_disc_marker(leaf) {
+    if let Some(stripped) = discs::strip_embedded_disc_marker(leaf) {
         return format!("{grandparent}{sep}{stripped}");
     }
 
     parent.to_string()
-}
-
-/// True when the directory name is a dedicated disc designator, e.g.
-/// "CD 01", "CD1", "Disc 2", "disc 02" (case-insensitive).
-fn is_disc_folder(leaf: &str) -> bool {
-    let lower = leaf.trim().to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("cd")
-        .or_else(|| lower.strip_prefix("disc"))
-        .map(str::trim)
-        .unwrap_or("");
-    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-}
-
-/// Strip a trailing embedded disc marker from an album folder name, e.g.
-/// "Gold (Disc 1)" -> "Gold", "Album - CD 2" -> "Album", "Gold [Disc 1]"
-/// -> "Gold". Returns None when no marker is present or the marker is the
-/// whole name (a dedicated disc folder, handled by [`is_disc_folder`]).
-fn strip_embedded_disc_marker(leaf: &str) -> Option<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)(?:[\s(\[-])(?:cd|disc)\s*\d+\s*[)\]]?$").expect("valid disc-marker regex")
-    });
-    let m = re.find(leaf)?;
-    let prefix = leaf[..m.start()].trim_end_matches([' ', '-', '–', '—', '(', '[', '\t']);
-    if prefix.is_empty() {
-        return None;
-    }
-    Some(prefix.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -615,11 +606,15 @@ pub async fn download_album(
         let mut failed = false;
 
         for file in &filtered_files {
-            // Extract the disc subdirectory from the file's parent path
-            // so tracks from different CDs land in separate staging
-            // subdirectories (preventing collisions for same-named
-            // files across discs, e.g. "01 - Track.flac" on both
-            // CD 01 and CD 02 of a multi-disc album).
+            // Isolate each disc of a multi-disc album into its own staging
+            // subdirectory so same-named tracks across discs (e.g.
+            // "01 - Track.flac" on both disc 1 and disc 2) never collide in
+            // one flat staging dir — whichever file landed second would
+            // otherwise overwrite the first before either reaches the
+            // library. Covers dedicated disc folders ("CD 01", "Disc 2")
+            // AND album folders with an embedded disc marker ("Gold (Disc
+            // 1)" / "Gold (Disc 2)"), matching the album_group_key merge
+            // that brings the discs together.
             let disc_leaf = file
                 .name
                 .rsplit_once(['/', '\\'])
@@ -627,11 +622,11 @@ pub async fn download_album(
                     parent.rsplit_once(['/', '\\']).map(|(_, leaf)| leaf)
                 })
                 .unwrap_or("");
-            // Only create a disc subdirectory when the leaf is a dedicated
-            // disc designator (CD 01, CD 02, Disc 1, etc.). For albums
-            // without disc folders the leaf is the album name and the
-            // staging dir is already correct — no extra nesting needed.
-            let disc_dir = if !disc_leaf.is_empty() && is_disc_folder(disc_leaf) {
+            // Only create a disc subdirectory when the leaf designates a
+            // single disc of a multi-disc album. For albums without disc
+            // folders the leaf is the album name and the staging dir is
+            // already correct — no extra nesting needed.
+            let disc_dir = if !disc_leaf.is_empty() && discs::is_disc_designator(disc_leaf) {
                 staging_dir.join(disc_leaf)
             } else {
                 staging_dir.to_path_buf()
@@ -713,7 +708,7 @@ pub async fn download_album(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{DownloadHandle, FileInfo, MockClient, SearchResult, UserInfo, UserStatus};
+    use crate::client::{DownloadHandle, FileInfo, MockClient, SearchResult};
     use crate::config::{DownloadConfig, FilterConfig};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -976,13 +971,6 @@ mod tests {
                 cancel_tx,
             })
         }
-
-        async fn user_info(&self, username: &str) -> Result<UserInfo> {
-            Ok(UserInfo {
-                username: username.into(),
-                status: UserStatus::Online,
-            })
-        }
     }
 
     /// A client whose `download()` fails the first `failures` calls (e.g.
@@ -1061,13 +1049,6 @@ mod tests {
                 cancel_tx,
             })
         }
-
-        async fn user_info(&self, username: &str) -> Result<UserInfo> {
-            Ok(UserInfo {
-                username: username.into(),
-                status: UserStatus::Online,
-            })
-        }
     }
 
     /// A client that fails downloads for specific filenames, simulating
@@ -1127,13 +1108,6 @@ mod tests {
             Ok(DownloadHandle {
                 status_rx,
                 cancel_tx,
-            })
-        }
-
-        async fn user_info(&self, username: &str) -> Result<UserInfo> {
-            Ok(UserInfo {
-                username: username.into(),
-                status: UserStatus::Online,
             })
         }
     }
@@ -2261,6 +2235,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_embedded_marker_discs_stage_into_separate_subdirectories() {
+        // Regression (release-review Finding 2): albums whose discs carry an
+        // embedded marker ("Gold (Disc 1)" / "Gold (Disc 2)") are merged
+        // into one download group by album_group_key, so same-named tracks
+        // across discs ("01 - Four.flac" on both discs) must still be
+        // isolated into per-disc staging subdirectories. Before this fix the
+        // marker style was staged flat and the second disc's file overwrote
+        // the first.
+        let client = Arc::new(MockClient::new());
+        *client.write_files.lock().unwrap() = true; // real bytes on disk
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\01 - Four.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 1)\\02 - Five.flac",
+                    900,
+                    10_000_000,
+                ),
+                // Same basenames on disc 2 — collision risk if staged flat.
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\01 - Four.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    "Music\\Abba\\Gold (Disc 2)\\02 - Five.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = result.unwrap();
+        assert_eq!(
+            downloaded.len(),
+            4,
+            "all 4 files across both marker discs must download, got {downloaded:?}"
+        );
+
+        // Each downloaded path sits under its own disc subdirectory.
+        let mut disc1_files = 0;
+        let mut disc2_files = 0;
+        for p in &downloaded {
+            let parent_name = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            match parent_name.as_str() {
+                "Gold (Disc 1)" => disc1_files += 1,
+                "Gold (Disc 2)" => disc2_files += 1,
+                other => panic!("unexpected staging parent {other:?} for {p:?}"),
+            }
+            assert!(p.is_file(), "downloaded file must exist on disk: {p:?}");
+        }
+        assert_eq!(disc1_files, 2);
+        assert_eq!(disc2_files, 2);
+
+        // The two same-named files exist as distinct files in distinct dirs.
+        let d1 = dir.path().join("Gold (Disc 1)").join("01 - Four.flac");
+        let d2 = dir.path().join("Gold (Disc 2)").join("01 - Four.flac");
+        assert!(
+            d1.is_file() && d2.is_file(),
+            "both disc copies must survive"
+        );
+    }
+
     // ── Post-download quality verification ──
 
     /// Minimal valid FLAC (same bytes as organizer.rs's write_real_flac):
@@ -2409,5 +2478,26 @@ mod tests {
             err_msg.contains("bitdepth") && err_msg.contains("below minimum"),
             "error must mention bitdepth and minimum, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn quality_rejections_are_not_retried() {
+        // Regression (release-review Finding 3): a file rejected by
+        // post-download quality verification must not be re-downloaded from
+        // the same peer — its quality cannot change. Transient failures
+        // remain retryable.
+        use crate::error::SeakarrError;
+        assert!(!is_retryable(&SeakarrError::QualityRejected(
+            "bitrate 90 kbps below minimum 320 kbps".into()
+        )));
+        assert!(!is_retryable(&SeakarrError::QualityRejected(
+            "bitdepth 16 below minimum 24".into()
+        )));
+        assert!(is_retryable(&SeakarrError::Download(
+            "transfer failed: user declined".into()
+        )));
+        assert!(is_retryable(&SeakarrError::Download(
+            "download timed out".into()
+        )));
     }
 }

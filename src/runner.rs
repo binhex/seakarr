@@ -47,16 +47,6 @@ pub fn spawn_cancel_listener(cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle
     })
 }
 
-/// Extract the track number from a downloaded file's stem for the organize
-/// pattern's `%track%` placeholder. Falls back to `"01"` when the filename
-/// carries no parseable track number (matching the historical hardcoded
-/// value). Returns the raw number (e.g. `"02 - Track"` -> `"2"`).
-fn track_number_for_organize(stem: &str) -> String {
-    crate::tracks::track_number_from_filename(stem)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "01".to_string())
-}
-
 /// Record every track's measured speed + success/failure into the peer
 /// reputation store. Failures are logged and ignored — reputation bookkeeping
 /// never fails an album.
@@ -444,8 +434,20 @@ pub async fn process_album(
             // different editions (box sets, anniversary editions) whose folder
             // can contain far more files than the album being upgraded has
             // (e.g. a 121-file peer folder for a 19-track library album).
-            let expected_count = library_track_count
-                .unwrap_or_else(|| ranked.first().map(|r| r.files.len()).unwrap_or(0));
+            //
+            // A library upgrade target is only ever supplied by auto mode,
+            // which always passes the scanner's replacement count, so the
+            // count is always Some here. The old fallback to the peer's
+            // folder size was dead code and would have been *wrong* if it had
+            // fired (a peer folder spans several album directories while
+            // download_album downloads only the largest group). A caller that
+            // somehow passes a target without a count is a programming error
+            // — surface it as a failed album rather than panicking.
+            let Some(expected_count) = library_track_count else {
+                return Ok(AlbumOutcome::Failed {
+                    reason: "library upgrade target set without a library track count".into(),
+                });
+            };
             if downloaded.len() < expected_count {
                 // The serving peer delivered an incomplete album — record an
                 // album-level failure for it (per-track outcomes were already
@@ -539,13 +541,15 @@ pub async fn process_album(
     if config.storage.organize && !config.library.paths.is_empty() {
         let lib_root = Path::new(&config.library.paths[0]);
         for path in &downloaded {
-            // Extract metadata from filename for pattern
+            // Metadata is derived exactly as in the auto-upgrade copy path
+            // (organizer::organize_name_from_stem): the leading track token
+            // is stripped from the title and the track number is zero-padded,
+            // so a staged "02 - Track Two.flac" organizes to
+            // "02 - Track Two.flac" — never the duplicated, unpadded
+            // "2 - 02 - Track Two.flac".
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let ext = path.extension().unwrap_or_default().to_string_lossy();
-            // Real track number from the filename (e.g. "02 - Track" -> 2),
-            // falling back to "01" for unnumbered files — previously every
-            // file was organized onto track "01".
-            let track = track_number_for_organize(&stem);
+            let (track, title) = organizer::organize_name_from_stem(&stem);
             match organizer::organize_file(organizer::OrganizeInput {
                 src: path,
                 library_root: lib_root,
@@ -553,7 +557,7 @@ pub async fn process_album(
                 artist,
                 album: album.unwrap_or("Unknown"),
                 track: &track,
-                title: &stem,
+                title: &title,
                 ext: &ext,
             }) {
                 Ok(_) => {}
@@ -628,7 +632,7 @@ pub async fn run_auto_mode(
 
     // Scan library
     tracing::info!("Scanning library...");
-    let albums = scanner::scan_library(&config.library.paths)?;
+    let albums = scanner::scan_library(&config.library.paths, &config.filters)?;
     let targets_with_counts = scanner::find_albums_to_upgrade(&albums, &config.filters);
     for album in &albums {
         let fmt_str: Vec<&str> = album.formats.iter().map(|f| f.as_str()).collect();
@@ -859,18 +863,35 @@ mod tests {
         }
     }
 
-    // Regression guard: the organize step must use the REAL track number
-    // from each downloaded filename ("02 - Track.flac" -> 2), not the
-    // hardcoded "01" that made every organized file land on track 1.
+    // Regression guard: the organize step must derive names exactly like the
+    // auto-upgrade copy path — zero-padded track number and the title
+    // stripped of its leading track token (see organizer::organize_name_from_stem).
     #[test]
-    fn organize_uses_real_track_number_from_filename() {
-        assert_eq!(track_number_for_organize("02 - Track One"), "2");
-        assert_eq!(track_number_for_organize("13 - Tender"), "13");
-        assert_eq!(track_number_for_organize("01 - Intro"), "1");
-        // No parseable number -> previous fallback behaviour ("01").
-        assert_eq!(track_number_for_organize("Cover Art"), "01");
-        // 4+ digit tokens (years) are ignored -> fallback "01".
-        assert_eq!(track_number_for_organize("2001 - A Space Odyssey"), "01");
+    fn organize_uses_shared_name_derivation() {
+        // Padded to two digits, no leading-token duplication.
+        assert_eq!(
+            organizer::organize_name_from_stem("02 - Track One"),
+            ("02".to_string(), "Track One".to_string())
+        );
+        assert_eq!(
+            organizer::organize_name_from_stem("13 - Tender"),
+            ("13".to_string(), "Tender".to_string())
+        );
+        assert_eq!(
+            organizer::organize_name_from_stem("1 - Intro"),
+            ("01".to_string(), "Intro".to_string())
+        );
+        // No parseable number -> previous fallback behaviour (track "01",
+        // stem unchanged as the title).
+        assert_eq!(
+            organizer::organize_name_from_stem("Cover Art"),
+            ("01".to_string(), "Cover Art".to_string())
+        );
+        // 4+ digit tokens (years) are ignored -> fallback track "01".
+        assert_eq!(
+            organizer::organize_name_from_stem("2001 - A Space Odyssey"),
+            ("01".to_string(), "2001 - A Space Odyssey".to_string())
+        );
     }
 
     fn make_test_config() -> Config {
@@ -1944,14 +1965,9 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let staging = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
-        // Pre-seed the album staging dir (staging/<artist>--<album>) with the
-        // 2 files the mock download will "write" (the mock returns
-        // dir/<basename> paths without creating file content, so
-        // copy_to_library needs them to already exist).
-        let album_staging = staging.path().join("Test Artist--Test Album");
-        std::fs::create_dir_all(&album_staging).unwrap();
-        std::fs::write(album_staging.join("01 - track.flac"), b"fake flac").unwrap();
-        std::fs::write(album_staging.join("02 - track.flac"), b"fake flac").unwrap();
+        // The mock writes real file bytes to the staging dir, so
+        // copy_to_library has actual content to copy (no pre-seeding).
+        *client.write_files.lock().unwrap() = true;
 
         let result = process_album(
             client.as_ref() as &dyn crate::client::SoulseekClient,
@@ -2061,14 +2077,13 @@ mod tests {
         std::fs::write(album_dir.join("01 - track.mp3"), b"fake mp3 data").unwrap();
         config.library.paths = vec![tmp.path().to_string_lossy().into()];
 
-        // Pre-seed the per-album staging dir: the mock client reports the
-        // download as complete without creating file content, so the staging
-        // files must already exist for copy_to_library to succeed.
+        // The mock writes real file bytes to staging during the run, so
+        // copy_to_library has actual content (no pre-seeding — a pre-seeded
+        // dir would be cleaned up as an "untracked leftover" by the
+        // startup recovery scan).
         let staging = TempDir::new().unwrap();
         config.storage.staging_dir = staging.path().to_string_lossy().into();
-        let album_staging = staging.path().join("Pop--Alesha Dixon");
-        std::fs::create_dir_all(&album_staging).unwrap();
-        std::fs::write(album_staging.join("01 - track.flac"), b"fake flac").unwrap();
+        *client.write_files.lock().unwrap() = true;
 
         let db = Database::open_in_memory().unwrap();
         let result = run_auto_mode(
@@ -2090,6 +2105,22 @@ mod tests {
             .join("Pop")
             .join("Alesha Dixon")
             .join("01 - track.flac");
+        let mut found = vec![];
+        fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if p.is_dir() {
+                if let Ok(rd) = std::fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        let q = e.path();
+                        if q.is_dir() {
+                            walk(&q, out);
+                        } else {
+                            out.push(q);
+                        }
+                    }
+                }
+            }
+        }
+        walk(tmp.path(), &mut found);
         assert!(
             expected.exists(),
             "upgrade must copy into the album's real location inside the library: {expected:?}"

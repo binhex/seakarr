@@ -26,19 +26,6 @@ pub struct FileInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct UserInfo {
-    pub username: String,
-    pub status: UserStatus,
-}
-
-#[derive(Debug, Clone)]
-pub enum UserStatus {
-    Online,
-    Away,
-    Offline,
-}
-
-#[derive(Debug, Clone)]
 pub enum DownloadStatus {
     Queued {
         queue_position: u32,
@@ -73,7 +60,6 @@ pub trait SoulseekClient: Send + Sync {
     async fn search(&self, query: &str, timeout_secs: u64) -> Result<Vec<SearchResult>>;
     async fn download(&self, file: &FileInfo, username: &str, dir: &Path)
         -> Result<DownloadHandle>;
-    async fn user_info(&self, username: &str) -> Result<UserInfo>;
 }
 
 // ── Mock implementation for testing ──
@@ -98,6 +84,12 @@ pub struct MockClient {
     /// When true, `download()` reports a transfer failure instead of
     /// completing — lets tests exercise retry/fallback/eviction paths.
     pub download_fails: Mutex<bool>,
+    /// When true, `download()` writes real file bytes to `dir/<basename>` on
+    /// completion. Off by default so existing tests (which assert throughput
+    /// from `file.size`, not on-disk metadata) keep their behaviour; on by
+    /// tests that need real files on disk (organize paths, multi-disc
+    /// collision checks).
+    pub write_files: Mutex<bool>,
 }
 
 impl MockClient {
@@ -112,6 +104,7 @@ impl MockClient {
             last_download_filename: Mutex::new(None),
             download_filenames: Mutex::new(vec![]),
             download_fails: Mutex::new(false),
+            write_files: Mutex::new(false),
         }
     }
 
@@ -193,6 +186,8 @@ impl SoulseekClient for MockClient {
         let speed = *self.download_speed.lock().unwrap();
         let total = 10_000_000u64;
         let download_fails = *self.download_fails.lock().unwrap();
+        let write_files = *self.write_files.lock().unwrap();
+        let dest = _dir.join(file.name.rsplit(['/', '\\']).next().unwrap_or(&file.name));
 
         // Simulate download progress in a background task
         tokio::spawn(async move {
@@ -222,19 +217,17 @@ impl SoulseekClient for MockClient {
                     .await;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            // Write real bytes BEFORE reporting completion so a caller that
+            // proceeds straight to organize/copy sees the file on disk.
+            if write_files {
+                let _ = std::fs::write(&dest, b"mock audio content");
+            }
             let _ = status_tx.send(DownloadStatus::Completed).await;
         });
 
         Ok(DownloadHandle {
             status_rx,
             cancel_tx,
-        })
-    }
-
-    async fn user_info(&self, _username: &str) -> Result<UserInfo> {
-        Ok(UserInfo {
-            username: _username.into(),
-            status: UserStatus::Online,
         })
     }
 }
@@ -251,27 +244,21 @@ impl SoulseekClient for MockClient {
 // `[lib] name`), even though the dependency key is `soulseek-rs-lib`.
 use soulseek_rs::actor::server_actor::PeerAddress;
 use soulseek_rs::client::{Client, ClientSettings};
-use soulseek_rs::error::SoulseekRs;
 use soulseek_rs::types::DownloadStatus as SsDownloadStatus;
 use soulseek_rs::types::File as SsFile;
 use soulseek_rs::types::SearchResult as SsSearchResult;
-use soulseek_rs::types::UserStatus as SsUserStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
-
-/// How long to wait for the server's user-status replies before reporting the
-/// user as offline.
-const USER_INFO_TIMEOUT_SECS: u64 = 10;
 
 /// `RealClient` wraps a connected `soulseek_rs_lib::Client`.
 ///
 /// The trait methods only receive `&self`, so the connected client lives
 /// behind interior mutability: a tokio mutex holding an `Arc<Client>`.
 /// `login()` builds a fresh client per attempt and stores it on success;
-/// search/download/user queries clone the `Arc` so their blocking calls can
-/// run on `spawn_blocking` without holding the lock.
+/// search/download queries clone the `Arc` so their blocking calls can run
+/// on `spawn_blocking` without holding the lock.
 pub struct RealClient {
     /// The connected soulseek client, set by `login()`.
     inner: tokio::sync::Mutex<Option<Arc<Client>>>,
@@ -573,15 +560,6 @@ fn ss_download_status_to_domain(status: SsDownloadStatus) -> DownloadStatus {
         SsDownloadStatus::TimedOut => DownloadStatus::Failed {
             reason: "transfer timed out".to_string(),
         },
-    }
-}
-
-/// Map a crate user status to the domain type.
-fn ss_user_status_to_domain(status: SsUserStatus) -> UserStatus {
-    match status {
-        SsUserStatus::Online => UserStatus::Online,
-        SsUserStatus::Away => UserStatus::Away,
-        SsUserStatus::Offline => UserStatus::Offline,
     }
 }
 
@@ -947,51 +925,6 @@ impl SoulseekClient for RealClient {
         Ok(DownloadHandle {
             status_rx,
             cancel_tx,
-        })
-    }
-
-    async fn user_info(&self, username: &str) -> Result<UserInfo> {
-        self.reconnect_if_needed().await?;
-        let client = self.connected_client().await?;
-        let username_owned = username.to_string();
-        let username_for_task = username_owned.clone();
-        let status =
-            tokio::task::spawn_blocking(move || -> std::result::Result<UserStatus, SoulseekRs> {
-                // Ask the server, then poll for the asynchronous replies.
-                client.request_user_info(&username_for_task)?;
-                let deadline = Instant::now() + StdDuration::from_secs(USER_INFO_TIMEOUT_SECS);
-                loop {
-                    if let Some(info) = client.user_info(&username_for_task) {
-                        if let Some(presence) = info.presence {
-                            return Ok(ss_user_status_to_domain(presence.status));
-                        }
-                    }
-                    if Instant::now() >= deadline {
-                        // The server did not answer; report the user as offline.
-                        return Ok(UserStatus::Offline);
-                    }
-                    std::thread::sleep(StdDuration::from_millis(100));
-                }
-            })
-            .await
-            .map_err(|e| SeakarrError::Client(format!("user info task panicked: {e}")))?
-            .map_err(|e| match e {
-                // Symmetric with search(): a session loss between the
-                // reconnect check and the request surfaces as NotConnected;
-                // map it to the caller-facing Disconnected.
-                ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
-                    reason: format!(
-                        "server connection lost while requesting user info for '{username_owned}'"
-                    ),
-                },
-                e => SeakarrError::Client(format!(
-                    "user info request for '{username_owned}' failed: {e}"
-                )),
-            })?;
-
-        Ok(UserInfo {
-            username: username_owned,
-            status,
         })
     }
 }
@@ -1402,22 +1335,6 @@ mod real_client_tests {
         assert!(matches!(
             ss_download_status_to_domain(SsDownloadStatus::TimedOut),
             DownloadStatus::Failed { reason } if reason.contains("timed out")
-        ));
-    }
-
-    #[test]
-    fn maps_user_statuses() {
-        assert!(matches!(
-            ss_user_status_to_domain(SsUserStatus::Online),
-            UserStatus::Online
-        ));
-        assert!(matches!(
-            ss_user_status_to_domain(SsUserStatus::Away),
-            UserStatus::Away
-        ));
-        assert!(matches!(
-            ss_user_status_to_domain(SsUserStatus::Offline),
-            UserStatus::Offline
         ));
     }
 

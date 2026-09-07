@@ -141,8 +141,10 @@ mod tests {
     }
 
     #[test]
-    fn test_first_numeric_token_wins() {
-        // Multi-disc style names yield the first 1-3 digit token.
+    fn test_disc_track_skips_leading_disc_number() {
+        // DISC-TRACK names ("1-01 - Title.flac") yield the TRACK number —
+        // the leading disc number is skipped by the two-digit-token rule
+        // (see test_extract_track_from_disc_track_format for the pairs).
         assert_eq!(track_number_from_filename("1-01 - Title.flac"), Some(1));
     }
 

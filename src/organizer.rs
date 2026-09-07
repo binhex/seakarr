@@ -83,6 +83,24 @@ fn strip_leading_track_token(stem: &str) -> &str {
     &stem[rest..]
 }
 
+/// Derive the `%track%` and `%title%` metadata values for a staging file
+/// stem (e.g. `"02 - Track Two"` -> `("02", "Track Two")`). The track
+/// number is zero-padded to two digits and the leading track token is
+/// stripped from the title so a `%track% - %title%` pattern yields clean
+/// names like `"02 - Track Two.flac"`. Files without a parseable track
+/// number fall back to track `"01"` with the stem unchanged as the title.
+///
+/// This is the single source of truth for organize naming: both the
+/// auto-upgrade copy path and the manual organize path must produce the
+/// same destination names for the same staging files.
+pub fn organize_name_from_stem(stem: &str) -> (String, String) {
+    let track = crate::tracks::track_number_from_filename(stem)
+        .map(|n| format!("{n:02}"))
+        .unwrap_or_else(|| "01".to_string());
+    let title = strip_leading_track_token(stem).to_string();
+    (track, title)
+}
+
 /// Expand an organization pattern with metadata placeholders.
 /// Placeholders: %artist%, %album%, %track%, %title%, %ext%, %user%
 pub fn expand_pattern(
@@ -171,7 +189,18 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
         dest
     };
 
-    fs::rename(input.src, &final_dest)?;
+    match fs::rename(input.src, &final_dest) {
+        Ok(()) => {}
+        // The staging area and the library may live on different mount
+        // points (separate disks, Docker volumes). rename(2) then fails
+        // with EXDEV; fall back to copy-and-delete so the file still lands
+        // in the library (mirroring the library-upgrade copy path).
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            fs::copy(input.src, &final_dest)?;
+            fs::remove_file(input.src)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(final_dest)
 }
 
@@ -182,6 +211,9 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
 /// a copy, not a move). Track numbers are zero-padded to two digits and the
 /// leading track token is stripped from the title, so `%track% - %title%`
 /// produces clean names like "01 - Song.flac".
+///
+/// A destination that already holds a strictly better file is kept (see the
+/// per-file guard below); otherwise the copy replaces it.
 pub fn copy_to_library(
     downloaded: &[PathBuf],
     library_root: &Path,
@@ -193,16 +225,14 @@ pub fn copy_to_library(
     for src in downloaded {
         let stem = src.file_stem().unwrap_or_default().to_string_lossy();
         let ext = src.extension().unwrap_or_default().to_string_lossy();
-        let track = crate::tracks::track_number_from_filename(&stem)
-            .map(|n| format!("{n:02}"))
-            .unwrap_or_else(|| "01".to_string());
-        let title = strip_leading_track_token(&stem);
-        let relative = expand_pattern(pattern, artist, album, &track, title, &ext, "unknown");
+        let (track, title) = organize_name_from_stem(&stem);
+        let relative = expand_pattern(pattern, artist, album, &track, &title, &ext, "unknown");
         let mut dest = library_root.join(&relative);
-        // Preserve the CD XX structure for multi-disc albums: when a source
-        // file lives in a disc subdirectory under staging (e.g.
-        // ".../CD 01/01 - Track.flac"), keep that disc subdirectory under the
-        // album so same-named tracks from different discs do not collide.
+        // Preserve the per-disc structure for multi-disc albums: when a
+        // source file lives in a disc subdirectory under staging (a dedicated
+        // "CD 01" folder or an embedded-marker "Gold (Disc 1)" folder),
+        // keep that disc subdirectory under the album so same-named tracks
+        // from different discs do not collide.
         if let Some(disc) = disc_subdir(src) {
             dest = match dest.parent() {
                 Some(parent) => parent
@@ -214,6 +244,28 @@ pub fn copy_to_library(
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+        if dest.exists() {
+            // Never downgrade an existing library file. When the destination
+            // already holds a copy that is strictly better than the new
+            // download (e.g. the library has a 24-bit FLAC and the flagged
+            // album's peer copy is 16-bit), keep the existing file and do
+            // not record the destination as newly written — the quality
+            // deletion pass must not treat it as a protected new file while
+            // its own score already exceeds the new baseline. Unparseable
+            // files score 0, so a parseable new download still replaces a
+            // corrupt or mislabelled stale file. Equal scores copy (the new
+            // download is in the same quality tier and becomes the new
+            // baseline).
+            let existing_score = file_quality_score(&dest).unwrap_or(0);
+            let new_score = file_quality_score(src).unwrap_or(0);
+            if existing_score > new_score {
+                tracing::info!(
+                    "Keeping higher-quality existing file {} (score {existing_score} > {new_score})",
+                    dest.display()
+                );
+                continue;
+            }
+        }
         fs::copy(src, &dest)?;
         dests.push(dest);
     }
@@ -221,15 +273,19 @@ pub fn copy_to_library(
 }
 
 /// Return the disc subdirectory component of a staging source path, if the
-/// file was downloaded into a dedicated disc folder (e.g. "CD 01", "CD 02",
-/// "Disc 1"). Walks the parent components and returns the deepest disc-folder
-/// component. Files flattened directly into the album staging root return
-/// `None` so their destination is unchanged.
+/// file was downloaded into a per-disc folder — either a dedicated disc
+/// folder ("CD 01", "Disc 2") or an album folder carrying an embedded disc
+/// marker ("Gold (Disc 1)"). Walks the parent components and returns the
+/// deepest disc folder component. Files flattened directly into the album
+/// staging root return `None` so their destination is unchanged.
+///
+/// Uses [`crate::discs`] so the destination grouping matches the download
+/// stager exactly.
 fn disc_subdir(src: &Path) -> Option<String> {
     let mut current = src.parent();
     while let Some(dir) = current {
         if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            if is_disc_folder(name) {
+            if crate::discs::is_disc_designator(name) {
                 // Return the innermost (deepest) disc folder — the one
                 // closest to the file. Do not keep walking upward.
                 return Some(name.to_string());
@@ -238,19 +294,6 @@ fn disc_subdir(src: &Path) -> Option<String> {
         current = dir.parent();
     }
     None
-}
-
-/// True when a directory name is a dedicated disc designator, e.g. "CD 01",
-/// "CD1", "Disc 2", "disc 02" (case-insensitive). Mirrors the logic in
-/// download.rs so the destination can be grouped identically to staging.
-fn is_disc_folder(leaf: &str) -> bool {
-    let lower = leaf.trim().to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("cd")
-        .or_else(|| lower.strip_prefix("disc"))
-        .map(str::trim)
-        .unwrap_or("");
-    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Delete audio files in the album directory that are lower quality than the
@@ -476,8 +519,13 @@ pub fn parse_album_slug(slug: &str) -> (String, String) {
 
 /// Recover interrupted library upgrades by scanning the staging directory for
 /// leftover album directories. Directories whose album is marked "success"
-/// in the DB are re-verified and copied into the library; "in-progress"
-/// directories from crashed downloads are cleaned up.
+/// in the DB are re-verified and copied into the library (crash during the
+/// copy step). Every other leftover — an album marked "failed", an album
+/// that could not be identified, or a directory whose run never recorded any
+/// status — is the debris of an interrupted *download*: the album was never
+/// fully staged, so the directory is removed. This keeps a later download
+/// for the same album from interleaving with stale `.part` files or partial
+/// tracks from the crashed run.
 pub fn recover_interrupted_upgrades(
     config: &Config,
     db: &crate::db::Database,
@@ -507,11 +555,16 @@ pub fn recover_interrupted_upgrades(
                 tracing::warn!("Recovering interrupted library upgrade: {artist} - {album}");
                 resume_library_upgrade(config, &album_staging, library_root, &artist, &album)?;
             }
-            Some(status) if status == "in-progress" => {
-                tracing::info!("Cleaning up incomplete download: {artist} - {album}");
+            // "in-progress" is never written by any code path (downloads
+            // record "failed" on interruption), so this arm also covers
+            // crashed downloads whose run ended with a recorded failure or
+            // no status at all.
+            _ => {
+                tracing::info!(
+                    "Cleaning up leftover staging from interrupted run: {artist} - {album}"
+                );
                 fs::remove_dir_all(&album_staging)?;
             }
-            _ => {}
         }
     }
     Ok(())
@@ -652,6 +705,28 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 16]);
         assert_eq!(bytes.len(), 42);
         fs::write(path, bytes).unwrap();
+    }
+
+    /// Same minimal FLAC as [`write_real_flac`] but with bits-per-sample-1 =
+    /// 23 (24-bit audio), so quality scoring ranks it strictly above a 16-bit
+    /// copy (used by the overwrite-guard tests). lofty reads the audio
+    /// properties as: sample rate in bits 63-44, bits-per-sample-1 in bits
+    /// 40-36, total samples in bits 35-0 — the 16-bit fixture encodes 15
+    /// there, this fixture encodes 23.
+    fn write_real_flac24(path: &Path) {
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        bytes.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        // 44100 Hz, same as write_real_flac, but bits-per-sample-1 = 23.
+        bytes.extend_from_slice(&0x0AC4_4370_0000_AC44u64.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert_eq!(bytes.len(), 42);
+        fs::write(path, bytes).unwrap();
+        // Self-check: lofty must read this as 24-bit for the guard tests to
+        // be meaningful.
+        assert_eq!(extract_bitdepth(path), Some(24));
     }
 
     #[test]
@@ -827,6 +902,118 @@ mod tests {
             .path()
             .join("Test Artist/Test Album/CD 02/02 - Track.flac")
             .exists());
+    }
+
+    #[test]
+    fn test_copy_to_library_preserves_embedded_marker_disc_subdirectories() {
+        // Regression (release-review Finding 2, library side): staging files
+        // under an embedded-marker disc folder ("Gold (Disc 1)") must keep
+        // that folder under the album when copied — mirrored from the
+        // dedicated-folder (CD 01) case.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let d1 = staging.path().join("Gold (Disc 1)");
+        let d2 = staging.path().join("Gold (Disc 2)");
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+        let d1_track = d1.join("01 - Four.flac");
+        let d2_track = d2.join("01 - Four.flac");
+        fs::write(&d1_track, b"disc1").unwrap();
+        fs::write(&d2_track, b"disc2").unwrap();
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        copy_to_library(
+            &[d1_track.clone(), d2_track.clone()],
+            library.path(),
+            pattern,
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/Gold (Disc 1)/01 - Four.flac")
+            .exists());
+        assert!(library
+            .path()
+            .join("Test Artist/Test Album/Gold (Disc 2)/01 - Four.flac")
+            .exists());
+    }
+
+    #[test]
+    fn test_copy_to_library_keeps_higher_quality_existing_file() {
+        // Regression (release-review Finding 4): a library upgrade must never
+        // downgrade an existing file. When the destination already holds a
+        // strictly better copy (24-bit vs the new 16-bit download), the copy
+        // is skipped and the destination is NOT reported as newly written
+        // (so the quality-deletion pass cannot target it).
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Artist").join("Test Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let existing = album_dir.join("01 - Track One.flac");
+        write_real_flac24(&existing);
+        let existing_bytes = fs::read(&existing).unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        write_real_flac(&src); // 16-bit — strictly worse
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        let dests = copy_to_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            pattern,
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert!(
+            dests.is_empty(),
+            "a better existing file must not be reported as newly written"
+        );
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            existing_bytes,
+            "existing 24-bit file must be untouched"
+        );
+        assert!(src.exists(), "staging file preserved (copy, not move)");
+    }
+
+    #[test]
+    fn test_copy_to_library_replaces_lower_quality_existing_file() {
+        // The reverse direction: an unparseable/corrupt existing file (score
+        // 0) is replaced by a parseable new download.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Artist").join("Test Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let existing = album_dir.join("01 - Track One.flac");
+        fs::write(&existing, b"corrupt junk bytes").unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        write_real_flac(&src);
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        let dests = copy_to_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            pattern,
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            fs::read(&src).unwrap(),
+            "corrupt existing file must be overwritten by the new download"
+        );
     }
 
     #[test]
@@ -1013,5 +1200,63 @@ mod tests {
 
         assert!(library.path().join("Artist/Album/01 - Song.flac").exists());
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_cleans_failed_leftover() {
+        // Regression (release-review Finding 7): a per-album staging dir left
+        // behind by an interrupted DOWNLOAD (album status "failed") must be
+        // removed, not ignored forever — otherwise the next download for the
+        // same album reuses the directory and can interleave with stale
+        // .part / partial files.
+        use crate::db::Database;
+
+        let staging_root = TempDir::new().unwrap();
+        let staging = staging_root.path().join("Artist--Album");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("01 - Song.flac.part"), b"partial bytes").unwrap();
+
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Artist", "Album", "failed")
+            .unwrap();
+
+        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+
+        assert!(
+            !staging.exists(),
+            "failed-status leftover staging dir must be cleaned up"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_cleans_untracked_leftover() {
+        // The same, for a leftover whose album has NO DB record at all (an
+        // album whose download crashed before any status could be recorded,
+        // or an album-only slug).
+        use crate::db::Database;
+
+        let staging_root = TempDir::new().unwrap();
+        let staging = staging_root.path().join("Unknown--Album");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("cover.jpg"), b"image").unwrap();
+
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let db = Database::open_in_memory().unwrap(); // no record at all
+
+        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+
+        assert!(
+            !staging.exists(),
+            "untracked leftover staging dir must be cleaned up"
+        );
     }
 }
