@@ -26,6 +26,9 @@ pub enum SeakarrError {
     #[error("download error: {0}")]
     Download(String),
 
+    #[error("quality verification rejected download: {0}")]
+    QualityRejected(String),
+
     #[error("pid lock error: {0}")]
     PidLock(String),
 

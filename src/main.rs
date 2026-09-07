@@ -83,9 +83,30 @@ struct Cli {
     ignore_processed: bool,
 }
 
-#[tokio::main]
-async fn main() {
-    std::process::exit(exit_code_after_run(run().await));
+/// Program entry point.
+///
+/// The vendored soulseek crate reads a `LOG_LEVEL` environment variable from
+/// the worker threads it spawns during connect/login. `std::env::set_var` is
+/// undefined behaviour once other threads exist (it mutates shared process
+/// state without synchronisation), and `#[tokio::main]` starts a
+/// multi-threaded runtime before the first line of the async body runs. The
+/// variable is therefore set here, synchronously, BEFORE the runtime is
+/// created. Deriving it needs only the CLI override (config-level logging is
+/// re-applied authoritatively inside `run()` via its own `Config::load`).
+fn main() {
+    let cli = Cli::parse();
+    let log_level = cli
+        .log_level
+        .clone()
+        .or_else(|| Config::load(&cli.config_path).ok().map(|c| c.logging.level))
+        .unwrap_or_else(|| "info".to_string());
+    std::env::set_var("LOG_LEVEL", &log_level);
+
+    // Manual runtime so `LOG_LEVEL` is set before the first worker thread
+    // spawns. `exit_code_after_run` bypasses the runtime drop (see its doc
+    // comment), so the runtime is never waited on after the run finishes.
+    let runtime = tokio::runtime::Runtime::new().expect("failed to initialise tokio runtime");
+    std::process::exit(exit_code_after_run(runtime.block_on(run())));
 }
 
 /// Map a run result to a process exit code, printing the error on failure.
@@ -170,33 +191,45 @@ async fn run() -> Result<()> {
     let db_dir = PathBuf::from(&config.database.path);
     let db = Database::open(&db_dir, &config.database)?;
 
+    // Acquire the PID lock BEFORE logging in. The Soulseek server treats a
+    // second login of the same username as a session takeover (the first
+    // instance goes "Displaced" and fails permanently), so a second instance
+    // that only failed the lock AFTER logging in would already have knocked
+    // the running instance offline. Early failures below release the lock so
+    // no orphaned PID file is left behind.
+    let pid_dir = PathBuf::from(&config.pid.path);
+    std::fs::create_dir_all(&pid_dir)?;
+    let pid_file = pid_dir.join(&config.pid.file);
+    acquire_pid_lock(&pid_file)?;
+
     // Connect to Soulseek
-    // Suppress the crate's internal logger (it uses LOG_LEVEL / RUST_LOG
-    // env vars, not the tracing ecosystem).  Set to INFO for debugging.
-    std::env::set_var("LOG_LEVEL", &config.logging.level);
+    // LOG_LEVEL (read by the vendored crate's worker threads) is set in `main`
+    // before the tokio runtime starts — std::env::set_var is UB once threads
+    // exist, so it must not be called here.
     tracing::info!(
         "Connecting to Soulseek server {}...",
         config.soulseek.server
     );
     let client = RealClient::new();
-    client
+    if let Err(e) = client
         .login(
             &config.soulseek.username,
             &config.soulseek.password,
             &config.soulseek.server,
             config.soulseek.listen_port,
         )
-        .await?;
+        .await
+    {
+        // Release the lock acquired above — a failed login must not leave an
+        // orphaned PID file behind.
+        if let Err(release_err) = release_pid_lock(&pid_file) {
+            tracing::warn!("Failed to release PID file after login error: {release_err}");
+        }
+        return Err(e);
+    }
     tracing::info!("Connected to Soulseek.");
 
     client.set_max_peers(config.soulseek.max_peers).await?;
-
-    // Acquire PID lock only after DB + login succeed, so failures before
-    // this point don't leave an orphaned PID file.
-    let pid_dir = PathBuf::from(&config.pid.path);
-    std::fs::create_dir_all(&pid_dir)?;
-    let pid_file = pid_dir.join(&config.pid.file);
-    acquire_pid_lock(&pid_file)?;
 
     if config.daemon.enabled {
         let interval_mins = config.daemon.rescan_interval_mins.max(1);
@@ -237,46 +270,121 @@ fn validate_for_test(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Write PID to file. Returns error if another instance is already running.
-fn acquire_pid_lock(pid_file: &Path) -> Result<()> {
-    if pid_file.exists() {
-        let contents = std::fs::read_to_string(pid_file)?;
-        // A corrupt or empty PID file is treated as stale.
-        let pid: i32 = match contents.trim().parse() {
-            Ok(p) if p > 0 => p,
-            _ => {
-                tracing::warn!("PID file {pid_file:?} is corrupt — removing and continuing");
-                std::fs::remove_file(pid_file)?;
-                0 // fall through to creation
-            }
-        };
-        if pid > 0 {
-            #[cfg(unix)]
+/// Result of probing a PID file's referenced process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidLiveness {
+    /// The process exists (and we can signal it).
+    Alive,
+    /// The process no longer exists — the lock is stale.
+    Stale,
+    /// Liveness cannot be determined from this process's privileges or platform.
+    Indeterminate,
+}
+
+/// Probe whether the process `pid` is alive using `kill -0` on Unix:
+/// exit 0 → alive; "no such process" (ESRCH) → stale; "operation not
+/// permitted" (EPERM, a process owned by another user) → alive; any other
+/// outcome (spawn failure, unknown exit code) → indeterminate, so the caller
+/// refuses to overwrite a potentially live lock.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> PidLiveness {
+    use std::process::Command;
+    let output = match Command::new("kill").arg("-0").arg(pid.to_string()).output() {
+        Ok(o) => o,
+        Err(_) => return PidLiveness::Indeterminate, // spawn failure: do not overwrite
+    };
+    match output.status.code() {
+        Some(0) => PidLiveness::Alive,
+        Some(1) => {
+            // kill -0 exits 1 for BOTH ESRCH (no such process → stale) and
+            // EPERM (process exists but owned by another user → alive). The
+            // exit code alone cannot tell them apart, so parse stderr instead
+            // of assuming code 1 always means "stale" (the old logic would
+            // clobber a live process owned by another user).
+            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            if stderr.contains("no such process") || stderr.contains("process not found") {
+                PidLiveness::Stale
+            } else if stderr.contains("operation not permitted")
+                || stderr.contains("permission denied")
             {
-                use std::process::Command;
-                let output = Command::new("kill").arg("-0").arg(pid.to_string()).output();
-                // Exit status 0: process exists and we can signal it → alive.
-                // Exit status 1: no such process → stale. Anything else
-                // (e.g. signal=EPERM) means the process exists but
-                // belongs to another user — treat as alive.
-                if let Ok(output) = &output {
-                    // kill -0 exit codes: 0 = process exists + we can signal → alive.
-                    // 1 = no such process (ESRCH) → stale. Anything else (e.g. EPERM,
-                    // another user's process) → treat as alive.
-                    if output.status.code() != Some(1) {
+                PidLiveness::Alive
+            } else {
+                PidLiveness::Indeterminate
+            }
+        }
+        _ => PidLiveness::Indeterminate,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i32) -> PidLiveness {
+    // No portable liveness probe on non-Unix: an existing parsed PID file is
+    // treated as potentially alive so we never clobber a live lock.
+    PidLiveness::Indeterminate
+}
+
+/// Write the current PID to `pid_file`. Returns an error if another instance
+/// is already running.
+///
+/// The PID file is created atomically with `O_EXCL`/`create_new`, closing the
+/// time-of-check-to-time-of-use window of the old exists-then-write sequence:
+/// two instances started together cannot both see an absent file and both
+/// write. On collision the loser probes the existing PID's liveness — a
+/// stale (dead) PID is removed and the atomic create is retried; a live or
+/// indeterminate PID causes an error.
+fn acquire_pid_lock(pid_file: &Path) -> Result<()> {
+    loop {
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pid_file);
+        match result {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(std::process::id().to_string().as_bytes())?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let contents = match std::fs::read_to_string(pid_file) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Unreadable PID file (e.g. a directory or a
+                        // permission error): cannot verify liveness, so refuse
+                        // to overwrite a potentially live lock.
+                        return Err(SeakarrError::PidLock(format!(
+                            "cannot read PID file {pid_file:?}; another instance may be running. If this is stale, delete it"
+                        )));
+                    }
+                };
+                let pid: i32 = match contents.trim().parse() {
+                    Ok(p) if p > 0 => p,
+                    _ => {
+                        // Corrupt/empty PID file is stale — remove and retry.
+                        tracing::warn!(
+                            "PID file {pid_file:?} is corrupt — removing and continuing"
+                        );
+                        std::fs::remove_file(pid_file)?;
+                        continue;
+                    }
+                };
+                match pid_is_alive(pid) {
+                    PidLiveness::Stale => {
+                        tracing::warn!(
+                            "PID file {pid_file:?} references dead PID {pid} — removing and continuing"
+                        );
+                        std::fs::remove_file(pid_file)?;
+                        continue; // retry the atomic create
+                    }
+                    PidLiveness::Alive | PidLiveness::Indeterminate => {
                         return Err(SeakarrError::PidLock(format!(
                             "Another instance is running with PID {pid}. If this is stale, delete {pid_file:?}"
                         )));
                     }
                 }
-                // On non-Unix we skip the liveness check; stale PID files
-                // must be removed manually.
             }
+            Err(e) => return Err(e.into()),
         }
     }
-    let my_pid = std::process::id();
-    std::fs::write(pid_file, my_pid.to_string())?;
-    Ok(())
 }
 
 fn release_pid_lock(pid_file: &Path) -> Result<()> {
@@ -702,5 +810,58 @@ mod tests {
         config.library_upgrade.enabled = true;
         let error = validate_for_test(&config).unwrap_err().to_string();
         assert!(error.contains("library_upgrade.enabled"));
+    }
+
+    // ── PID lock (atomic create + liveness classification) ──
+
+    #[test]
+    fn pid_lock_writes_current_pid() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("seakarr.pid");
+        acquire_pid_lock(&pid_file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap(),
+            std::process::id().to_string(),
+            "lock must contain our own PID"
+        );
+    }
+
+    #[test]
+    fn pid_lock_rejects_live_pid() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("seakarr.pid");
+        acquire_pid_lock(&pid_file).unwrap(); // holds the lock with our own live PID
+        let err = acquire_pid_lock(&pid_file).unwrap_err();
+        assert!(
+            err.to_string().contains("Another instance is running"),
+            "a live PID must be reported as another instance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pid_lock_replaces_stale_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("seakarr.pid");
+        // A PID far above any real kernel pid_max → kill -0 reports ESRCH.
+        std::fs::write(&pid_file, "999999999").unwrap();
+        acquire_pid_lock(&pid_file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap(),
+            std::process::id().to_string(),
+            "stale PID must be replaced by our own"
+        );
+    }
+
+    #[test]
+    fn pid_lock_removes_corrupt_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("seakarr.pid");
+        std::fs::write(&pid_file, "not-a-pid").unwrap();
+        acquire_pid_lock(&pid_file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap(),
+            std::process::id().to_string(),
+            "corrupt PID file must be treated as stale and replaced"
+        );
     }
 }

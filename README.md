@@ -169,7 +169,7 @@ A default config is created automatically on first run. The file is divided into
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `paths` | Root directories to scan for music files. Each path should contain `Artist/Album` subdirectories. Overridden by `--library-path`. | `[]` |
-| `scan_on_startup` | Rescan the library on every run (auto mode). | `true` |
+| `scan_on_startup` | Rescan the library on startup (auto mode). *(Reserved for future use — not yet enforced.)* | `true` |
 
 ### `storage`
 
@@ -197,6 +197,7 @@ mode are ignored. CLI values take precedence over values in the selected section
 | `manual.artist` | Manual artist fallback, used only in `manual` mode. | `""` |
 | `manual.album` | Manual album fallback, used only in `manual` mode. | `""` |
 | `batch.file_path` | Batch file fallback, used only in `batch` mode. | `""` |
+| `search_title_match` | Minimum percentage of the album's non-generic track titles that a title-search result must contain for the title-search fallback tier to keep it. Set `0` to disable the tier. | `70` |
 | `peer_reputation` | Blend measured speed + reliability into search ranking. Set to `false` to rank by advertised speed only. | `true` |
 
 ### `filters`
@@ -206,20 +207,20 @@ Controls which Soulseek search results pass the quality gate.
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `allowed_extensions` | Only consider files with these extensions (lowercase, no dot). | `[flac]` |
-| `min_bitrate` | Minimum bitrate in kbps. Files below this value and files missing bitrate metadata are excluded. Set `null` to disable. | `null` |
-| `min_bitdepth` | Minimum bit depth in bits (e.g. `16` or `24`). *(Reserved for future use — not yet enforced.)* | `null` |
+| `min_bit_rate` | Minimum bitrate in kbps. Lossy files whose actual bitrate is below this value are rejected (verified after download when the peer omits the bitrate attribute). `0` disables. | `0` |
+| `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. | `0` |
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered or multi-disc collections. | `true` |
 | `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. | `3` |
-| `peer_track_count` | In auto mode, reject search results whose usable track count is below the library's existing track count for the same album. Prevents silent downgrades when the library already has a more complete copy. Ignored in batch and manual mode. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
+| `peer_track_count` | In auto mode, reject search results whose usable track count is below the library's existing track count for the same album. Prevents silent downgrades when the library already has a more complete copy. Also applies in manual mode when the album is already present in the library (a library track count is derived there); batch mode has no library track count. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `concurrent` | Maximum simultaneous album downloads. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
-| `max_queue_length` | Maximum acceptable upload queue length. `0` = free-slot only. | `0` |
+| `max_queue_length` | Maximum acceptable upload queue length. `0` = free-slot only. *(Reserved for future use — not yet enforced.)* | `0` |
 | `max_start_time_secs` | Maximum seconds to wait at the front of a remote queue before the transfer starts. *(Reserved for future use — not yet enforced.)* | `120` |
 | `max_queue_time_secs` | Maximum total seconds to wait from enqueue before any file starts. `0` disables. *(Reserved for future use — not yet enforced.)* | `1800` |
 | `min_upload_speed_kbps` | Cancel transfers where measured speed drops below this threshold. `0` disables the speed check. | `250` |
@@ -230,6 +231,16 @@ Controls which Soulseek search results pass the quality gate.
 | `retry_delay_secs` | Seconds to wait between retry attempts. | `30` |
 | `min_filtered_users` | Minimum number of filtered candidates required to apply the speed check. *(Reserved for future use — not yet enforced.)* | `10` |
 | `skip_retry_hours` | Cooldown in hours before re-attempting a transiently-failed album on the next run. *(Reserved for future use — not yet enforced.)* | `24` |
+
+### `library_upgrade`
+
+Auto-mode workflow that finds library albums failing the quality gate and re-downloads them from a
+better source, replacing the existing files.
+
+| Key | Description | Default |
+| --- | ----------- | ------- |
+| `enabled` | Enable the library-upgrade workflow (auto mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. | `false` |
+| `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly downloaded copies (non-audio files are never deleted). | `false` |
 
 ### `database`
 
@@ -277,7 +288,7 @@ Seakarr has three operating modes:
 1. **Scan** — walks every path in `library.paths`, reads audio tags via `lofty`, and groups tracks by
    artist and album. Prefers tag metadata over directory names.
 2. **Detect upgrades** — for each album, checks whether any track is in a non-allowed format or below
-   `min_bitrate`. Albums with tagged bitrate `None` are also flagged (unknown quality).
+   `min_bit_rate`. Albums with tagged bitrate `None` are also flagged (unknown quality).
 3. **Search** — queries the Soulseek network for each flagged album.
 4. **Filter & rank** — filters results by extension, bitrate, excluded words, and free upload slots;
    when `filters.contiguous_tracks` is enabled, results whose downloadable track numbers have gaps
@@ -354,9 +365,9 @@ These albums appear in the "Failed" section of the run summary with the reason
 
 Two known limitations of the heuristic, also solvable with `contiguous_tracks: false`: (1) the
 first number in the filename wins, so artist names containing digits (`Maroon 5`, `50 Cent`,
-`Blink 182`) are parsed instead of the track number and can mask gaps; (2) multi-disc numbering
-(`1-01`, `2-03`) is treated as a single track number per file, so partial multi-disc shares may
-pass.
+`Blink 182`) are parsed instead of the track number and can mask gaps; (2) disc-track numbering
+(`1-01`, `2-03`) is parsed per disc — each disc's tracks are validated independently, so a
+partial multi-disc share (missing a whole disc) is rejected rather than silently passing.
 
 **Q: How should I organise my music library?**
 
@@ -386,8 +397,9 @@ The `filters.allowed_extensions` config key controls which formats pass the qual
 
 **Q: Can I download from queued peers instead of only free-slot peers?**
 
-Set `download.max_queue_length` to a value greater than `0`. This allows downloading from peers with up
-to N items in their upload queue. The default (`0`) means only peers with a free upload slot are considered.
+Not yet. The `download.max_queue_length` key is parsed for future use but is not currently
+enforced — only peers with a free upload slot (`slots > 0`) are considered, matching the default
+value of `0`.
 
 **Q: How do I prevent seakarr from downloading files with certain words in the filename?**
 
@@ -396,9 +408,9 @@ name contains "vinyl", "demo", or "live" (case-insensitive).
 
 **Q: What happens if my staging directory and library are on different filesystems?**
 
-The `organize_file` step uses `fs::rename`, which fails with a cross-device link error when the source and
-destination are on different mount points. In this case the album is marked as failed and the files remain
-in staging. A future version will add a copy-and-delete fallback for this scenario.
+`fs::rename` cannot move a file across mount points, so seakarr detects the cross-device error and falls
+back to copying the file into the library and then deleting the staging copy. The organized file lands in
+the correct library location regardless of filesystem layout.
 
 **Q: Can I run multiple instances of seakarr at once?**
 

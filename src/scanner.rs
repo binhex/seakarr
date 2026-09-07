@@ -13,7 +13,15 @@ pub struct ScannedAlbum {
     pub path: PathBuf,
     pub artist: String,
     pub album: String,
+    /// Total number of audio files grouped into this album (all formats).
     pub track_count: usize,
+    /// Number of files that fail the quality/format gate and therefore need
+    /// replacing by the library-upgrade workflow. This — not `track_count` —
+    /// is the completeness/peer-count reference: a mixed-format album (e.g.
+    /// 12 FLAC + 12 MP3 where `allowed_extensions` is `[flac]`) needs only
+    /// its 12 non-conforming files re-downloaded, and comparing a peer's
+    /// FLAC group against the total 24 would reject every peer forever.
+    pub needs_upgrade: usize,
     pub min_bitrate: Option<u32>,
     pub max_bitrate: Option<u32>,
     pub formats: Vec<String>,
@@ -28,11 +36,22 @@ const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
     "dsf", "dff", "spx",
 ];
 
-/// Walk library directories, group audio files by artist/album, collect format+bitrate info.
-pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
+/// Walk library directories, group audio files by artist/album, collect
+/// format+bitrate info, and per-file gate status. `filters` provides the
+/// allowed-extension and minimum-bitrate gate used to compute.
+/// [`ScannedAlbum::needs_upgrade`] for every file.
+pub fn scan_library(
+    library_paths: &[String],
+    filters: &crate::config::FilterConfig,
+) -> Result<Vec<ScannedAlbum>> {
     let mut albums: std::collections::BTreeMap<(String, String), ScannedAlbum> =
         std::collections::BTreeMap::new();
     let ext_set: HashSet<&str> = KNOWN_AUDIO_EXTENSIONS.iter().copied().collect();
+    let allowed_set: HashSet<String> = filters
+        .allowed_extensions
+        .iter()
+        .map(|e| e.to_lowercase())
+        .collect();
 
     for lib_path_str in library_paths {
         let lib_path = Path::new(lib_path_str);
@@ -73,6 +92,16 @@ pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
             // Read audio tags if available
             let (tag_artist, tag_album, bitrate) = read_audio_tags(path);
 
+            // Whether THIS file fails the quality gate: a non-allowed format,
+            // or a bitrate below the configured minimum (unknown bitrate is
+            // treated as failing — the album is flagged for upgrade because
+            // its quality cannot be verified). Files that already conform are
+            // NOT part of the upgrade — they must not inflate the baseline
+            // that peer-track-count and the completeness gate compare against.
+            let file_needs_upgrade = !allowed_set.contains(ext.as_str())
+                || (filters.min_bit_rate > 0
+                    && (bitrate.is_none() || bitrate.unwrap() < filters.min_bit_rate));
+
             // Prefer tag metadata over directory name
             let final_artist = tag_artist.unwrap_or(artist);
             let final_album = tag_album.unwrap_or(album);
@@ -97,6 +126,9 @@ pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
                 .entry(key)
                 .and_modify(|a| {
                     a.track_count += 1;
+                    if file_needs_upgrade {
+                        a.needs_upgrade += 1;
+                    }
                     if let Some(br) = bitrate {
                         a.min_bitrate = Some(a.min_bitrate.map_or(br, |m| m.min(br)));
                         a.max_bitrate = Some(a.max_bitrate.map_or(br, |m| m.max(br)));
@@ -110,6 +142,7 @@ pub fn scan_library(library_paths: &[String]) -> Result<Vec<ScannedAlbum>> {
                     artist: final_artist,
                     album: final_album,
                     track_count: 1,
+                    needs_upgrade: usize::from(file_needs_upgrade),
                     min_bitrate: bitrate,
                     max_bitrate: bitrate,
                     formats: vec![ext],
@@ -146,9 +179,12 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
 
 /// Determine which albums need upgrading based on filter config.
 /// An album is flagged if ANY track is below quality thresholds or in a non-allowed format.
-/// Returns (artist, album, track_count, library_location) — the directory the
-/// album was found in (for a standard <root>/Artist/Album layout this is the
-/// library root; for nested layouts it is the directory above the artist
+/// Returns (artist, album, replacement_count, library_location) where
+/// `replacement_count` is the number of files failing the quality gate
+/// (computed per-file during the scan, see [`ScannedAlbum::needs_upgrade`]) —
+/// NOT the album's total track count. The library location (the directory the
+/// album was found in; for a standard <root>/Artist/Album layout this is the
+/// library root, for nested layouts it is the directory above the artist
 /// folder) is threaded to the runner so auto-mode copies upgrades back into
 /// the album's real location.
 pub fn find_albums_to_upgrade(
@@ -186,7 +222,7 @@ pub fn find_albums_to_upgrade(
             (
                 a.artist.clone(),
                 a.album.clone(),
-                a.track_count,
+                a.needs_upgrade,
                 a.path.clone(),
             )
         })
@@ -208,7 +244,7 @@ mod tests {
     #[test]
     fn test_scan_empty_directory() {
         let dir = TempDir::new().unwrap();
-        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
         assert!(albums.is_empty());
     }
 
@@ -227,7 +263,7 @@ mod tests {
         fs::create_dir_all(&mp3_dir).unwrap();
         fs::write(mp3_dir.join("track.mp3"), b"fake mp3 data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
         assert_eq!(albums.len(), 2);
         // Both albums should be present
         let artists: Vec<&str> = albums.iter().map(|a| a.artist.as_str()).collect();
@@ -243,6 +279,7 @@ mod tests {
                 artist: "Artist1".into(),
                 album: "Album1".into(),
                 track_count: 3,
+                needs_upgrade: 3,
                 min_bitrate: Some(128),
                 max_bitrate: Some(192),
                 formats: vec!["mp3".into()],
@@ -252,6 +289,7 @@ mod tests {
                 artist: "Artist2".into(),
                 album: "Album2".into(),
                 track_count: 5,
+                needs_upgrade: 0,
                 min_bitrate: Some(900),
                 max_bitrate: Some(1200),
                 formats: vec!["flac".into()],
@@ -275,7 +313,7 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         assert_eq!(to_upgrade[0].0, "Artist1");
         assert_eq!(to_upgrade[0].1, "Album1");
-        assert_eq!(to_upgrade[0].2, 3); // track_count
+        assert_eq!(to_upgrade[0].2, 3); // needs_upgrade: all 3 mp3 files fail the gate
     }
 
     #[test]
@@ -288,7 +326,7 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -304,7 +342,7 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         assert_eq!(to_upgrade[0].0, "Artist");
         assert_eq!(to_upgrade[0].1, "Album");
-        assert_eq!(to_upgrade[0].2, 1); // track_count
+        assert_eq!(to_upgrade[0].2, 1); // needs_upgrade: single ogg file fails the gate
         assert_eq!(to_upgrade[0].3, dir.path().to_path_buf()); // library root
     }
 
@@ -325,7 +363,7 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path())).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -341,7 +379,7 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         assert_eq!(to_upgrade[0].0, "Pop"); // dir-derived artist (no tags in fake bytes)
         assert_eq!(to_upgrade[0].1, "Alesha Dixon"); // dir-derived album
-        assert_eq!(to_upgrade[0].2, 1); // track_count
+        assert_eq!(to_upgrade[0].2, 1); // needs_upgrade: single ogg file fails the gate
                                         // The upgrade target must be the directory above the artist folder
                                         // (<root>/Pop), not the library root — this is what preserves the
                                         // album's real location inside the library.
@@ -355,6 +393,7 @@ mod tests {
             artist: "Artist".into(),
             album: "Album".into(),
             track_count: 2,
+            needs_upgrade: 2,
             min_bitrate: Some(320),
             max_bitrate: Some(320),
             formats: vec!["mp3".into()],
@@ -374,6 +413,56 @@ mod tests {
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
         assert_eq!(to_upgrade.len(), 1); // mp3 should trigger upgrade (not flac)
         assert_eq!(to_upgrade[0].0, "Artist");
-        assert_eq!(to_upgrade[0].2, 2); // track_count
+        assert_eq!(to_upgrade[0].2, 2); // needs_upgrade: both mp3 files fail the gate
+    }
+
+    /// Regression (release-review round 2, P1): the upgrade baseline must be
+    /// the number of files that FAIL the quality gate, not the album's total
+    /// audio-file count. A mixed-format album (12 FLAC + 12 MP3 with
+    /// `allowed_extensions: [flac]`) needs only its 12 MP3s re-downloaded;
+    /// comparing a peer's FLAC group against the total 24 would reject every
+    /// peer forever and block the upgrade.
+    #[test]
+    fn test_mixed_format_album_baseline_counts_only_files_needing_upgrade() {
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Test Artist").join("Test Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        for n in 1..=12 {
+            fs::write(
+                album_dir.join(format!("{n:02} - track.flac")),
+                b"fake flac data",
+            )
+            .unwrap();
+            fs::write(
+                album_dir.join(format!("{n:02} - old.mp3")),
+                b"fake mp3 data",
+            )
+            .unwrap();
+        }
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        let album = &albums[0];
+        assert_eq!(album.track_count, 24);
+        assert_eq!(
+            album.needs_upgrade, 12,
+            "only the 12 non-allowed MP3 files need replacing"
+        );
+
+        let config = crate::config::FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bit_rate: 0,
+            min_bit_depth: 0,
+            exclude_words: vec![],
+            include_locked: false,
+            contiguous_tracks: true,
+            min_tracks: 0,
+            peer_track_count: true,
+        };
+        let to_upgrade = find_albums_to_upgrade(&albums, &config);
+        assert_eq!(to_upgrade.len(), 1);
+        // The runner's peer-track-count / completeness gates use this count:
+        // a peer offering the 12 replacement FLACs is accepted.
+        assert_eq!(to_upgrade[0].2, 12);
     }
 }
