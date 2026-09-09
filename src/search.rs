@@ -1,4 +1,4 @@
-use crate::client::{SearchResult, SoulseekClient};
+use crate::client::{FileInfo, SearchResult, SoulseekClient};
 use crate::config::FilterConfig;
 use crate::error::Result;
 use regex::Regex;
@@ -48,6 +48,152 @@ pub async fn search_album(
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
+}
+
+/// A distinct album discovered from one artist-only search.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtistAlbumResults {
+    pub album: String,
+    pub results: Vec<SearchResult>,
+}
+
+/// Group one artist search response into independent album candidates.
+///
+/// Files are first checked against the requested artist path, then grouped by
+/// the album directory immediately above the file. A dedicated disc directory
+/// is folded into its parent album, so all discs of one album remain together.
+/// Results without an identifiable album directory are omitted because their
+/// album cannot be safely named or organized.
+pub(crate) fn group_artist_results(
+    results: &[SearchResult],
+    artist: &str,
+) -> Vec<ArtistAlbumResults> {
+    let mut groups: std::collections::HashMap<String, (String, Vec<SearchResult>)> =
+        std::collections::HashMap::new();
+
+    for result in results {
+        let mut result_albums: std::collections::HashMap<String, (String, Vec<FileInfo>)> =
+            std::collections::HashMap::new();
+        for file in &result.files {
+            if !path_matches_artist_directory(&file.name, artist) {
+                continue;
+            }
+            let Some(album) = artist_album_name(&file.name, artist) else {
+                continue;
+            };
+            let key = album.to_lowercase();
+            let entry = result_albums
+                .entry(key)
+                .or_insert_with(|| (album.clone(), Vec::new()));
+            entry.1.push(file.clone());
+        }
+
+        for (key, (album, files)) in result_albums {
+            groups
+                .entry(key)
+                .or_insert_with(|| (album.clone(), Vec::new()))
+                .1
+                .push(SearchResult {
+                    username: result.username.clone(),
+                    speed: result.speed,
+                    slots: result.slots,
+                    files,
+                });
+        }
+    }
+
+    let mut albums: Vec<ArtistAlbumResults> = groups
+        .into_values()
+        .map(|(album, results)| ArtistAlbumResults { album, results })
+        .collect();
+    albums.sort_by_cached_key(|group| group.album.to_lowercase());
+    albums
+}
+
+/// Extract a logical album name from a share-relative file path.
+fn artist_album_name(path: &str, artist: &str) -> Option<String> {
+    let components: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut album_index = components.len().checked_sub(2)?;
+    if crate::discs::is_disc_folder(components[album_index]) {
+        album_index = album_index.checked_sub(1)?;
+    }
+    if album_index == 0 {
+        return None;
+    }
+    if !artist_directory_matches(&components[album_index - 1..album_index], artist) {
+        return None;
+    }
+    let leaf = components[album_index];
+    let album = crate::discs::strip_embedded_disc_marker(leaf).unwrap_or_else(|| leaf.to_owned());
+    let album = album.trim();
+    (!album.is_empty()).then(|| album.to_owned())
+}
+
+/// Match the requested artist against one directory component, ignoring
+/// common articles but rejecting extra artist words such as `Other Artist`
+/// when the target is only `Artist`.
+fn canonical_artist_words(value: &str) -> Vec<String> {
+    normalize_search_term(value)
+        .split_whitespace()
+        .map(|word| {
+            if word.eq_ignore_ascii_case("n") {
+                "and".to_string()
+            } else {
+                word.to_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn artist_directory_matches(components: &[&str], artist: &str) -> bool {
+    let artist_words = canonical_artist_words(artist);
+    if artist_words.is_empty() {
+        return false;
+    }
+    let artist_distinctive: Vec<String> = artist_words
+        .iter()
+        .filter(|word| !ARTIST_STOP_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    let ignore_stop_words = !artist_distinctive.is_empty();
+    let expected = if ignore_stop_words {
+        artist_distinctive
+    } else {
+        artist_words
+    };
+    components.iter().any(|component| {
+        let component_words: Vec<String> = canonical_artist_words(component)
+            .into_iter()
+            .filter(|word| !ignore_stop_words || !ARTIST_STOP_WORDS.contains(&word.as_str()))
+            .collect();
+        let mut actual = component_words;
+        let mut expected = expected.clone();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        actual == expected
+    })
+}
+
+/// Keep only files whose directory path contains an exact artist directory.
+pub(crate) fn retain_artist_files(results: &mut Vec<SearchResult>, artist: &str) {
+    for result in &mut *results {
+        result
+            .files
+            .retain(|file| path_matches_artist_directory(&file.name, artist));
+    }
+    results.retain(|result| !result.files.is_empty());
+}
+
+/// Check whether a file path contains an exact artist directory component.
+fn path_matches_artist_directory(path: &str, artist: &str) -> bool {
+    let components: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    components.len() >= 2 && artist_directory_matches(&components[..components.len() - 1], artist)
 }
 
 /// Normalize an artist/album name for the punctuation-tolerant search tier.
@@ -168,7 +314,10 @@ pub async fn search_album_with_fallback(
     } else {
         tracing::info!("Searching for Artist ({artist})");
     }
-    let results = search_album(client, artist, album, timeout_secs).await?;
+    let mut results = search_album(client, artist, album, timeout_secs).await?;
+    if album.is_some() && !artist.trim().is_empty() {
+        retain_artist_files(&mut results, artist);
+    }
     if !results.is_empty() {
         if tier_has_usable_results(&results, filters, library_track_count, album) {
             return Ok(SearchOutcome { results });
@@ -187,9 +336,10 @@ pub async fn search_album_with_fallback(
                     artist_lower.trim(),
                     album_lower.trim()
                 );
-                let lower_results =
+                let mut lower_results =
                     search_fallback_tier(client, &artist_lower, Some(&album_lower), timeout_secs)
                         .await;
+                retain_artist_files(&mut lower_results, artist);
                 if !lower_results.is_empty() {
                     if tier_has_usable_results(&lower_results, filters, library_track_count, album)
                     {
@@ -222,9 +372,10 @@ pub async fn search_album_with_fallback(
                     artist_norm,
                     album_norm
                 );
-                let norm_results =
+                let mut norm_results =
                     search_fallback_tier(client, &artist_norm, Some(&album_norm), timeout_secs)
                         .await;
+                retain_artist_files(&mut norm_results, artist);
                 if !norm_results.is_empty() {
                     if tier_has_usable_results(&norm_results, filters, library_track_count, album) {
                         return Ok(SearchOutcome {
@@ -246,17 +397,9 @@ pub async fn search_album_with_fallback(
         if let Some(album_name) = album {
             if !album_name.trim().is_empty() {
                 tracing::info!("Searching for Album ({})", album_name.trim());
-                let album_results =
+                let mut artist_matches =
                     search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
-                let mut artist_matches: Vec<SearchResult> = album_results
-                    .into_iter()
-                    .filter(|r| r.files.iter().any(|f| path_matches_artist(&f.name, artist)))
-                    .collect();
-                for result in &mut artist_matches {
-                    result
-                        .files
-                        .retain(|f| path_matches_artist(&f.name, artist));
-                }
+                retain_artist_files(&mut artist_matches, artist);
                 if !artist_matches.is_empty() {
                     if tier_has_usable_results(&artist_matches, filters, library_track_count, album)
                     {
@@ -634,50 +777,46 @@ pub fn record_search(
 /// artist against a file path ("The Beatles" must match "Beatles").
 const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 
-/// Check whether a share-relative file path matches the artist, word-level.
+/// Check whether a share-relative file path matches the artist by exact
+/// alphanumeric word tokens.
 ///
-/// The path is lowercased and `\` separators normalised to `/`. The artist
-/// is split into alphanumeric words; common articles are dropped and every
-/// remaining word must appear as a case-insensitive substring of the path.
-/// If no words remain (artist is all stop-words), the full lowercased
-/// artist name is matched as a substring instead.
+/// Common articles are dropped when other artist words exist, so "The
+/// Beatles" matches a path containing "Beatles". Matching uses whole tokens,
+/// not substrings, so "Prince" does not match "Princess". If an artist is
+/// made entirely of stop-words, every stop-word token must be present.
 ///
-/// Used by the album-only fallback tier of
-/// [`search_album_with_fallback`] to verify that a search result actually
-/// belongs to the target artist.
-///
-/// Known accepted risk: substring-per-word means "Prince" also matches
-/// "Princess". Degenerate artists widen the window further, e.g.:
-/// single-letter tokens ("U2" matches any path containing `u` and `2`),
-/// a lone stop-word artist ("The" matches nearly every path via the
-/// full-name fallback), contraction words ("Guns N' Roses" requires only
-/// `guns`, `n`, and `roses` anywhere), and a single-letter artist ("A"
-/// matches nearly every path). Empty or blank artist names never match.
-/// Accented characters are compared literally ("Tiësto" ≠ "Tiesto") — a
-/// false negative, not a false positive. Downstream quality filters still
-/// apply.
+/// Used by the album-only fallback tier and artist-only album discovery to
+/// verify that a search result belongs to the target artist. Empty or blank
+/// artist names never match.
 pub fn path_matches_artist(path: &str, artist: &str) -> bool {
     if artist.trim().is_empty() {
         return false;
     }
-    let normalised = path.to_lowercase().replace('\\', "/");
+    let path_words: Vec<String> = path
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
     let words: Vec<String> = artist
         .split(|c: char| !c.is_alphanumeric())
-        .map(|w| w.to_lowercase())
-        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|word| !word.is_empty())
         .collect();
+    if words.is_empty() {
+        return false;
+    }
     let distinctive: Vec<&String> = words
         .iter()
-        .filter(|w| !ARTIST_STOP_WORDS.contains(&w.as_str()))
+        .filter(|word| !ARTIST_STOP_WORDS.contains(&word.as_str()))
         .collect();
-    if distinctive.is_empty() {
-        // All words were stop-words (e.g. artist "The The"): fall back to
-        // the full lowercased name as a substring match. Trimmed so a
-        // padded batch line (" The The ") still matches paths carrying the
-        // unpadded name.
-        return normalised.contains(artist.trim().to_lowercase().as_str());
-    }
-    distinctive.iter().all(|w| normalised.contains(w.as_str()))
+    let required = if distinctive.is_empty() {
+        words.iter().collect()
+    } else {
+        distinctive
+    };
+    required
+        .iter()
+        .all(|word| path_words.iter().any(|path_word| path_word == *word))
 }
 
 #[cfg(test)]
@@ -724,6 +863,51 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].username, "user1");
+    }
+
+    #[test]
+    fn test_group_artist_results_separates_albums_and_merges_discs() {
+        let results = vec![SearchResult {
+            username: "peer1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Test Artist\Album One\CD 01\01 - one.flac",
+                    900,
+                    30_000_000,
+                ),
+                make_file(
+                    r"Test Artist\Album One\CD 02\01 - two.flac",
+                    900,
+                    30_000_000,
+                ),
+                make_file(r"Test Artist\Album Two\01 - one.flac", 900, 30_000_000),
+                make_file(
+                    r"Other Performer\Album Three\01 - one.flac",
+                    900,
+                    30_000_000,
+                ),
+                make_file(r"Test Artist\01 - loose.flac", 900, 30_000_000),
+                make_file(
+                    r"Test Artist\Other Artist\Album Three\01 - nested.flac",
+                    900,
+                    30_000_000,
+                ),
+            ],
+        }];
+
+        let albums = group_artist_results(&results, "Test Artist");
+        assert_eq!(
+            albums
+                .iter()
+                .map(|album| album.album.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Album One", "Album Two"]
+        );
+        assert_eq!(albums[0].results.len(), 1);
+        assert_eq!(albums[0].results[0].files.len(), 2);
+        assert_eq!(albums[1].results[0].files.len(), 1);
     }
 
     #[tokio::test]
@@ -815,12 +999,17 @@ mod tests {
             r"Music\Other Artist\History\01 - track.flac",
             "Michael Jackson"
         ));
+        assert!(!path_matches_artist(
+            r"Music\Princess\Album\01 - track.flac",
+            "Prince"
+        ));
     }
 
     #[test]
     fn test_path_matches_artist_empty_artist_returns_false() {
         assert!(!path_matches_artist("anything.flac", ""));
         assert!(!path_matches_artist(r"Music\Whatever\01.flac", "   "));
+        assert!(!path_matches_artist(r"Music\Whatever\01.flac", "!!!"));
     }
 
     #[tokio::test]
@@ -914,6 +1103,28 @@ mod tests {
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Artist Album".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_artist_album_search_prunes_wrong_artist_files() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer1".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(r"Artist\Album\01 - right.flac", 900, 30_000_000),
+                make_file(r"Other Artist\Album\01 - wrong.flac", 900, 30_000_000),
+            ],
+        }];
+
+        let outcome =
+            search_album_with_fallback(&client, "Artist", Some("Album"), 15, &test_filters(), None)
+                .await
+                .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].files.len(), 1);
+        assert!(outcome.results[0].files[0].name.contains("right"));
     }
 
     #[tokio::test]

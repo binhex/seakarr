@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 use crate::config::DatabaseConfig;
@@ -178,34 +178,63 @@ impl Database {
     // ── Processed albums ──
 
     pub fn mark_album_processed(&self, artist: &str, album: &str, status: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO processed_albums (artist, album, status, attempts, last_tried)
-             VALUES (?1, ?2, ?3, 1, datetime('now'))
-             ON CONFLICT(artist, album) DO UPDATE SET
-               status = excluded.status,
-               attempts = attempts + 1,
-               last_tried = datetime('now')",
-            params![artist, album, status],
-        )?;
+        let existing_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM processed_albums
+                 WHERE artist = ?1 COLLATE NOCASE AND album = ?2 COLLATE NOCASE
+                 ORDER BY id DESC LIMIT 1",
+                params![artist, album],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing_id {
+            self.conn.execute(
+                "DELETE FROM processed_albums
+                 WHERE id <> ?1
+                   AND artist = ?2 COLLATE NOCASE AND album = ?3 COLLATE NOCASE",
+                params![id, artist, album],
+            )?;
+            self.conn.execute(
+                "UPDATE processed_albums
+                 SET status = ?1, attempts = attempts + 1, last_tried = datetime('now')
+                 WHERE id = ?2",
+                params![status, id],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO processed_albums (artist, album, status, attempts, last_tried)
+                 VALUES (?1, ?2, ?3, 1, datetime('now'))",
+                params![artist, album, status],
+            )?;
+        }
         Ok(())
     }
 
     pub fn is_album_processed(&self, artist: &str, album: &str) -> Result<bool> {
-        let count: i32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM processed_albums WHERE artist = ?1 AND album = ?2 AND status = 'success'",
-            params![artist, album],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM processed_albums
+                 WHERE artist = ?1 COLLATE NOCASE AND album = ?2 COLLATE NOCASE
+                 ORDER BY id DESC LIMIT 1",
+                params![artist, album],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status.as_deref() == Some("success"))
     }
 
-    /// Delete the successful processed-album row for the exact artist/album
-    /// pair. Returns `true` when a row was removed, `false` when none matched.
+    /// Delete the successful processed-album row for the case-insensitive
+    /// artist/album pair. Returns `true` when a row was removed, `false` when
+    /// none matched.
     /// Failed records retain their attempt history; other albums, search
     /// history, and unrelated rows are never touched.
     pub fn delete_processed_album(&self, artist: &str, album: &str) -> Result<bool> {
         let deleted = self.conn.execute(
-            "DELETE FROM processed_albums WHERE artist = ?1 AND album = ?2 AND status = 'success'",
+            "DELETE FROM processed_albums
+             WHERE artist = ?1 COLLATE NOCASE AND album = ?2 COLLATE NOCASE
+               AND status = 'success'",
             params![artist, album],
         )?;
         Ok(deleted > 0)
@@ -214,9 +243,11 @@ impl Database {
     /// Return the current status of an album's processing run, or None when
     /// the album is not tracked in the database.
     pub fn get_album_status(&self, artist: &str, album: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT status FROM processed_albums WHERE artist = ?1 AND album = ?2")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT status FROM processed_albums
+                 WHERE artist = ?1 COLLATE NOCASE AND album = ?2 COLLATE NOCASE
+                 ORDER BY id DESC LIMIT 1",
+        )?;
         let mut rows = stmt.query_map(params![artist, album], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -464,6 +495,35 @@ mod tests {
             !db.delete_processed_album("Artist", "Missing").unwrap(),
             "a missing pair must report no deletion"
         );
+    }
+
+    #[test]
+    fn processed_album_keys_are_case_insensitive() {
+        let db = test_db();
+        db.migrate().unwrap();
+
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
+        assert!(db.is_album_processed("artist", "album").unwrap());
+
+        assert!(db.delete_processed_album("aRtIsT", "aLbUm").unwrap());
+        assert!(db.get_processed_albums().unwrap().is_empty());
+
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO processed_albums (artist, album, status)
+                 VALUES (?1, ?2, 'success')",
+                rusqlite::params!["ARTIST", "ALBUM"],
+            )
+            .unwrap();
+        db.mark_album_processed("ARTIST", "ALBUM", "failed")
+            .unwrap();
+        let albums = db.get_processed_albums().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].status, "failed");
+        assert!(!db.delete_processed_album("aRtIsT", "aLbUm").unwrap());
     }
 
     #[test]

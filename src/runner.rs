@@ -115,6 +115,38 @@ pub async fn process_album(
     library_track_count: Option<usize>,
     target_library_path: Option<&Path>,
 ) -> Result<AlbumOutcome> {
+    process_album_internal(
+        client,
+        artist,
+        album,
+        ignore_processed,
+        config,
+        db,
+        staging_dir,
+        progress,
+        cancel,
+        library_track_count,
+        target_library_path,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_album_internal(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    album: Option<&str>,
+    ignore_processed: bool,
+    config: &Config,
+    db: &Database,
+    staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
+    cancel: Option<&Arc<AtomicBool>>,
+    library_track_count: Option<usize>,
+    target_library_path: Option<&Path>,
+    presearched_results: Option<Vec<crate::client::SearchResult>>,
+) -> Result<AlbumOutcome> {
     if artist.trim().is_empty() && config.storage.organize && !config.library.paths.is_empty() {
         return Err(SeakarrError::Config(
             "cannot organize an album-only download without an artist; provide --artist or disable storage.organize"
@@ -154,42 +186,52 @@ pub async fn process_album(
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
 
-    // Search for artist + album.
-    let search_start = std::time::Instant::now();
-    let outcome = match search::search_album_with_fallback(
-        client,
-        artist,
-        album,
-        config.search.timeout_secs,
-        &config.filters,
-        library_track_count,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            // Preserve a failed status after --ignore-processed removes a
-            // prior success record, so a hard search error cannot erase all
-            // processing state for the album.
-            mark_album_processed_if_identifiable(db, artist, album, "failed")?;
-            return Err(error);
+    // Search for artist + album unless artist-only mode supplied results that
+    // were already discovered and grouped in one artist query.
+    let presearched = presearched_results.is_some();
+    let mut results = match presearched_results {
+        Some(results) => results,
+        None => {
+            let search_start = std::time::Instant::now();
+            let outcome = match search::search_album_with_fallback(
+                client,
+                artist,
+                album,
+                config.search.timeout_secs,
+                &config.filters,
+                library_track_count,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Preserve a failed status after --ignore-processed removes a
+                    // prior success record, so a hard search error cannot erase all
+                    // processing state for the album.
+                    mark_album_processed_if_identifiable(db, artist, album, "failed")?;
+                    return Err(error);
+                }
+            };
+            let duration_ms = search_start.elapsed().as_millis() as u64;
+            let history_album = album.map(str::trim);
+            if let Err(e) = search::record_search(
+                artist,
+                history_album,
+                outcome.results.len(),
+                duration_ms,
+                db,
+            ) {
+                tracing::warn!(
+                    "{artist} — {}: failed to record search history: {e}",
+                    album.unwrap_or("(all)")
+                );
+            }
+            outcome.results
         }
     };
-    let duration_ms = search_start.elapsed().as_millis() as u64;
-    let history_album = album.map(str::trim);
-    if let Err(e) = search::record_search(
-        artist,
-        history_album,
-        outcome.results.len(),
-        duration_ms,
-        db,
-    ) {
-        tracing::warn!(
-            "{artist} — {}: failed to record search history: {e}",
-            album.unwrap_or("(all)")
-        );
+    if album.is_some() && !artist.trim().is_empty() {
+        search::retain_artist_files(&mut results, artist);
     }
-    let results = outcome.results;
 
     // Filter + rank
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
@@ -208,6 +250,7 @@ pub async fn process_album(
     let mut title_search_attempted = false;
 
     if filtered.is_empty()
+        && !presearched
         && config.search.search_title_match > 0
         && !config.library.paths.is_empty()
         && !artist.trim().is_empty()
@@ -759,6 +802,116 @@ pub async fn run_auto_mode(
     Ok(())
 }
 
+/// Resolve an artist/album pair to the casing already stored in history.
+fn canonical_processed_target(
+    db: &Database,
+    artist: &str,
+    album: &str,
+) -> Result<(String, String)> {
+    let Some(record) = db.get_processed_albums()?.into_iter().find(|record| {
+        record.artist.trim().eq_ignore_ascii_case(artist.trim())
+            && record.album.eq_ignore_ascii_case(album)
+    }) else {
+        return Ok((artist.to_owned(), album.to_owned()));
+    };
+    Ok((record.artist, record.album))
+}
+
+/// Process every logical album discovered by one artist-only search.
+#[allow(clippy::too_many_arguments)]
+async fn run_artist_only_mode(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    ignore_processed: bool,
+    config: &Config,
+    db: &Database,
+    staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<(String, AlbumOutcome)>> {
+    let search_start = std::time::Instant::now();
+    let outcome = search::search_album_with_fallback(
+        client,
+        artist,
+        None,
+        config.search.timeout_secs,
+        &config.filters,
+        None,
+    )
+    .await?;
+    let duration_ms = search_start.elapsed().as_millis() as u64;
+    if let Err(e) = search::record_search(artist, None, outcome.results.len(), duration_ms, db) {
+        tracing::warn!("{artist} — (all): failed to record search history: {e}");
+    }
+
+    let albums = search::group_artist_results(&outcome.results, artist);
+    if albums.is_empty() {
+        let reason = if cancel.load(Ordering::SeqCst) {
+            "download cancelled by user"
+        } else {
+            "no identifiable albums found"
+        };
+        return Ok(vec![(
+            "(all)".to_string(),
+            AlbumOutcome::Failed {
+                reason: reason.into(),
+            },
+        )]);
+    }
+
+    let mut outcomes = Vec::with_capacity(albums.len());
+    for album in albums {
+        if cancel.load(Ordering::SeqCst) {
+            outcomes.push((
+                "(all)".to_string(),
+                AlbumOutcome::Failed {
+                    reason: "download cancelled by user".into(),
+                },
+            ));
+            break;
+        }
+        let discovered_album = album.album;
+        let (process_artist, process_album) =
+            canonical_processed_target(db, artist, &discovered_album)?;
+        let library_track_count = if config.library.paths.is_empty() {
+            None
+        } else {
+            search::get_library_track_filenames(
+                &config.library.paths,
+                &process_artist,
+                &process_album,
+            )
+            .ok()
+            .filter(|tracks| !tracks.is_empty())
+            .map(|tracks| tracks.len())
+        };
+        let result = process_album_internal(
+            client,
+            &process_artist,
+            Some(&process_album),
+            ignore_processed,
+            config,
+            db,
+            staging_dir,
+            progress,
+            Some(cancel),
+            library_track_count,
+            None,
+            Some(album.results),
+        )
+        .await?;
+        let cancelled = matches!(
+            &result,
+            AlbumOutcome::Failed { reason } if reason.contains("cancelled by user")
+        );
+        outcomes.push((process_album, result));
+        if cancelled {
+            break;
+        }
+    }
+    Ok(outcomes)
+}
+
 /// Run in manual mode: process a single artist and/or album search target.
 pub async fn run_manual_mode(
     client: &dyn SoulseekClient,
@@ -791,11 +944,9 @@ pub async fn run_manual_mode(
     let cancel = Arc::new(AtomicBool::new(false));
     let _listener = spawn_cancel_listener(Arc::clone(&cancel));
 
-    // Derive library track count from the configured library paths
-    // when available, so the peer_track_count filter can reject peers
-    // with fewer tracks than the library even in manual mode.
-    // Album-only searches (no artist) have no library counterpart to
-    // derive a track count from.
+    // Derive library track count from the configured library paths when an
+    // explicit album is selected, so peer_track_count can reject peers with
+    // fewer tracks than the library even in manual mode.
     let derived_library_count = album.and_then(|album_name| {
         if artist_name.is_empty() || config.library.paths.is_empty() {
             return None;
@@ -805,33 +956,67 @@ pub async fn run_manual_mode(
             .filter(|tracks| !tracks.is_empty())
             .map(|tracks| tracks.len())
     });
-    let result = process_album(
-        client,
-        artist_name,
-        album,
-        ignore_processed,
-        config,
-        db,
-        staging_dir,
-        progress_ref,
-        Some(&cancel),
-        derived_library_count,
-        None, // target_library_path (manual mode: no library upgrade)
-    )
-    .await;
-    match &result {
-        Ok(outcome) => report.record(artist_name, album_display, outcome.clone()),
-        Err(e) => {
-            tracing::error!("Manual mode: {artist_name} — {album_display}: {e}");
-            report.record(
-                artist_name,
-                album_display,
-                AlbumOutcome::Failed {
-                    reason: e.to_string(),
-                },
-            );
+    let result = if album.is_none() && !artist_name.is_empty() {
+        match run_artist_only_mode(
+            client,
+            artist_name,
+            ignore_processed,
+            config,
+            db,
+            staging_dir,
+            progress_ref,
+            &cancel,
+        )
+        .await
+        {
+            Ok(outcomes) => {
+                for (album_name, outcome) in outcomes {
+                    report.record(artist_name, &album_name, outcome);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Manual mode: {artist_name} — {album_display}: {e}");
+                report.record(
+                    artist_name,
+                    album_display,
+                    AlbumOutcome::Failed {
+                        reason: e.to_string(),
+                    },
+                );
+                Err(e)
+            }
         }
-    }
+    } else {
+        let result = process_album(
+            client,
+            artist_name,
+            album,
+            ignore_processed,
+            config,
+            db,
+            staging_dir,
+            progress_ref,
+            Some(&cancel),
+            derived_library_count,
+            None, // target_library_path (manual mode: no library upgrade)
+        )
+        .await;
+        match &result {
+            Ok(outcome) => report.record(artist_name, album_display, outcome.clone()),
+            Err(e) => {
+                tracing::error!("Manual mode: {artist_name} — {album_display}: {e}");
+                report.record(
+                    artist_name,
+                    album_display,
+                    AlbumOutcome::Failed {
+                        reason: e.to_string(),
+                    },
+                );
+            }
+        }
+        result.map(|_| ())
+    };
 
     if let Some(ref p) = progress {
         p.clear();
@@ -839,7 +1024,7 @@ pub async fn run_manual_mode(
 
     report.print_summary();
     _listener.abort();
-    result.map(|_| ())
+    result
 }
 
 #[cfg(test)]
@@ -1338,6 +1523,122 @@ mod tests {
         assert!(
             rep["peera"].total_downloads >= 1,
             "a failed download must record a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_mode_downloads_each_discovered_album() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "artist-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(r"Test Artist\Album One\01 - one.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Album One\02 - two.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Album Two\01 - one.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Album Two\02 - two.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
+            .await
+            .expect("artist-only manual mode must process all discovered albums");
+
+        assert_eq!(
+            client.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist"],
+            "artist-only mode must discover albums with one artist query"
+        );
+        let downloaded = client.download_filenames.lock().unwrap().clone();
+        assert_eq!(
+            downloaded.len(),
+            4,
+            "artist-only mode must download every track from both discovered albums"
+        );
+        assert!(downloaded.iter().any(|name| name.contains("Album One")));
+        assert!(downloaded.iter().any(|name| name.contains("Album Two")));
+        let processed = db.get_processed_albums().unwrap();
+        assert_eq!(processed.len(), 2);
+        assert!(processed
+            .iter()
+            .all(|record| record.artist == "Test Artist"));
+        assert!(processed.iter().any(|record| record.album == "Album One"));
+        assert!(processed.iter().any(|record| record.album == "Album Two"));
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_mode_preserves_multi_disc_organization() {
+        let client = MockClient::new();
+        *client.write_files.lock().unwrap() = true;
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "artist-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Test Artist\Album One\CD 01\01 - one.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Test Artist\Album One\CD 02\01 - one.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.storage.organize = true;
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
+            .await
+            .expect("artist-only manual mode must organize all discs");
+
+        let album_dir = library.path().join("Test Artist").join("Album One");
+        assert!(album_dir.join("CD 01/01 - one.flac").exists());
+        assert!(album_dir.join("CD 02/01 - one.flac").exists());
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_mode_matches_processed_album_case_insensitively() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "artist-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Test Artist\ALBUM ONE\01 - one.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Test Artist", "Album One", "success")
+            .unwrap();
+
+        run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
+            .await
+            .expect("artist-only manual mode must honor processed albums");
+
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "case-only album path differences must not trigger a re-download"
         );
     }
 

@@ -73,7 +73,10 @@ seakarr
 # Continuous daemon mode (re-scan every 60 min)
 seakarr --daemon
 
-# Manual search for a specific artist/album
+# Manual search for every album found for an artist
+seakarr --mode manual --artist "Pink Floyd"
+
+# Manual search for one specific album
 seakarr --mode manual --artist "Pink Floyd" --album "The Wall"
 
 # Reprocess an album whose previous successful download is recorded
@@ -87,8 +90,10 @@ seakarr --mode batch --batch-file wantlist.txt
 Mode selection is explicit. `--artist` and `--album` are manual selectors, and
 `--batch-file` is a batch selector; these options do not silently override the
 configured `search.default_mode`. When the configured mode is `auto`, add
-`--mode manual` for a manual target or `--mode batch` for a batch file. Album-only
-manual searches are supported. `--test` performs the same mode and selector
+`--mode manual` for a manual target or `--mode batch` for a batch file. An
+artist-only manual search discovers and processes each identifiable album from
+one artist query. Explicit artist+album and album-only manual searches are also
+supported. `--test` performs the same mode and selector
 validation before structural checks, so manual mode requires a non-empty artist or
 album and batch mode requires a non-empty batch file path. To clear a configured manual
 fallback for one field, pass that selector explicitly as an empty value, such as
@@ -128,7 +133,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `auto`, `manual`, or `batch`: library scan, target search, or batch file. | *(from config)* |
-| `--artist <name>` | Manual selector; may be used without `--album`. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each identifiable album found. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--daemon` | Repeat the same validated auto, manual, or batch operation each cycle. | `false` |
@@ -306,9 +311,10 @@ Seakarr has three operating modes:
 
 ### Manual mode
 
-Performs steps 3–7 above for a single artist and/or album. At least one target is
-required; CLI values take precedence over `search.manual.artist` and
-`search.manual.album`, and album-only searches are supported.
+Performs steps 3–7 above for an explicit album, or for every identifiable album
+returned by an artist-only search. At least one target is required; CLI values
+take precedence over `search.manual.artist` and `search.manual.album`, and
+album-only searches are supported.
 
 ### Batch mode
 

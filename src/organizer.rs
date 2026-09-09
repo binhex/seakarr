@@ -162,7 +162,13 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
         input.ext,
         "unknown",
     );
-    let dest = input.library_root.join(&relative);
+    let mut dest = input.library_root.join(&relative);
+    if let Some(disc) = disc_subdir(input.src) {
+        dest = match dest.parent() {
+            Some(parent) => parent.join(disc).join(dest.file_name().unwrap_or_default()),
+            None => PathBuf::from(disc).join(dest.file_name().unwrap_or_default()),
+        };
+    }
 
     // Create parent directories
     if let Some(parent) = dest.parent() {
@@ -285,6 +291,12 @@ fn disc_subdir(src: &Path) -> Option<String> {
     let mut current = src.parent();
     while let Some(dir) = current {
         if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            // The runner's per-album staging root uses Artist--Album. It can
+            // contain an embedded "(Disc N)" album name but is not itself a
+            // disc directory.
+            if name.contains("--") {
+                break;
+            }
             if crate::discs::is_disc_designator(name) {
                 // Return the innermost (deepest) disc folder — the one
                 // closest to the file. Do not keep walking upward.
