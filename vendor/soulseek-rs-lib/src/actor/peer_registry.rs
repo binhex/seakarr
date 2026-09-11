@@ -209,8 +209,34 @@ impl PeerRegistry {
         handle.send(message)
     }
 
-    pub fn queue_upload(&self, username: &str, filename: String) -> Result<(), String> {
-        self.send_to_peer(username, PeerMessage::QueueUpload(filename))
+    pub fn queue_upload(
+        &self,
+        username: &str,
+        filename: String,
+        attempt_id: u32,
+    ) -> Result<(), String> {
+        self.send_to_peer(
+            username,
+            PeerMessage::QueueUpload {
+                filename,
+                attempt_id,
+            },
+        )
+    }
+
+    pub fn stop_queue_position_requests(
+        &self,
+        username: &str,
+        filename: String,
+        attempt_id: Option<u32>,
+    ) -> Result<(), String> {
+        self.send_to_peer(
+            username,
+            PeerMessage::StopQueuePositionRequests {
+                filename,
+                attempt_id,
+            },
+        )
     }
 }
 

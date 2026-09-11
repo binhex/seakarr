@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD013 -->
 # seakarr
 
 Automated Soulseek music downloader with library quality upgrading.
@@ -12,16 +13,21 @@ Automated Soulseek music downloader with library quality upgrading.
   library.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
-- **Quality filtering** — filter Soulseek results by file extension, minimum bitrate, excluded keywords, and
-  free upload slots. Reject files with no free upload slots and path-traversal names.
+- **Quality filtering** — filter Soulseek results by file extension, minimum
+  bitrate, excluded keywords, and upload availability. With
+  `download.max_queue_length: 0` a peer must offer a free upload slot; a
+  positive limit also admits zero-slot peers until their reported queue
+  position can be validated. Path-traversal names are rejected.
 - **Peer reputation** — remembers each peer's effective throughput (bytes ÷ transfer time: retry delays plus
   the final transfer, excluding queue wait) and success rate (in SQLite), and ranks search results by a blend
   of advertised and measured throughput plus a reliability factor, so fast, reliable peers are preferred and
   slow or error-prone peers are demoted — regardless of what you search for. Controlled by
   `search.peer_reputation` (default `true`).
-- **Download resilience** — speed monitoring with configurable minimums (slow peers cancelled mid-transfer),
-  stall timeout with cancel, per-file retries with configurable count and delay, and candidate fallback
-  (try the next ranked peer once retries are exhausted).
+- **Download resilience** — speed monitoring with configurable minimums (slow
+  peers cancelled mid-transfer), queue-wait limits while a transfer sits in a
+  remote queue (`max_queue_time_secs`, `max_start_time_secs`), stall timeout
+  with cancel, per-file retries with configurable count and delay, and
+  candidate fallback (try the next ranked peer once retries are exhausted).
 - **Post-download organisation** — move completed files from a staging directory into your library using a
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
@@ -225,12 +231,12 @@ Controls which Soulseek search results pass the quality gate.
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `concurrent` | Maximum simultaneous album downloads. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
-| `max_queue_length` | Maximum acceptable upload queue length. `0` = free-slot only. *(Reserved for future use — not yet enforced.)* | `0` |
-| `max_start_time_secs` | Maximum seconds to wait at the front of a remote queue before the transfer starts. *(Reserved for future use — not yet enforced.)* | `120` |
-| `max_queue_time_secs` | Maximum total seconds to wait from enqueue before any file starts. `0` disables. *(Reserved for future use — not yet enforced.)* | `1800` |
+| `max_queue_length` | `0` requires a free upload slot during candidate selection; later telemetry does not retroactively reject an admitted free-slot peer. A positive value also permits zero-slot peers only when a reported positive queue position is at or below the limit. Unknown positions and wire position `0` do not prove a zero-slot peer is within the limit. | `0` |
+| `max_start_time_secs` | Maximum seconds from first reaching queue position `1` until the first transfer progress. `0` disables this queue-head limit. | `120` |
+| `max_queue_time_secs` | Maximum total seconds from enqueue until the first transfer progress. `0` disables this total queue limit. | `1800` |
 | `min_upload_speed_kbps` | Cancel transfers where measured speed drops below this threshold. `0` disables the speed check. | `250` |
 | `speed_check_wait_secs` | Seconds to wait after a transfer starts before measuring speed. | `30` |
-| `timeout_secs` | Inactivity timeout — cancel the download if no status update arrives within this period. | `180` |
+| `timeout_secs` | Post-start inactivity timeout — starts at the first `InProgress` status, resets only on later `InProgress` events, and is not reset by a paused status. Cancels the transfer when no update arrives within this period. | `180` |
 | `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. *(Reserved for future use — not yet enforced.)* | `120` |
 | `max_retries` | Per-file retry attempts on the same peer before falling back to the next candidate. `0` disables retries. | `4` |
 | `retry_delay_secs` | Seconds to wait between retry attempts. | `30` |
@@ -295,15 +301,26 @@ Seakarr has three operating modes:
 2. **Detect upgrades** — for each album, checks whether any track is in a non-allowed format or below
    `min_bit_rate`. Albums with tagged bitrate `None` are also flagged (unknown quality).
 3. **Search** — queries the Soulseek network for each flagged album.
-4. **Filter & rank** — filters results by extension, bitrate, excluded words, and free upload slots;
-   when `filters.contiguous_tracks` is enabled, results whose downloadable track numbers have gaps
-   (or none at all) are discounted.
+4. **Filter & rank** — filters results by extension, bitrate, excluded words,
+   and upload availability: with `download.max_queue_length: 0` a peer must
+   offer a free upload slot, while a positive limit also admits zero-slot peers
+   whose queue position is validated during download. When
+   `filters.contiguous_tracks` is enabled, results whose downloadable track
+   numbers have gaps (or none at all) are discounted.
    Ranks candidates by `speed × slot_bonus × bitrate_bonus × reliability_factor` (reliability and measured-speed
    reputation adjust the advertised speed).
-5. **Download** — downloads from the highest-ranked peer, monitoring transfer speed in real time. If the
-   speed drops below `min_upload_speed_kbps`, the transfer is cancelled and the next candidate is tried.
-   Per-album stall timeout guards against unresponsive peers. Per-file retries with configurable count
-   and delay (`max_retries`, `retry_delay_secs`) re-attempt the same peer before falling back to the next candidate.
+5. **Download** — downloads from the highest-ranked peer, monitoring transfer
+   speed in real time. While a transfer waits in a remote queue, seakarr asks
+   the peer for its position immediately and every five minutes.
+   `max_queue_time_secs` caps the total wait from enqueue and
+   `max_start_time_secs` caps the wait after reaching queue position `1`; a
+   peer that exceeds either limit is abandoned and the next candidate is tried
+   without retrying the same peer. After transfer progress begins,
+   `timeout_secs` guards against inactivity (the per-album stall timeout for
+   unresponsive peers). If the speed drops below `min_upload_speed_kbps`, the
+   transfer is cancelled and the next candidate is tried. Per-file retries with
+   configurable count and delay (`max_retries`, `retry_delay_secs`) re-attempt
+   the same peer before falling back to the next candidate.
 6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
    into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
 7. **Persist & notify** — the album is marked as processed in SQLite and an Apprise notification is sent
@@ -403,9 +420,18 @@ The `filters.allowed_extensions` config key controls which formats pass the qual
 
 **Q: Can I download from queued peers instead of only free-slot peers?**
 
-Not yet. The `download.max_queue_length` key is parsed for future use but is not currently
-enforced — only peers with a free upload slot (`slots > 0`) are considered, matching the default
-value of `0`.
+Yes. Keep `download.max_queue_length: 0` for free-slot-only behavior, or set a
+positive limit to try zero-slot peers whose reported positive queue position
+is within that bound. Unknown and out-of-bound positions fail closed and move
+to the next candidate without retrying the same peer. A wire position of `0`
+means the peer has no actionable queue entry; it is treated as unknown and
+never proves a zero-slot peer eligible. A peer admitted with an advertised free
+slot is not retroactively rejected by later telemetry. `max_queue_time_secs`
+limits total queue wait, `max_start_time_secs` limits the wait after reaching
+position `1`, and `timeout_secs` controls inactivity only after transfer
+progress begins. With the defaults, a silent pre-start wait can therefore last
+up to `max_queue_time_secs: 1800`, rather than the post-start
+`timeout_secs: 180`.
 
 **Q: How do I prevent seakarr from downloading files with certain words in the filename?**
 

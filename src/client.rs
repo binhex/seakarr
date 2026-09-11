@@ -27,8 +27,19 @@ pub struct FileInfo {
 
 #[derive(Debug, Clone)]
 pub enum DownloadStatus {
+    /// Queued by the peer. `queue_position` is `Some` only for an actionable
+    /// one-based position. `None` means either no report yet or wire position
+    /// zero (not currently queued); neither proves a zero-slot peer in-bounds.
     Queued {
-        queue_position: u32,
+        queue_position: Option<u32>,
+    },
+    /// The peer paused a transfer that had already started (or paused it
+    /// before it started). Kept distinct from `InProgress` so a pre-start
+    /// pause consumes queue time instead of resetting the transfer
+    /// inactivity deadline.
+    Paused {
+        bytes_downloaded: u64,
+        total_bytes: u64,
     },
     InProgress {
         speed_bytes_per_sec: u64,
@@ -528,12 +539,15 @@ fn ss_file_to_domain(file: SsFile) -> FileInfo {
 }
 
 /// Map a crate download status to the domain type.
+///
+/// Queued positions and paused state are preserved one-for-one: the crate
+/// reports `None` while a position is unknown, and collapsing that to a
+/// number would make an unknown position indistinguishable from the queue
+/// head. A paused pre-start transfer must stay `Paused` so it consumes queue
+/// time rather than looking like zero-speed progress.
 fn ss_download_status_to_domain(status: SsDownloadStatus) -> DownloadStatus {
     match status {
-        // The crate sends Queued without a position (it tracks queue position
-        // internally and only updates its own store); the domain type wants a
-        // number, so report 0.
-        SsDownloadStatus::Queued => DownloadStatus::Queued { queue_position: 0 },
+        SsDownloadStatus::Queued { queue_position } => DownloadStatus::Queued { queue_position },
         SsDownloadStatus::InProgress {
             bytes_downloaded,
             total_bytes,
@@ -543,13 +557,10 @@ fn ss_download_status_to_domain(status: SsDownloadStatus) -> DownloadStatus {
             bytes_downloaded,
             total_bytes,
         },
-        // The domain type has no Paused variant; keep reporting progress so
-        // the consumer's speed/timeout checks keep running.
         SsDownloadStatus::Paused {
             bytes_downloaded,
             total_bytes,
-        } => DownloadStatus::InProgress {
-            speed_bytes_per_sec: 0,
+        } => DownloadStatus::Paused {
             bytes_downloaded,
             total_bytes,
         },
@@ -603,9 +614,9 @@ fn forward_transfer_status(
                         // interactive the line is fully suppressed — the
                         // progress bar handles display.
                         if last_progress_log.elapsed() >= std::time::Duration::from_secs(5) {
-                            // Log both InProgress and Paused (Paused
-                            // maps to InProgress with speed=0 in the
-                            // domain type, so display it consistently).
+                            // Log both InProgress and Paused (Paused is
+                            // forwarded as-is and carries no speed, so
+                            // display it at zero).
                             let (bd, tb, sp) = match &status {
                                 SsDownloadStatus::InProgress {
                                     bytes_downloaded,
@@ -667,6 +678,28 @@ fn forward_transfer_status(
             }
         }
     }
+}
+
+/// Forward one attempt's statuses, then remove only that attempt's vendor
+/// record. Keeping the sequence in one helper prevents delayed bridge cleanup
+/// from reverting to filename-wide removal and deleting a newer retry.
+fn forward_transfer_status_and_cleanup(
+    crate_rx: &std::sync::mpsc::Receiver<SsDownloadStatus>,
+    forward_tx: &tokio::sync::mpsc::Sender<DownloadStatus>,
+    forward_cancelled: &AtomicBool,
+    interactive: bool,
+    filename: &str,
+    client: &Client,
+    attempt_id: u32,
+) {
+    forward_transfer_status(
+        crate_rx,
+        forward_tx,
+        forward_cancelled,
+        interactive,
+        filename,
+    );
+    let _ = client.remove_download_by_attempt_id(attempt_id);
 }
 
 #[async_trait]
@@ -841,7 +874,7 @@ impl SoulseekClient for RealClient {
         let queue_client = client.clone();
         let queue_filename = filename.clone();
         let queue_username = username_owned.clone();
-        let (download_handle, crate_rx) = tokio::task::spawn_blocking(move || {
+        let (vendor_download, crate_rx) = tokio::task::spawn_blocking(move || {
             queue_client.download(queue_filename, queue_username, size, download_dir)
         })
         .await
@@ -869,8 +902,8 @@ impl SoulseekClient for RealClient {
         let cancelled = Arc::new(AtomicBool::new(false));
 
         // Forward statuses until a terminal status, a cancellation, or the
-        // crate closes the channel. Afterwards drop any stale download record
-        // so a retry of the same file is not shadowed (same md5 token).
+        // crate closes the channel. Afterwards drop only this attempt's stale
+        // record so delayed cleanup cannot remove a newer same-file retry.
         let forward_tx = status_tx.clone();
         let forward_cancelled = cancelled.clone();
         let bridge_client = client.clone();
@@ -879,42 +912,42 @@ impl SoulseekClient for RealClient {
         // Keep the Download handle alive — it holds the internal Sender that
         // the crate uses to push status updates. Dropping it closes the channel
         // and silently kills the transfer.
-        let _download_handle = download_handle;
+        let download_attempt_id = vendor_download.attempt_id;
+        let _vendor_download = vendor_download;
         tokio::task::spawn_blocking(move || {
-            // Keep _download_handle alive for the entire bridge lifetime.
-            let _keep = &_download_handle;
+            // Keep the vendor Download alive for the entire bridge lifetime.
+            let _keep = &_vendor_download;
             tracing::debug!("Bridge started for {bridge_filename} from {bridge_username}");
             // Evaluate once: isatty is a syscall per call, and the
             // interactive/non-interactive decision does not change mid-transfer.
             let interactive = is_interactive();
-            forward_transfer_status(
+            forward_transfer_status_and_cleanup(
                 &crate_rx,
                 &forward_tx,
                 &forward_cancelled,
                 interactive,
                 &bridge_filename,
+                &bridge_client,
+                download_attempt_id,
             );
             tracing::debug!(
-                "Bridge finished for {bridge_filename} from {bridge_username}, clearing download state"
+                "Bridge finished for {bridge_filename} from {bridge_username}, cleared attempt {download_attempt_id}"
             );
-            let _ = bridge_client.remove_download(&bridge_username, &bridge_filename);
         });
 
         // Cancellation: stop the wire transfer, drop the record, report.
         let cancel_client = client;
-        let cancel_username = username_owned;
-        let cancel_filename = filename;
         tokio::spawn(async move {
             if cancel_rx.recv().await.is_none() {
                 return;
             }
             cancelled.store(true, Ordering::SeqCst);
-            let _ = cancel_client.pause_download(&cancel_username, &cancel_filename);
+            let _ = cancel_client.pause_download_by_attempt_id(download_attempt_id);
             // Do NOT remove_download here — the F-connection transfer is
             // still running and wait_while_paused holds a store reference.
             // Removing the download races with the transfer thread and
-            // causes TokenNotFound. The bridge's own remove_download call
-            // after drain_transfer handles cleanup.
+            // causes TokenNotFound. The bridge's own attempt-scoped cleanup
+            // after drain_transfer handles removal safely.
             let _ = status_tx
                 .send(DownloadStatus::Failed {
                     reason: "cancelled".into(),
@@ -1291,11 +1324,117 @@ mod real_client_tests {
         assert_eq!(mapped.files[0].attribs.get(&4), Some(&44100));
     }
 
+    // Regression guard: the bridge must forward queue positions and paused
+    // state as non-terminal statuses. The previous mapping collapsed a paused
+    // transfer into zero-speed InProgress and invented queued position 0 for
+    // an unknown position, so
+    // the download state machine could not tell a real queue position from a
+    // missing one — and a pre-start pause looked like stalled transfer data.
+    #[tokio::test]
+    async fn bridge_forwards_queue_positions_as_non_terminal_statuses() {
+        let (crate_sender, crate_receiver) = std::sync::mpsc::channel();
+        let (forward_sender, mut forward_receiver) = tokio::sync::mpsc::channel(4);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            forward_transfer_status(
+                &crate_receiver,
+                &forward_sender,
+                &worker_cancelled,
+                false,
+                "song.flac",
+            );
+        });
+
+        crate_sender
+            .send(SsDownloadStatus::Queued {
+                queue_position: Some(2),
+            })
+            .unwrap();
+        assert!(matches!(
+            forward_receiver.recv().await,
+            Some(DownloadStatus::Queued {
+                queue_position: Some(2)
+            })
+        ));
+
+        crate_sender.send(SsDownloadStatus::Completed).unwrap();
+        assert!(matches!(
+            forward_receiver.recv().await,
+            Some(DownloadStatus::Completed)
+        ));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_cleanup_removes_only_its_attempt() {
+        let client = Arc::new(Client::new("test-user", "test-password"));
+        let (old_attempt, old_receiver) = client
+            .download(
+                "song.mp3".to_string(),
+                "peer".to_string(),
+                100,
+                "test".to_string(),
+            )
+            .unwrap();
+        let (new_attempt, _new_receiver) = client
+            .download(
+                "song.mp3".to_string(),
+                "peer".to_string(),
+                100,
+                "test".to_string(),
+            )
+            .unwrap();
+        let old_attempt_id = old_attempt.attempt_id;
+        let new_attempt_id = new_attempt.attempt_id;
+        let (forward_sender, mut forward_receiver) = tokio::sync::mpsc::channel(4);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_client = client.clone();
+        let worker_cancelled = cancelled.clone();
+
+        let worker = tokio::task::spawn_blocking(move || {
+            forward_transfer_status_and_cleanup(
+                &old_receiver,
+                &forward_sender,
+                &worker_cancelled,
+                false,
+                "song.mp3",
+                &worker_client,
+                old_attempt_id,
+            );
+        });
+
+        assert!(matches!(
+            forward_receiver.recv().await,
+            Some(DownloadStatus::Failed { .. })
+        ));
+        worker.await.unwrap();
+        let downloads = client.get_all_downloads();
+        assert!(!downloads
+            .iter()
+            .any(|download| download.attempt_id == old_attempt_id));
+        assert!(downloads
+            .iter()
+            .any(|download| download.attempt_id == new_attempt_id));
+    }
+
     #[test]
     fn maps_download_statuses() {
         assert!(matches!(
-            ss_download_status_to_domain(SsDownloadStatus::Queued),
-            DownloadStatus::Queued { queue_position: 0 }
+            ss_download_status_to_domain(SsDownloadStatus::Queued {
+                queue_position: None,
+            }),
+            DownloadStatus::Queued {
+                queue_position: None
+            }
+        ));
+        assert!(matches!(
+            ss_download_status_to_domain(SsDownloadStatus::Queued {
+                queue_position: Some(1),
+            }),
+            DownloadStatus::Queued {
+                queue_position: Some(1)
+            }
         ));
         assert!(matches!(
             ss_download_status_to_domain(SsDownloadStatus::InProgress {
@@ -1314,8 +1453,7 @@ mod real_client_tests {
                 bytes_downloaded: 100,
                 total_bytes: 1000,
             }),
-            DownloadStatus::InProgress {
-                speed_bytes_per_sec: 0,
+            DownloadStatus::Paused {
                 bytes_downloaded: 100,
                 total_bytes: 1000,
             }

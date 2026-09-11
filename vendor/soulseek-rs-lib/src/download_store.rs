@@ -19,6 +19,14 @@ impl DownloadStore {
         self.downloads.retain(|d| d.token != token);
     }
 
+    pub fn remove_by_attempt_id(&mut self, attempt_id: u32) -> Option<Download> {
+        let index = self
+            .downloads
+            .iter()
+            .position(|download| download.attempt_id == attempt_id)?;
+        Some(self.downloads.remove(index))
+    }
+
     #[must_use]
     pub fn get_by_token(&self, token: u32) -> Option<&Download> {
         self.downloads.iter().find(|d| d.token == token)
@@ -50,11 +58,27 @@ impl DownloadStore {
         }
     }
 
+    /// Publish a tokenless queue-position response to the newest matching
+    /// attempt that is still queued.
+    ///
+    /// Soulseek encodes "not currently queued" as zero; expose that as an
+    /// unknown position rather than as a one-based queue position. Because a
+    /// code-44 response has no attempt token, newest-queued selection is the
+    /// safest attribution when an old terminal record awaits cleanup.
     pub fn update_queue_position(&mut self, username: &str, filename: &str, position: u32) -> bool {
-        let Some(download) = self.get_by_file_mut(username, filename) else {
+        let Some(download) = self.downloads.iter_mut().rev().find(|download| {
+            download.username == username
+                && download.filename == filename
+                && matches!(download.status, DownloadStatus::Queued { .. })
+        }) else {
             return false;
         };
-        download.queue_position = Some(position);
+        let queue_position = (position > 0).then_some(position);
+        let status = DownloadStatus::Queued { queue_position };
+        download.queue_position = queue_position;
+        download.status = status.clone();
+        let sender = download.sender.clone();
+        let _ = sender.send(status);
         true
     }
 
@@ -62,7 +86,7 @@ impl DownloadStore {
         let Some(index) = self.downloads.iter().position(|download| {
             download.username == username
                 && download.filename == filename
-                && matches!(download.status, DownloadStatus::Queued)
+                && matches!(download.status, DownloadStatus::Queued { .. })
         }) else {
             return false;
         };
@@ -86,7 +110,21 @@ impl DownloadStore {
         let Some(download) = self.get_by_file_mut(username, filename) else {
             return false;
         };
+        Self::pause(download)
+    }
 
+    pub fn pause_by_attempt_id(&mut self, attempt_id: u32) -> bool {
+        let Some(download) = self
+            .downloads
+            .iter_mut()
+            .find(|download| download.attempt_id == attempt_id)
+        else {
+            return false;
+        };
+        Self::pause(download)
+    }
+
+    fn pause(download: &mut Download) -> bool {
         let paused_status = match &download.status {
             DownloadStatus::InProgress {
                 bytes_downloaded,
@@ -169,6 +207,7 @@ mod tests {
         Download {
             username: "peer".to_string(),
             filename: format!("file-{token}.mp3"),
+            attempt_id: token,
             token,
             size: 100,
             download_directory: "test".to_string(),
@@ -182,7 +221,12 @@ mod tests {
     #[test]
     fn add_get_remove_roundtrip() {
         let mut store = DownloadStore::new();
-        store.add(make_download(123, DownloadStatus::Queued));
+        store.add(make_download(
+            123,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        ));
 
         assert!(store.get_by_token(123).is_some());
         assert_eq!(store.tokens(), vec![123]);
@@ -194,18 +238,169 @@ mod tests {
     }
 
     #[test]
-    fn update_queue_position_sets_field_when_match() {
+    fn update_queue_position_updates_store_and_notifies_receiver() {
         let mut store = DownloadStore::new();
-        let mut download = make_download(1, DownloadStatus::Queued);
+        let (sender, receiver) = mpsc::channel();
+        let mut download = make_download(
+            1,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         download.username = "peer".to_string();
         download.filename = "song.mp3".to_string();
+        download.sender = sender;
         store.add(download);
 
-        assert!(store.update_queue_position("peer", "song.mp3", 42));
-        assert_eq!(store.get_by_token(1).unwrap().queue_position, Some(42));
+        assert!(store.update_queue_position("peer", "song.mp3", 7));
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(DownloadStatus::Queued {
+                queue_position: Some(7)
+            })
+        ));
+        let stored = store.get_by_token(1).unwrap();
+        assert_eq!(stored.queue_position, Some(7));
+        assert!(matches!(
+            stored.status,
+            DownloadStatus::Queued {
+                queue_position: Some(7)
+            }
+        ));
 
         assert!(!store.update_queue_position("peer", "missing.mp3", 1));
         assert!(!store.update_queue_position("other", "song.mp3", 1));
+    }
+
+    #[test]
+    fn zero_queue_position_is_published_as_unknown() {
+        let mut store = DownloadStore::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut download = make_download(
+            1,
+            DownloadStatus::Queued {
+                queue_position: Some(2),
+            },
+        );
+        download.username = "peer".to_string();
+        download.filename = "song.mp3".to_string();
+        download.sender = sender;
+        download.queue_position = Some(2);
+        store.add(download);
+
+        assert!(store.update_queue_position("peer", "song.mp3", 0));
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(DownloadStatus::Queued {
+                queue_position: None
+            })
+        ));
+        let stored = store.get_by_token(1).unwrap();
+        assert_eq!(stored.queue_position, None);
+        assert!(matches!(
+            stored.status,
+            DownloadStatus::Queued {
+                queue_position: None
+            }
+        ));
+    }
+
+    #[test]
+    fn queue_position_update_targets_newest_queued_same_file_attempt() {
+        let mut store = DownloadStore::new();
+        let (old_sender, old_receiver) = mpsc::channel();
+        let (new_sender, new_receiver) = mpsc::channel();
+        let mut old_attempt = make_download(1, DownloadStatus::Failed(None));
+        old_attempt.filename = "song.mp3".to_string();
+        old_attempt.sender = old_sender;
+        store.add(old_attempt);
+        let mut new_attempt = make_download(
+            2,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
+        new_attempt.filename = "song.mp3".to_string();
+        new_attempt.sender = new_sender;
+        store.add(new_attempt);
+
+        assert!(store.update_queue_position("peer", "song.mp3", 4));
+        assert!(matches!(
+            old_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            new_receiver.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(DownloadStatus::Queued {
+                queue_position: Some(4)
+            })
+        ));
+        assert_eq!(store.get_by_token(1).unwrap().queue_position, None);
+        assert_eq!(store.get_by_token(2).unwrap().queue_position, Some(4));
+    }
+
+    #[test]
+    fn late_queue_position_does_not_regress_in_progress_download() {
+        let mut store = DownloadStore::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut download = make_download(
+            1,
+            DownloadStatus::InProgress {
+                bytes_downloaded: 25,
+                total_bytes: 100,
+                speed_bytes_per_sec: 10.0,
+            },
+        );
+        download.filename = "song.mp3".to_string();
+        download.sender = sender;
+        store.add(download);
+
+        assert!(!store.update_queue_position("peer", "song.mp3", 7));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let stored = store.get_by_token(1).unwrap();
+        assert_eq!(stored.queue_position, None);
+        assert!(matches!(
+            stored.status,
+            DownloadStatus::InProgress {
+                bytes_downloaded: 25,
+                total_bytes: 100,
+                speed_bytes_per_sec: 10.0
+            }
+        ));
+    }
+
+    #[test]
+    fn late_queue_position_does_not_regress_paused_download() {
+        let mut store = DownloadStore::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut download = make_download(
+            1,
+            DownloadStatus::Paused {
+                bytes_downloaded: 25,
+                total_bytes: 100,
+            },
+        );
+        download.filename = "song.mp3".to_string();
+        download.sender = sender;
+        store.add(download);
+
+        assert!(!store.update_queue_position("peer", "song.mp3", 7));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let stored = store.get_by_token(1).unwrap();
+        assert_eq!(stored.queue_position, None);
+        assert!(matches!(
+            stored.status,
+            DownloadStatus::Paused {
+                bytes_downloaded: 25,
+                total_bytes: 100
+            }
+        ));
     }
 
     #[test]
@@ -253,7 +448,12 @@ mod tests {
     #[test]
     fn remove_queued_skips_active_downloads() {
         let mut store = DownloadStore::new();
-        store.add(make_download(123, DownloadStatus::Queued));
+        store.add(make_download(
+            123,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        ));
         store.add(make_download(
             456,
             DownloadStatus::InProgress {
@@ -280,10 +480,20 @@ mod tests {
         let mut failed = make_download(1, DownloadStatus::Failed(None));
         failed.filename = "song.mp3".to_string();
         store.add(failed);
-        let mut dup = make_download(2, DownloadStatus::Queued);
+        let mut dup = make_download(
+            2,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         dup.filename = "song.mp3".to_string();
         store.add(dup);
-        let mut other = make_download(3, DownloadStatus::Queued);
+        let mut other = make_download(
+            3,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         other.filename = "other.mp3".to_string();
         store.add(other);
 
@@ -301,17 +511,32 @@ mod tests {
         let (tx_other_user, _rx_other_user) = mpsc::channel();
         let (tx_other_file, _rx_other_file) = mpsc::channel();
 
-        let mut a = make_download(1, DownloadStatus::Queued);
+        let mut a = make_download(
+            1,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         a.sender = tx_match;
         a.username = "peer".to_string();
         a.filename = "song.mp3".to_string();
 
-        let mut b = make_download(2, DownloadStatus::Queued);
+        let mut b = make_download(
+            2,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         b.sender = tx_other_user;
         b.username = "other".to_string();
         b.filename = "song.mp3".to_string();
 
-        let mut c = make_download(3, DownloadStatus::Queued);
+        let mut c = make_download(
+            3,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         c.sender = tx_other_file;
         c.username = "peer".to_string();
         c.filename = "different.mp3".to_string();
@@ -366,7 +591,12 @@ mod tests {
 
         // A queued download has no active transfer and will never recover
         // once the peer is gone — it should be collected as failed.
-        let mut queued = make_download(3, DownloadStatus::Queued);
+        let mut queued = make_download(
+            3,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+        );
         queued.sender = tx_queued;
         queued.username = "peer".to_string();
         queued.filename = "queued.mp3".to_string();

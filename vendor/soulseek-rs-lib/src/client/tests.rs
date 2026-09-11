@@ -10,6 +10,7 @@ fn download(
     Download {
         username: username.to_string(),
         filename: filename.to_string(),
+        attempt_id: token,
         token,
         size: 100,
         download_directory: "test".to_string(),
@@ -29,7 +30,9 @@ fn test_client_context_downloads() {
         "test",
         "test.txt",
         token,
-        DownloadStatus::Queued,
+        DownloadStatus::Queued {
+            queue_position: None,
+        },
         mpsc::channel().0,
     ));
     assert!(context.get_download_by_token(123).is_some());
@@ -103,6 +106,56 @@ fn test_client_pause_and_resume_download() {
 }
 
 #[test]
+fn pause_download_by_attempt_id_preserves_newer_same_file_attempt() {
+    let client = Client::new("test-user", "test-password");
+    {
+        let mut context = client.context.write().unwrap();
+        let mut old_attempt = download(
+            "peer",
+            "song.mp3",
+            99,
+            DownloadStatus::InProgress {
+                bytes_downloaded: 10,
+                total_bytes: 100,
+                speed_bytes_per_sec: 10.0,
+            },
+            mpsc::channel().0,
+        );
+        old_attempt.attempt_id = 1;
+        context.add_download(old_attempt);
+        context.add_download(download(
+            "peer",
+            "song.mp3",
+            2,
+            DownloadStatus::InProgress {
+                bytes_downloaded: 20,
+                total_bytes: 100,
+                speed_bytes_per_sec: 20.0,
+            },
+            mpsc::channel().0,
+        ));
+    }
+
+    assert!(client.pause_download_by_attempt_id(1));
+    let context = client.context.read().unwrap();
+    assert!(matches!(
+        context.get_download_by_token(99).unwrap().status,
+        DownloadStatus::Paused {
+            bytes_downloaded: 10,
+            total_bytes: 100
+        }
+    ));
+    assert!(matches!(
+        context.get_download_by_token(2).unwrap().status,
+        DownloadStatus::InProgress {
+            bytes_downloaded: 20,
+            total_bytes: 100,
+            speed_bytes_per_sec: 20.0
+        }
+    ));
+}
+
+#[test]
 fn stop_listener_is_idempotent_and_safe_to_drop() {
     // A client that never connected has no listener thread, so
     // stop_listener() must be a no-op that just sets the shutdown flag. Two
@@ -170,7 +223,9 @@ fn fail_queued_downloads_notifies_receiver_and_store() {
         "peer",
         "f.mp3",
         7,
-        DownloadStatus::Queued,
+        DownloadStatus::Queued {
+            queue_position: None,
+        },
         sender,
     ));
 
@@ -187,6 +242,113 @@ fn fail_queued_downloads_notifies_receiver_and_store() {
             .status,
         DownloadStatus::Failed(_)
     ));
+}
+
+#[test]
+fn place_in_queue_update_reaches_download_receiver() {
+    let client = Client::new("me", "password");
+    let (download_sender, status_receiver) = mpsc::channel();
+    client.context.write().unwrap().add_download(download(
+        "peer",
+        "song.mp3",
+        7,
+        DownloadStatus::Queued {
+            queue_position: None,
+        },
+        download_sender,
+    ));
+
+    let (ops_sender, ops_receiver) = mpsc::channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    Client::listen_to_client_operations(
+        ops_receiver,
+        client.context.clone(),
+        "me".to_string(),
+        shutdown.clone(),
+    );
+    ops_sender
+        .send(ClientOperation::PlaceInQueueUpdate {
+            username: "peer".to_string(),
+            filename: "song.mp3".to_string(),
+            place: 3,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        status_receiver.recv_timeout(Duration::from_secs(1)),
+        Ok(DownloadStatus::Queued {
+            queue_position: Some(3)
+        })
+    ));
+    shutdown.store(true, Ordering::Relaxed);
+    drop(ops_sender);
+}
+
+#[test]
+fn transfer_request_updates_newest_queued_same_file_attempt() {
+    let client = Client::new("me", "password");
+    {
+        let mut context = client.context.write().unwrap();
+        let mut old_attempt = download(
+            "peer",
+            "song.mp3",
+            99,
+            DownloadStatus::Failed(None),
+            mpsc::channel().0,
+        );
+        old_attempt.attempt_id = 1;
+        context.add_download(old_attempt);
+        context.add_download(download(
+            "peer",
+            "song.mp3",
+            2,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+            mpsc::channel().0,
+        ));
+    }
+
+    let (ops_sender, ops_receiver) = mpsc::channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    Client::listen_to_client_operations(
+        ops_receiver,
+        client.context.clone(),
+        "me".to_string(),
+        shutdown.clone(),
+    );
+    ops_sender
+        .send(ClientOperation::UpdateDownloadTokens(
+            Transfer {
+                direction: 1,
+                token: 77,
+                filename: "song.mp3".to_string(),
+                size: 100,
+            },
+            "peer".to_string(),
+        ))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if client
+            .context
+            .read()
+            .unwrap()
+            .get_download_by_token(77)
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "transfer token was not updated");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let context = client.context.read().unwrap();
+    assert_eq!(context.get_download_by_token(77).unwrap().attempt_id, 2);
+    assert!(context.get_download_by_token(99).is_some());
+    assert!(context.get_download_by_token(2).is_none());
+    shutdown.store(true, Ordering::Relaxed);
+    drop(ops_sender);
 }
 
 #[test]
@@ -295,6 +457,37 @@ fn a_flood_of_files_fills_a_search_before_the_response_cap() {
 }
 
 #[test]
+fn remove_download_by_attempt_id_preserves_newer_same_file() {
+    let client = Client::new("test-user", "test-password");
+    {
+        let mut context = client.context.write().unwrap();
+        let mut old_attempt = download(
+            "peer",
+            "song.mp3",
+            99,
+            DownloadStatus::Failed(None),
+            mpsc::channel().0,
+        );
+        old_attempt.attempt_id = 1;
+        context.add_download(old_attempt);
+        context.add_download(download(
+            "peer",
+            "song.mp3",
+            2,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
+            mpsc::channel().0,
+        ));
+    }
+
+    assert!(client.remove_download_by_attempt_id(1));
+    let context = client.context.read().unwrap();
+    assert!(context.get_download_by_token(99).is_none());
+    assert!(context.get_download_by_token(2).is_some());
+}
+
+#[test]
 fn test_client_removes_only_queued_downloads() {
     let client = Client::new("test-user", "test-password");
     {
@@ -303,7 +496,9 @@ fn test_client_removes_only_queued_downloads() {
             "peer",
             "queued.mp3",
             123,
-            DownloadStatus::Queued,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
             mpsc::channel().0,
         ));
         context.add_download(download(
@@ -539,7 +734,9 @@ fn protected_peers_covers_downloads_uploads_and_pending_serves() {
         "downloader",
         "song.mp3",
         1,
-        DownloadStatus::Queued,
+        DownloadStatus::Queued {
+            queue_position: None,
+        },
         mpsc::channel().0,
     ));
     context.add_download(download(
@@ -574,7 +771,9 @@ fn an_expired_broker_connect_fails_the_queued_downloads() {
             "ghost",
             "f.mp3",
             7,
-            DownloadStatus::Queued,
+            DownloadStatus::Queued {
+                queue_position: None,
+            },
             sender,
         ));
         ctx.pending_connect_tokens
@@ -607,7 +806,9 @@ fn a_replayed_transfer_response_does_not_start_a_second_transfer() {
         "peer",
         "f.mp3",
         9,
-        DownloadStatus::Queued,
+        DownloadStatus::Queued {
+            queue_position: None,
+        },
         sender,
     ));
 

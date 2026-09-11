@@ -12,11 +12,29 @@ use unicode_normalization::UnicodeNormalization;
 /// When `album` is `Some`, results whose file paths do not contain the album
 /// name as whole words are also rejected (primary artist+album search tier).
 /// The track-name fallback tier passes `None` so it is never album-gated.
+///
+/// This wrapper is free-slot-only (queue cap 0), so results with no free
+/// upload slots are rejected. Callers that enforce
+/// `download.max_queue_length` use [`filter_results_with_queue_limit`], which
+/// keeps a zero-slot candidate for download-time queue validation.
 pub fn filter_results(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
     album: Option<&str>,
+) -> Vec<SearchResult> {
+    filter_results_with_queue_limit(results, config, library_track_count, album, 0)
+}
+
+/// Queue-aware variant of [`filter_results`]. A zero-slot result is kept only
+/// when `max_queue_length` is positive; its reported queue position is
+/// validated when the download is actually queued.
+pub(crate) fn filter_results_with_queue_limit(
+    results: &[SearchResult],
+    config: &FilterConfig,
+    library_track_count: Option<usize>,
+    album: Option<&str>,
+    max_queue_length: u32,
 ) -> Vec<SearchResult> {
     results
         .iter()
@@ -33,10 +51,13 @@ pub fn filter_results(
                 }
             }
 
-            // Filter: must have free upload slots. Results with no free
-            // slots (slots == 0) are always rejected. The include_locked
-            // field is defined but not yet enforced.
-            if r.slots == 0 {
+            // Filter: must have free upload slots unless a positive queue
+            // cap permits a bounded queue wait (the peer's reported queue
+            // position is validated at download time). With the default cap
+            // of 0, results with no free slots (slots == 0) are always
+            // rejected. The include_locked field is defined but not yet
+            // enforced.
+            if r.slots == 0 && max_queue_length == 0 {
                 return false;
             }
 
@@ -671,6 +692,29 @@ mod tests {
         let filtered = filter_results(&results, &cfg, None, None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "user2");
+    }
+
+    #[test]
+    fn positive_queue_cap_keeps_zero_slot_candidate_for_download_validation() {
+        // With a positive queue cap, a zero-slot candidate must reach the
+        // download step, where its reported queue position is validated.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "queued-peer",
+            500,
+            0,
+            vec![make_file("Album/01 - track.flac", 900, 30_000_000)],
+        )];
+
+        let filtered = filter_results_with_queue_limit(&results, &cfg, None, None, 3);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].username, "queued-peer");
+
+        // The rejection summary must agree: a positive cap is not a
+        // free-slot rejection.
+        let summary = summarize_rejections_with_queue_limit(&results, &cfg, None, None, 3);
+        assert_eq!(summary.no_free_slots, 0);
     }
 
     #[test]
@@ -1482,11 +1526,27 @@ impl FilterRejectionSummary {
 
 /// Analyze why results were rejected without re-running the full filter.
 /// Returns a summary of rejection reasons across all results.
+///
+/// This wrapper is free-slot-only (queue cap 0). Callers that enforce
+/// `download.max_queue_length` use [`summarize_rejections_with_queue_limit`]
+/// so an admitted zero-slot candidate is not counted as a free-slot rejection.
 pub fn summarize_rejections(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
     album: Option<&str>,
+) -> FilterRejectionSummary {
+    summarize_rejections_with_queue_limit(results, config, library_track_count, album, 0)
+}
+
+/// Queue-aware variant of [`summarize_rejections`]. A zero-slot result is
+/// counted as a free-slot rejection only when `max_queue_length` is 0.
+pub(crate) fn summarize_rejections_with_queue_limit(
+    results: &[SearchResult],
+    config: &FilterConfig,
+    library_track_count: Option<usize>,
+    album: Option<&str>,
+    max_queue_length: u32,
 ) -> FilterRejectionSummary {
     let mut summary = FilterRejectionSummary::default();
     let mut ext_counts: std::collections::BTreeMap<String, usize> =
@@ -1501,8 +1561,10 @@ pub fn summarize_rejections(
             }
         }
 
-        // Slot check
-        if r.slots == 0 {
+        // Slot check: mirrors filter_results — a positive queue cap keeps a
+        // zero-slot result eligible for download-time queue validation, so
+        // it is not a free-slot rejection.
+        if r.slots == 0 && max_queue_length == 0 {
             summary.no_free_slots += 1;
             continue;
         }

@@ -29,6 +29,13 @@ pub enum SeakarrError {
     #[error("quality verification rejected download: {0}")]
     QualityRejected(String),
 
+    /// A queued download exceeded `max_queue_time_secs` or
+    /// `max_start_time_secs`, or the peer reported a queue position outside
+    /// `max_queue_length`. Waiting longer on the same peer cannot help, so
+    /// this error is never retried in place — the candidate fallback moves on.
+    #[error("download queue timeout: {0}")]
+    QueueTimeout(String),
+
     #[error("pid lock error: {0}")]
     PidLock(String),
 
@@ -37,3 +44,17 @@ pub enum SeakarrError {
 }
 
 pub type Result<T> = std::result::Result<T, SeakarrError>;
+
+#[cfg(test)]
+mod tests {
+    use super::SeakarrError;
+
+    #[test]
+    fn queue_timeout_error_displays_reason() {
+        let error = SeakarrError::QueueTimeout("queue position 4 exceeds limit 3".into());
+        assert_eq!(
+            error.to_string(),
+            "download queue timeout: queue position 4 exceeds limit 3"
+        );
+    }
+}

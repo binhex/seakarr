@@ -5,7 +5,7 @@ use tokio::time::{timeout, Duration};
 
 use indicatif::ProgressBar;
 
-use crate::client::{DownloadStatus, FileInfo, SearchResult, SoulseekClient};
+use crate::client::{DownloadHandle, DownloadStatus, FileInfo, SearchResult, SoulseekClient};
 use crate::config::DownloadConfig;
 use crate::discs;
 use crate::error::{Result, SeakarrError};
@@ -82,6 +82,11 @@ pub struct DownloadStats {
 /// The progress bar is created lazily on the first `InProgress` status —
 /// before that point no bar renders. Pass `None` for `progress` to skip
 /// the bar entirely.
+///
+/// This entry point assumes the candidate has a free upload slot. Callers
+/// that know the candidate's advertised slot count use
+/// [`download_file_for_candidate`] so the queue policy can require a
+/// position from candidates that have to wait.
 #[allow(clippy::too_many_arguments)]
 pub async fn download_file(
     client: &dyn SoulseekClient,
@@ -93,6 +98,42 @@ pub async fn download_file(
     progress: Option<&ProgressDisplay>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(PathBuf, f64)> {
+    download_file_for_candidate(
+        client, file, username, 1, dir, config, filters, progress, cancel,
+    )
+    .await
+}
+
+/// Download a single file from a specific candidate, applying the queue
+/// policy while the peer holds it.
+///
+/// `peer_slots` is the candidate's advertised free upload slots from the
+/// search result. With `max_queue_length > 0` it decides whether an attempt
+/// must prove an in-bound queue position before its first progress event: a
+/// zero-slot candidate is expected to queue and its position is enforced,
+/// while a candidate with a free slot may start immediately. Waiting for the
+/// queue head does not consume `timeout_secs`; `max_queue_time_secs` bounds
+/// the total queue wait and `max_start_time_secs` bounds the wait from the
+/// first observed position-1 state.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_file_for_candidate(
+    client: &dyn SoulseekClient,
+    file: &FileInfo,
+    username: &str,
+    peer_slots: u8,
+    dir: &Path,
+    config: &DownloadConfig,
+    filters: &crate::config::FilterConfig,
+    progress: Option<&ProgressDisplay>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<(PathBuf, f64)> {
+    if config.max_queue_length == 0 && peer_slots == 0 {
+        return Err(SeakarrError::QueueTimeout(format!(
+            "{} from {username} requires an advertised free slot when max_queue_length=0",
+            file.name
+        )));
+    }
+
     // Validate the remote name for traversal safety, but pass the FULL
     // share-relative path to the crate: the Soulseek QueueUpload wire
     // message must quote the path exactly as the peer shared it (e.g.
@@ -151,7 +192,7 @@ pub async fn download_file(
             }
         }
         match download_once(
-            client, file, basename, username, dir, config, filters, progress, cancel,
+            client, file, basename, username, peer_slots, dir, config, filters, progress, cancel,
         )
         .await
         {
@@ -188,13 +229,17 @@ pub async fn download_file(
     Err(last_err.unwrap())
 }
 
-/// Classify a download error for the per-peer retry loop. A quality
-/// rejection is permanent — the same file downloaded again from the same
-/// peer has the same bitrate/bitdepth, so retrying only burns the retry
-/// delay. Every other failure (timeouts, refused transfers, dropped
-/// connections) is treated as transient and retried.
-fn is_retryable(e: &SeakarrError) -> bool {
-    !matches!(e, SeakarrError::QualityRejected(_))
+/// Classify a download error for the per-peer retry loop. Two error kinds are
+/// permanent: a quality rejection (the same file downloaded again from the
+/// same peer has the same bitrate/bitdepth) and a queue policy failure (the
+/// peer's queue cannot improve by waiting again). Every other failure
+/// (timeouts, refused transfers, dropped connections) is treated as transient
+/// and retried.
+fn is_retryable(error: &SeakarrError) -> bool {
+    !matches!(
+        error,
+        SeakarrError::QualityRejected(_) | SeakarrError::QueueTimeout(_)
+    )
 }
 
 /// Update an exponential moving average (EMA) with a new sample.
@@ -223,17 +268,156 @@ fn effective_throughput_kib_s(bytes: u64, elapsed: std::time::Duration) -> f64 {
     bytes as f64 / secs / 1024.0
 }
 
-/// Single download attempt for `download_file` (no retry loop). Queues the
-/// transfer and polls status until success, failure, timeout, or cancel.
-/// Returns the destination path plus the transfer duration (first InProgress
-/// to completion). The `basename` parameter must be pre-validated by the
-/// caller.
+/// How often the status channel is polled. Small enough that a cancellation
+/// (Ctrl+C) is honoured promptly, large enough to keep the polling loop cheap
+/// during a long queue wait.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Which queue limit expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDeadlineKind {
+    /// `max_queue_time_secs` — the total time the peer kept the file queued.
+    TotalQueue,
+    /// `max_start_time_secs` — the time since the peer first reported the
+    /// file at queue position 1.
+    QueueHead,
+}
+
+/// Build the queue deadline for a limit measured from `start`. Zero disables
+/// the limit, so the deadline is `None` and the wait is unbounded.
+fn enabled_deadline(start: tokio::time::Instant, seconds: u64) -> Option<tokio::time::Instant> {
+    (seconds > 0)
+        .then(|| start.checked_add(Duration::from_secs(seconds)))
+        .flatten()
+}
+
+/// Pick the queue deadline that expires first, keeping its source so the
+/// error can name the limit that was actually exceeded.
+fn earliest_queue_deadline(
+    total: Option<tokio::time::Instant>,
+    head: Option<tokio::time::Instant>,
+) -> Option<(tokio::time::Instant, QueueDeadlineKind)> {
+    match (total, head) {
+        (Some(total), Some(head)) if head < total => Some((head, QueueDeadlineKind::QueueHead)),
+        (Some(total), _) => Some((total, QueueDeadlineKind::TotalQueue)),
+        (None, Some(head)) => Some((head, QueueDeadlineKind::QueueHead)),
+        (None, None) => None,
+    }
+}
+
+/// Reject a positive peer-reported queue position above an active cap.
+/// Cap-zero candidates have already proved a free slot before queueing and
+/// are not retroactively rejected by later telemetry.
+fn queue_position_rejection(position: u32, max_queue_length: u32) -> Option<String> {
+    if max_queue_length > 0 && position > max_queue_length {
+        Some(format!(
+            "reported queue position {position}, exceeding max_queue_length={max_queue_length}"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Ask the peer to cancel the transfer and wait for it to stop, so the
+/// caller's staging cleanup cannot race a still-running transfer thread.
+async fn cancel_and_drain(handle: &mut DownloadHandle) {
+    let _ = handle.cancel_tx.send(()).await;
+    drain_transfer(&mut handle.status_rx, 5).await;
+}
+
+fn cancellation_requested(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// Clear the progress bar, cancel the in-flight transfer, and hand back the
+/// error to return — the single exit path for every aborted attempt.
+async fn stop_with_error(
+    handle: &mut DownloadHandle,
+    bar: &Option<ProgressBar>,
+    error: SeakarrError,
+) -> SeakarrError {
+    if let Some(bar) = bar {
+        bar.finish_and_clear();
+    }
+    cancel_and_drain(handle).await;
+    error
+}
+
+/// End a queued attempt whose queue deadline expired, naming the limit that
+/// was exceeded. A cancellation that arrived in the meantime wins over the
+/// expiry — Ctrl+C must always surface as a cancellation.
+#[allow(clippy::too_many_arguments)]
+async fn expire_queue_wait(
+    handle: &mut DownloadHandle,
+    bar: &Option<ProgressBar>,
+    cancel: Option<&Arc<AtomicBool>>,
+    kind: QueueDeadlineKind,
+    basename: &str,
+    username: &str,
+    config: &DownloadConfig,
+    observed_queue_position: Option<u32>,
+) -> SeakarrError {
+    let reason = match kind {
+        QueueDeadlineKind::TotalQueue => format!(
+            "{basename} from {username} exceeded max_queue_time_secs={} (last queue position: {})",
+            config.max_queue_time_secs,
+            observed_queue_position
+                .map(|position| position.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        QueueDeadlineKind::QueueHead => format!(
+            "{basename} from {username} exceeded max_start_time_secs={} at queue position 1",
+            config.max_start_time_secs,
+        ),
+    };
+    tracing::warn!("Download queue timeout: {reason}");
+    let error = if cancellation_requested(cancel) {
+        SeakarrError::Download("download cancelled by user".into())
+    } else {
+        SeakarrError::QueueTimeout(reason)
+    };
+    stop_with_error(handle, bar, error).await
+}
+
+/// End a queued attempt rejected by the queue policy (a position the
+/// configured `max_queue_length` does not allow, or a zero-slot candidate
+/// that started without proving a position). A cancellation that arrived in
+/// the meantime wins over the rejection.
+async fn reject_queued_attempt(
+    handle: &mut DownloadHandle,
+    bar: &Option<ProgressBar>,
+    cancel: Option<&Arc<AtomicBool>>,
+    reason: String,
+) -> SeakarrError {
+    tracing::warn!("Download queue rejected: {reason}");
+    let error = if cancellation_requested(cancel) {
+        SeakarrError::Download("download cancelled by user".into())
+    } else {
+        SeakarrError::QueueTimeout(reason)
+    };
+    stop_with_error(handle, bar, error).await
+}
+
+/// Single download attempt for `download_file_for_candidate` (no retry loop).
+/// Queues the transfer and polls status until success, failure, timeout, or
+/// cancel. Returns the destination path plus the transfer duration (first
+/// InProgress to completion). The `basename` parameter must be pre-validated by
+/// the caller.
+///
+/// Queue wait and transfer inactivity are timed separately: `timeout_secs`
+/// starts at the first real progress event and is reset only by further
+/// progress, while the queue wait is bounded by `max_queue_time_secs` (from
+/// enqueue) and `max_start_time_secs` (from the first position-1 observation).
+/// Observed queue positions are validated against `max_queue_length`, and a
+/// zero-slot candidate with a positive cap must prove an in-bound position
+/// before its first progress event.
 #[allow(clippy::too_many_arguments)]
 async fn download_once(
     client: &dyn SoulseekClient,
     file: &FileInfo,
     basename: &str,
     username: &str,
+    peer_slots: u8,
     dir: &Path,
     config: &DownloadConfig,
     filters: &crate::config::FilterConfig,
@@ -245,7 +429,21 @@ async fn download_once(
         Err(e) => return Err(e),
     };
     tracing::info!("Download queued: {basename} from {username}");
+    // Queue state. `total_queue_deadline` bounds the whole wait from enqueue;
+    // `queue_head_at` records the first position-1 observation, which starts
+    // the `max_start_time_secs` clock only at that point. Either is `None`
+    // when its limit is zero (disabled).
+    let enqueued_at = tokio::time::Instant::now();
+    let total_queue_deadline = enabled_deadline(enqueued_at, config.max_queue_time_secs);
+    let mut queue_head_at: Option<tokio::time::Instant> = None;
+    let mut observed_queue_position: Option<u32> = None;
+    // Transfer state. The deadline starts at the first real progress event,
+    // so queue wait is never charged against `timeout_secs`.
     let mut transfer_start: Option<tokio::time::Instant> = None;
+    let mut transfer_deadline: Option<tokio::time::Instant> = None;
+    // A zero-slot candidate with a positive cap is expected to queue, so it
+    // must prove an in-bound position before it may start transferring.
+    let requires_queue_position = config.max_queue_length > 0 && peer_slots == 0;
     // Progress bar for this transfer, created lazily on the first InProgress
     // status. Before the transfer actually starts no bar may render — the
     // user should only see progress once a download is underway (the bar was
@@ -259,32 +457,56 @@ async fn download_once(
     // the raw instantaneous speed_bytes_per_sec from each InProgress
     // status so the displayed speed doesn't jump around.
     let mut speed_ema: Option<f64> = None;
-    // Wall-clock deadline for the entire transfer — reset on every status
-    // message. With 1-second polling, Err(_elapsed) fires every second;
-    // only trigger timeout when the deadline is truly exceeded.
-    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
 
     loop {
-        // Honour cancellation (Ctrl+C / SIGINT): abort the transfer and
-        // clean up. The caller (download_album) removes the staging dir.
-        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            let _ = handle.cancel_tx.send(()).await;
-            drain_transfer(&mut handle.status_rx, 5).await;
-            if let Some(bar) = &bar {
-                bar.finish_and_clear();
-            }
-            return Err(SeakarrError::Download("download cancelled by user".into()));
+        // Honour cancellation (Ctrl+C / SIGINT) first: it outranks every
+        // queue and transfer deadline. The caller (download_album) removes
+        // the staging dir.
+        if cancellation_requested(cancel) {
+            return Err(stop_with_error(
+                &mut handle,
+                &bar,
+                SeakarrError::Download("download cancelled by user".into()),
+            )
+            .await);
         }
-        // Poll status with a short timeout so the cancel flag is checked
-        // frequently (at least once per second). The wall-clock deadline
-        // for the whole transfer is still config.timeout_secs.
-        let poll_timeout = Duration::from_secs(1);
+        let now = tokio::time::Instant::now();
+        // While queued, the earliest of the total queue limit and the
+        // queue-head limit bounds the wait. Once the transfer has started,
+        // only transfer inactivity matters.
+        let head_deadline =
+            queue_head_at.and_then(|head| enabled_deadline(head, config.max_start_time_secs));
+        let active_queue_deadline = earliest_queue_deadline(total_queue_deadline, head_deadline);
+        let active_deadline = if transfer_start.is_some() {
+            transfer_deadline
+        } else {
+            active_queue_deadline.map(|(deadline, _)| deadline)
+        };
+        if transfer_start.is_none() {
+            if let Some((deadline, kind)) = active_queue_deadline {
+                if now >= deadline {
+                    return Err(expire_queue_wait(
+                        &mut handle,
+                        &bar,
+                        cancel,
+                        kind,
+                        basename,
+                        username,
+                        config,
+                        observed_queue_position,
+                    )
+                    .await);
+                }
+            }
+        }
+        // Poll status with a short timeout so cancellation and deadline
+        // expiry are checked frequently, and never later than the active
+        // deadline.
+        let poll_timeout = active_deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(STATUS_POLL_INTERVAL)
+            .min(STATUS_POLL_INTERVAL);
         let msg = timeout(poll_timeout, handle.status_rx.recv()).await;
-
-        // Only InProgress resets the deadline — actual data is flowing.
-        // Queued/Paused states do NOT reset: a peer that stays queued
-        // beyond timeout_secs should be abandoned. The Err (poll timeout)
-        // arm checks the deadline.
 
         match msg {
             Ok(Some(DownloadStatus::InProgress {
@@ -292,10 +514,22 @@ async fn download_once(
                 bytes_downloaded,
                 total_bytes,
             })) => {
-                // Data is flowing — reset the wall-clock deadline.
-                deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
+                let now = tokio::time::Instant::now();
+                // Fail closed: a zero-slot candidate with a positive cap must
+                // not start on an unproven position, or a peer could keep the
+                // file queued and then start it outside the configured policy.
+                if transfer_start.is_none()
+                    && requires_queue_position
+                    && observed_queue_position.is_none()
+                {
+                    let reason = format!(
+                        "{basename} from {username} started with an unknown queue position while max_queue_length={}",
+                        config.max_queue_length
+                    );
+                    return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
+                }
                 if transfer_start.is_none() {
-                    transfer_start = Some(tokio::time::Instant::now());
+                    transfer_start = Some(now);
                     // Create the progress bar only once the transfer has
                     // actually started (first InProgress). Skip for
                     // zero-length transfers — indicatif renders len==0 as
@@ -306,6 +540,9 @@ async fn download_once(
                         }
                     }
                 }
+                // Real progress is the only thing that starts (and resets)
+                // `timeout_secs`; queue wait never counts against it.
+                transfer_deadline = now.checked_add(Duration::from_secs(config.timeout_secs));
                 last_total_bytes = total_bytes;
                 // Speed check: only after the transfer has actually started
                 // transferring (not just queued), and past the wait period.
@@ -314,17 +551,18 @@ async fn download_once(
                         if ts.elapsed().as_secs() >= config.speed_check_wait_secs {
                             let speed_kbps = (speed_bytes_per_sec / 1024) as u32;
                             if speed_kbps < config.min_upload_speed_kbps {
-                                if let Some(bar) = &bar {
-                                    bar.finish_and_clear();
-                                }
-                                let _ = handle.cancel_tx.send(()).await;
-                                // Wait for the transfer to terminate before
-                                // returning — download_album calls remove_dir_all.
-                                drain_transfer(&mut handle.status_rx, 5).await;
-                                return Err(SeakarrError::Download(format!(
-                                    "speed {speed_kbps} KB/s below minimum {} KB/s",
-                                    config.min_upload_speed_kbps
-                                )));
+                                // Cancel and drain before returning —
+                                // download_album calls remove_dir_all and must
+                                // not race the transfer thread.
+                                return Err(stop_with_error(
+                                    &mut handle,
+                                    &bar,
+                                    SeakarrError::Download(format!(
+                                        "speed {speed_kbps} KB/s below minimum {} KB/s",
+                                        config.min_upload_speed_kbps
+                                    )),
+                                )
+                                .await);
                             }
                         }
                     }
@@ -339,6 +577,20 @@ async fn download_once(
                 }
             }
             Ok(Some(DownloadStatus::Completed)) => {
+                // Same fail-closed rule as the first progress event: an
+                // attempt that completes without ever proving its position
+                // must not be accepted. Free-slot candidates are unaffected
+                // and keep the zero-throughput path below.
+                if transfer_start.is_none()
+                    && requires_queue_position
+                    && observed_queue_position.is_none()
+                {
+                    let reason = format!(
+                        "{basename} from {username} completed without a queue position while max_queue_length={}",
+                        config.max_queue_length
+                    );
+                    return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
+                }
                 if let Some(bar) = &bar {
                     // Snap to 100% before clearing — the final InProgress
                     // may have left the bar below the total.
@@ -372,13 +624,37 @@ async fn download_once(
                 ));
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
+                tracing::warn!("Download of {basename} failed: {reason}");
                 if let Some(bar) = &bar {
                     bar.finish_and_clear();
                 }
-                tracing::warn!("Download of {basename} failed: {reason}");
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
             }
-            Ok(Some(DownloadStatus::Queued { .. })) => {}
+            Ok(Some(DownloadStatus::Queued { queue_position })) => {
+                // Positions are only meaningful before the transfer starts: a
+                // late Queued must not re-enter queue state or reset any
+                // deadline.
+                if transfer_start.is_none() {
+                    if let Some(position) = queue_position.filter(|position| *position > 0) {
+                        if let Some(detail) =
+                            queue_position_rejection(position, config.max_queue_length)
+                        {
+                            let reason = format!("{basename} from {username} {detail}");
+                            return Err(
+                                reject_queued_attempt(&mut handle, &bar, cancel, reason).await
+                            );
+                        }
+                        observed_queue_position = Some(position);
+                        if position == 1 && queue_head_at.is_none() {
+                            queue_head_at = Some(tokio::time::Instant::now());
+                        }
+                    }
+                }
+            }
+            // A pause is not progress: it neither starts nor resets the
+            // transfer inactivity deadline, and it does not re-enter queue
+            // state once the transfer has started.
+            Ok(Some(DownloadStatus::Paused { .. })) => {}
             Ok(None) => {
                 if let Some(bar) = &bar {
                     bar.finish_and_clear();
@@ -389,21 +665,39 @@ async fn download_once(
                 ));
             }
             Err(_elapsed) => {
-                // The 1-second poll timed out — check the wall-clock
-                // deadline before declaring the transfer dead.
-                if tokio::time::Instant::now() >= deadline {
-                    if let Some(bar) = &bar {
-                        bar.finish_and_clear();
+                // The poll window expired — check the active deadline before
+                // declaring the attempt dead. Only the deadline that applies
+                // to the current phase can expire.
+                let now = tokio::time::Instant::now();
+                if transfer_start.is_some() {
+                    if transfer_deadline.is_some_and(|deadline| now >= deadline) {
+                        tracing::warn!(
+                            "Download of {basename} timed out after {}s",
+                            config.timeout_secs
+                        );
+                        return Err(stop_with_error(
+                            &mut handle,
+                            &bar,
+                            SeakarrError::Download("download timed out".into()),
+                        )
+                        .await);
                     }
-                    tracing::warn!(
-                        "Download of {basename} timed out after {}s",
-                        config.timeout_secs
-                    );
-                    let _ = handle.cancel_tx.send(()).await;
-                    drain_transfer(&mut handle.status_rx, 5).await;
-                    return Err(SeakarrError::Download("download timed out".into()));
+                } else if let Some((deadline, kind)) = active_queue_deadline {
+                    if now >= deadline {
+                        return Err(expire_queue_wait(
+                            &mut handle,
+                            &bar,
+                            cancel,
+                            kind,
+                            basename,
+                            username,
+                            config,
+                            observed_queue_position,
+                        )
+                        .await);
+                    }
                 }
-                // Still within deadline — continue polling.
+                // Still within the deadline — continue polling.
             }
         }
     }
@@ -633,10 +927,11 @@ pub async fn download_album(
             };
             std::fs::create_dir_all(&disc_dir)?;
 
-            match download_file(
+            match download_file_for_candidate(
                 client,
                 file,
                 &candidate.username,
+                candidate.slots,
                 &disc_dir,
                 config,
                 filters,
@@ -654,11 +949,12 @@ pub async fn download_album(
                     });
                 }
                 Err(e) => {
-                    // download_file already retried this file on the same
-                    // peer up to max_retries times (with retry_delay_secs
-                    // between attempts). A failure here means those retries
-                    // were exhausted, so fall back to the next ranked
-                    // candidate — the candidate list is the outer fallback.
+                    // download_file_for_candidate already retried this file
+                    // on the same peer up to max_retries times (with
+                    // retry_delay_secs between attempts). A failure here means
+                    // those retries were exhausted, so fall back to the next
+                    // ranked candidate — the candidate list is the outer
+                    // fallback.
                     tracing::warn!(
                         "Download of {} from {} failed after retries: {e}",
                         file.name,
@@ -2499,5 +2795,613 @@ mod tests {
         assert!(is_retryable(&SeakarrError::Download(
             "download timed out".into()
         )));
+    }
+
+    // ── Queue-aware download state machine ──
+    //
+    // These tests drive the state machine with simulated time
+    // (`start_paused = true`) through `ScriptedClient`, which replays a
+    // fixed status script per `download()` call. The last scripted status
+    // may leave the attempt waiting: the client holds the status sender open
+    // until seakarr cancels, so a cancelled attempt records the cancellation
+    // instead of ending the script early.
+
+    #[derive(Clone)]
+    struct StatusStep {
+        after: Duration,
+        status: DownloadStatus,
+    }
+
+    fn status_step(after: Duration, status: DownloadStatus) -> StatusStep {
+        StatusStep { after, status }
+    }
+
+    struct ScriptedClient {
+        scripts: Mutex<std::collections::VecDeque<Vec<StatusStep>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        cancellations: Arc<std::sync::atomic::AtomicUsize>,
+        usernames: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedClient {
+        fn new(scripts: Vec<Vec<StatusStep>>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                cancellations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                usernames: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SoulseekClient for ScriptedClient {
+        async fn login(&self, _u: &str, _p: &str, _s: &str, _port: u16) -> Result<()> {
+            Ok(())
+        }
+
+        async fn search(&self, _query: &str, _timeout_secs: u64) -> Result<Vec<SearchResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn download(
+            &self,
+            _file: &FileInfo,
+            username: &str,
+            _dir: &Path,
+        ) -> Result<DownloadHandle> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.usernames.lock().unwrap().push(username.to_string());
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one status script per download call");
+            let (status_tx, status_rx) = mpsc::channel(16);
+            let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+            let cancellations = self.cancellations.clone();
+            tokio::spawn(async move {
+                for step in script {
+                    tokio::select! {
+                        _ = tokio::time::sleep(step.after) => {
+                            if status_tx.send(step.status).await.is_err() {
+                                return;
+                            }
+                        }
+                        cancelled = cancel_rx.recv() => {
+                            if cancelled.is_some() {
+                                cancellations.fetch_add(1, Ordering::SeqCst);
+                                let _ = status_tx.send(DownloadStatus::Failed {
+                                    reason: "cancelled".into(),
+                                }).await;
+                            }
+                            return;
+                        }
+                    }
+                }
+                if cancel_rx.recv().await.is_some() {
+                    cancellations.fetch_add(1, Ordering::SeqCst);
+                    let _ = status_tx
+                        .send(DownloadStatus::Failed {
+                            reason: "cancelled".into(),
+                        })
+                        .await;
+                }
+            });
+            Ok(DownloadHandle {
+                status_rx,
+                cancel_tx,
+            })
+        }
+    }
+
+    /// Run one scripted attempt through the private candidate entry point and
+    /// return the staging dir (kept alive for the caller) plus the result.
+    async fn download_with_script(
+        client: &ScriptedClient,
+        peer_slots: u8,
+        file_size: u64,
+        config: &DownloadConfig,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> (TempDir, Result<(PathBuf, f64)>) {
+        let dir = TempDir::new().unwrap();
+        let file = make_file("Music\\Artist\\Album\\01.flac", 900, file_size);
+        let result = download_file_for_candidate(
+            client,
+            &file,
+            "peer",
+            peer_slots,
+            dir.path(),
+            config,
+            &default_filter_config_test(),
+            None,
+            cancel,
+        )
+        .await;
+        (dir, result)
+    }
+
+    fn queue_timeout_reason(result: &Result<(PathBuf, f64)>) -> String {
+        match result {
+            Err(SeakarrError::QueueTimeout(reason)) => reason.clone(),
+            other => panic!("expected a QueueTimeout, got {other:?}"),
+        }
+    }
+
+    fn in_progress(total_bytes: u64) -> DownloadStatus {
+        DownloadStatus::InProgress {
+            speed_bytes_per_sec: 1_024,
+            bytes_downloaded: total_bytes,
+            total_bytes,
+        }
+    }
+
+    fn queue_position(position: u32) -> DownloadStatus {
+        DownloadStatus::Queued {
+            queue_position: Some(position),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_failure_does_not_send_redundant_cancel() {
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::ZERO,
+            DownloadStatus::Failed {
+                reason: "peer denied transfer".to_string(),
+            },
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(matches!(
+            result,
+            Err(SeakarrError::Download(reason)) if reason.contains("peer denied transfer")
+        ));
+        assert_eq!(
+            client.cancellations.load(Ordering::SeqCst),
+            0,
+            "a terminal vendor status must not be cancelled and drained again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_cap_zero_rejects_zero_slot_before_queueing() {
+        let client =
+            ScriptedClient::new(vec![vec![status_step(Duration::ZERO, queue_position(1))]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 0;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(reason.contains("requires an advertised free slot"));
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            0,
+            "an invalid direct candidate must be rejected before contacting the peer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_wait_does_not_consume_transfer_timeout() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(2)),
+            status_step(Duration::from_secs(2), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 1;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 10;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "two seconds of queue wait must not consume a one-second transfer timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_queue_timeout_expires_queued_attempt() {
+        let client =
+            ScriptedClient::new(vec![vec![status_step(Duration::ZERO, queue_position(2))]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 0;
+        config.max_queue_time_secs = 2;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("max_queue_time_secs=2"),
+            "the reason must name the exhausted limit: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_head_timeout_starts_at_position_one() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(2)),
+            status_step(Duration::from_secs(2), queue_position(1)),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 1;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("max_start_time_secs=1"),
+            "the reason must name the queue-head limit: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_at_position_two_does_not_consume_start_limit() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(2)),
+            status_step(Duration::from_secs(2), queue_position(1)),
+            status_step(Duration::from_millis(500), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 1;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 1;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "the start limit may only count from the first position-1 observation: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_start_pause_does_not_start_transfer_timeout() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(
+                Duration::ZERO,
+                DownloadStatus::Paused {
+                    bytes_downloaded: 0,
+                    total_bytes: 1_024,
+                },
+            ),
+            status_step(Duration::from_secs(2), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 1;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "a pre-start pause is queue time, not transfer inactivity: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_start_pause_does_not_reset_transfer_timeout() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, in_progress(1_024)),
+            status_step(
+                Duration::from_millis(800),
+                DownloadStatus::Paused {
+                    bytes_downloaded: 0,
+                    total_bytes: 1_024,
+                },
+            ),
+            status_step(Duration::from_millis(400), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 1;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        let error = result.expect_err("a one-second stall past the pause must time out");
+        assert!(
+            matches!(&error, SeakarrError::Download(reason) if reason.contains("timed out")),
+            "a post-start pause is transfer inactivity, so the ordinary timeout applies: {error:?}"
+        );
+        assert!(!matches!(error, SeakarrError::QueueTimeout(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_queue_timers_allow_delayed_start() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(2), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 1;
+        config.max_start_time_secs = 0;
+        config.max_queue_time_secs = 0;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "zero queue timers disable queue expiry entirely: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_queue_cap_preserves_admitted_free_slot_candidate() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(1)),
+            status_step(Duration::from_millis(10), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 0;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "a cap-zero candidate admitted with a free slot must not be retroactively rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn positive_cap_rejects_out_of_bound_position() {
+        let client =
+            ScriptedClient::new(vec![vec![status_step(Duration::ZERO, queue_position(4))]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains('4') && reason.contains('3'),
+            "the reason must name the observed position and the cap: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_zero_position_is_ignored_for_free_slot_candidate() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(0)),
+            status_step(Duration::from_millis(10), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "wire position zero means no actionable queue position and must not abort a free-slot transfer: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_zero_position_does_not_prove_zero_slot_candidate() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(0)),
+            status_step(Duration::from_millis(10), in_progress(1_024)),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("unknown queue position"),
+            "wire position zero must not satisfy the positive-cap proof requirement: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_slot_candidate_fails_closed_without_position() {
+        let client =
+            ScriptedClient::new(vec![vec![status_step(Duration::ZERO, in_progress(1_024))]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("unknown queue position"),
+            "a candidate without a free slot must prove its position: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn free_slot_candidate_can_start_without_position() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "a candidate with a free slot may start without a queue position: {result:?}"
+        );
+    }
+
+    // Queue timeouts are per-peer policy failures: waiting on the same peer
+    // again cannot change its queue, so the retry loop must skip straight to
+    // the next candidate instead of burning max_retries on a doomed peer.
+    #[tokio::test(start_paused = true)]
+    async fn queue_timeout_falls_back_without_same_peer_retry() {
+        let client = ScriptedClient::new(vec![
+            vec![status_step(Duration::ZERO, queue_position(1))],
+            vec![
+                status_step(Duration::ZERO, in_progress(1_024)),
+                status_step(Duration::from_millis(10), DownloadStatus::Completed),
+            ],
+        ]);
+        let dir = TempDir::new().unwrap();
+        let candidates = vec![
+            SearchResult {
+                username: "queued-peer".into(),
+                speed: 100,
+                slots: 0,
+                files: vec![make_file("Music\\Artist\\Album\\01.flac", 900, 1_024)],
+            },
+            SearchResult {
+                username: "free-peer".into(),
+                speed: 200,
+                slots: 1,
+                files: vec![make_file("Music\\Artist\\Album\\01.flac", 900, 1_024)],
+            },
+        ];
+        let mut config = default_dl_config();
+        config.max_retries = 3;
+        config.retry_delay_secs = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 1;
+        config.max_queue_time_secs = 10;
+
+        let result = download_album(
+            &client,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the free-slot peer must serve the file: {result:?}"
+        );
+        // One attempt per peer: a retryable queue error would call the
+        // queued peer four times (1 + max_retries) before falling back.
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.usernames.lock().unwrap().as_slice(),
+            ["queued-peer", "free-peer"]
+        );
+        assert_eq!(client.cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_is_excluded_from_effective_throughput() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, queue_position(1)),
+            status_step(Duration::from_secs(5), in_progress(1_024)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+        config.max_start_time_secs = 60;
+        config.max_queue_time_secs = 60;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, None).await;
+
+        let (_, speed_kbps) = result.expect("a queued wait within the limits must succeed");
+        // 1 KiB transferred over one second of transfer time: including the
+        // five-second queue wait would report roughly one-sixth KiB/s and
+        // wrongly demote a busy-but-fast peer.
+        assert!(
+            (speed_kbps - 1.0).abs() < 0.05,
+            "unexpected speed: {speed_kbps}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_when_requested_during_queue_expiry_poll() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_900)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_time_secs = 2;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, Some(&cancel)).await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("download cancelled by user"),
+            "cancellation set while recv is pending must outrank queue expiry: {error:?}"
+        );
+        assert!(!matches!(error, SeakarrError::QueueTimeout(_)));
+        assert_eq!(client.cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_when_requested_during_position_poll() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_millis(150),
+            queue_position(4),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 0, 1_024, &config, Some(&cancel)).await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("download cancelled by user"),
+            "cancellation set while recv is pending must outrank position rejection: {error:?}"
+        );
+        assert!(!matches!(error, SeakarrError::QueueTimeout(_)));
+        assert_eq!(client.cancellations.load(Ordering::SeqCst), 1);
     }
 }

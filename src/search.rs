@@ -233,16 +233,24 @@ pub fn normalize_search_term(input: &str) -> String {
 }
 
 /// Returns true when `results` contain at least one result that passes the
-/// full filter pipeline — i.e. when the tier produced a downloadable result
-/// set. The cascade continues to the next tier when a tier returns non-empty
-/// but unusable results.
+/// full (queue-aware) filter pipeline — i.e. when the tier produced a
+/// downloadable result set. The cascade continues to the next tier when a
+/// tier returns non-empty but unusable results.
 fn tier_has_usable_results(
     results: &[SearchResult],
     filters: &FilterConfig,
     library_track_count: Option<usize>,
     album: Option<&str>,
+    max_queue_length: u32,
 ) -> bool {
-    !crate::filter::filter_results(results, filters, library_track_count, album).is_empty()
+    !crate::filter::filter_results_with_queue_limit(
+        results,
+        filters,
+        library_track_count,
+        album,
+        max_queue_length,
+    )
+    .is_empty()
 }
 
 /// Run a fallback-tier search, treating errors as "no results" so a
@@ -286,6 +294,12 @@ async fn search_fallback_tier(
 /// title-search fallback still have data. An empty outcome is returned when
 /// no tier produces any results (including the album-only tier matching no
 /// artist).
+///
+/// This wrapper is free-slot-only (queue cap 0): a tier whose results all
+/// have zero free slots is not considered usable. Callers that enforce
+/// `download.max_queue_length` use
+/// [`search_album_with_fallback_with_queue_limit`], so a zero-slot peer
+/// admitted by a positive queue cap is not discarded before download.
 pub async fn search_album_with_fallback(
     client: &dyn SoulseekClient,
     artist: &str,
@@ -293,6 +307,31 @@ pub async fn search_album_with_fallback(
     timeout_secs: u64,
     filters: &FilterConfig,
     library_track_count: Option<usize>,
+) -> Result<SearchOutcome> {
+    search_album_with_fallback_with_queue_limit(
+        client,
+        artist,
+        album,
+        timeout_secs,
+        filters,
+        library_track_count,
+        0,
+    )
+    .await
+}
+
+/// Queue-aware variant of [`search_album_with_fallback`]. A tier is usable
+/// when it yields at least one result that passes the queue-aware filter
+/// pipeline, so a zero-slot candidate admitted by a positive queue cap does
+/// not trigger unnecessary fallback searches.
+pub(crate) async fn search_album_with_fallback_with_queue_limit(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    album: Option<&str>,
+    timeout_secs: u64,
+    filters: &FilterConfig,
+    library_track_count: Option<usize>,
+    max_queue_length: u32,
 ) -> Result<SearchOutcome> {
     // The first tier whose raw results were non-empty but did not survive
     // filtering. Returned when no tier yields a usable (filter-passing)
@@ -319,7 +358,13 @@ pub async fn search_album_with_fallback(
         retain_artist_files(&mut results, artist);
     }
     if !results.is_empty() {
-        if tier_has_usable_results(&results, filters, library_track_count, album) {
+        if tier_has_usable_results(
+            &results,
+            filters,
+            library_track_count,
+            album,
+            max_queue_length,
+        ) {
             return Ok(SearchOutcome { results });
         }
         fallback = Some(results);
@@ -341,8 +386,13 @@ pub async fn search_album_with_fallback(
                         .await;
                 retain_artist_files(&mut lower_results, artist);
                 if !lower_results.is_empty() {
-                    if tier_has_usable_results(&lower_results, filters, library_track_count, album)
-                    {
+                    if tier_has_usable_results(
+                        &lower_results,
+                        filters,
+                        library_track_count,
+                        album,
+                        max_queue_length,
+                    ) {
                         return Ok(SearchOutcome {
                             results: lower_results,
                         });
@@ -377,7 +427,13 @@ pub async fn search_album_with_fallback(
                         .await;
                 retain_artist_files(&mut norm_results, artist);
                 if !norm_results.is_empty() {
-                    if tier_has_usable_results(&norm_results, filters, library_track_count, album) {
+                    if tier_has_usable_results(
+                        &norm_results,
+                        filters,
+                        library_track_count,
+                        album,
+                        max_queue_length,
+                    ) {
                         return Ok(SearchOutcome {
                             results: norm_results,
                         });
@@ -401,8 +457,13 @@ pub async fn search_album_with_fallback(
                     search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
                 retain_artist_files(&mut artist_matches, artist);
                 if !artist_matches.is_empty() {
-                    if tier_has_usable_results(&artist_matches, filters, library_track_count, album)
-                    {
+                    if tier_has_usable_results(
+                        &artist_matches,
+                        filters,
+                        library_track_count,
+                        album,
+                        max_queue_length,
+                    ) {
                         return Ok(SearchOutcome {
                             results: artist_matches,
                         });
@@ -1103,6 +1164,38 @@ mod tests {
         assert_eq!(outcome.results.len(), 1);
         let queries = client.search_queries.lock().unwrap().clone();
         assert_eq!(queries, vec!["Artist Album".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn positive_queue_cap_stops_search_fallback() {
+        let client = MockClient::new();
+        // A zero-slot primary result is usable when a positive queue cap is
+        // configured (the download step validates the real queue position),
+        // so the cascade must stop at the primary tier instead of running
+        // the lowercase/album-only fallbacks.
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "queued-peer".into(),
+            speed: 500,
+            slots: 0,
+            files: vec![make_file("Artist/Album/01 - Track.flac", 900, 30_000_000)],
+        }];
+
+        let outcome = search_album_with_fallback_with_queue_limit(
+            &client,
+            "Artist",
+            Some("Album"),
+            15,
+            &test_filters(),
+            None,
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(
+            client.search_queries.lock().unwrap().as_slice(),
+            ["Artist Album"]
+        );
     }
 
     #[tokio::test]

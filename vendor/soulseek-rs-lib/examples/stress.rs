@@ -1149,7 +1149,7 @@ fn main() {
     let mut by_status: HashMap<&'static str, usize> = HashMap::new();
     for download in client.get_all_downloads() {
         let label = match download.status {
-            soulseek_rs::DownloadStatus::Queued => "Queued",
+            soulseek_rs::DownloadStatus::Queued { .. } => "Queued",
             soulseek_rs::DownloadStatus::InProgress { .. } => "InProgress",
             soulseek_rs::DownloadStatus::Completed => "Completed",
             soulseek_rs::DownloadStatus::Failed(_) => "Failed",
@@ -1166,7 +1166,7 @@ fn main() {
     let stuck: Vec<String> = client
         .get_all_downloads()
         .iter()
-        .filter(|d| matches!(d.status, soulseek_rs::DownloadStatus::Queued))
+        .filter(|d| matches!(d.status, soulseek_rs::DownloadStatus::Queued { .. }))
         .map(|d| d.username.clone())
         .collect();
     if !stuck.is_empty() {

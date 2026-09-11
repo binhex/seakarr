@@ -496,10 +496,13 @@ mod tests {
         Download {
             username: "peer".to_string(),
             filename: "song.mp3".to_string(),
+            attempt_id: 1,
             token: 1,
             size,
             download_directory: dir.display().to_string(),
-            status: DownloadStatus::Queued,
+            status: DownloadStatus::Queued {
+                queue_position: None,
+            },
             sender: mpsc::channel().0,
             queue_position: None,
             metadata: DownloadMetadata::default(),

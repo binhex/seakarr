@@ -15,9 +15,8 @@ use crate::error::{Result, SeakarrError};
 //   LibraryConfig::scan_on_startup
 //   SearchConfig::response_limit, r#type, delay_secs,
 //                block_threshold, block_pause_secs
-//   DownloadConfig::max_queue_length, max_start_time_secs,
-//                max_queue_time_secs, max_download_time_mins,
-//                min_filtered_users, skip_retry_hours
+//   DownloadConfig::max_download_time_mins, min_filtered_users,
+//                skip_retry_hours
 //
 // The README config tables mark these as reserved.
 

@@ -38,13 +38,19 @@ Out of scope:
 
 ### Queue length
 
-- `max_queue_length: 0` preserves the current free-slot-only behavior.
+- `max_queue_length: 0` preserves free-slot-only candidate filtering. Once a
+  candidate is admitted because the search advertised a free slot, later
+  positive telemetry does not retroactively reject it; queue timers still
+  apply.
 - A positive `max_queue_length` permits a zero-slot peer only when a real
   queue position is observed and is within the configured bound.
 - An unknown queue position is never treated as within the bound. If a
   positive queue cap is active and no valid position arrives before the
   queued attempt must proceed or expire, the candidate fails closed.
-- Queue position is one-based; position `1` represents the queue head.
+- Positive queue positions are one-based; position `1` represents the queue
+  head. Wire position `0` means the peer has no current queue entry (including
+  after handing the file over), so it is normalized to an unknown,
+  non-actionable position and never proves a zero-slot candidate is in-bound.
 
 ### Timers
 
@@ -83,10 +89,43 @@ information. Extend the vendor status path so a queue-position update is
 forwarded to the download's status channel, while preserving the internal
 queue-position store.
 
-The application domain status must distinguish an unknown queue position from
-a real position. The bridge must preserve queued status as queued and must not
-map queued or paused states to transfer progress before the first real
-`InProgress` event.
+The application domain status must distinguish an actionable positive queue
+position from no position. The vendor normalizes wire position `0` to `None`,
+the same non-actionable state used before a position is known. The bridge must
+preserve queued status as queued and must not map queued or paused states to
+transfer progress before the first real `InProgress` event.
+
+The downloader must actively request queue-position telemetry rather than rely
+on unsolicited peer messages. After sending `QueueUpload` (peer code 43), the
+vendor peer actor sends `PlaceInQueueRequest` (peer code 51) immediately and
+every 300 seconds while that file remains queued. This telemetry is
+policy-independent because the protocol actor does not own application config,
+advertised free-slot snapshots can become stale, and position `1` drives the
+queue-head deadline for any wait. Polling stops when transfer starts, the
+upload fails, the download is removed or cancelled, or the peer actor
+disconnects. Transfer-request handling defers its stop until the client
+operation selects the newest matching queued attempt, migrates the wire token,
+and sends an attempt-scoped stop before replying. Repeated
+`PlaceInQueueResponse` messages (peer code 44) may update a still-queued
+download, but a late response must not regress an `InProgress`, `Paused`,
+completed, or failed vendor status back to queued.
+
+Peer code 44 identifies a download only by filename and carries no transfer
+token. When old and new same-user/same-filename records overlap, the vendor
+applies a response to the newest matching record that is still queued, instead
+of letting a terminal record consume it. A response delayed across retry
+generations still cannot be identified perfectly and may update the newer
+attempt; this protocol limitation remains fail-closed at the application
+boundary.
+
+Internal lifecycle cleanup is stricter: every queued download carries a stable
+attempt ID that does not change when its Soulseek wire transfer token changes.
+Queue polling schedules and explicit stop/removal operations use that attempt
+ID, so delayed cleanup from one attempt cannot delete, pause, or stop a newer
+retry of the same user and filename, including when `retry_delay_secs` is `0`.
+The ID retains the local u32 token counter's 2^31 wrap interval. That practical
+single-session limit is accepted; eliminating it would require a second wider
+identity model for a collision that cannot occur in realistic operation.
 
 ### Filtering and download flow
 
@@ -121,7 +160,10 @@ stalled transfer.
 
 No new YAML keys or database migrations are required. Existing configurations
 continue to parse because the three queue settings already exist. The default
-`max_queue_length: 0` behavior is unchanged. Existing default queue timers
+`max_queue_length: 0` behavior is unchanged at candidate admission: search
+still requires an advertised free slot. A candidate already
+admitted on that basis is not retroactively rejected solely because later
+telemetry reports a positive queue position. Existing default queue timers
 become active as documented, which intentionally changes queued downloads from
 being governed by the generic transfer timeout to being governed by the queue
 limits first.
@@ -144,8 +186,18 @@ Add focused tests for:
 7. `max_queue_length: 0` rejecting zero-slot candidates.
 8. A positive queue cap accepting an observed in-bound position, rejecting an
    out-of-bound position, and failing closed when the position remains unknown.
-9. Vendor queue-position updates reaching the application status channel.
-10. Existing transfer timeout, cancellation, quality verification, retry,
+9. Wire position `0` becoming non-actionable without proving a zero-slot
+   candidate eligible, and cap-zero preserving a candidate admitted with a
+   free slot despite later positive telemetry.
+10. Vendor queue-position updates reaching the application status channel.
+11. The vendor sending an immediate and periodic queue-position request, and
+    stopping those requests when the queued download leaves that lifecycle.
+12. Late queue-position responses not regressing a non-queued vendor status.
+13. Delayed cleanup from an old attempt preserving a newer same-file retry's
+    download record and queue-position polling schedule.
+14. Overlapping same-file records routing tokenless queue telemetry to the
+    newest record that is still queued.
+15. Existing transfer timeout, cancellation, quality verification, retry,
     free-slot, and integration tests remaining green.
 
 ## Acceptance criteria
@@ -155,5 +207,7 @@ Add focused tests for:
 - A peer that exceeds either configured queue deadline is abandoned promptly.
 - Once transfer starts, the existing inactivity timeout remains effective.
 - Queue limits and errors are visible in logs and candidate fallback behavior.
+- Permitted queued downloads actively request position telemetry immediately
+  and every five minutes while queued.
 - All existing Rust, integration, vendor, formatting, lint, and pre-commit
   checks pass.

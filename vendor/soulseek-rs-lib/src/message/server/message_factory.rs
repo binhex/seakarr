@@ -86,6 +86,15 @@ impl MessageFactory {
         Message::new().write_int32(92).clone()
     }
 
+    /// Ask a peer where our queued file sits (peer code 51).
+    #[must_use]
+    pub fn build_place_in_queue_request(filename: &str) -> Message {
+        Message::new()
+            .write_int32(51)
+            .write_string(filename)
+            .clone()
+    }
+
     /// Tell a peer where their queued file sits (peer code 44). Place counts
     /// from 1.
     #[must_use]
@@ -369,6 +378,17 @@ fn test_build_check_privileges() {
         vec![92, 0, 0, 0],
         MessageFactory::build_check_privileges().get_data()
     );
+}
+
+#[test]
+fn test_build_place_in_queue_request() {
+    let message = MessageFactory::build_place_in_queue_request("song.mp3");
+    let expect: Vec<u8> = [
+        51, 0, 0, 0, // code
+        8, 0, 0, 0, 115, 111, 110, 103, 46, 109, 112, 51, // "song.mp3"
+    ]
+    .to_vec();
+    assert_eq!(expect, message.get_data());
 }
 
 #[test]

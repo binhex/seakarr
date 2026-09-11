@@ -193,13 +193,14 @@ async fn process_album_internal(
         Some(results) => results,
         None => {
             let search_start = std::time::Instant::now();
-            let outcome = match search::search_album_with_fallback(
+            let outcome = match search::search_album_with_fallback_with_queue_limit(
                 client,
                 artist,
                 album,
                 config.search.timeout_secs,
                 &config.filters,
                 library_track_count,
+                config.download.max_queue_length,
             )
             .await
             {
@@ -236,8 +237,13 @@ async fn process_album_internal(
     // Filter + rank
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
     let mut total_users = results.len();
-    let mut filtered =
-        filter::filter_results(&results, &config.filters, library_track_count, album);
+    let mut filtered = filter::filter_results_with_queue_limit(
+        &results,
+        &config.filters,
+        library_track_count,
+        album,
+        config.download.max_queue_length,
+    );
     // Track which results were last filtered (for rejection summary)
     let mut last_filtered_results: Vec<crate::client::SearchResult> = results.clone();
     // Title-search fallback: when the primary search returned no usable results
@@ -299,7 +305,7 @@ async fn process_album_internal(
                                     total_results =
                                         title_results.iter().map(|r| r.files.len()).sum();
                                     total_users = title_results.len();
-                                    filtered = filter::filter_results(
+                                    filtered = filter::filter_results_with_queue_limit(
                                         &title_results,
                                         &config.filters,
                                         library_track_count,
@@ -308,6 +314,7 @@ async fn process_album_internal(
                                         // album by name, so rejecting on album
                                         // would leave us with nothing.
                                         None,
+                                        config.download.max_queue_length,
                                     );
                                     last_filtered_results = title_results.clone();
                                 }
@@ -356,12 +363,13 @@ async fn process_album_internal(
             // If the title tier ran and found results that were rejected
             // by filters, print a rejection summary so the user knows WHY.
             if title_search_attempted && !last_filtered_results.is_empty() {
-                let rejection_summary = filter::summarize_rejections(
+                let rejection_summary = filter::summarize_rejections_with_queue_limit(
                     &last_filtered_results,
                     &config.filters,
                     library_track_count,
                     // Title-search results are never album-gated.
                     None,
+                    config.download.max_queue_length,
                 );
                 if rejection_summary.has_rejections() {
                     tracing::info!(
@@ -380,15 +388,24 @@ async fn process_album_internal(
         } else {
             ""
         };
-        let rejection_summary = filter::summarize_rejections(
+        let rejection_summary = filter::summarize_rejections_with_queue_limit(
             &last_filtered_results,
             &config.filters,
             library_track_count,
             // When the title-search fallback fired, no album gate applies.
             if title_search_attempted { None } else { album },
+            config.download.max_queue_length,
         );
+        let availability_requirement = if config.download.max_queue_length == 0 {
+            "free slot".to_string()
+        } else {
+            format!(
+                "free slot or queue position <= {}",
+                config.download.max_queue_length
+            )
+        };
         tracing::info!(
-            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, free slot{contiguity_note})\n  → {}",
+            "{artist} — {}: {total_results} files from {total_users} users, 0 passed filters (need: {:?} format, {availability_requirement}{contiguity_note})\n  → {}",
             album.unwrap_or("(all)"),
             config.filters.allowed_extensions,
             rejection_summary.summary_line(),
@@ -830,13 +847,14 @@ async fn run_artist_only_mode(
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<(String, AlbumOutcome)>> {
     let search_start = std::time::Instant::now();
-    let outcome = search::search_album_with_fallback(
+    let outcome = search::search_album_with_fallback_with_queue_limit(
         client,
         artist,
         None,
         config.search.timeout_secs,
         &config.filters,
         None,
+        config.download.max_queue_length,
     )
     .await?;
     let duration_ms = search_start.elapsed().as_millis() as u64;

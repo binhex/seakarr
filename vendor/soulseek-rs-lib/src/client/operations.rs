@@ -152,7 +152,10 @@ impl Client {
                             token, peer
                         );
                         let Some(download) = maybe_download else {
-                            error!("Can't find download with token {:?}", token);
+                            debug!(
+                                "[client] ignoring transfer for unknown or cleaned-up token {}",
+                                token
+                            );
                             continue;
                         };
                         if matches!(
@@ -324,15 +327,22 @@ impl Client {
                             }
                         };
 
-                        let download_to_update = context.get_downloads().iter().find_map(|d| {
-                            if d.username == username && d.filename == transfer.filename {
-                                Some((d.token, d.clone()))
-                            } else {
-                                None
-                            }
-                        });
+                        let download_to_update =
+                            context.get_downloads().iter().rev().find_map(|download| {
+                                if download.username == username
+                                    && download.filename == transfer.filename
+                                    && matches!(download.status, DownloadStatus::Queued { .. })
+                                {
+                                    Some((download.token, download.clone()))
+                                } else {
+                                    None
+                                }
+                            });
 
-                        if let Some((old_token, download)) = download_to_update {
+                        let matched_attempt_id = if let Some((old_token, download)) =
+                            download_to_update
+                        {
+                            let attempt_id = download.attempt_id;
                             trace!(
                                 "[client] UpdateDownloadTokens found {old_token}, transfer: {:?}",
                                 transfer
@@ -344,7 +354,10 @@ impl Client {
                                 ..download
                             });
                             context.remove_download(old_token);
-                        }
+                            Some(attempt_id)
+                        } else {
+                            None
+                        };
 
                         // Only now invite the file connection: it is
                         // matched by this token, which is recorded as
@@ -354,6 +367,13 @@ impl Client {
                         let registry = context.peer_registry.clone();
                         drop(context);
                         if let Some(registry) = registry {
+                            if let Some(attempt_id) = matched_attempt_id {
+                                let _ = registry.stop_queue_position_requests(
+                                    &username,
+                                    transfer.filename.clone(),
+                                    Some(attempt_id),
+                                );
+                            }
                             let response =
                                 MessageFactory::build_transfer_response_message(transfer);
                             let _ = registry
@@ -447,7 +467,7 @@ impl Client {
                         // downloads that were queued for this peer while it
                         // was unreachable. Collect under a read guard, then
                         // act without it held.
-                        let (registry, files): (Option<PeerRegistry>, Vec<String>) =
+                        let (registry, files): (Option<PeerRegistry>, Vec<(String, u32)>) =
                             match client_context.read_safe() {
                                 Ok(ctx) => (
                                     ctx.peer_registry.clone(),
@@ -455,9 +475,9 @@ impl Client {
                                         .iter()
                                         .filter(|d| {
                                             d.username == username
-                                                && matches!(d.status, DownloadStatus::Queued)
+                                                && matches!(d.status, DownloadStatus::Queued { .. })
                                         })
-                                        .map(|d| d.filename.clone())
+                                        .map(|d| (d.filename.clone(), d.attempt_id))
                                         .collect(),
                                 ),
                                 Err(e) => {
@@ -472,8 +492,8 @@ impl Client {
                             .map(|mut ctx| ctx.take_peer_messages(&username))
                             .unwrap_or_default();
                         if let Some(registry) = registry {
-                            for filename in files {
-                                let _ = registry.queue_upload(&username, filename);
+                            for (filename, attempt_id) in files {
+                                let _ = registry.queue_upload(&username, filename, attempt_id);
                             }
                             for message in queued_messages {
                                 let _ = registry

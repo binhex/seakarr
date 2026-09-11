@@ -160,11 +160,18 @@ pub struct DownloadMetadata {
 pub struct Download {
     pub username: String,
     pub filename: String,
+    /// Stable identity for this download attempt. Unlike `token`, this value
+    /// does not change when the peer supplies its transfer token. It inherits
+    /// the local token counter's 2^31 wrap interval; this practical session
+    /// limit is accepted rather than changing the Soulseek-facing token type.
+    pub attempt_id: u32,
     pub token: u32,
     pub size: u64,
     pub download_directory: String,
     pub status: DownloadStatus,
     pub sender: Sender<DownloadStatus>,
+    /// Latest actionable one-based queue position. `None` also represents the
+    /// protocol's zero response (the peer has no current queue entry).
     pub queue_position: Option<u32>,
     pub metadata: DownloadMetadata,
 }
@@ -207,7 +214,10 @@ impl Download {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum DownloadStatus {
-    Queued,
+    Queued {
+        /// An actionable one-based position, or `None` when unknown/not queued.
+        queue_position: Option<u32>,
+    },
     InProgress {
         bytes_downloaded: u64,
         total_bytes: u64,

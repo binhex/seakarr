@@ -24,6 +24,17 @@ impl Client {
     }
 
     #[must_use]
+    pub fn pause_download_by_attempt_id(&self, attempt_id: u32) -> bool {
+        match self.context.write_safe() {
+            Ok(mut ctx) => ctx.downloads.pause_by_attempt_id(attempt_id),
+            Err(e) => {
+                error!("[client] pause_download_by_attempt_id: {}", e);
+                false
+            }
+        }
+    }
+
+    #[must_use]
     pub fn resume_download(&self, username: &str, filename: &str) -> bool {
         match self.context.write_safe() {
             Ok(mut ctx) => ctx.downloads.resume_by_file(username, filename),
@@ -36,13 +47,17 @@ impl Client {
 
     #[must_use]
     pub fn remove_queued_download(&self, username: &str, filename: &str) -> bool {
-        match self.context.write_safe() {
+        let removed = match self.context.write_safe() {
             Ok(mut ctx) => ctx.downloads.remove_queued_by_file(username, filename),
             Err(e) => {
                 error!("[client] remove_queued_download: {}", e);
                 false
             }
+        };
+        if removed {
+            self.stop_queue_position_requests(username, filename, None);
         }
+        removed
     }
 
     /// Remove every download for `username`/`filename` regardless of status.
@@ -52,12 +67,64 @@ impl Client {
     /// Returns whether anything was removed.
     #[must_use]
     pub fn remove_download(&self, username: &str, filename: &str) -> bool {
-        match self.context.write_safe() {
+        let removed = match self.context.write_safe() {
             Ok(mut ctx) => ctx.downloads.remove_by_file(username, filename),
             Err(e) => {
                 error!("[client] remove_download: {}", e);
                 false
             }
+        };
+        if removed {
+            self.stop_queue_position_requests(username, filename, None);
+        }
+        removed
+    }
+
+    /// Remove only the download created by one stable attempt ID.
+    ///
+    /// Unlike [`Client::remove_download`], this cannot remove a newer retry of
+    /// the same user and filename after delayed bridge cleanup.
+    #[must_use]
+    pub fn remove_download_by_attempt_id(&self, attempt_id: u32) -> bool {
+        let (removed, registry) = match self.context.write_safe() {
+            Ok(mut ctx) => (
+                ctx.downloads.remove_by_attempt_id(attempt_id),
+                ctx.peer_registry.clone(),
+            ),
+            Err(e) => {
+                error!("[client] remove_download_by_attempt_id: {}", e);
+                return false;
+            }
+        };
+        let Some(download) = removed else {
+            return false;
+        };
+        if let Some(registry) = registry {
+            let _ = registry.stop_queue_position_requests(
+                &download.username,
+                download.filename,
+                Some(download.attempt_id),
+            );
+        }
+        true
+    }
+
+    fn stop_queue_position_requests(
+        &self,
+        username: &str,
+        filename: &str,
+        attempt_id: Option<u32>,
+    ) {
+        let registry = match self.context.read_safe() {
+            Ok(ctx) => ctx.peer_registry.clone(),
+            Err(e) => {
+                error!("[client] stop_queue_position_requests: {}", e);
+                return;
+            }
+        };
+        if let Some(registry) = registry {
+            let _ =
+                registry.stop_queue_position_requests(username, filename.to_string(), attempt_id);
         }
     }
 
@@ -97,10 +164,13 @@ impl Client {
         let download = Download {
             username: username.clone(),
             filename,
+            attempt_id: token,
             token,
             size,
             download_directory,
-            status: DownloadStatus::Queued,
+            status: DownloadStatus::Queued {
+                queue_position: None,
+            },
             sender: download_sender,
             queue_position: None,
             metadata,
@@ -117,10 +187,11 @@ impl Client {
             .as_ref()
             .is_some_and(|r| r.contains(&username));
         let queued_now = peer_registered
-            && context
-                .peer_registry
-                .as_ref()
-                .is_some_and(|r| r.queue_upload(&username, download.filename.clone()).is_ok());
+            && context.peer_registry.as_ref().is_some_and(|registry| {
+                registry
+                    .queue_upload(&username, download.filename.clone(), download.attempt_id)
+                    .is_ok()
+            });
 
         drop(context);
 
@@ -166,7 +237,7 @@ impl Client {
         let doomed: Vec<(u32, Sender<DownloadStatus>)> = context
             .get_downloads()
             .iter()
-            .filter(|d| d.username == username && matches!(d.status, DownloadStatus::Queued))
+            .filter(|d| d.username == username && matches!(d.status, DownloadStatus::Queued { .. }))
             .map(|d| (d.token, d.sender.clone()))
             .collect();
         for (token, sender) in doomed {

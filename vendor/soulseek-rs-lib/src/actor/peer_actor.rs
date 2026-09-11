@@ -13,6 +13,7 @@ use crate::types::{Download, SearchResult, Transfer};
 use crate::utils::lock::RwLockExt;
 use crate::{debug, error, trace, warn};
 
+use std::collections::HashMap;
 use std::io::{self, Error, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, Sender};
@@ -35,7 +36,14 @@ pub enum PeerMessage {
         place: u32,
     },
     SetUsername(String),
-    QueueUpload(String),
+    QueueUpload {
+        filename: String,
+        attempt_id: u32,
+    },
+    StopQueuePositionRequests {
+        filename: String,
+        attempt_id: Option<u32>,
+    },
     RequestTransfer(Download),
     /// A peer queued one of our shared files for download (they sent us code 43).
     IncomingQueueUpload(String),
@@ -52,6 +60,12 @@ pub enum PeerMessage {
         size: u64,
     },
     ProcessRead,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuePositionRequest {
+    attempt_id: u32,
+    next_request: Instant,
 }
 
 pub struct PeerActor {
@@ -82,6 +96,9 @@ pub struct PeerActor {
     /// Transfer tokens for uploads we are serving to this peer. A TransferResponse
     /// for one of these is our upload being accepted, not a download offer.
     serving_tokens: std::collections::HashSet<u32>,
+    /// Queued downloads awaiting peer-provided position telemetry. Each value
+    /// is the next instant when peer code 51 should be sent.
+    queue_position_requests: HashMap<String, QueuePositionRequest>,
     /// Bytes queued for the peer that the socket would not take yet. The stream
     /// is non-blocking (so socket reads never starve the mailbox), so a message
     /// larger than the send buffer — a full share listing is easily megabytes —
@@ -103,6 +120,13 @@ const MAX_PENDING_WRITE: usize = 32 * 1024 * 1024;
 /// simply reconnects — every serious client reaps idle peers this way. Five
 /// minutes comfortably outlives a search's chatter and queue updates.
 const IDLE_DISCONNECT: Duration = Duration::from_mins(5);
+
+/// Match established Soulseek clients by refreshing each queued download's
+/// position every five minutes.
+const QUEUE_POSITION_REQUEST_INTERVAL: Duration = Duration::from_mins(5);
+/// Prevent the idle reaper from winning in the sub-tick gap immediately
+/// before a scheduled queue-position request becomes due.
+const QUEUE_POSITION_IDLE_GRACE: Duration = Duration::from_secs(1);
 
 impl PeerActor {
     #[must_use]
@@ -137,6 +161,7 @@ impl PeerActor {
             disconnect_reported: false,
             id,
             serving_tokens: std::collections::HashSet::new(),
+            queue_position_requests: HashMap::new(),
             pending_write: Vec::new(),
             last_activity: Instant::now(),
         }
@@ -236,9 +261,17 @@ impl PeerActor {
             PeerMessage::SetUsername(username) => {
                 self.handle_set_username(username);
             }
-            PeerMessage::QueueUpload(filename) => {
-                let message = MessageFactory::build_queue_upload_message(&filename);
-                self.send_message(message);
+            PeerMessage::QueueUpload {
+                filename,
+                attempt_id,
+            } => {
+                self.start_queue_position_requests(filename, attempt_id);
+            }
+            PeerMessage::StopQueuePositionRequests {
+                filename,
+                attempt_id,
+            } => {
+                self.stop_queue_position_requests(&filename, attempt_id);
             }
             PeerMessage::IncomingQueueUpload(filename) => {
                 self.handle_incoming_queue_upload(filename);
@@ -311,7 +344,10 @@ impl PeerActor {
     /// the client loop that records the token. Under load the client loop is
     /// the one that loses, the file connection finds no download, and the
     /// transfer is dropped with the download stuck on Queued forever.
-    fn handle_transfer_request(&self, transfer: Transfer) {
+    fn handle_transfer_request(&mut self, transfer: Transfer) {
+        // Polling cleanup is deferred until UpdateDownloadTokens correlates
+        // this tokenless local lifecycle event to the newest queued attempt.
+        // The client operation sends an attempt-scoped stop before replying.
         let username = self.peer_username();
         debug!("[peer:{}] TransferRequest for {}", username, transfer.token);
 
@@ -432,7 +468,8 @@ impl PeerActor {
         );
     }
 
-    fn handle_upload_failed(&self, filename: String) {
+    fn handle_upload_failed(&mut self, filename: String) {
+        self.stop_queue_position_requests(&filename, None);
         let username = self.peer_username();
         self.forward_to_client(
             ClientOperation::UploadFailed(username, filename),
@@ -531,6 +568,49 @@ impl PeerActor {
         }
 
         self.process_dispatcher_messages();
+    }
+
+    fn start_queue_position_requests(&mut self, filename: String, attempt_id: u32) {
+        // Deliberately policy-independent: this protocol actor does not own
+        // application config, advertised slot snapshots can become stale, and
+        // position 1 drives the separate queue-head deadline for every wait.
+        self.send_message(MessageFactory::build_queue_upload_message(&filename));
+        self.send_message(MessageFactory::build_place_in_queue_request(&filename));
+        self.queue_position_requests.insert(
+            filename,
+            QueuePositionRequest {
+                attempt_id,
+                next_request: Instant::now() + QUEUE_POSITION_REQUEST_INTERVAL,
+            },
+        );
+    }
+
+    fn stop_queue_position_requests(&mut self, filename: &str, attempt_id: Option<u32>) {
+        let should_remove = attempt_id.is_none_or(|expected| {
+            self.queue_position_requests
+                .get(filename)
+                .is_some_and(|request| request.attempt_id == expected)
+        });
+        if should_remove {
+            self.queue_position_requests.remove(filename);
+        }
+    }
+
+    fn request_due_queue_positions(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .queue_position_requests
+            .iter()
+            .filter(|(_, request)| request.next_request <= now)
+            .map(|(filename, _)| filename.clone())
+            .collect();
+
+        for filename in due {
+            self.send_message(MessageFactory::build_place_in_queue_request(&filename));
+            if let Some(request) = self.queue_position_requests.get_mut(&filename) {
+                request.next_request = now + QUEUE_POSITION_REQUEST_INTERVAL;
+            }
+        }
     }
 
     fn send_message(&mut self, message: Message) {
@@ -839,6 +919,7 @@ impl Actor for PeerActor {
             }
             ConnectionState::Connected => {
                 if self.stream.is_some() {
+                    self.request_due_queue_positions();
                     // a backlogged message drains one socket buffer
                     // per 100ms tick. Enough for a share listing; if a future
                     // message stream needs more throughput, wake the actor as
@@ -847,7 +928,17 @@ impl Actor for PeerActor {
                     self.process_read();
                     self.flush_pending_write();
 
-                    if self.stream.is_some() && self.last_activity.elapsed() > IDLE_DISCONNECT {
+                    let queue_poll_due_soon =
+                        self.queue_position_requests.values().any(|request| {
+                            request
+                                .next_request
+                                .saturating_duration_since(Instant::now())
+                                <= QUEUE_POSITION_IDLE_GRACE
+                        });
+                    if self.stream.is_some()
+                        && !queue_poll_due_soon
+                        && self.last_activity.elapsed() > IDLE_DISCONNECT
+                    {
                         debug!(
                             "[peer:{}] idle for {}s, closing",
                             self.peer_username(),
@@ -866,6 +957,7 @@ impl Actor for PeerActor {
 mod tests {
     use super::*;
     use crate::peer::{ConnectionType, Peer};
+    use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::Receiver;
 
@@ -921,6 +1013,122 @@ mod tests {
     }
 
     #[test]
+    fn queue_upload_requests_position_immediately_and_periodically() {
+        let (mut actor, _rx, mut far_end) = connected_actor();
+        let filename = "song.mp3".to_string();
+
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: filename.clone(),
+            attempt_id: 1,
+        });
+
+        let mut expected = MessageFactory::build_queue_upload_message(&filename).get_buffer();
+        expected.extend_from_slice(
+            &MessageFactory::build_place_in_queue_request(&filename).get_buffer(),
+        );
+        let mut actual = vec![0; expected.len()];
+        far_end.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        actor.queue_position_requests.insert(
+            filename.clone(),
+            QueuePositionRequest {
+                attempt_id: 1,
+                next_request: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            },
+        );
+        actor.tick();
+
+        let expected = MessageFactory::build_place_in_queue_request(&filename).get_buffer();
+        let mut actual = vec![0; expected.len()];
+        far_end.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(actor.queue_position_requests[&filename].next_request > Instant::now());
+    }
+
+    #[test]
+    fn queue_position_polling_stops_when_queue_lifecycle_ends() {
+        let (mut actor, _rx, _far_end) = connected_actor();
+
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: "removed.mp3".to_string(),
+            attempt_id: 1,
+        });
+        actor.handle_message(PeerMessage::StopQueuePositionRequests {
+            filename: "removed.mp3".to_string(),
+            attempt_id: None,
+        });
+        assert!(!actor.queue_position_requests.contains_key("removed.mp3"));
+
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: "failed.mp3".to_string(),
+            attempt_id: 2,
+        });
+        actor.handle_message(PeerMessage::UploadFailed(
+            String::new(),
+            "failed.mp3".to_string(),
+        ));
+        assert!(!actor.queue_position_requests.contains_key("failed.mp3"));
+
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: "started.mp3".to_string(),
+            attempt_id: 3,
+        });
+        actor.handle_message(PeerMessage::TransferRequest(Transfer {
+            direction: 1,
+            token: 42,
+            filename: "started.mp3".to_string(),
+            size: 1,
+        }));
+        assert!(actor.queue_position_requests.contains_key("started.mp3"));
+        actor.handle_message(PeerMessage::StopQueuePositionRequests {
+            filename: "started.mp3".to_string(),
+            attempt_id: Some(3),
+        });
+        assert!(!actor.queue_position_requests.contains_key("started.mp3"));
+    }
+
+    #[test]
+    fn transfer_request_defers_polling_stop_until_attempt_correlation() {
+        let (mut actor, _rx, _far_end) = connected_actor();
+        let filename = "song.mp3".to_string();
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: filename.clone(),
+            attempt_id: 2,
+        });
+
+        actor.handle_message(PeerMessage::TransferRequest(Transfer {
+            direction: 1,
+            token: 42,
+            filename: filename.clone(),
+            size: 1,
+        }));
+
+        assert_eq!(actor.queue_position_requests[&filename].attempt_id, 2);
+    }
+
+    #[test]
+    fn stale_stop_preserves_requeued_file_position_polling() {
+        let (mut actor, _rx, _far_end) = connected_actor();
+        let filename = "song.mp3".to_string();
+
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: filename.clone(),
+            attempt_id: 1,
+        });
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: filename.clone(),
+            attempt_id: 2,
+        });
+        actor.handle_message(PeerMessage::StopQueuePositionRequests {
+            filename: filename.clone(),
+            attempt_id: Some(1),
+        });
+
+        assert_eq!(actor.queue_position_requests[&filename].attempt_id, 2);
+    }
+
+    #[test]
     fn an_upload_failed_message_reaches_the_client_as_this_peer() {
         let (mut actor, rx, _far_end) = connected_actor();
 
@@ -936,6 +1144,28 @@ mod tests {
             }
             other => panic!("expected UploadFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn queued_position_schedule_prevents_idle_reap_before_poll() {
+        let (mut actor, _rx, _far_end) = connected_actor();
+        actor.handle_message(PeerMessage::QueueUpload {
+            filename: "song.mp3".to_string(),
+            attempt_id: 1,
+        });
+        actor.last_activity = Instant::now()
+            .checked_sub(IDLE_DISCONNECT + Duration::from_millis(1))
+            .unwrap();
+        actor
+            .queue_position_requests
+            .get_mut("song.mp3")
+            .unwrap()
+            .next_request = Instant::now() + Duration::from_millis(1);
+
+        actor.tick();
+
+        assert!(actor.stream.is_some());
+        assert!(actor.queue_position_requests.contains_key("song.mp3"));
     }
 
     #[test]

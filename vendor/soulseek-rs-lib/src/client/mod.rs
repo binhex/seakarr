@@ -589,7 +589,7 @@ impl ClientContext {
             .filter(|d| {
                 matches!(
                     d.status,
-                    DownloadStatus::Queued
+                    DownloadStatus::Queued { .. }
                         | DownloadStatus::InProgress { .. }
                         | DownloadStatus::Paused { .. }
                 )
