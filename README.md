@@ -13,6 +13,10 @@ Automated Soulseek music downloader with library quality upgrading.
   library.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
+- **Authoritative artist discography** — artist-only manual runs resolve conceptual albums from MusicBrainz
+  release groups (cached locally for 30 days) and then run one sequential `Artist Album` Soulseek search per
+  eligible album, oldest first. Release categories and optional MusicBrainz artist IDs are configurable; the
+  previous folder heuristic remains the explicit opt-out and the visible fallback.
 - **Quality filtering** — filter Soulseek results by file extension, minimum
   bitrate, excluded keywords, and upload availability. With
   `download.max_queue_length: 0` a peer must offer a free upload slot; a
@@ -97,9 +101,12 @@ Mode selection is explicit. `--artist` and `--album` are manual selectors, and
 `--batch-file` is a batch selector; these options do not silently override the
 configured `search.default_mode`. When the configured mode is `auto`, add
 `--mode manual` for a manual target or `--mode batch` for a batch file. An
-artist-only manual search discovers and processes each identifiable album from
-one artist query. Explicit artist+album and album-only manual searches are also
-supported. `--test` performs the same mode and selector
+artist-only manual search resolves MusicBrainz conceptual albums first and then
+performs one sequential targeted Soulseek search per eligible album, oldest
+first. Explicit artist+album, album-only, batch, auto, and library-upgrade flows
+are unchanged. If authoritative discovery cannot be established, the previous
+single-query folder heuristic remains available as a visible fallback; set
+`discography.enabled: false` to select it deliberately. `--test` performs the same mode and selector
 validation before structural checks, so manual mode requires a non-empty artist or
 album and batch mode requires a non-empty batch file path. To clear a configured manual
 fallback for one field, pass that selector explicitly as an empty value, such as
@@ -139,7 +146,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `auto`, `manual`, or `batch`: library scan, target search, or batch file. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each identifiable album found. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--daemon` | Repeat the same validated auto, manual, or batch operation each cycle. | `false` |
@@ -210,6 +217,20 @@ mode are ignored. CLI values take precedence over values in the selected section
 | `batch.file_path` | Batch file fallback, used only in `batch` mode. | `""` |
 | `search_title_match` | Minimum percentage of the album's non-generic track titles that a title-search result must contain for the title-search fallback tier to keep it. Set `0` to disable the tier. | `70` |
 | `peer_reputation` | Blend measured speed + reliability into search ranking. Set to `false` to rank by advertised speed only. | `true` |
+
+### `discography`
+
+Controls authoritative MusicBrainz discovery for artist-only manual runs. The
+artist's conceptual release groups are resolved before any Soulseek search;
+explicit artist-plus-album, album-only, batch, auto, and library-upgrade flows
+are unchanged. The MusicBrainz API needs no account or API key.
+
+| Key | Description | Default |
+| --- | ----------- | ------- |
+| `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
+| `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
+| `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. | `[studio_album]` |
+| `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. | `{}` |
 
 ### `filters`
 
@@ -328,10 +349,20 @@ Seakarr has three operating modes:
 
 ### Manual mode
 
-Performs steps 3–7 above for an explicit album, or for every identifiable album
-returned by an artist-only search. At least one target is required; CLI values
-take precedence over `search.manual.artist` and `search.manual.album`, and
-album-only searches are supported.
+Performs steps 3–7 above for an explicit album, or for every eligible album
+resolved from an artist-only MusicBrainz discography lookup. Each resolved album
+then runs through the normal targeted `Artist Album` search, sequentially and
+oldest first; editions and remasters of the same conceptual album are
+deduplicated before searching. At least one target is required; CLI values take
+precedence over `search.manual.artist` and `search.manual.album`, and album-only
+searches are supported.
+
+Explicit artist-plus-album and album-only manual searches, batch mode, automatic
+mode, and the library-upgrade workflow are unchanged and never consult
+MusicBrainz. The legacy single-query folder heuristic is retained as the
+`discography.enabled: false` opt-out and as an automatic fallback when
+authoritative discovery cannot be established; automatic fallback is reported
+with a WARN and a run-summary notice.
 
 ### Batch mode
 
@@ -449,6 +480,86 @@ the correct library location regardless of filesystem layout.
 No — the PID lock prevents concurrent runs. If a second instance starts, it detects the existing PID file,
 checks whether the process is still alive, and exits with an error. Delete the PID file manually if it is
 stale.
+
+**Q: How does artist-only manual mode choose which albums to download?**
+
+Artist-only manual runs resolve the artist on MusicBrainz and process conceptual release groups rather than
+arbitrary Soulseek folders:
+
+- Automatic resolution accepts only one unique exact artist name match. Matching uses Unicode NFKC
+  normalization, lowercase conversion, trimming, and whitespace collapse, but punctuation stays significant,
+  so `AC/DC` and `AC DC` are distinct. Zero matches or multiple matches are unresolved: seakarr does not pick
+  the highest-scored result, it falls back as described below. Use `discography.artist_mbids` to pin an
+  ambiguous name to a MusicBrainz artist UUID; a configured ID always takes precedence over name search.
+- Only release groups matching `discography.allowed_types` are eligible, and a group carrying several
+  recognised classifications must match all of them. The default `[studio_album]` accepts MusicBrainz primary
+  type `Album` with no secondary type, so live albums, compilations, remixes, soundtracks, DJ mixes,
+  mixtapes, EPs, and singles are excluded until you opt in.
+- Release-group browse requests use MusicBrainz `release-group-status=website-default`, which excludes
+  promotional, bootleg, and pseudo-release-only groups while keeping a conceptual album that also has an
+  official release.
+- Conceptual albums are deduplicated by normalized title and processed oldest first, so different editions or
+  remasters of the same album produce one targeted `Artist Album` search. Undated albums are processed after
+  dated ones, sorted by title.
+- Each eligible album runs through the existing targeted search cascade sequentially; one album's failure does
+  not block the remaining albums, and cancellation stops scheduling later ones.
+
+**Q: What happens when MusicBrainz cannot be reached or returns nothing?**
+
+Fallback precedence is fresh cache, successful refresh, stale cache, then the legacy heuristic:
+
+- A cached discography is fresh for `discography.cache_days` complete 24-hour periods (30 by default). `0`
+  attempts a refresh on every run but still keeps the cached copy as a stale fallback. Boundary equality is
+  stale, and a clock rollback or future timestamp is stale too.
+- A successful refresh replaces the cached copy atomically. The raw release groups are re-filtered against the
+  current `allowed_types` on every run, so changing categories applies immediately without re-downloading.
+- If a refresh fails, seakarr warns with the cache age and the failure reason and processes the compatible
+  stale cache instead.
+- If no compatible cache exists, seakarr logs a prominent WARN, records a run-summary notice naming the exact
+  reason, and uses the legacy single-query folder heuristic; the notice states that album names were discovered
+  heuristically from Soulseek folders.
+- A valid authoritative empty result — zero release groups, or zero albums left after `allowed_types`
+  filtering — is not an error: no Soulseek search runs, there is no heuristic fallback, and the run summary
+  shows a neutral notice instead of a failed or skipped album.
+- Set `discography.enabled: false` to select the legacy heuristic deliberately. That choice is logged as an
+  explicit configuration choice without an outage warning.
+
+**Q: Does MusicBrainz require an account or API key?**
+
+No. Seakarr sends an identifying User-Agent and paces requests to at most one per second, following the
+[MusicBrainz rate-limiting guidance](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting). Normal reads
+need no credential, and no new secret is added to `seakarr.yml`.
+
+**Q: How do I pin an ambiguous artist name to a MusicBrainz ID?**
+
+Add the artist name and its canonical hyphenated UUID to `discography.artist_mbids`. Keys are matched after
+the same normalization used for automatic artist matching:
+
+```yaml
+discography:
+  enabled: true
+  cache_days: 30
+  allowed_types: [studio_album, live_album]
+  artist_mbids:
+    "Nirvana": "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+```
+
+A configured ID takes precedence over name search. If it differs from the cached identity, the cache row is
+ignored and refreshed.
+
+**Q: What are the current MusicBrainz discovery limits?**
+
+The integration deliberately favors safe fallback over guessing:
+
+- Artist search reads at most 100 candidates. If MusicBrainz reports more, seakarr cannot prove the exact-name
+  match is unique, so it uses compatible stale cache or the clearly warned legacy fallback.
+- Configuration validates an MBID's UUID shape, not its existence. A well-formed ID that MusicBrainz does not
+  recognize is retried on a later stale/uncached run and follows the normal visible fallback path; failed IDs
+  are not negatively cached.
+- The SQLite cache keeps one bounded row per normalized artist queried and has no automatic eviction. A later
+  refresh replaces that artist's row atomically.
+- `Retry-After` accepts integer delay-seconds from 0 through 30. HTTP-date, malformed, or larger values are
+  treated as provider unavailability so an external response cannot cause an unbounded wait.
 
 ___
 If you appreciate my work, then please consider buying me a beer  :D

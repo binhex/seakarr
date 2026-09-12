@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,7 @@ pub struct Config {
     pub library: LibraryConfig,
     pub storage: StorageConfig,
     pub search: SearchConfig,
+    pub discography: DiscographyConfig,
     pub filters: FilterConfig,
     pub download: DownloadConfig,
     pub database: DatabaseConfig,
@@ -219,6 +221,51 @@ pub struct DaemonConfig {
     pub enabled: bool,
     #[serde(default = "default_rescan_interval")]
     pub rescan_interval_mins: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscographyReleaseType {
+    StudioAlbum,
+    LiveAlbum,
+    Ep,
+    Single,
+    Compilation,
+    Remix,
+    Soundtrack,
+    DjMix,
+    Mixtape,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscographyConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_discography_cache_days")]
+    pub cache_days: u64,
+    #[serde(default = "default_discography_release_types")]
+    pub allowed_types: Vec<DiscographyReleaseType>,
+    #[serde(default)]
+    pub artist_mbids: BTreeMap<String, String>,
+}
+
+fn default_discography_cache_days() -> u64 {
+    30
+}
+
+fn default_discography_release_types() -> Vec<DiscographyReleaseType> {
+    vec![DiscographyReleaseType::StudioAlbum]
+}
+
+impl Default for DiscographyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_days: default_discography_cache_days(),
+            allowed_types: default_discography_release_types(),
+            artist_mbids: BTreeMap::new(),
+        }
+    }
 }
 
 // ── CLI overrides struct ──
@@ -548,6 +595,15 @@ fn flow_value_contains_key(value: &str, key: &str) -> bool {
     yaml_key_value_start(value[segment_start..].trim(), key).is_some()
 }
 
+fn valid_mbid(value: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == GROUPS.len()
+        && parts.iter().zip(GROUPS).all(|(part, length)| {
+            part.len() == length && part.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
 impl Config {
     /// Load config from a directory containing `seakarr.yml`.
     /// Creates a default file if none exists.
@@ -739,6 +795,35 @@ impl Config {
         Ok(())
     }
 
+    fn validate_discography(&self) -> Result<()> {
+        if self.discography.enabled && self.discography.allowed_types.is_empty() {
+            return Err(SeakarrError::Config(
+                "discography.allowed_types must not be empty when discography.enabled is true"
+                    .into(),
+            ));
+        }
+        if self.discography.cache_days > i64::MAX as u64 / 86_400 {
+            return Err(SeakarrError::Config(
+                "discography.cache_days is too large".into(),
+            ));
+        }
+        let mut normalized = HashSet::new();
+        for (artist, mbid) in &self.discography.artist_mbids {
+            let key = crate::discography::normalize_catalog_key(artist);
+            if key.is_empty() || !normalized.insert(key) {
+                return Err(SeakarrError::Config(format!(
+                    "discography.artist_mbids contains an empty or duplicate normalized artist key: {artist:?}"
+                )));
+            }
+            if !valid_mbid(mbid) {
+                return Err(SeakarrError::Config(format!(
+                    "discography.artist_mbids contains an invalid MusicBrainz ID for {artist:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate configuration constraints that do not require credentials.
     /// Shared by normal startup and `--test` mode to keep their checks in sync.
     pub fn validate_non_credential_constraints(&self) -> Result<()> {
@@ -771,6 +856,7 @@ impl Config {
                 "daemon.rescan_interval_mins is too large; maximum is 307445734561271883".into(),
             ));
         }
+        self.validate_discography()?;
         Ok(())
     }
 
@@ -902,6 +988,7 @@ impl Default for Config {
                 manual: ManualConfig::default(),
                 batch: BatchConfig::default(),
             },
+            discography: DiscographyConfig::default(),
             filters: FilterConfig {
                 allowed_extensions: default_extensions(),
                 min_bit_rate: 0,
@@ -990,6 +1077,13 @@ search:
   block_pause_secs: 300
   search_title_match: 70
   peer_reputation: true
+
+discography:
+  enabled: true
+  cache_days: 30
+  allowed_types: ["studio_album"]
+  artist_mbids:
+    "Test Artist": "11111111-1111-1111-1111-111111111111"
 
 filters:
   allowed_extensions: ["flac"]
@@ -2141,5 +2235,91 @@ search:
             !search["peer_reputation"].as_bool().unwrap(),
             "the explicit opt-out must be preserved, not flipped to the default true"
         );
+    }
+
+    #[test]
+    fn discography_defaults_are_authoritative_studio_albums() {
+        let config = Config::default();
+        assert!(config.discography.enabled);
+        assert_eq!(config.discography.cache_days, 30);
+        assert_eq!(
+            config.discography.allowed_types,
+            vec![DiscographyReleaseType::StudioAlbum]
+        );
+        assert!(config.discography.artist_mbids.is_empty());
+    }
+
+    #[test]
+    fn discography_validation_rejects_invalid_values() {
+        let mut config = Config::default();
+        config.discography.allowed_types.clear();
+        assert!(config
+            .validate_non_credential_constraints()
+            .unwrap_err()
+            .to_string()
+            .contains("discography.allowed_types"));
+
+        let mut config = Config::default();
+        config
+            .discography
+            .artist_mbids
+            .insert("Artist".to_string(), "not-a-musicbrainz-id".to_string());
+        assert!(config
+            .validate_non_credential_constraints()
+            .unwrap_err()
+            .to_string()
+            .contains("discography.artist_mbids"));
+
+        let mut config = Config::default();
+        config.discography.artist_mbids.insert(
+            "Artist".to_string(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        );
+        config.discography.artist_mbids.insert(
+            " artist ".to_string(),
+            "22222222-2222-2222-2222-222222222222".to_string(),
+        );
+        assert!(config
+            .validate_non_credential_constraints()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate normalized artist"));
+    }
+
+    #[test]
+    fn disabled_discography_allows_an_empty_release_allowlist() {
+        let mut config = Config::default();
+        config.discography.enabled = false;
+        config.discography.allowed_types.clear();
+
+        assert!(config.validate_non_credential_constraints().is_ok());
+    }
+
+    #[test]
+    fn discography_unknown_release_type_is_rejected() {
+        let error =
+            serde_yaml::from_str::<Config>("discography:\n  allowed_types: [not_a_release_type]\n")
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("not_a_release_type"), "got: {error}");
+    }
+
+    #[test]
+    fn existing_yaml_is_reconciled_with_discography_defaults() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "soulseek:\n  username: user\n  password: pass\n",
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let contents = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+
+        assert!(config.discography.enabled);
+        assert!(contents.contains("discography:"));
+        assert!(contents.contains("cache_days: 30"));
+        assert!(contents.contains("studio_album"));
     }
 }
