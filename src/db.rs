@@ -45,6 +45,15 @@ pub struct PeerReputation {
     pub avg_speed_kbps: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscographyCacheEntry {
+    pub artist_key: String,
+    pub artist_mbid: String,
+    pub canonical_artist: String,
+    pub fetched_at: i64,
+    pub release_groups_json: String,
+}
+
 /// Input data for enqueueing a download into the persistent queue.
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
@@ -161,6 +170,14 @@ impl Database {
                 status       TEXT NOT NULL DEFAULT 'pending',
                 error        TEXT,
                 processed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS discography_cache (
+                artist_key         TEXT PRIMARY KEY COLLATE NOCASE,
+                artist_mbid        TEXT NOT NULL,
+                canonical_artist   TEXT NOT NULL,
+                fetched_at         INTEGER NOT NULL,
+                release_groups_json TEXT NOT NULL
             );",
         )?;
 
@@ -367,6 +384,56 @@ impl Database {
         }
         Ok(map)
     }
+
+    // ── Discography cache ──
+
+    pub fn get_discography_cache(&self, artist_key: &str) -> Result<Option<DiscographyCacheEntry>> {
+        self.conn
+            .query_row(
+                "SELECT artist_key, artist_mbid, canonical_artist, fetched_at, release_groups_json
+                 FROM discography_cache WHERE artist_key = ?1 COLLATE NOCASE",
+                params![artist_key],
+                |row| {
+                    Ok(DiscographyCacheEntry {
+                        artist_key: row.get(0)?,
+                        artist_mbid: row.get(1)?,
+                        canonical_artist: row.get(2)?,
+                        fetched_at: row.get(3)?,
+                        release_groups_json: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_discography_cache(&self, entry: &DiscographyCacheEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO discography_cache
+             (artist_key, artist_mbid, canonical_artist, fetched_at, release_groups_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(artist_key) DO UPDATE SET
+               artist_mbid = excluded.artist_mbid,
+               canonical_artist = excluded.canonical_artist,
+               fetched_at = excluded.fetched_at,
+               release_groups_json = excluded.release_groups_json",
+            params![
+                entry.artist_key,
+                entry.artist_mbid,
+                entry.canonical_artist,
+                entry.fetched_at,
+                entry.release_groups_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_discography_cache(&self, artist_key: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM discography_cache WHERE artist_key = ?1 COLLATE NOCASE",
+            params![artist_key],
+        )? > 0)
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +498,7 @@ mod tests {
         assert!(tables.contains(&"download_stats".to_string()));
         assert!(tables.contains(&"batch_jobs".to_string()));
         assert!(tables.contains(&"batch_job_lines".to_string()));
+        assert!(tables.contains(&"discography_cache".to_string()));
     }
 
     #[test]
@@ -593,5 +661,37 @@ mod tests {
         assert_eq!(map["alice"].avg_speed_kbps, 600.0); // (500 + 700) / 2
         assert_eq!(map["bob"].total_downloads, 1);
         assert_eq!(map["bob"].successful, 0);
+    }
+
+    #[test]
+    fn discography_cache_round_trips_and_replaces_atomically() {
+        let db = test_db();
+        let first = DiscographyCacheEntry {
+            artist_key: "test artist".into(),
+            artist_mbid: "11111111-1111-1111-1111-111111111111".into(),
+            canonical_artist: "Test Artist".into(),
+            fetched_at: 1_000,
+            release_groups_json: "[]".into(),
+        };
+        db.upsert_discography_cache(&first).unwrap();
+        assert_eq!(
+            db.get_discography_cache("test artist").unwrap(),
+            Some(first)
+        );
+
+        let replacement = DiscographyCacheEntry {
+            artist_key: "test artist".into(),
+            artist_mbid: "22222222-2222-2222-2222-222222222222".into(),
+            canonical_artist: "Test Artist Two".into(),
+            fetched_at: 2_000,
+            release_groups_json: "[{}]".into(),
+        };
+        db.upsert_discography_cache(&replacement).unwrap();
+        assert_eq!(
+            db.get_discography_cache("TEST ARTIST").unwrap(),
+            Some(replacement)
+        );
+        assert!(db.delete_discography_cache("test artist").unwrap());
+        assert!(db.get_discography_cache("test artist").unwrap().is_none());
     }
 }

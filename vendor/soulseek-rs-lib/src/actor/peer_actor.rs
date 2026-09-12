@@ -344,7 +344,7 @@ impl PeerActor {
     /// the client loop that records the token. Under load the client loop is
     /// the one that loses, the file connection finds no download, and the
     /// transfer is dropped with the download stuck on Queued forever.
-    fn handle_transfer_request(&mut self, transfer: Transfer) {
+    fn handle_transfer_request(&self, transfer: Transfer) {
         // Polling cleanup is deferred until UpdateDownloadTokens correlates
         // this tokenless local lifecycle event to the newest queued attempt.
         // The client operation sends an attempt-scoped stop before replying.

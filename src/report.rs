@@ -14,6 +14,7 @@ pub struct RunReport {
     downloaded: Vec<(String, String, usize)>, // (artist, album, track_count)
     skipped: Vec<(String, String)>,           // (artist, album)
     failed: Vec<(String, String, String)>,    // (artist, album, reason)
+    notices: Vec<String>,
 }
 
 impl RunReport {
@@ -38,35 +39,64 @@ impl RunReport {
         }
     }
 
-    /// Print summary via tracing::info!. Omits empty sections. Prints nothing
-    /// if no outcomes were recorded.
-    pub fn print_summary(&self) {
-        let total = self.downloaded.len() + self.skipped.len() + self.failed.len();
-        if total == 0 {
-            return;
+    /// Record a run-level notice, independent of any album outcome.
+    pub fn add_notice(&mut self, notice: impl Into<String>) {
+        self.notices.push(notice.into());
+    }
+
+    pub fn notice_count(&self) -> usize {
+        self.notices.len()
+    }
+
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    fn summary_lines(&self) -> Vec<String> {
+        if self.downloaded.is_empty()
+            && self.skipped.is_empty()
+            && self.failed.is_empty()
+            && self.notices.is_empty()
+        {
+            return Vec::new();
         }
-
-        tracing::info!("=== Run summary ===");
-
+        let mut lines = vec!["=== Run summary ===".to_string()];
+        if !self.notices.is_empty() {
+            lines.push(format!("Notices ({}):", self.notices.len()));
+            lines.extend(self.notices.iter().map(|notice| format!("  {notice}")));
+        }
         if !self.downloaded.is_empty() {
-            tracing::info!("Downloaded ({}):", self.downloaded.len());
-            for (artist, album, track_count) in &self.downloaded {
-                tracing::info!("  {artist} — {album} ({track_count} tracks)");
-            }
+            lines.push(format!("Downloaded ({}):", self.downloaded.len()));
+            lines.extend(
+                self.downloaded
+                    .iter()
+                    .map(|(artist, album, count)| format!("  {artist} — {album} ({count} tracks)")),
+            );
         }
-
         if !self.skipped.is_empty() {
-            tracing::info!("Skipped ({}):", self.skipped.len());
-            for (artist, album) in &self.skipped {
-                tracing::info!("  {artist} — {album}");
-            }
+            lines.push(format!("Skipped ({}):", self.skipped.len()));
+            lines.extend(
+                self.skipped
+                    .iter()
+                    .map(|(artist, album)| format!("  {artist} — {album}")),
+            );
         }
-
         if !self.failed.is_empty() {
-            tracing::info!("Failed ({}):", self.failed.len());
-            for (artist, album, reason) in &self.failed {
-                tracing::info!("  {artist} — {album} ({reason})");
-            }
+            lines.push(format!("Failed ({}):", self.failed.len()));
+            lines.extend(
+                self.failed
+                    .iter()
+                    .map(|(artist, album, reason)| format!("  {artist} — {album} ({reason})")),
+            );
+        }
+        lines
+    }
+
+    /// Print summary via tracing::info!. Omits empty sections. Prints nothing
+    /// if no outcomes or notices were recorded.
+    pub fn print_summary(&self) {
+        for line in self.summary_lines() {
+            tracing::info!("{line}");
         }
     }
 
@@ -149,6 +179,31 @@ mod tests {
         assert_eq!(report.downloaded_count(), 2);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.failed_count(), 1);
+    }
+
+    #[test]
+    fn notices_are_retained_even_without_album_outcomes() {
+        let mut report = RunReport::new();
+        report.add_notice("Authoritative discovery unavailable; used legacy album discovery");
+        assert_eq!(report.notice_count(), 1);
+        assert_eq!(
+            report.notices(),
+            ["Authoritative discovery unavailable; used legacy album discovery"]
+        );
+    }
+
+    #[test]
+    fn notice_only_summary_is_rendered() {
+        let mut report = RunReport::new();
+        report.add_notice("Legacy discovery was used");
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "=== Run summary ===".to_string(),
+                "Notices (1):".to_string(),
+                "  Legacy discovery was used".to_string(),
+            ]
+        );
     }
 
     #[test]

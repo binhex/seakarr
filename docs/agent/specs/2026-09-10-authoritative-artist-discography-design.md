@@ -230,10 +230,12 @@ Other HTTP 4xx responses are not retried.
 Artist and release-group responses are requested as JSON. Release-group browse
 requests set `release-group-status=website-default`. Each response body is
 limited to 4 MiB before deserialization. Release groups use the provider's
-maximum supported page size and at most 100 pages. A malformed page, repeated
-offset, inconsistent count, or page-limit overflow makes the refresh
-incomplete. Incomplete data is never cached or processed as an authoritative
-complete discography.
+maximum supported page size and at most 100 pages. Every page must contain the
+exact expected number of records for its offset and reported total. A malformed
+or short page, repeated offset, inconsistent count, payload-count mismatch,
+duplicate release-group ID, or page-limit overflow makes the refresh
+incomplete. Incomplete data is never
+cached or processed as an authoritative complete discography.
 
 Tests use an injected pacing/retry clock or paused Tokio time; they never wait
 real seconds.
@@ -315,7 +317,8 @@ mode.
 
 A complete MusicBrainz response with zero release groups, or zero releases left
 after configured filtering, is an authoritative empty result. It never falls
-back to heuristic discovery.
+back to heuristic discovery and adds a neutral run-summary notice rather than a
+failed or skipped album outcome.
 
 The run report gains a general notice mechanism rather than encoding fallback
 as a failed album. Notices do not change the process exit status.
@@ -334,6 +337,21 @@ flows retain their existing behavior and query patterns.
 
 The existing legacy grouping implementation remains covered because it is a
 supported fallback, not deleted dead code.
+
+## Deliberate limits
+
+- Artist search accepts at most one complete page of 100 candidates. A larger
+  reported result set cannot prove exact-name uniqueness and therefore uses a
+  compatible stale cache or visible legacy fallback, even if page one contains
+  one exact match.
+- Configuration validates MBID syntax, not remote existence. A well-formed ID
+  that returns 404 is not negatively cached and is retried on a later
+  stale/uncached run before following normal fallback precedence.
+- The SQLite cache retains one bounded row per normalized artist with no
+  automatic eviction. Refresh atomically replaces that artist's row.
+- `Retry-After` supports bounded integer delay-seconds from 0 through 30.
+  HTTP-date, malformed, and larger values are treated as provider
+  unavailability rather than creating an unbounded wait.
 
 ## Testing
 
@@ -393,7 +411,8 @@ Runner tests prove:
 - successful processed albums are skipped before searching;
 - album failures do not block later albums;
 - cancellation stops later searches;
-- authoritative empty results issue no Soulseek request;
+- authoritative empty results issue no Soulseek request and create a neutral
+  summary notice rather than a failed/skipped album;
 - stale cache warnings are visible;
 - automatic legacy fallback emits both WARN and a final summary notice;
 - explicit disablement uses legacy behavior without an outage warning;
@@ -413,7 +432,8 @@ Runner tests prove:
   default.
 - Provider ambiguity or failure cannot silently activate heuristic discovery;
   WARN and run-summary output clearly identify automatic legacy fallback.
-- A valid authoritative empty result downloads nothing rather than falling back.
+- A valid authoritative empty result downloads nothing, reports a neutral
+  notice, and does not fall back.
 - Explicit artist-plus-album, album-only, batch, auto, and library-upgrade modes
   are unchanged.
 - Provider and retry tests use no live service and no real multi-second waits.

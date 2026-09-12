@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 
 # The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
@@ -13,6 +13,7 @@ default-members = [".", "vendor/soulseek-rs-lib"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
 config = "0.14"
 soulseek-rs-lib = { path = "vendor/soulseek-rs-lib" }

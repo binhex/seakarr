@@ -8,6 +8,10 @@ use futures::FutureExt;
 use crate::client::SoulseekClient;
 use crate::config::Config;
 use crate::db::Database;
+use crate::discography::{
+    discover_artist_albums, DiscographyProvider, DiscoveryOutcome, DiscoveryProvenance,
+    MusicBrainzProvider,
+};
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, RunReport};
@@ -834,9 +838,20 @@ fn canonical_processed_target(
     Ok((record.artist, record.album))
 }
 
-/// Process every logical album discovered by one artist-only search.
+/// Outcome of an artist-only manual run: per-album outcomes plus an optional
+/// run-level notice (e.g. a visible automatic legacy fallback).
+struct ArtistOnlyRun {
+    outcomes: Vec<(String, AlbumOutcome)>,
+    notice: Option<String>,
+}
+
+/// Process a fixed list of album targets. Each work item carries the album
+/// title and optional pre-searched Soulseek results: legacy grouping supplies
+/// `Some(results)` (no new query, no search-history row) while authoritative
+/// targets supply `None`, causing `process_album_internal` to run the normal
+/// targeted search and search-history recording.
 #[allow(clippy::too_many_arguments)]
-async fn run_artist_only_mode(
+async fn process_artist_album_work(
     client: &dyn SoulseekClient,
     artist: &str,
     ignore_processed: bool,
@@ -845,40 +860,10 @@ async fn run_artist_only_mode(
     staging_dir: &Path,
     progress: Option<&ProgressDisplay>,
     cancel: &Arc<AtomicBool>,
+    work: Vec<(String, Option<Vec<crate::client::SearchResult>>)>,
 ) -> Result<Vec<(String, AlbumOutcome)>> {
-    let search_start = std::time::Instant::now();
-    let outcome = search::search_album_with_fallback_with_queue_limit(
-        client,
-        artist,
-        None,
-        config.search.timeout_secs,
-        &config.filters,
-        None,
-        config.download.max_queue_length,
-    )
-    .await?;
-    let duration_ms = search_start.elapsed().as_millis() as u64;
-    if let Err(e) = search::record_search(artist, None, outcome.results.len(), duration_ms, db) {
-        tracing::warn!("{artist} — (all): failed to record search history: {e}");
-    }
-
-    let albums = search::group_artist_results(&outcome.results, artist);
-    if albums.is_empty() {
-        let reason = if cancel.load(Ordering::SeqCst) {
-            "download cancelled by user"
-        } else {
-            "no identifiable albums found"
-        };
-        return Ok(vec![(
-            "(all)".to_string(),
-            AlbumOutcome::Failed {
-                reason: reason.into(),
-            },
-        )]);
-    }
-
-    let mut outcomes = Vec::with_capacity(albums.len());
-    for album in albums {
+    let mut outcomes = Vec::with_capacity(work.len());
+    for (album_title, presearched) in work {
         if cancel.load(Ordering::SeqCst) {
             outcomes.push((
                 "(all)".to_string(),
@@ -888,9 +873,7 @@ async fn run_artist_only_mode(
             ));
             break;
         }
-        let discovered_album = album.album;
-        let (process_artist, process_album) =
-            canonical_processed_target(db, artist, &discovered_album)?;
+        let (process_artist, process_album) = canonical_processed_target(db, artist, &album_title)?;
         let library_track_count = if config.library.paths.is_empty() {
             None
         } else {
@@ -915,7 +898,7 @@ async fn run_artist_only_mode(
             Some(cancel),
             library_track_count,
             None,
-            Some(album.results),
+            presearched,
         )
         .await?;
         let cancelled = matches!(
@@ -928,6 +911,239 @@ async fn run_artist_only_mode(
         }
     }
     Ok(outcomes)
+}
+
+/// Process every logical album discovered by one artist-only Soulseek search.
+/// This is the untouched legacy folder heuristic: broad artist search, a
+/// single search-history row, folder grouping, presearched results handed to
+/// each album, and the same cancellation behaviour as before. It remains the
+/// explicit-disable path and the visible automatic fallback.
+#[allow(clippy::too_many_arguments)]
+async fn run_legacy_artist_only_mode(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    ignore_processed: bool,
+    config: &Config,
+    db: &Database,
+    staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ArtistOnlyRun> {
+    let search_start = std::time::Instant::now();
+    let outcome = search::search_album_with_fallback_with_queue_limit(
+        client,
+        artist,
+        None,
+        config.search.timeout_secs,
+        &config.filters,
+        None,
+        config.download.max_queue_length,
+    )
+    .await?;
+    let duration_ms = search_start.elapsed().as_millis() as u64;
+    if let Err(e) = search::record_search(artist, None, outcome.results.len(), duration_ms, db) {
+        tracing::warn!("{artist} — (all): failed to record search history: {e}");
+    }
+
+    let albums = search::group_artist_results(&outcome.results, artist);
+    if albums.is_empty() {
+        let reason = if cancel.load(Ordering::SeqCst) {
+            "download cancelled by user"
+        } else {
+            "no identifiable albums found"
+        };
+        return Ok(ArtistOnlyRun {
+            outcomes: vec![(
+                "(all)".to_string(),
+                AlbumOutcome::Failed {
+                    reason: reason.into(),
+                },
+            )],
+            notice: None,
+        });
+    }
+
+    let work = albums
+        .into_iter()
+        .map(|album| (album.album, Some(album.results)))
+        .collect();
+    let outcomes = process_artist_album_work(
+        client,
+        artist,
+        ignore_processed,
+        config,
+        db,
+        staging_dir,
+        progress,
+        cancel,
+        work,
+    )
+    .await?;
+    Ok(ArtistOnlyRun {
+        outcomes,
+        notice: None,
+    })
+}
+
+/// Artist-only manual mode against an injected authoritative discography
+/// provider. Authoritative targets become one sequential targeted Soulseek
+/// search per conceptual album; empty outcomes search nothing; stale caches
+/// warn; an unavailable provider falls back to the legacy folder heuristic
+/// with a visible run notice.
+#[allow(clippy::too_many_arguments)]
+async fn run_artist_only_mode_with_provider(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    ignore_processed: bool,
+    config: &Config,
+    db: &Database,
+    staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
+    cancel: &Arc<AtomicBool>,
+    provider: &dyn DiscographyProvider,
+) -> Result<ArtistOnlyRun> {
+    match discover_artist_albums(provider, db, artist, &config.discography).await {
+        DiscoveryOutcome::Authoritative { albums, provenance } => {
+            if let DiscoveryProvenance::StaleCache {
+                age_days,
+                refresh_error,
+            } = &provenance
+            {
+                tracing::warn!(
+                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache"
+                );
+            }
+            let work = albums
+                .into_iter()
+                .map(|album| (album.title, None))
+                .collect();
+            let outcomes = process_artist_album_work(
+                client,
+                artist,
+                ignore_processed,
+                config,
+                db,
+                staging_dir,
+                progress,
+                cancel,
+                work,
+            )
+            .await?;
+            Ok(ArtistOnlyRun {
+                outcomes,
+                notice: None,
+            })
+        }
+        DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
+            if let DiscoveryProvenance::StaleCache {
+                age_days,
+                refresh_error,
+            } = &provenance
+            {
+                tracing::warn!(
+                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); no eligible authoritative albums"
+                );
+            }
+            Ok(ArtistOnlyRun {
+                outcomes: Vec::new(),
+                notice: Some(format!(
+                    "No eligible authoritative albums found for {artist}"
+                )),
+            })
+        }
+        DiscoveryOutcome::LegacyFallback { reason } => {
+            tracing::warn!(
+                "{artist}: authoritative discography unavailable ({reason}); falling back to heuristic folder-based album discovery"
+            );
+            let run = run_legacy_artist_only_mode(
+                client,
+                artist,
+                ignore_processed,
+                config,
+                db,
+                staging_dir,
+                progress,
+                cancel,
+            )
+            .await?;
+            Ok(ArtistOnlyRun {
+                outcomes: run.outcomes,
+                notice: Some(format!(
+                    "Authoritative discography unavailable: {reason}; album names were discovered heuristically from Soulseek folders"
+                )),
+            })
+        }
+    }
+}
+
+/// Complete an artist-only manual run. With `discography.enabled` (the
+/// default) the authoritative MusicBrainz provider takes over; an explicit
+/// disable keeps the legacy folder heuristic silently, while a provider
+/// construction failure keeps it with the same visible warned fallback.
+#[allow(clippy::too_many_arguments)]
+async fn run_artist_only_mode(
+    client: &dyn SoulseekClient,
+    artist: &str,
+    ignore_processed: bool,
+    config: &Config,
+    db: &Database,
+    staging_dir: &Path,
+    progress: Option<&ProgressDisplay>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ArtistOnlyRun> {
+    if !config.discography.enabled {
+        tracing::info!(
+            "{artist}: authoritative discography is disabled in config — using legacy folder-based album discovery"
+        );
+        return run_legacy_artist_only_mode(
+            client,
+            artist,
+            ignore_processed,
+            config,
+            db,
+            staging_dir,
+            progress,
+            cancel,
+        )
+        .await;
+    }
+    let provider = match MusicBrainzProvider::new() {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::warn!(
+                "{artist}: failed to construct the MusicBrainz provider ({error}); using legacy folder-based album discovery"
+            );
+            let run = run_legacy_artist_only_mode(
+                client,
+                artist,
+                ignore_processed,
+                config,
+                db,
+                staging_dir,
+                progress,
+                cancel,
+            )
+            .await?;
+            return Ok(ArtistOnlyRun {
+                outcomes: run.outcomes,
+                notice: Some(format!(
+                    "Authoritative discography unavailable: {error}; album names were discovered heuristically from Soulseek folders"
+                )),
+            });
+        }
+    };
+    run_artist_only_mode_with_provider(
+        client,
+        artist,
+        ignore_processed,
+        config,
+        db,
+        staging_dir,
+        progress,
+        cancel,
+        &provider,
+    )
+    .await
 }
 
 /// Run in manual mode: process a single artist and/or album search target.
@@ -987,9 +1203,12 @@ pub async fn run_manual_mode(
         )
         .await
         {
-            Ok(outcomes) => {
-                for (album_name, outcome) in outcomes {
+            Ok(run) => {
+                for (album_name, outcome) in run.outcomes {
                     report.record(artist_name, &album_name, outcome);
+                }
+                if let Some(notice) = run.notice {
+                    report.add_notice(notice);
                 }
                 Ok(())
             }
@@ -1561,6 +1780,7 @@ mod tests {
 
         let staging = TempDir::new().unwrap();
         let mut config = make_test_config();
+        config.discography.enabled = false;
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
 
@@ -1615,6 +1835,7 @@ mod tests {
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
         let mut config = make_test_config();
+        config.discography.enabled = false;
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         config.storage.organize = true;
         config.library.paths = vec![library.path().to_string_lossy().into()];
@@ -1645,6 +1866,7 @@ mod tests {
 
         let staging = TempDir::new().unwrap();
         let mut config = make_test_config();
+        config.discography.enabled = false;
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
         db.mark_album_processed("Test Artist", "Album One", "success")
@@ -1657,6 +1879,534 @@ mod tests {
         assert!(
             client.download_filenames.lock().unwrap().is_empty(),
             "case-only album path differences must not trigger a re-download"
+        );
+    }
+
+    // ── Authoritative discography integration ──
+
+    use crate::client::DownloadHandle;
+    use crate::discography::{
+        ArtistCandidate, DiscographyError, DiscographyProvider, ReleaseGroup,
+    };
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeDiscographyProvider {
+        groups: Vec<ReleaseGroup>,
+        failure: Option<String>,
+    }
+
+    impl FakeDiscographyProvider {
+        fn with_groups(groups: Vec<ReleaseGroup>) -> Self {
+            Self {
+                groups,
+                failure: None,
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                groups: Vec::new(),
+                failure: Some(reason.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DiscographyProvider for FakeDiscographyProvider {
+        async fn search_artists(
+            &self,
+            artist: &str,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(vec![ArtistCandidate {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                name: artist.to_string(),
+            }])
+        }
+
+        async fn artist_by_id(
+            &self,
+            artist_mbid: &str,
+        ) -> std::result::Result<ArtistCandidate, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(ArtistCandidate {
+                id: artist_mbid.to_string(),
+                name: "Test Artist".to_string(),
+            })
+        }
+
+        async fn release_groups(
+            &self,
+            _artist_mbid: &str,
+        ) -> std::result::Result<Vec<ReleaseGroup>, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(self.groups.clone())
+        }
+    }
+
+    fn release_group(id: &str, title: &str, date: &str) -> ReleaseGroup {
+        ReleaseGroup {
+            id: id.to_string(),
+            title: title.to_string(),
+            first_release_date: Some(date.to_string()),
+            primary_type: Some("Album".to_string()),
+            secondary_types: Vec::new(),
+        }
+    }
+
+    fn album_result(artist: &str, album: &str) -> SearchResult {
+        SearchResult {
+            username: "peer".to_string(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                &format!(r"{artist}\{album}\01 - track.flac"),
+                900,
+                10_000_000,
+            )],
+        }
+    }
+
+    fn artist_only_fixture() -> (Config, Database, TempDir) {
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into_owned();
+        config.filters.min_tracks = 1;
+        config.filters.contiguous_tracks = true;
+        config.download.min_upload_speed_kbps = 0;
+        (config, Database::open_in_memory().unwrap(), staging)
+    }
+
+    struct CancelAfterFirstSearchClient {
+        inner: MockClient,
+        cancel: Arc<AtomicBool>,
+        searches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SoulseekClient for CancelAfterFirstSearchClient {
+        async fn login(
+            &self,
+            username: &str,
+            password: &str,
+            server: &str,
+            port: u16,
+        ) -> Result<()> {
+            self.inner.login(username, password, server, port).await
+        }
+
+        async fn search(&self, query: &str, timeout_secs: u64) -> Result<Vec<SearchResult>> {
+            let result = self.inner.search(query, timeout_secs).await;
+            if self.searches.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn download(
+            &self,
+            file: &FileInfo,
+            username: &str,
+            dir: &Path,
+        ) -> Result<DownloadHandle> {
+            self.inner.download(file, username, dir).await
+        }
+    }
+
+    #[tokio::test]
+    async fn artist_only_authoritative_discovery_searches_each_album_oldest_first() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Older".into(),
+            vec![album_result("Test Artist", "Older")],
+        );
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Newer".into(),
+            vec![album_result("Test Artist", "Newer")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("new", "Newer", "2005"),
+            release_group("old", "Older", "1999"),
+        ]);
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Older", "Test Artist Newer"]
+        );
+        assert_eq!(run.outcomes.len(), 2);
+        assert!(run.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_processed_album_skips_before_search() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Older".into(),
+            vec![album_result("Test Artist", "Older")],
+        );
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Newer".into(),
+            vec![album_result("Test Artist", "Newer")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("new", "Newer", "2005"),
+            release_group("old", "Older", "1999"),
+        ]);
+        let (config, db, staging) = artist_only_fixture();
+        db.mark_album_processed("Test Artist", "Older", "success")
+            .unwrap();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Newer"],
+            "the already-processed older album must be skipped before any search"
+        );
+        assert_eq!(run.outcomes[0].1, AlbumOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn authoritative_album_failure_continues() {
+        let soulseek = MockClient::new();
+        // Only the newer album has results; the older album's targeted search
+        // comes back empty and fails, but iteration must continue.
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Newer".into(),
+            vec![album_result("Test Artist", "Newer")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("new", "Newer", "2005"),
+            release_group("old", "Older", "1999"),
+        ]);
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let queries = soulseek.search_queries.lock().unwrap().clone();
+        let older = queries
+            .iter()
+            .position(|query| query == "Test Artist Older")
+            .expect("the older album's primary query must run first");
+        let newer = queries
+            .iter()
+            .position(|query| query == "Test Artist Newer")
+            .expect("the newer album must still be searched after a failure");
+        assert!(
+            older < newer,
+            "album queries must stay in chronological order, got {queries:?}"
+        );
+        assert!(
+            matches!(run.outcomes[0].1, AlbumOutcome::Failed { .. }),
+            "the empty older album must fail"
+        );
+        assert!(
+            matches!(run.outcomes[1].1, AlbumOutcome::Downloaded { .. }),
+            "the newer album must still download after the older album failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_cancellation_stops_iteration() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Older".into(),
+            vec![album_result("Test Artist", "Older")],
+        );
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Newer".into(),
+            vec![album_result("Test Artist", "Newer")],
+        );
+        let client = CancelAfterFirstSearchClient {
+            inner: soulseek,
+            cancel: Arc::clone(&cancel),
+            searches: AtomicUsize::new(0),
+        };
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("new", "Newer", "2005"),
+            release_group("old", "Older", "1999"),
+        ]);
+        let (config, db, staging) = artist_only_fixture();
+
+        run_artist_only_mode_with_provider(
+            &client,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &cancel,
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let queries = client.inner.search_queries.lock().unwrap().clone();
+        assert!(
+            !queries.contains(&"Test Artist Newer".to_string()),
+            "cancellation after the first album's search must stop iteration, got {queries:?}"
+        );
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "the first search must have set the cancellation flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_empty_searches_nothing() {
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::with_groups(Vec::new());
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "an authoritative empty discovery must not search Soulseek"
+        );
+        assert!(
+            run.outcomes.is_empty(),
+            "an authoritative empty result is not a failed or skipped album"
+        );
+        assert_eq!(
+            run.notice.as_deref(),
+            Some("No eligible authoritative albums found for Test Artist")
+        );
+    }
+
+    #[test]
+    fn stale_cache_warns_without_legacy_notice() {
+        use crate::db::DiscographyCacheEntry;
+
+        let buf = Arc::new(Mutex::new(String::new()));
+        let writer = CapturingWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let soulseek = MockClient::new();
+                let provider = FakeDiscographyProvider::failing("service unavailable");
+                let (config, db, staging) = artist_only_fixture();
+                db.upsert_discography_cache(&DiscographyCacheEntry {
+                    artist_key: "test artist".to_string(),
+                    artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
+                    canonical_artist: "Test Artist".to_string(),
+                    fetched_at: 0,
+                    release_groups_json: serde_json::to_string(&[release_group(
+                        "old",
+                        "Old Album",
+                        "1998",
+                    )])
+                    .unwrap(),
+                })
+                .unwrap();
+
+                let run = run_artist_only_mode_with_provider(
+                    &soulseek,
+                    "Test Artist",
+                    false,
+                    &config,
+                    &db,
+                    staging.path(),
+                    None,
+                    &Arc::new(AtomicBool::new(false)),
+                    &provider,
+                )
+                .await
+                .unwrap();
+
+                let captured = buf.lock().unwrap().clone();
+                assert!(
+                    captured.contains("day(s) old")
+                        && captured.contains("service unavailable")
+                        && captured.contains("stale"),
+                    "the stale-cache WARN must name the age and refresh error, got:\n{captured}"
+                );
+                assert!(
+                    run.notice.is_none(),
+                    "a stale cache must not produce a legacy-fallback notice"
+                );
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn automatic_legacy_fallback_is_visible() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist".into(),
+            vec![album_result("Test Artist", "Album One")],
+        );
+        let provider = FakeDiscographyProvider::failing("service unavailable");
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist"],
+            "the automatic legacy fallback must use the original one-artist query"
+        );
+        let notice = run
+            .notice
+            .expect("an automatic legacy fallback must attach a run notice");
+        assert!(
+            notice.contains("service unavailable") && notice.contains("heuristically"),
+            "the notice must name the transport reason and the heuristic origin, got: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_discography_uses_legacy_without_outage_notice() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist".into(),
+            vec![album_result("Test Artist", "Album One")],
+        );
+        let (mut config, db, staging) = artist_only_fixture();
+        config.discography.enabled = false;
+
+        let run = run_artist_only_mode(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist"],
+            "an explicit disable must keep the legacy one-artist query"
+        );
+        assert!(
+            run.notice.is_none(),
+            "an explicit disable is not an outage and must not emit a notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_and_automatic_modes_keep_query_contracts() {
+        // Explicit album fixture: an artist+album manual run must issue exactly
+        // the primary "Artist Album" query, unchanged by the artist-only
+        // authoritative refactor.
+        let explicit = MockClient::new();
+        explicit.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Test Album".into(),
+            vec![album_result("Test Artist", "Test Album")],
+        );
+        let (config, db, _staging) = artist_only_fixture();
+        run_manual_mode(
+            &explicit,
+            Some("Test Artist"),
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("explicit album manual mode must run");
+        assert_eq!(
+            explicit.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Test Album"],
+            "explicit album processing must keep its single targeted query"
+        );
+
+        // Album-only fixture: an album-only manual run keeps its album-only
+        // query and never issues an artist query.
+        let album_only = MockClient::new();
+        run_manual_mode(&album_only, None, Some("Test Album"), false, &config, &db)
+            .await
+            .expect("album-only manual mode must run");
+        assert_eq!(
+            album_only.search_queries.lock().unwrap().as_slice(),
+            ["Test Album".to_string()]
         );
     }
 
