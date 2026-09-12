@@ -95,6 +95,55 @@ fn mark_album_processed_if_identifiable(
     Ok(())
 }
 
+fn unique_user_count(results: &[crate::client::SearchResult]) -> usize {
+    results
+        .iter()
+        .map(|result| result.username.to_lowercase())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn candidate_disc_numbers(result: &crate::client::SearchResult) -> std::collections::BTreeSet<u32> {
+    result
+        .files
+        .iter()
+        .filter_map(|file| {
+            let parent = file.name.rsplit_once(['/', '\\'])?.0;
+            let leaf = parent.rsplit(['/', '\\']).next()?;
+            crate::discs::disc_number(leaf)
+        })
+        .collect()
+}
+
+/// Remove marked candidates that contain fewer discs than the most complete
+/// candidate for this identity. Flat-folder candidates remain eligible. When
+/// every marked candidate contains only one disc but several disc numbers are
+/// advertised across peers, none is complete and the album fails for retry.
+fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::SearchResult>) -> bool {
+    let disc_sets: Vec<std::collections::BTreeSet<u32>> =
+        results.iter().map(candidate_disc_numbers).collect();
+    let advertised: std::collections::BTreeSet<u32> = disc_sets.iter().flatten().copied().collect();
+    if advertised.len() < 2 {
+        return false;
+    }
+    let largest = disc_sets
+        .iter()
+        .map(std::collections::BTreeSet::len)
+        .max()
+        .unwrap_or(0);
+    if largest <= 1 {
+        results.clear();
+        return true;
+    }
+    let mut index = 0usize;
+    results.retain(|_| {
+        let keep = disc_sets[index].is_empty() || disc_sets[index].len() == largest;
+        index += 1;
+        keep
+    });
+    results.is_empty()
+}
+
 /// Process a single album: search → filter rank → download → organize → notify.
 /// When `target_library_path` is provided and `library_upgrade.enabled` is on
 /// (auto mode only), a completed download is copied into the origin library
@@ -237,15 +286,26 @@ async fn process_album_internal(
     if album.is_some() && !artist.trim().is_empty() {
         search::retain_artist_files(&mut results, artist);
     }
+    if presearched && remove_incomplete_split_disc_candidates(&mut results) {
+        mark_album_processed_if_identifiable(db, artist, album, "failed")?;
+        return Ok(AlbumOutcome::Failed {
+            reason: "multi-disc album is split across peers; no complete candidate available"
+                .into(),
+        });
+    }
 
     // Filter + rank
     let mut total_results: usize = results.iter().map(|r| r.files.len()).sum();
-    let mut total_users = results.len();
+    let mut total_users = unique_user_count(&results);
+    // Artist-only legacy results were already assigned to one normalized album
+    // group. Reapplying one chosen display spelling as an album-name gate would
+    // discard peers whose folder uses another spelling of that same release.
+    let filter_album = if presearched { None } else { album };
     let mut filtered = filter::filter_results_with_queue_limit(
         &results,
         &config.filters,
         library_track_count,
-        album,
+        filter_album,
         config.download.max_queue_length,
     );
     // Track which results were last filtered (for rejection summary)
@@ -308,7 +368,7 @@ async fn process_album_internal(
                                 if !title_results.is_empty() {
                                     total_results =
                                         title_results.iter().map(|r| r.files.len()).sum();
-                                    total_users = title_results.len();
+                                    total_users = unique_user_count(&title_results);
                                     filtered = filter::filter_results_with_queue_limit(
                                         &title_results,
                                         &config.filters,
@@ -397,7 +457,11 @@ async fn process_album_internal(
             &config.filters,
             library_track_count,
             // When the title-search fallback fired, no album gate applies.
-            if title_search_attempted { None } else { album },
+            if title_search_attempted {
+                None
+            } else {
+                filter_album
+            },
             config.download.max_queue_length,
         );
         let availability_requirement = if config.download.max_queue_length == 0 {
@@ -422,7 +486,11 @@ async fn process_album_internal(
     // Rank bonus applies only to primary-tier results: when the title-search
     // fallback fired, the album name is not a meaningful discriminator (we
     // searched by track title because the album name search failed).
-    let rank_album = if title_search_attempted { None } else { album };
+    let rank_album = if title_search_attempted {
+        None
+    } else {
+        filter_album
+    };
     // Load the peer reputation map (measured speed + reliability) before
     // ranking. On a DB error we proceed with an empty map — reputation never
     // blocks a search.
@@ -435,7 +503,7 @@ async fn process_album_internal(
     tracing::info!(
         "{artist} — {}: {total_results} files from {total_users} users, {} users passed filters, best: {} (speed={})",
         album.unwrap_or("(all)"),
-        filtered.len(),
+        unique_user_count(&filtered),
         ranked.first().map(|r| r.username.as_str()).unwrap_or("?"),
         ranked.first().map(|r| r.speed).unwrap_or(0),
     );
@@ -823,19 +891,51 @@ pub async fn run_auto_mode(
     Ok(())
 }
 
-/// Resolve an artist/album pair to the casing already stored in history.
-fn canonical_processed_target(
-    db: &Database,
+fn processed_target_identity(artist: &str, album: &str) -> (String, String) {
+    (
+        search::artist_identity_key(artist),
+        search::album_identity_key(album, artist),
+    )
+}
+
+fn successful_processed_target(
+    records: &[crate::db::ProcessedAlbum],
     artist: &str,
     album: &str,
-) -> Result<(String, String)> {
-    let Some(record) = db.get_processed_albums()?.into_iter().find(|record| {
-        record.artist.trim().eq_ignore_ascii_case(artist.trim())
-            && record.album.eq_ignore_ascii_case(album)
-    }) else {
-        return Ok((artist.to_owned(), album.to_owned()));
-    };
-    Ok((record.artist, record.album))
+) -> Option<(String, String)> {
+    let (artist_identity, album_identity) = processed_target_identity(artist, album);
+    records
+        .iter()
+        .find(|record| {
+            record.status == "success"
+                && !crate::discs::is_disc_designator(&record.album)
+                && search::artist_identity_key(&record.artist) == artist_identity
+                && search::album_identity_key(&record.album, artist) == album_identity
+        })
+        .map(|record| (record.artist.clone(), record.album.clone()))
+}
+
+/// Resolve an artist/album pair to an identity-equivalent spelling already
+/// stored in history. Prefer a successful row so an older failed spelling
+/// cannot hide proof that the release was already downloaded.
+fn canonical_processed_target(
+    records: &[crate::db::ProcessedAlbum],
+    artist: &str,
+    album: &str,
+) -> (String, String) {
+    if let Some(target) = successful_processed_target(records, artist, album) {
+        return target;
+    }
+    let (artist_identity, album_identity) = processed_target_identity(artist, album);
+    records
+        .iter()
+        .find(|record| {
+            !(record.status == "success" && crate::discs::is_disc_designator(&record.album))
+                && search::artist_identity_key(&record.artist) == artist_identity
+                && search::album_identity_key(&record.album, artist) == album_identity
+        })
+        .map(|record| (record.artist.clone(), record.album.clone()))
+        .unwrap_or_else(|| (artist.to_owned(), album.to_owned()))
 }
 
 /// Outcome of an artist-only manual run: per-album outcomes plus an optional
@@ -863,6 +963,14 @@ async fn process_artist_album_work(
     work: Vec<(String, Option<Vec<crate::client::SearchResult>>)>,
 ) -> Result<Vec<(String, AlbumOutcome)>> {
     let mut outcomes = Vec::with_capacity(work.len());
+    let processed_records = db.get_processed_albums()?;
+    let mut successful_identities: std::collections::HashSet<(String, String)> = processed_records
+        .iter()
+        .filter(|record| {
+            record.status == "success" && !crate::discs::is_disc_designator(&record.album)
+        })
+        .map(|record| processed_target_identity(&record.artist, &record.album))
+        .collect();
     for (album_title, presearched) in work {
         if cancel.load(Ordering::SeqCst) {
             outcomes.push((
@@ -873,7 +981,23 @@ async fn process_artist_album_work(
             ));
             break;
         }
-        let (process_artist, process_album) = canonical_processed_target(db, artist, &album_title)?;
+        // An authoritative target keeps its MusicBrainz title for searching,
+        // but an identity-equivalent legacy success still proves it is already
+        // processed.
+        if presearched.is_none()
+            && !ignore_processed
+            && successful_identities.contains(&processed_target_identity(artist, &album_title))
+        {
+            outcomes.push((album_title, AlbumOutcome::Skipped));
+            continue;
+        }
+        // Historical spellings are safe only for grouped legacy results. An
+        // authoritative MusicBrainz title must remain the search/gate title.
+        let (process_artist, process_album) = if presearched.is_some() {
+            canonical_processed_target(&processed_records, artist, &album_title)
+        } else {
+            (artist.to_owned(), album_title.clone())
+        };
         let library_track_count = if config.library.paths.is_empty() {
             None
         } else {
@@ -905,6 +1029,9 @@ async fn process_artist_album_work(
             &result,
             AlbumOutcome::Failed { reason } if reason.contains("cancelled by user")
         );
+        if matches!(result, AlbumOutcome::Downloaded { .. }) {
+            successful_identities.insert(processed_target_identity(artist, &album_title));
+        }
         outcomes.push((process_album, result));
         if cancelled {
             break;
@@ -1882,6 +2009,249 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_merged_variants_keep_every_peer_eligible() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![
+            SearchResult {
+                username: "unavailable-peer".into(),
+                speed: 900,
+                slots: 0,
+                files: vec![make_file(
+                    r"Test Artist\1998 Album Name\01.flac",
+                    900,
+                    10_000_000,
+                )],
+            },
+            SearchResult {
+                username: "usable-peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(r"Test Artist\Album Name (1998)\01.flac", 900, 10_000_000),
+                    make_file(r"Test Artist\Album Name (1998)\02.flac", 900, 10_000_000),
+                ],
+            },
+        ];
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.discography.enabled = false;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.filters.min_tracks = 2;
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
+            .await
+            .unwrap();
+
+        let downloaded = client.download_filenames.lock().unwrap();
+        assert_eq!(
+            downloaded.len(),
+            2,
+            "merged usable peer was filtered: {downloaded:?}"
+        );
+        assert!(downloaded
+            .iter()
+            .all(|name| name.contains("Album Name (1998)")));
+    }
+
+    #[test]
+    fn canonical_processed_target_matches_normalized_album_identity() {
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed(
+            "Kruder & Dorfmeister",
+            "Kruder & Dorfmeister - The K&D Sessions",
+            "success",
+        )
+        .unwrap();
+
+        let records = db.get_processed_albums().unwrap();
+        let target =
+            canonical_processed_target(&records, "Kruder & Dorfmeister", "1998 K And D Sessions");
+
+        assert_eq!(
+            target,
+            (
+                "Kruder & Dorfmeister".to_string(),
+                "Kruder & Dorfmeister - The K&D Sessions".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_split_discs_across_peers_fail_instead_of_marking_partial_success() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![
+            SearchResult {
+                username: "disc-one-peer".into(),
+                speed: 600,
+                slots: 1,
+                files: vec![make_file(
+                    r"Test Artist\Album {cd1}\01.flac",
+                    900,
+                    10_000_000,
+                )],
+            },
+            SearchResult {
+                username: "disc-two-peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Test Artist\Album {cd2}\01.flac",
+                    900,
+                    10_000_000,
+                )],
+            },
+        ];
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.discography.enabled = false;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.filters.min_tracks = 1;
+        let db = Database::open_in_memory().unwrap();
+
+        let run = run_legacy_artist_only_mode(
+            &client,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &run.outcomes[0].1,
+            AlbumOutcome::Failed { reason }
+                if reason.contains("multi-disc album is split across peers")
+        ));
+        assert!(client.download_filenames.lock().unwrap().is_empty());
+        assert_eq!(
+            db.get_album_status("Test Artist", "Album")
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn split_disc_filter_keeps_largest_self_consistent_edition() {
+        let mut results = vec![
+            SearchResult {
+                username: "two-discs".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(r"Artist\Album {cd1}\01.flac", 900, 10_000_000),
+                    make_file(r"Artist\Album {cd2}\01.flac", 900, 10_000_000),
+                ],
+            },
+            SearchResult {
+                username: "third-disc".into(),
+                speed: 400,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album {cd3}\01.flac", 900, 10_000_000)],
+            },
+        ];
+
+        assert!(!remove_incomplete_split_disc_candidates(&mut results));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].username, "two-discs");
+    }
+
+    #[test]
+    fn split_disc_filter_keeps_flat_and_fully_advertised_candidates() {
+        let mut results = vec![
+            SearchResult {
+                username: "complete".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(r"Artist\Album {cd1}\01.flac", 900, 10_000_000),
+                    make_file(r"Artist\Album {cd2}\01.flac", 900, 10_000_000),
+                ],
+            },
+            SearchResult {
+                username: "split".into(),
+                speed: 400,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album {cd1}\01.flac", 900, 10_000_000)],
+            },
+            SearchResult {
+                username: "flat".into(),
+                speed: 300,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album\01.flac", 900, 10_000_000)],
+            },
+        ];
+
+        assert!(!remove_incomplete_split_disc_candidates(&mut results));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.username.as_str())
+                .collect::<Vec<_>>(),
+            ["complete", "flat"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_same_peer_variants_do_not_combine_incomplete_track_counts() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(r"Test Artist\1998 Album\01.flac", 900, 10_000_000),
+                make_file(r"Test Artist\1998 Album\02.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Album (1998)\01.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Album (1998)\02.flac", 900, 10_000_000),
+            ],
+        }];
+        let staging = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.discography.enabled = false;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.filters.min_tracks = 3;
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
+            .await
+            .unwrap();
+
+        assert!(client.download_filenames.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn canonical_processed_target_ignores_historical_single_disc_success() {
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Test Artist", "Album {cd1}", "success")
+            .unwrap();
+        let records = db.get_processed_albums().unwrap();
+
+        let target = canonical_processed_target(&records, "Test Artist", "Album");
+
+        assert_eq!(target, ("Test Artist".to_string(), "Album".to_string()));
+    }
+
+    #[test]
+    fn canonical_processed_target_prefers_successful_identity_match() {
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Test Artist", "1998 Album", "failed")
+            .unwrap();
+        db.mark_album_processed("Test Artist", "Test Artist - Album (1998)", "success")
+            .unwrap();
+
+        let records = db.get_processed_albums().unwrap();
+        let target = canonical_processed_target(&records, "Test Artist", "Album");
+
+        assert_eq!(target.1, "Test Artist - Album (1998)");
+    }
+
     // ── Authoritative discography integration ──
 
     use crate::client::DownloadHandle;
@@ -2057,6 +2427,100 @@ mod tests {
         );
         assert_eq!(run.outcomes.len(), 2);
         assert!(run.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_search_keeps_musicbrainz_title_despite_failed_legacy_spelling() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Album".into(),
+            vec![album_result("Test Artist", "Album")],
+        );
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("album-id", "Album", "1998")]);
+        let (config, db, staging) = artist_only_fixture();
+        db.mark_album_processed("Test Artist", "Test Artist - Album (1998)", "failed")
+            .unwrap();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap()[0],
+            "Test Artist Album"
+        );
+        assert!(matches!(run.outcomes[0].1, AlbumOutcome::Downloaded { .. }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_discovery_skips_identity_equivalent_legacy_success() {
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::with_groups(vec![release_group(
+            "album-id",
+            "The K&D Sessions",
+            "1998",
+        )]);
+        let (config, db, staging) = artist_only_fixture();
+        db.mark_album_processed("Test Artist", "1998 The K&D Sessions", "success")
+            .unwrap();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+        assert_eq!(run.outcomes[0].1, AlbumOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn authoritative_run_skips_identity_equivalent_legacy_success() {
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::with_groups(vec![release_group(
+            "album-id",
+            "The K&D Sessions",
+            "1998",
+        )]);
+        let (config, db, staging) = artist_only_fixture();
+        db.mark_album_processed("Kruder and Dorfmeister", "1998 K And D Sessions", "success")
+            .unwrap();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Kruder & Dorfmeister",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+        assert_eq!(run.outcomes[0].1, AlbumOutcome::Skipped);
     }
 
     #[tokio::test]

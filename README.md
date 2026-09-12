@@ -536,6 +536,27 @@ Fallback precedence is fresh cache, successful refresh, stale cache, then the le
 - Set `discography.enabled: false` to select the legacy heuristic deliberately. That choice is logged as an
   explicit configuration choice without an outage warning.
 
+The legacy heuristic normalizes common folder-name variations (explicit artist
+prefixes, leading release years, punctuation, common Latin variants, trademark
+marks, audio-format suffixes, and folder disc markers) so one release is
+processed once. A separator-less prefix for a single-word artist remains
+significant (`Nirvana Nevermind` differs from `Nevermind`) to avoid collapsing
+titles such as `Doors Open` into `Open`. This is a conservative text heuristic,
+not edition metadata: genuinely distinct releases whose names differ only by a
+stripped marker can collapse into one candidate, while a trailing bare year
+remains significant to avoid merging titles such as `Blade Runner` and
+`Blade Runner 2049`.
+
+For legacy artist-only discovery, folder-marked single-disc peers are rejected
+when another candidate advertises a larger, self-consistent disc set. If every
+marked candidate contains only one of several observed discs, the album fails
+with `multi-disc album is split across peers; no complete candidate available`
+and is retried later rather than recorded as a partial success. Flat folders,
+filename-only disc numbering, explicit artist-plus-album runs, and batch runs
+are outside this split-disc check. Success rows created by older versions under
+a single-disc album label are ignored by normalized history matching; rerun the
+album to replace that partial result.
+
 **Q: Does MusicBrainz require an account or API key?**
 
 No. Seakarr sends an identifying User-Agent and paces requests to at most one per second, following the

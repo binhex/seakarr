@@ -298,8 +298,9 @@ fn disc_subdir(src: &Path) -> Option<String> {
                 break;
             }
             if crate::discs::is_disc_designator(name) {
-                // Return the innermost (deepest) disc folder — the one
-                // closest to the file. Do not keep walking upward.
+                // Preserve the peer's original disc label for traceability;
+                // only its classification is normalized across marker styles.
+                // Return the innermost folder, closest to the file.
                 return Some(name.to_string());
             }
         }
@@ -691,6 +692,36 @@ mod tests {
         .unwrap();
         // Duplicate should get (1) suffix
         assert!(library.path().join("Artist/Title (1).flac").exists());
+    }
+
+    #[test]
+    fn organize_preserves_brace_marker_disc_subdirectory() {
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("Album {cd1}");
+        fs::create_dir_all(&disc).unwrap();
+        let source = disc.join("01 - Song.flac");
+        fs::write(&source, b"content").unwrap();
+
+        let destination = organize_file(OrganizeInput {
+            src: &source,
+            library_root: library.path(),
+            pattern: "%artist%/%album%/%track% - %title%.%ext%",
+            artist: "Artist",
+            album: "Album",
+            track: "01",
+            title: "Song",
+            ext: "flac",
+        })
+        .unwrap();
+
+        assert_eq!(
+            destination,
+            library
+                .path()
+                .join("Artist/Album/Album {cd1}/01 - Song.flac")
+        );
+        assert!(destination.is_file());
     }
 
     // ── Library upgrade tests ──

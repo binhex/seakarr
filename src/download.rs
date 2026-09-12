@@ -2626,6 +2626,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn brace_marker_discs_stage_into_separate_subdirectories() {
+        let client = Arc::new(MockClient::new());
+        *client.write_files.lock().unwrap() = true;
+        let dir = TempDir::new().unwrap();
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file("Music\\Album {cd1}\\01.flac", 900, 10_000_000),
+                make_file("Music\\Album {cd2}\\01.flac", 900, 10_000_000),
+            ],
+        }];
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let downloaded = download_album(
+            client.as_ref(),
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(downloaded.len(), 2);
+        assert!(dir.path().join("Album {cd1}/01.flac").is_file());
+        assert!(dir.path().join("Album {cd2}/01.flac").is_file());
+    }
+
     // ── Post-download quality verification ──
 
     /// Minimal valid FLAC (same bytes as organizer.rs's write_real_flac):
