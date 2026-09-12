@@ -36,9 +36,10 @@ Automated Soulseek music downloader with library quality upgrading.
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
 - **SQLite persistence** — tracks processed albums, download queue, peer reputation, and search history
-  across restarts and daemon cycles.
-- **Daemon mode** — run continuously, re-scanning your library on a configurable interval and upgrading
-  albums as they become available on Soulseek. Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM.
+  across restarts and schedule cycles.
+- **Scheduled mode** — run the selected auto, manual, or batch operation immediately, then repeat it after a
+  configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle cancellation or
+  stops the scheduler while it is waiting between cycles.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
   directory.
 - **Notifications** — sends alerts via any [Apprise](https://github.com/caronc/apprise)-compatible service
@@ -80,8 +81,8 @@ seakarr --test
 # One-shot automatic upgrade scan
 seakarr
 
-# Continuous daemon mode (re-scan every 60 min)
-seakarr --daemon
+# Scheduled foreground loop (run immediately, then wait 60 min after each cycle)
+seakarr --schedule
 
 # Manual search for every album found for an artist
 seakarr --mode manual --artist "Pink Floyd"
@@ -149,7 +150,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
-| `--daemon` | Repeat the same validated auto, manual, or batch operation each cycle. | `false` |
+| `--schedule` | Run immediately, then repeat the same validated auto, manual, or batch operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
 
 `--ignore-processed` applies to one-shot auto, manual, and batch modes. It is a
@@ -160,7 +161,7 @@ deleted before the attempt; if the retry fails, the album remains eligible for
 normal future retries. In manual and batch modes, use `storage.organize: true` if
 the replacement should be moved into the library; otherwise it remains in staging.
 In auto mode, only albums selected by the existing upgrade scanner are eligible.
-The flag cannot be combined with `--daemon` (or configured daemon mode), so a
+The flag cannot be combined with `--schedule` (or configured scheduled mode), so a
 forced reprocess is never repeated automatically on every cycle. If a forced
 search fails before completing, the album is recorded as failed and remains
 eligible for normal future retries.
@@ -304,12 +305,22 @@ better source, replacing the existing files.
 Apprise supports ntfy, Discord, Telegram, email, Slack, and many other services. Example:
 `ntfy://my-topic`, `discord://webhook-id/webhook-token`.
 
-### `daemon`
+### `schedule`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `enabled` | Run in daemon mode (continuously re-scan). Also enabled by `--daemon`. | `false` |
-| `rescan_interval_mins` | Minutes between library re-scans in daemon mode. Values below `1` are clamped to `1`. | `60` |
+| `enabled` | Run the selected operation in a foreground interval loop. Also enabled by `--schedule`. | `false` |
+| `interval_mins` | Minutes to wait after a completed cycle before starting the next one. Values below `1` are clamped to `1`. | `60` |
+
+#### Migrating from daemon terminology
+
+`--daemon` remains as a hidden compatibility flag for this release. It behaves
+like `--schedule`, prints a deprecation warning, and will be removed in the
+next minor release. Existing `daemon.enabled` and
+`daemon.rescan_interval_mins` values are migrated automatically to
+`schedule.enabled` and `schedule.interval_mins`. Before rewriting the file,
+seakarr saves the original as `seakarr.yml.bak`. Explicit values already under
+`schedule` take precedence over legacy values.
 
 ## How it works
 
@@ -369,13 +380,14 @@ with a WARN and a run-summary notice.
 Reads a newline-separated text file of `artist - album` lines and performs steps 3–7 for each line. Reports
 success and failure counts on completion. Lines starting with `#` are treated as comments.
 
-### Daemon mode
+### Scheduled mode
 
-When `--daemon` or `daemon.enabled` is set, the same validated auto, manual, or batch
-plan runs in a continuous loop. After each cycle, seakarr sleeps for
-`daemon.rescan_interval_mins` before dispatching that unchanged plan again. The daemon
-handles SIGINT (Ctrl+C) and SIGTERM gracefully — the PID file is removed and the current
-cycle is allowed to finish.
+When `--schedule` or `schedule.enabled` is set, the same validated auto, manual, or batch
+plan runs immediately in a foreground loop. After each cycle completes, seakarr waits for
+`schedule.interval_mins` before dispatching that unchanged plan again. SIGTERM received at
+any time stops the scheduler after the active cycle and removes the PID file. Ctrl+C during
+an active cycle requests cancellation; Ctrl+C while waiting between cycles stops the
+scheduler and removes the PID file.
 
 ## Development
 

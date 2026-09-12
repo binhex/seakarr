@@ -1077,8 +1077,8 @@ mod real_client_tests {
     }
 
     // After the cooldown elapses, a reconnect must be attempted again (the
-    // daemon must recover from a transient outage without a restart). The
-    // stale cached reason must not short-circuit the attempt.
+    // scheduled loop must recover from a transient outage without a restart).
+    // The stale cached reason must not short-circuit the attempt.
     #[tokio::test]
     async fn expired_reconnect_failure_allows_retry_after_cooldown() {
         let rc = real_client_with_loss(SessionLoss::Disconnected).await;

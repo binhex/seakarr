@@ -91,12 +91,13 @@ fn configured_mode_conflict(
 
 /// Resolve and validate the operation selected by config and CLI overrides.
 pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<ExecutionPlan> {
-    // --ignore-processed forces a reprocess on this run; combined with daemon
-    // mode it would repeat the forced download every cycle, so reject the
-    // combination before any mode resolution or startup side effects.
-    if cli.ignore_processed && (cli.daemon || config.daemon.enabled) {
+    // --ignore-processed forces a reprocess on this run; combined with
+    // scheduled mode it would repeat the forced download every cycle, so
+    // reject the combination before any mode resolution or startup side
+    // effects.
+    if cli.ignore_processed && (cli.schedule || config.schedule.enabled) {
         return Err(SeakarrError::Config(
-            "--ignore-processed cannot be used with daemon mode".into(),
+            "--ignore-processed cannot be used with scheduled mode".into(),
         ));
     }
 
@@ -714,27 +715,27 @@ mod tests {
     }
 
     #[test]
-    fn ignore_processed_is_rejected_for_daemon_mode() {
-        // --ignore-processed must never combine with daemon mode: it would
-        // force a reprocess on every daemon cycle.
+    fn ignore_processed_is_rejected_for_scheduled_cli_mode() {
+        // --ignore-processed must never combine with scheduled mode: it would
+        // force a reprocess on every scheduled cycle.
         let config = config_with_mode("auto");
         let mut overrides = cli(None, None, None, None);
-        overrides.daemon = true;
+        overrides.schedule = true;
         overrides.ignore_processed = true;
 
-        assert_config_error(&config, &overrides, "cannot be used with daemon mode");
+        assert_config_error(&config, &overrides, "cannot be used with scheduled mode");
     }
 
     #[test]
-    fn ignore_processed_is_rejected_for_configured_daemon() {
-        // The daemon flag can come from the YAML config as well; both forms
+    fn ignore_processed_is_rejected_for_configured_schedule() {
+        // The schedule flag can come from the YAML config as well; both forms
         // must be rejected before any processing.
         let mut config = config_with_mode("auto");
-        config.daemon.enabled = true;
+        config.schedule.enabled = true;
         let mut overrides = cli(None, None, None, None);
         overrides.ignore_processed = true;
 
-        assert_config_error(&config, &overrides, "cannot be used with daemon mode");
+        assert_config_error(&config, &overrides, "cannot be used with scheduled mode");
     }
 
     #[test]

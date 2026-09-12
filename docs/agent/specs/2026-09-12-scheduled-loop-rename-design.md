@@ -42,8 +42,9 @@ The behavior of the recurring loop does not otherwise change.
 
 The current `--daemon` flag and `daemon.enabled` configuration enter a foreground loop. Seakarr resolves one
 auto, manual, or batch execution plan, dispatches it immediately, waits for
-`daemon.rescan_interval_mins` after that cycle completes, and dispatches the same plan again. SIGINT and
-SIGTERM stop the loop gracefully and remove the PID file.
+`daemon.rescan_interval_mins` after that cycle completes, and dispatches the same plan again. SIGTERM received
+during a cycle stops the loop after that cycle; SIGINT during a cycle requests cancellation, while SIGINT or
+SIGTERM received between cycles stops the loop and removes the PID file.
 
 The term "rescan" is also inaccurate for manual and batch plans, which repeat searches or batch processing
 rather than scanning the library.
@@ -163,7 +164,8 @@ cycle.
 - An interval that cannot be represented safely is rejected using the new key path.
 - `--ignore-processed` combined with CLI- or config-enabled scheduling fails before startup side effects.
 - A cycle failure is logged and the scheduler continues to the next interval, matching current behavior.
-- SIGINT and SIGTERM continue to stop the loop gracefully and remove the PID file.
+- SIGTERM during a cycle stops scheduling after that cycle; SIGINT during a cycle requests cancellation.
+- SIGINT or SIGTERM received between cycles stops the loop and removes the PID file.
 - Config migration failures retain the existing backup/write error behavior and do not silently discard values.
 - User-visible logs use "Schedule," "scheduled mode," or "cycle," not "daemon."
 
@@ -196,8 +198,9 @@ The implementation is complete when tests demonstrate all of the following:
 8. Mixed old/new YAML gives new values precedence and inherits only missing legacy values.
 9. Re-loading migrated YAML is idempotent.
 10. Auto, manual, and batch schedules run immediately and reuse the same validated plan on later cycles.
-11. Interval clamping, overflow rejection, cycle-failure continuation, signal shutdown, and PID cleanup retain their
-    current behavior with schedule-oriented messages.
+11. Interval clamping, overflow rejection, cycle-failure continuation, signal handling, and PID cleanup retain their
+    current behavior with schedule-oriented messages: SIGTERM stops after an active cycle, SIGINT requests active-cycle
+    cancellation, and either signal stops scheduling while the loop is waiting.
 12. `--ignore-processed` remains rejected for both CLI- and config-enabled scheduling before login or other startup
     side effects.
 13. The full existing test suite passes without database or network contract changes.

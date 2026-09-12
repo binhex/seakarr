@@ -74,8 +74,12 @@ struct Cli {
     #[arg(long)]
     test: bool,
 
-    /// Run continuously as a daemon
+    /// Repeat the selected operation in a foreground interval loop
     #[arg(long)]
+    schedule: bool,
+
+    /// Deprecated compatibility flag; use --schedule
+    #[arg(long, hide = true)]
     daemon: bool,
 
     /// Reprocess an album even when it has a successful processed-album record
@@ -131,6 +135,13 @@ fn exit_code_after_run(result: Result<()>) -> i32 {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.daemon {
+        eprintln!(
+            "warning: --daemon is deprecated; use --schedule; \
+             support will be removed in the next minor release"
+        );
+    }
+
     // Load and merge config
     let mut config = Config::load(&cli.config_path)?;
 
@@ -147,7 +158,7 @@ async fn run() -> Result<()> {
         batch_file: cli.batch_file.as_ref().map(|p| p.to_string_lossy().into()),
         artist: cli.artist.clone(),
         album: cli.album.clone(),
-        daemon: cli.daemon,
+        schedule: cli.schedule || cli.daemon,
         test: cli.test,
         ignore_processed: cli.ignore_processed,
     };
@@ -231,21 +242,15 @@ async fn run() -> Result<()> {
 
     client.set_max_peers(config.soulseek.max_peers).await?;
 
-    if config.daemon.enabled {
-        let interval_mins = config.daemon.rescan_interval_mins.max(1);
-        if config.daemon.rescan_interval_mins == 0 {
-            tracing::warn!("daemon.rescan_interval_mins is 0 — clamping to 1 to avoid busy-loop");
+    if config.schedule.enabled {
+        let interval_mins = config.schedule.interval_mins;
+        if interval_mins == 0 {
+            tracing::warn!("schedule.interval_mins is 0; clamping to 1 to avoid busy-loop");
         }
-        let interval =
-            tokio::time::Duration::from_secs(interval_mins.checked_mul(60).ok_or_else(|| {
-                SeakarrError::Config(
-                    "daemon.rescan_interval_mins is too large; maximum is 307445734561271883"
-                        .into(),
-                )
-            })?);
-        // --ignore-processed + daemon was rejected during mode validation, so
-        // the daemon path always dispatches with false.
-        run_daemon(&client, &config, &db, &pid_file, interval, &execution_plan).await
+        let interval = schedule_interval(interval_mins)?;
+        // --ignore-processed + schedule was rejected during mode validation, so
+        // the scheduled path always dispatches with false.
+        run_schedule(&client, &config, &db, &pid_file, interval, &execution_plan).await
     } else {
         let result =
             dispatch_execution_plan(&client, &execution_plan, &config, &db, cli.ignore_processed)
@@ -394,8 +399,24 @@ fn release_pid_lock(pid_file: &Path) -> Result<()> {
     Ok(())
 }
 
+fn schedule_interval(interval_mins: u64) -> Result<tokio::time::Duration> {
+    let interval_mins = interval_mins.max(1);
+    let seconds = interval_mins.checked_mul(60).ok_or_else(|| {
+        SeakarrError::Config(format!(
+            "schedule.interval_mins is too large; maximum is {}",
+            u64::MAX / 60
+        ))
+    })?;
+    Ok(tokio::time::Duration::from_secs(seconds))
+}
+
+fn finish_scheduled_shutdown(pid_file: &Path, signal: &str) -> Result<()> {
+    tracing::info!("Schedule: received {signal}, shutting down...");
+    release_pid_lock(pid_file)
+}
+
 /// Dispatch a validated execution plan to the matching runner. This is the
-/// only mode-to-runner match in the binary — both one-shot runs and daemon
+/// only mode-to-runner match in the binary - both one-shot runs and scheduled
 /// cycles execute the same already-validated plan with the same criteria.
 async fn dispatch_execution_plan(
     client: &dyn SoulseekClient,
@@ -423,9 +444,9 @@ async fn dispatch_execution_plan(
     }
 }
 
-/// Daemon loop: run a cycle using the validated execution plan, then sleep
-/// until the next cycle or shut down gracefully on SIGINT/SIGTERM.
-async fn run_daemon(
+/// Scheduled loop: run immediately using the validated execution plan, then
+/// wait until the next cycle or shut down gracefully on SIGINT/SIGTERM.
+async fn run_schedule(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
@@ -436,21 +457,19 @@ async fn run_daemon(
     let mut sigterm = signal_terminate();
 
     loop {
-        tracing::info!("Daemon: starting scan cycle...");
-        if let Err(e) = run_daemon_cycle(client, config, db, plan).await {
-            tracing::error!("Scan cycle failed: {e}");
+        tracing::info!("Schedule: starting cycle...");
+        if let Err(error) = run_schedule_cycle(client, config, db, plan).await {
+            tracing::error!("Scheduled cycle failed: {error}");
         }
 
         // Wait for the next cycle time, Ctrl+C, or SIGTERM.
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Daemon: received SIGINT, shutting down...");
-                release_pid_lock(pid_file)?;
+                finish_scheduled_shutdown(pid_file, "SIGINT")?;
                 return Ok(());
             }
             _ = wait_for_sigterm(&mut sigterm) => {
-                tracing::info!("Daemon: received SIGTERM, shutting down...");
-                release_pid_lock(pid_file)?;
+                finish_scheduled_shutdown(pid_file, "SIGTERM")?;
                 return Ok(());
             }
             _ = tokio::time::sleep(interval) => {}
@@ -458,17 +477,17 @@ async fn run_daemon(
     }
 }
 
-/// Run one daemon cycle with the same validated plan used by one-shot execution.
+/// Run one scheduled cycle with the same validated plan used by one-shot execution.
 ///
 /// Keeping dispatch centralized ensures CLI criteria are not reinterpreted and
 /// an explicit manual or batch plan cannot fall through to auto mode.
-async fn run_daemon_cycle(
+async fn run_schedule_cycle(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
     plan: &ExecutionPlan,
 ) -> Result<()> {
-    // Daemon cycles never carry --ignore-processed: the combination is
+    // Scheduled cycles never carry --ignore-processed: the combination is
     // rejected during mode validation before any dispatch.
     dispatch_execution_plan(client, plan, config, db, false).await
 }
@@ -602,7 +621,7 @@ mod tests {
     // Regression: a validated manual plan must reach the manual runner with
     // its artist and album criteria instead of being reinterpreted by the cycle.
     #[tokio::test]
-    async fn daemon_cycle_honours_manual_mode_artist_album() {
+    async fn schedule_cycle_honours_manual_mode_artist_album() {
         let client = MockClient::new();
         let mut config = Config::default();
         config.soulseek.username = "test".into();
@@ -617,7 +636,7 @@ mod tests {
         config.search.default_mode = "manual".into();
         config.search.manual.artist = "Michael Bolton".into();
         config.search.manual.album = "The Essential Michael Bolton".into();
-        config.daemon.enabled = true;
+        config.schedule.enabled = true;
         // Empty library paths: auto mode would fail with
         // "library.paths is empty", proving manual mode ran instead.
         config.library.paths = vec![];
@@ -629,15 +648,313 @@ mod tests {
             album: Some("The Essential Michael Bolton".into()),
         };
 
-        run_daemon_cycle(&client, &config, &db, &plan)
+        run_schedule_cycle(&client, &config, &db, &plan)
             .await
-            .expect("daemon cycle must succeed in manual mode");
+            .expect("scheduled cycle must succeed in manual mode");
 
         let queries = client.search_queries.lock().unwrap();
         assert!(
             queries.iter().any(|q| q.contains("Michael Bolton")),
-            "manual-mode daemon cycle must search for the requested artist, got queries: {queries:?}"
+            "manual-mode scheduled cycle must search for the requested artist, got queries: {queries:?}"
         );
+    }
+
+    // The first query must be observable while virtual time remains paused;
+    // sleeping before the first cycle would make this bounded driver fail.
+    #[tokio::test(start_paused = true)]
+    async fn schedule_starts_first_cycle_before_waiting() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.download.concurrent = 2;
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls.clear();
+        config.filters.min_tracks = 0;
+        config.library.paths.clear();
+        let staging = TempDir::new().unwrap();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+        let pid_file = staging.path().join("seakarr.pid");
+        let plan = ExecutionPlan::Manual {
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+        };
+        let schedule = run_schedule(
+            &client,
+            &config,
+            &db,
+            &pid_file,
+            tokio::time::Duration::from_secs(3_600),
+            &plan,
+        );
+        tokio::pin!(schedule);
+
+        drive_schedule_until_queries(schedule.as_mut(), &client, 1).await;
+    }
+
+    async fn drive_schedule_until_queries<F>(
+        mut schedule: std::pin::Pin<&mut F>,
+        client: &MockClient,
+        expected: usize,
+    ) where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if client.search_queries.lock().unwrap().len() >= expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "schedule did not issue {expected} query or queries"
+            );
+            tokio::select! {
+                result = schedule.as_mut() => panic!("schedule ended unexpectedly: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn receive_child_marker(
+        receiver: &std::sync::mpsc::Receiver<String>,
+        marker: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(line) if line.contains(marker) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn scheduled_manual_fixture() -> (MockClient, Config, Database, TempDir, ExecutionPlan) {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.download.concurrent = 2;
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls.clear();
+        config.filters.min_tracks = 0;
+        config.library.paths.clear();
+        let staging = TempDir::new().unwrap();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let database = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Manual {
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+        };
+        (client, config, database, staging, plan)
+    }
+
+    #[test]
+    fn schedule_interval_clamps_zero_to_one_minute() {
+        assert_eq!(schedule_interval(0).unwrap().as_secs(), 60);
+    }
+
+    #[test]
+    fn finish_scheduled_shutdown_removes_pid_file() {
+        let temp = TempDir::new().unwrap();
+        let pid_file = temp.path().join("seakarr.pid");
+        std::fs::write(&pid_file, "123").unwrap();
+
+        finish_scheduled_shutdown(&pid_file, "test signal").unwrap();
+
+        assert!(!pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_handles_real_signals_and_removes_pid_file() {
+        if let Ok(signal) = std::env::var("SEAKARR_SCHEDULE_SIGNAL_CHILD") {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (client, config, database, staging, plan) = scheduled_manual_fixture();
+                let pid_file = staging.path().join("seakarr.pid");
+                std::fs::write(&pid_file, "123").unwrap();
+                let schedule = run_schedule(
+                    &client,
+                    &config,
+                    &database,
+                    &pid_file,
+                    tokio::time::Duration::from_secs(3_600),
+                    &plan,
+                );
+                tokio::pin!(schedule);
+                drive_schedule_until_queries(schedule.as_mut(), &client, 3).await;
+                tokio::select! {
+                    result = schedule.as_mut() => {
+                        panic!("schedule ended before {signal}: {result:?}")
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+                println!("READY");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+
+                schedule.await.unwrap();
+                assert!(!pid_file.exists(), "{signal} must remove the PID file");
+                println!("PID_REMOVED");
+                std::io::stdout().flush().unwrap();
+            });
+            return;
+        }
+
+        for (signal_name, signal_number) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
+            let executable = std::env::current_exe().unwrap();
+            let mut child = std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("tests::schedule_handles_real_signals_and_removes_pid_file")
+                .arg("--nocapture")
+                .env("SEAKARR_SCHEDULE_SIGNAL_CHILD", signal_name)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn schedule signal child");
+            let pid = child.id() as i32;
+            let stdout = child.stdout.take().unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if sender.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            if !receive_child_marker(&receiver, "READY", std::time::Duration::from_secs(10)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                reader.join().unwrap();
+                panic!("{signal_name} child did not become ready within 10 seconds");
+            }
+
+            unsafe { libc::kill(pid, signal_number) };
+
+            let mut stopped =
+                receive_child_marker(&receiver, "PID_REMOVED", std::time::Duration::from_secs(1));
+            if !stopped && signal_name == "SIGINT" {
+                // A first SIGINT may have reached the active cycle's cancel
+                // listener just before the scheduler entered its wait.
+                unsafe { libc::kill(pid, signal_number) };
+                stopped = receive_child_marker(
+                    &receiver,
+                    "PID_REMOVED",
+                    std::time::Duration::from_secs(9),
+                );
+            }
+            if !stopped {
+                let _ = child.kill();
+                let _ = child.wait();
+                reader.join().unwrap();
+                panic!("{signal_name} child did not stop within 10 seconds");
+            }
+            let status = child.wait().expect("schedule signal child did not exit");
+            reader.join().unwrap();
+            assert!(status.success(), "{signal_name} child failed: {status:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_reuses_the_same_plan_after_each_interval() {
+        let (client, config, database, staging, plan) = scheduled_manual_fixture();
+        let pid_file = staging.path().join("seakarr.pid");
+        let interval = tokio::time::Duration::from_secs(60);
+        let schedule = run_schedule(&client, &config, &database, &pid_file, interval, &plan);
+        tokio::pin!(schedule);
+
+        drive_schedule_until_queries(schedule.as_mut(), &client, 3).await;
+        tokio::time::advance(interval).await;
+        drive_schedule_until_queries(schedule.as_mut(), &client, 6).await;
+
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries.len() >= 6,
+            "expected two three-tier search cycles: {queries:?}"
+        );
+        let first_cycle = &queries[..3];
+        assert!(
+            queries.chunks_exact(3).all(|cycle| cycle == first_cycle),
+            "every cycle must reuse the same manual plan: {queries:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_reuses_an_auto_plan_after_each_interval() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls.clear();
+        config.filters.min_tracks = 0;
+        let temp = TempDir::new().unwrap();
+        let album_dir = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
+        config.library.paths = vec![temp.path().to_string_lossy().into_owned()];
+        config.storage.staging_dir = temp.path().join("staging").to_string_lossy().into_owned();
+        let database = Database::open_in_memory().unwrap();
+        let pid_file = temp.path().join("seakarr.pid");
+        let interval = tokio::time::Duration::from_secs(60);
+        let plan = ExecutionPlan::Auto;
+        let schedule = run_schedule(&client, &config, &database, &pid_file, interval, &plan);
+        tokio::pin!(schedule);
+
+        drive_schedule_until_queries(schedule.as_mut(), &client, 3).await;
+        tokio::time::advance(interval).await;
+        drive_schedule_until_queries(schedule.as_mut(), &client, 6).await;
+
+        let queries = client.search_queries.lock().unwrap();
+        assert!(
+            queries.len() >= 6,
+            "expected two three-tier auto cycles: {queries:?}"
+        );
+        let first_cycle = &queries[..3];
+        assert!(
+            queries.chunks_exact(3).all(|cycle| cycle == first_cycle),
+            "every cycle must reuse the auto plan: {queries:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_continues_after_a_failed_cycle() {
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.library.paths.clear();
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let database = Database::open_in_memory().unwrap();
+        let batch_file = temp.path().join("missing.txt");
+        let pid_file = temp.path().join("seakarr.pid");
+        let interval = tokio::time::Duration::from_secs(60);
+        let plan = ExecutionPlan::Batch {
+            file_path: batch_file.to_string_lossy().into_owned(),
+        };
+        let schedule = run_schedule(&client, &config, &database, &pid_file, interval, &plan);
+        tokio::pin!(schedule);
+
+        tokio::select! {
+            result = schedule.as_mut() => panic!("failed cycle stopped schedule: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        std::fs::write(&batch_file, "Artist - Album\n").unwrap();
+        tokio::time::advance(interval).await;
+        drive_schedule_until_queries(schedule.as_mut(), &client, 3).await;
     }
 
     // A validated manual plan must dispatch to the manual runner even with

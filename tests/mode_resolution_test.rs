@@ -294,9 +294,9 @@ fn ignore_processed_with_manual_test_passes_validation() {
 }
 
 #[test]
-fn ignore_processed_with_daemon_fails_before_login() {
-    // --ignore-processed cannot combine with --daemon: it would force a
-    // reprocess on every daemon cycle. The validation must fire before any
+fn ignore_processed_with_schedule_fails_before_login() {
+    // --ignore-processed cannot combine with --schedule: it would force a
+    // reprocess on every scheduled cycle. The validation must fire before any
     // Soulseek login or other startup side effects.
     let temp = TempDir::new().unwrap();
     let config_dir = temp.path().join("config");
@@ -309,7 +309,7 @@ fn ignore_processed_with_daemon_fails_before_login() {
             "--log-path",
             log_dir.to_str().unwrap(),
             "--ignore-processed",
-            "--daemon",
+            "--schedule",
             "--test",
             "--artist",
             "Artist",
@@ -327,14 +327,85 @@ fn ignore_processed_with_daemon_fails_before_login() {
     assert_eq!(
         output.status.code(),
         Some(1),
-        "--ignore-processed --daemon must fail validation, got:\n{combined}"
+        "--ignore-processed --schedule must fail validation, got:\n{combined}"
     );
     assert!(
-        combined.contains("cannot be used with daemon mode"),
-        "error must explain the daemon conflict, got:\n{combined}"
+        combined.contains("cannot be used with scheduled mode"),
+        "error must explain the schedule conflict, got:\n{combined}"
     );
     assert!(
         !combined.contains("Connecting to Soulseek"),
-        "--ignore-processed --daemon must fail before login:\n{combined}"
+        "--ignore-processed --schedule must fail before login:\n{combined}"
     );
+}
+
+#[test]
+fn ignore_processed_with_configured_schedule_fails_before_login() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        r#"
+search:
+  default_mode: auto
+schedule:
+  enabled: true
+  interval_mins: 60
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--ignore-processed",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(1), "got:\n{combined}");
+    assert!(combined.contains("cannot be used with scheduled mode"));
+    assert!(!combined.contains("Connecting to Soulseek"));
+}
+
+#[test]
+fn ignore_processed_with_legacy_daemon_warns_and_fails_before_login() {
+    // The hidden compatibility alias must reach the same pre-login validation
+    // and warn that --daemon is deprecated.
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--ignore-processed",
+            "--daemon",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(1), "got:\n{combined}");
+    assert!(combined.contains("--daemon is deprecated; use --schedule"));
+    assert!(combined.contains("cannot be used with scheduled mode"));
+    assert!(!combined.contains("Connecting to Soulseek"));
 }

@@ -815,8 +815,8 @@ pub async fn run_auto_mode(
     report.print_summary();
 
     // Abort the cancel listener so the tokio task does not accumulate across
-    // daemon scan cycles (each cycle calls run_auto_mode again). Without
-    // abort(), the JoinHandle drop only detaches the task — it keeps running
+    // scheduled scan cycles (each cycle calls run_auto_mode again). Without
+    // abort(), the JoinHandle drop only detaches the task - it keeps running
     // and waiting for SIGINT, leaking one task per scan.
     _listener.abort();
 

@@ -47,7 +47,7 @@ pub struct Config {
     pub pid: PidConfig,
     pub notifications: NotificationConfig,
     pub library_upgrade: LibraryUpgradeConfig,
-    pub daemon: DaemonConfig,
+    pub schedule: ScheduleConfig,
     // Populated by Config::load for on-disk configs; in-memory configs (e.g.
     // Config::default()) have no source. Skipped by (de)serialization so it
     // never appears in YAML output.
@@ -216,11 +216,11 @@ pub struct LibraryUpgradeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonConfig {
+pub struct ScheduleConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_rescan_interval")]
-    pub rescan_interval_mins: u64,
+    #[serde(default = "default_schedule_interval")]
+    pub interval_mins: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -284,7 +284,7 @@ pub struct CliOverrides {
     pub batch_file: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
-    pub daemon: bool,
+    pub schedule: bool,
     pub test: bool,
     /// Runtime-only: bypass the processed-album success check for this run.
     pub ignore_processed: bool,
@@ -403,7 +403,7 @@ fn default_pid_path() -> String {
 fn default_pid_file() -> String {
     "seakarr.pid".into()
 }
-fn default_rescan_interval() -> u64 {
+fn default_schedule_interval() -> u64 {
     60
 }
 
@@ -466,9 +466,9 @@ impl Default for LibraryUpgradeConfig {
         Config::default().library_upgrade
     }
 }
-impl Default for DaemonConfig {
+impl Default for ScheduleConfig {
     fn default() -> Self {
-        Config::default().daemon
+        Config::default().schedule
     }
 }
 
@@ -682,8 +682,13 @@ impl Config {
         // Preserves existing values (e.g., min_bitrate: 320 becomes
         // min_bit_rate: 320). Null legacy values are dropped so
         // merge_with_defaults restores the schema default (0 for the u32
-        // quality keys, true for peer_reputation).
-        let renamed = migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate")
+        // quality keys, true for peer_reputation). The legacy `daemon` section
+        // is folded into the canonical `schedule` section first, with explicit
+        // `schedule` values winning.
+        // Bitwise OR is intentional: every migration mutates file_value and
+        // must run even when an earlier migration already returned true.
+        let renamed = migrate_schedule_section(&mut file_value, config_file)?
+            | migrate_rename(&mut file_value, "filters", "min_bitrate", "min_bit_rate")
             | migrate_rename(&mut file_value, "filters", "min_bitdepth", "min_bit_depth")
             | migrate_rename(
                 &mut file_value,
@@ -743,8 +748,8 @@ impl Config {
         if let Some(ref v) = cli.mode {
             self.search.default_mode = v.clone();
         }
-        // Persist manual/batch criteria into config so the daemon loop
-        // (which only sees Config, never the CLI) can honour them.
+        // Keep the effective in-memory Config consistent with CLI overrides.
+        // Scheduled dispatch uses the validated ExecutionPlan directly.
         if let Some(ref v) = cli.artist {
             self.search.manual.artist = v.clone();
         }
@@ -754,8 +759,8 @@ impl Config {
         if let Some(ref v) = cli.batch_file {
             self.search.batch.file_path = v.clone();
         }
-        if cli.daemon {
-            self.daemon.enabled = true;
+        if cli.schedule {
+            self.schedule.enabled = true;
         }
     }
 
@@ -851,10 +856,11 @@ impl Config {
                 "library_upgrade.enabled requires at least one library.paths entry".into(),
             ));
         }
-        if self.daemon.rescan_interval_mins > u64::MAX / 60 {
-            return Err(SeakarrError::Config(
-                "daemon.rescan_interval_mins is too large; maximum is 307445734561271883".into(),
-            ));
+        if self.schedule.interval_mins > u64::MAX / 60 {
+            return Err(SeakarrError::Config(format!(
+                "schedule.interval_mins is too large; maximum is {}",
+                u64::MAX / 60
+            )));
         }
         self.validate_discography()?;
         Ok(())
@@ -871,6 +877,96 @@ impl Config {
         }
         self.validate_non_credential_constraints()
     }
+}
+
+/// Rename a key inside one YAML mapping, preserving the value.
+///
+/// The legacy key is always removed when present. A non-null legacy value is
+/// copied onto the new key unless the file already carries a meaningful
+/// (non-null) new-format value, which wins. A null legacy value is dropped so
+/// the caller's default merge restores the schema default.
+///
+/// Returns `true` if a rename occurred (old key was present), `false` otherwise.
+fn rename_mapping_key(mapping: &mut serde_yaml::Mapping, old_key: &str, new_key: &str) -> bool {
+    let old_key = serde_yaml::Value::String(old_key.into());
+    let new_key = serde_yaml::Value::String(new_key.into());
+    let Some(old_value) = mapping.remove(&old_key) else {
+        return false;
+    };
+
+    if !old_value.is_null() && mapping.get(&new_key).is_none_or(serde_yaml::Value::is_null) {
+        mapping.insert(new_key, old_value);
+    }
+    true
+}
+
+/// Fold the legacy top-level `daemon` section into the canonical `schedule`
+/// section, renaming `rescan_interval_mins` to `interval_mins` in both.
+///
+/// Explicit `schedule` values win; a field missing (or null) under `schedule`
+/// inherits the legacy value. The legacy section is always removed. Running
+/// this before `merge_with_defaults` lets the merged schema drop any remaining
+/// legacy-only keys.
+///
+/// Returns `true` if a legacy section or key was present, `false` otherwise.
+fn migrate_schedule_section(config: &mut serde_yaml::Value, config_file: &Path) -> Result<bool> {
+    let serde_yaml::Value::Mapping(root) = config else {
+        return Ok(false);
+    };
+    let daemon_key = serde_yaml::Value::String("daemon".into());
+    let schedule_key = serde_yaml::Value::String("schedule".into());
+    if root
+        .get(&schedule_key)
+        .is_some_and(|value| !value.is_null() && !matches!(value, serde_yaml::Value::Mapping(_)))
+    {
+        return Err(SeakarrError::Config(format!(
+            "schedule section must be a mapping in {config_file:?}; expected keys enabled and interval_mins"
+        )));
+    }
+    let mut legacy = root.remove(&daemon_key);
+    let had_legacy = legacy.is_some();
+
+    // A null legacy section is equivalent to an omitted/empty section, matching
+    // the existing default-merging behavior for every optional YAML section.
+    if legacy
+        .as_ref()
+        .is_some_and(|value| !value.is_null() && !matches!(value, serde_yaml::Value::Mapping(_)))
+    {
+        return Err(SeakarrError::Config(format!(
+            "legacy daemon section must be a mapping in {config_file:?}"
+        )));
+    }
+    if let Some(serde_yaml::Value::Mapping(mapping)) = legacy.as_mut() {
+        rename_mapping_key(mapping, "rescan_interval_mins", "interval_mins");
+    }
+
+    Ok(match (root.get_mut(&schedule_key), legacy) {
+        (Some(serde_yaml::Value::Mapping(current)), Some(serde_yaml::Value::Mapping(legacy))) => {
+            let renamed_interval =
+                rename_mapping_key(current, "rescan_interval_mins", "interval_mins");
+            for (key, value) in legacy {
+                if current.get(&key).is_none_or(serde_yaml::Value::is_null) {
+                    current.insert(key, value);
+                }
+            }
+            had_legacy || renamed_interval
+        }
+        // Canonical schedule section with no legacy mapping (absent or null).
+        (Some(serde_yaml::Value::Mapping(current)), _) => {
+            rename_mapping_key(current, "rescan_interval_mins", "interval_mins") || had_legacy
+        }
+        (Some(current), Some(legacy)) if current.is_null() && !legacy.is_null() => {
+            *current = legacy;
+            true
+        }
+        (Some(_), _) => had_legacy,
+        (None, Some(legacy)) if !legacy.is_null() => {
+            root.insert(schedule_key, legacy);
+            true
+        }
+        (None, Some(_)) => true,
+        (None, None) => false,
+    })
 }
 
 /// Rename a key within a YAML section, preserving the value.
@@ -1030,9 +1126,9 @@ impl Default for Config {
                 enabled: false,
                 delete_lesser_quality: false,
             },
-            daemon: DaemonConfig {
+            schedule: ScheduleConfig {
                 enabled: false,
-                rescan_interval_mins: default_rescan_interval(),
+                interval_mins: default_schedule_interval(),
             },
             source: None,
         }
@@ -1045,6 +1141,7 @@ impl Default for Config {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn sample_yaml() -> &'static str {
@@ -1124,9 +1221,9 @@ pid:
 notifications:
   urls: []
 
-daemon:
+schedule:
   enabled: false
-  rescan_interval_mins: 60
+  interval_mins: 60
 "#
     }
 
@@ -1581,9 +1678,9 @@ storage:
 logging:
   level: INFO
   path: ""
-daemon:
+schedule:
   enabled: false
-  interval_secs: 3600
+  interval_mins: 60
 library:
   paths: []
   scan_on_startup: true
@@ -1772,11 +1869,8 @@ library_upgrade:
         assert!(config.validate().is_ok());
     }
 
-    // Regression: `--daemon --mode manual --artist X --album Y` must keep
-    // the manual criteria reachable from the daemon loop. merge_cli stores
-    // mode/daemon but must ALSO persist artist/album/batch_file into the
-    // config sections so run_daemon (which only sees Config, never the CLI)
-    // can honour the requested search criteria.
+    // CLI merging keeps the effective in-memory Config consistent with the
+    // validated ExecutionPlan, which carries the criteria used for dispatch.
     #[test]
     fn merge_cli_persists_manual_and_batch_criteria() {
         let mut config = Config::default();
@@ -1793,7 +1887,7 @@ library_upgrade:
             batch_file: None,
             artist: Some("Michael Bolton".into()),
             album: Some("The Essential Michael Bolton".into()),
-            daemon: true,
+            schedule: true,
             test: false,
             ignore_processed: false,
         });
@@ -1801,7 +1895,7 @@ library_upgrade:
         assert_eq!(config.search.default_mode, "manual");
         assert_eq!(config.search.manual.artist, "Michael Bolton");
         assert_eq!(config.search.manual.album, "The Essential Michael Bolton");
-        assert!(config.daemon.enabled);
+        assert!(config.schedule.enabled);
 
         // Batch criteria must survive as well.
         let mut config = Config::default();
@@ -1810,11 +1904,201 @@ library_upgrade:
             batch_file: Some("/tmp/albums.txt".into()),
             artist: None,
             album: None,
-            daemon: true,
+            schedule: true,
             ..Default::default()
         });
         assert_eq!(config.search.default_mode, "batch");
         assert_eq!(config.search.batch.file_path, "/tmp/albums.txt");
+    }
+
+    // ── schedule tests ──
+
+    #[test]
+    fn default_config_serializes_only_schedule_names() {
+        let value = serde_yaml::to_value(Config::default()).unwrap();
+
+        assert!(value.get("schedule").is_some());
+        assert!(value.get("daemon").is_none());
+        assert_eq!(value["schedule"]["enabled"].as_bool(), Some(false));
+        assert_eq!(value["schedule"]["interval_mins"].as_u64(), Some(60));
+        assert!(value["schedule"].get("rescan_interval_mins").is_none());
+    }
+
+    fn write_config(dir: &TempDir, yaml: &str) -> PathBuf {
+        let path = dir.path().join("seakarr.yml");
+        fs::write(&path, yaml).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_migrates_daemon_section_and_interval() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+daemon:
+  enabled: true
+  rescan_interval_mins: 17
+"#,
+        );
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(config.schedule.enabled);
+        assert_eq!(config.schedule.interval_mins, 17);
+
+        let migrated = fs::read_to_string(&path).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&migrated).unwrap();
+        assert!(value.get("daemon").is_none());
+        assert!(value["schedule"].get("rescan_interval_mins").is_none());
+        assert_eq!(value["schedule"]["enabled"].as_bool(), Some(true));
+        assert_eq!(value["schedule"]["interval_mins"].as_u64(), Some(17));
+        assert!(dir.path().join("seakarr.yml.bak").exists());
+    }
+
+    #[test]
+    fn load_mixed_schedule_values_win_and_inherit_missing_legacy_values() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+daemon:
+  enabled: true
+  rescan_interval_mins: 17
+schedule:
+  enabled: false
+"#,
+        );
+
+        let config = Config::load(dir.path()).unwrap();
+        assert!(!config.schedule.enabled);
+        assert_eq!(config.schedule.interval_mins, 17);
+
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert!(value.get("daemon").is_none());
+        assert_eq!(value["schedule"]["enabled"].as_bool(), Some(false));
+        assert_eq!(value["schedule"]["interval_mins"].as_u64(), Some(17));
+    }
+
+    #[test]
+    fn load_rejects_non_mapping_legacy_daemon_even_with_schedule() {
+        let dir = TempDir::new().unwrap();
+        write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+daemon: false
+schedule:
+  enabled: true
+  interval_mins: 60
+"#,
+        );
+
+        let error = Config::load(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("legacy daemon section must be a mapping"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_non_mapping_schedule_before_migration_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+daemon:
+  enabled: true
+  rescan_interval_mins: 30
+schedule: true
+"#,
+        );
+        let original = fs::read_to_string(&path).unwrap();
+
+        let error = Config::load(dir.path()).unwrap_err().to_string();
+
+        assert!(
+            error.contains("schedule section must be a mapping"),
+            "got: {error}"
+        );
+        assert!(error.contains("enabled and interval_mins"), "got: {error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!dir.path().join("seakarr.yml.bak").exists());
+    }
+
+    #[test]
+    fn load_null_legacy_daemon_uses_schedule_defaults() {
+        let dir = TempDir::new().unwrap();
+        write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+daemon:
+"#,
+        );
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert!(!config.schedule.enabled);
+        assert_eq!(config.schedule.interval_mins, 60);
+        let migrated = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(!migrated.contains("daemon:"));
+        assert!(migrated.contains("schedule:"));
+        assert!(dir.path().join("seakarr.yml.bak").exists());
+    }
+
+    #[test]
+    fn load_complete_current_schedule_does_not_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let yaml = serde_yaml::to_string(&Config::default()).unwrap();
+        let path = write_config(&dir, &yaml);
+        let before = fs::read_to_string(&path).unwrap();
+
+        Config::load(dir.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(!dir.path().join("seakarr.yml.bak").exists());
+    }
+
+    #[test]
+    fn load_current_schedule_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+soulseek:
+  username: test
+  password: test
+schedule:
+  enabled: true
+  interval_mins: 23
+"#,
+        );
+
+        Config::load(dir.path()).unwrap();
+        let once = fs::read_to_string(&path).unwrap();
+        Config::load(dir.path()).unwrap();
+        let twice = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(once, twice);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "only seakarr.yml and its single backup should exist"
+        );
     }
 
     // ── migrate_rename tests ──
@@ -2143,14 +2427,18 @@ search:
     }
 
     #[test]
-    fn test_validate_rejects_unrepresentable_daemon_interval() {
+    fn test_validate_rejects_unrepresentable_schedule_interval() {
         let mut config = Config::default();
-        config.daemon.rescan_interval_mins = u64::MAX;
+        config.schedule.interval_mins = u64::MAX;
         let error = config
             .validate_non_credential_constraints()
             .unwrap_err()
             .to_string();
-        assert!(error.contains("daemon.rescan_interval_mins"));
+        assert!(error.contains("schedule.interval_mins"));
+        assert!(
+            error.contains(&(u64::MAX / 60).to_string()),
+            "error must state the enforced maximum, got: {error}"
+        );
     }
 
     #[test]
