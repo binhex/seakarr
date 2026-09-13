@@ -123,13 +123,8 @@ Example for a test literal in `src/discography/mod.rs`:
 
 - [ ] **Step 4: Verify no construction site was missed**
 
-Run: `rg -n 'ArtistCandidate \{' src/ | wc -l`
-Expected: 11 (the 11 literals from the spec's exploration; the count includes none of the struct definition, which does not contain `ArtistCandidate {`).
-
-Then confirm each literal carries a score:
-
-Run: `rg -n -A4 'ArtistCandidate \{' src/ | rg -c 'score:'`
-Expected: 11
+Run: `cargo build --workspace --all-targets`
+Expected: exit 0. The compiler is the authority here: it reported one `error[E0063]` per construction site before the update, so a successful all-target build proves every literal now supplies `score`. Do not pipe this command through `rg`, because doing so would hide an unrelated build failure.
 
 - [ ] **Step 5: Run the suite**
 
@@ -162,12 +157,14 @@ Add to `mod tests` in `src/discography/musicbrainz.rs`:
         Mock::given(method("GET"))
             .and(path("/ws/2/artist"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "count": 3,
+                "count": 5,
                 "offset": 0,
                 "artists": [
                     { "id": "16b97aaa-d7c0-469f-8c97-47c705b2d02f", "name": "Ils", "score": 100 },
                     { "id": "638e9183-2cde-4c07-b1d5-1f0e0361ed1c", "name": "Ils", "score": "86" },
-                    { "id": "cc54a811-a221-49f1-b93d-ed42f1affbb0", "name": "Ils" }
+                    { "id": "cc54a811-a221-49f1-b93d-ed42f1affbb0", "name": "Ils", "score": 83.0 },
+                    { "id": "5323e64e-008f-4b5c-affc-f410b3746908", "name": "Ils", "score": null },
+                    { "id": "0dd756ed-e253-45e6-b95f-dc08ac87018d", "name": "Ils" }
                 ]
             })))
             .expect(1)
@@ -179,12 +176,19 @@ Add to `mod tests` in `src/discography/musicbrainz.rs`:
 
         assert_eq!(artists[0].score, Some(100));
         assert_eq!(artists[1].score, Some(86));
-        assert_eq!(artists[2].score, None);
+        assert_eq!(artists[2].score, Some(83));
+        assert_eq!(artists[3].score, None);
+        assert_eq!(artists[4].score, None);
     }
 
     #[tokio::test]
     async fn artist_search_rejects_out_of_range_and_non_numeric_scores() {
-        for invalid in [serde_json::json!(101), serde_json::json!(-1), serde_json::json!("high")] {
+        for invalid in [
+            serde_json::json!(101),
+            serde_json::json!(-1),
+            serde_json::json!(86.5),
+            serde_json::json!("high"),
+        ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/ws/2/artist"))
@@ -208,6 +212,30 @@ Add to `mod tests` in `src/discography/musicbrainz.rs`:
                 "score {invalid} must fail decoding rather than be clamped or ignored"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn artist_search_rejects_a_mixed_page_with_one_invalid_score() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 2,
+                "offset": 0,
+                "artists": [
+                    { "id": "16b97aaa-d7c0-469f-8c97-47c705b2d02f", "name": "Ils", "score": 100 },
+                    { "id": "not-an-exact-match", "name": "Somebody Else", "score": "high" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        assert!(matches!(
+            provider.search_artists("Ils").await,
+            Err(DiscographyError::Decode(_))
+        ));
     }
 ```
 
@@ -242,7 +270,8 @@ struct ArtistWire {
 /// Decode a MusicBrainz artist-search score.
 ///
 /// The search API returns a JSON integer, while MusicBrainz's MMD JSON
-/// examples show a numeric string, so both are accepted. Anything else, and
+/// examples show a numeric string; JSON numbers with an integral value are
+/// equivalent, so all three encodings are accepted. Anything else, and
 /// any value outside the documented 0-100 range, is a decoding error: a score
 /// must never be clamped, defaulted, or silently discarded, because the
 /// resolver treats a missing score as "cannot rank" and an invented score
@@ -256,7 +285,12 @@ where
     let value = serde_json::Value::deserialize(deserializer)?;
     let score = match value {
         serde_json::Value::Null => return Ok(None),
-        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|value| value.fract() == 0.0)
+                .map(|value| value as i64)
+        }),
         serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
         _ => None,
     };
@@ -290,7 +324,7 @@ Leave `artist_by_id` at `score: None`; that endpoint carries no search score and
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p seakarr --lib discography::musicbrainz::tests -v`
-Expected: PASS for both new tests and every pre-existing provider test.
+Expected: PASS for all three new provider score tests and every pre-existing provider test.
 
 - [ ] **Step 6: Commit**
 
@@ -375,38 +409,53 @@ In `mod tests` in `src/discography/mod.rs`, add these helpers and tests:
 
     #[test]
     fn dominance_is_independent_of_response_order() {
-        let mut reversed = ils_candidates();
-        reversed.reverse();
-        assert_eq!(
-            resolve_artist("ils", &reversed).unwrap(),
-            resolve_artist("ils", &ils_candidates()).unwrap()
-        );
+        fn assert_all_permutations(
+            candidates: &mut [ArtistCandidate],
+            index: usize,
+            expected: &ResolvedArtist,
+            visited: &mut usize,
+        ) {
+            if index == candidates.len() {
+                assert_eq!(resolve_artist("ils", candidates).unwrap(), *expected);
+                *visited += 1;
+                return;
+            }
+            for swap_index in index..candidates.len() {
+                candidates.swap(index, swap_index);
+                assert_all_permutations(candidates, index + 1, expected, visited);
+                candidates.swap(index, swap_index);
+            }
+        }
+
+        let expected = resolve_artist("ils", &ils_candidates()).unwrap();
+        let mut candidates = ils_candidates();
+        let mut visited = 0;
+        assert_all_permutations(&mut candidates, 0, &expected, &mut visited);
+        assert_eq!(visited, 24, "four candidates must produce 4! permutations");
     }
 
     #[test]
-    fn unique_exact_name_still_resolves_without_a_score() {
-        let candidates = vec![scored("only", "Nils Frahm", None)];
-        let resolved = resolve_artist("nils frahm", &candidates).unwrap();
-        assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
-        assert_eq!(resolved.candidate.id, "only");
+    fn unique_exact_name_resolves_with_or_without_a_score() {
+        for score in [None, Some(60)] {
+            let candidates = vec![scored("only", "Nils Frahm", score)];
+            let resolved = resolve_artist("nils frahm", &candidates).unwrap();
+            assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
+            assert_eq!(resolved.candidate.id, "only");
+        }
     }
 
     #[test]
     fn weak_or_incomplete_dominance_is_unresolved() {
-        let cases: Vec<(&str, Vec<ArtistCandidate>)> = vec![
+        let cases: Vec<(&str, Vec<ArtistCandidate>, &str)> = vec![
             (
                 "top score below 100",
-                vec![
-                    scored("a", "Ils", Some(99)),
-                    scored("b", "Ils", Some(70)),
-                ],
+                vec![scored("a", "Ils", Some(99)), scored("b", "Ils", Some(70))],
+                "highest score 99 is below 100",
             ),
             (
                 "margin below 10",
-                vec![
-                    scored("a", "Ils", Some(100)),
-                    scored("b", "Ils", Some(91)),
-                ],
+                vec![scored("a", "Ils", Some(100)), scored("b", "Ils", Some(91))],
+                "leading margin 9 is below 10",
             ),
             (
                 "tied top score",
@@ -415,26 +464,44 @@ In `mod tests` in `src/discography/mod.rs`, add these helpers and tests:
                     scored("b", "Ils", Some(100)),
                     scored("c", "Ils", Some(70)),
                 ],
+                "tied top score of 100",
             ),
             (
                 "missing competing score",
                 vec![scored("a", "Ils", Some(100)), scored("b", "Ils", None)],
+                "at least one has no search score",
             ),
             (
                 "invalid score above the range",
-                vec![
-                    scored("a", "Ils", Some(255)),
-                    scored("b", "Ils", Some(70)),
-                ],
+                vec![scored("a", "Ils", Some(255)), scored("b", "Ils", Some(70))],
+                "invalid score 255",
             ),
-            ("no exact match", vec![scored("a", "Somebody Else", Some(100))]),
+            (
+                "invalid score takes precedence over a later missing score",
+                vec![scored("a", "Ils", Some(255)), scored("b", "Ils", None)],
+                "invalid score 255",
+            ),
+            (
+                "invalid score takes precedence over an earlier missing score",
+                vec![scored("a", "Ils", None), scored("b", "Ils", Some(255))],
+                "invalid score 255",
+            ),
+            (
+                "no exact match",
+                vec![scored("a", "Somebody Else", Some(100))],
+                "no candidate matches \"ils\"",
+            ),
         ];
 
-        for (label, candidates) in cases {
-            let result = resolve_artist("ils", &candidates);
+        for (label, candidates, expected_reason) in cases {
+            let error = resolve_artist("ils", &candidates).unwrap_err();
             assert!(
-                matches!(result, Err(DiscographyError::ArtistUnresolved(_))),
-                "{label} must stay unresolved, got {result:?}"
+                matches!(error, DiscographyError::ArtistUnresolved(_)),
+                "{label} must stay unresolved, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_reason),
+                "{label} must explain the failed rule, got: {error}"
             );
         }
     }
@@ -508,9 +575,9 @@ pub struct ResolvedArtist {
 ///
 /// One canonical exact-name match is accepted as before. Duplicate exact-name
 /// matches are accepted only when every candidate carries a score, the
-/// canonical names compare equal after [`normalize_catalog_key`], exactly one
-/// candidate holds the highest score, that score is [`REQUIRED_TOP_SCORE`],
-/// and it leads the runner-up by at least [`REQUIRED_SCORE_MARGIN`].
+/// canonical names compare equal after `normalize_catalog_key`, exactly one
+/// candidate holds the highest score, that score is `REQUIRED_TOP_SCORE`, and
+/// it leads the runner-up by at least `REQUIRED_SCORE_MARGIN`.
 ///
 /// Aliases, sort names, and descriptive metadata never widen eligibility, and
 /// provider response order never decides the winner. A score above 100 is
@@ -542,20 +609,32 @@ fn resolve_dominant_artist(
     matches: &[&ArtistCandidate],
 ) -> std::result::Result<ResolvedArtist, DiscographyError> {
     let exact_matches = matches.len();
-    let mut scored: Vec<(u8, &ArtistCandidate)> = Vec::with_capacity(exact_matches);
-    for candidate in matches {
-        let Some(score) = candidate.score else {
-            return Err(DiscographyError::ArtistUnresolved(format!(
-                "{exact_matches} candidates match {artist_key:?} and at least one has no search score"
-            )));
-        };
-        if score > REQUIRED_TOP_SCORE {
-            return Err(DiscographyError::ArtistUnresolved(format!(
-                "{exact_matches} candidates match {artist_key:?} and one reports the invalid score {score}"
-            )));
-        }
-        scored.push((score, candidate));
+    // Reject invalid provider data before absent data, and scan the whole set
+    // rather than returning on the first offending candidate: the reported
+    // reason, including the quoted invalid value, must not depend on the order
+    // MusicBrainz returned candidates in.
+    if let Some(invalid) = matches
+        .iter()
+        .filter_map(|candidate| candidate.score)
+        .filter(|score| *score > REQUIRED_TOP_SCORE)
+        .max()
+    {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and one reports the invalid score {invalid}"
+        )));
     }
+    if matches.iter().any(|candidate| candidate.score.is_none()) {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and at least one has no search score"
+        )));
+    }
+    // Both defect classes were rejected above, so every score is present and in
+    // range here.
+    let mut scored: Vec<(u8, &ArtistCandidate)> = matches
+        .iter()
+        .filter_map(|candidate| candidate.score.map(|score| (score, *candidate)))
+        .collect();
+    debug_assert_eq!(scored.len(), exact_matches);
     // Sort by score, then MBID, so the comparison never depends on the order
     // MusicBrainz returned the candidates in.
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.id.cmp(&right.1.id)));
@@ -630,7 +709,8 @@ Replace the existing `exact_artist_resolution_uses_only_unique_canonical_name` t
             ]
         )
         .is_err());
-        assert!(resolve_artist("Missing", &candidates).is_err());
+        let error = resolve_artist("Missing", &candidates).unwrap_err();
+        assert!(error.to_string().contains("no candidate matches \"Missing\""));
     }
 ```
 
@@ -678,7 +758,7 @@ Expected: no output.
 - [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p seakarr --lib discography::tests -v`
-Expected: PASS for the eight new resolver tests, the updated exact-name test, and all pre-existing discovery tests.
+Expected: PASS for the seven new resolver tests, the updated exact-name test, and all pre-existing discovery tests.
 
 - [ ] **Step 9: Commit**
 
@@ -700,8 +780,8 @@ git commit -m "feat: resolve dominant duplicate MusicBrainz artist names by scor
 In `mod tests` in `src/discography/mod.rs`, add:
 
 ```rust
-    #[tokio::test]
-    async fn dominant_selection_logs_its_evidence_at_info() {
+    #[test]
+    fn dominant_selection_logs_its_evidence_at_info() {
         let db = Database::open_in_memory().unwrap();
         let provider = FakeProvider {
             artist_responses: Mutex::new(VecDeque::from([Ok(ils_candidates())])),
@@ -722,8 +802,14 @@ In `mod tests` in `src/discography/mod.rs`, add:
             .without_time()
             .finish();
 
+        // A plain `#[test]` building its own current-thread runtime: a
+        // `#[tokio::test]` body already runs inside a runtime, so calling
+        // `Runtime::new().block_on(..)` from it panics with
+        // "Cannot start a runtime from within a runtime".
         let outcome = tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Runtime::new()
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap()
                 .block_on(discover_artist_albums_at(
                     &provider,
@@ -743,13 +829,21 @@ In `mod tests` in `src/discography/mod.rs`, add:
         ));
 
         let logs = buffer.lock().unwrap().clone();
+        assert!(logs.contains(" INFO "), "got: {logs}");
         assert!(
-            logs.contains("16b97aaa-d7c0-469f-8c97-47c705b2d02f"),
-            "log must name the selected MBID, got: {logs}"
+            logs.contains("resolved duplicate canonical artist name by search-score dominance"),
+            "got: {logs}"
         );
-        assert!(logs.contains("100"), "log must include the top score");
-        assert!(logs.contains("86"), "log must include the runner-up score");
-        assert!(logs.contains("14"), "log must include the margin");
+        assert!(logs.contains("artist=Ils"), "got: {logs}");
+        assert!(logs.contains("selected_name=Ils"), "got: {logs}");
+        assert!(
+            logs.contains("selected_mbid=16b97aaa-d7c0-469f-8c97-47c705b2d02f"),
+            "got: {logs}"
+        );
+        assert!(logs.contains("exact_matches=4"), "got: {logs}");
+        assert!(logs.contains("top_score=100"), "got: {logs}");
+        assert!(logs.contains("runner_up_score=86"), "got: {logs}");
+        assert!(logs.contains("margin=14"), "got: {logs}");
     }
 ```
 
@@ -758,7 +852,7 @@ If `mutex`/`Arc`/`VecDeque` imports or the `tracing_subscriber` dependency are n
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p seakarr --lib discography::tests::dominant_selection_logs_its_evidence_at_info -v`
-Expected: FAIL on the MBID assertion — no selection log exists yet.
+Expected: FAIL on the level assertion — no selection log exists yet, so the captured buffer contains no `INFO` token.
 
 - [ ] **Step 3: Add the INFO log**
 
@@ -809,9 +903,26 @@ git commit -m "feat: log dominant artist selection evidence at info level"
 
 - Modify: `src/discography/mod.rs` (`mod tests`)
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the regression-pin tests**
 
-Add to `mod tests` in `src/discography/mod.rs`:
+First extend the test-only `FakeProvider` so the selected MBID passed to
+`release_groups` is observable:
+
+```rust
+        requested_group_mbids: Mutex<Vec<String>>,
+```
+
+At the start of `FakeProvider::release_groups`, record its argument:
+
+```rust
+            self.requested_group_mbids
+                .lock()
+                .unwrap()
+                .push(artist_mbid.to_string());
+```
+
+Rename that method parameter from `_artist_mbid` to `artist_mbid`, then add to
+`mod tests` in `src/discography/mod.rs`:
 
 ```rust
     #[tokio::test]
@@ -845,6 +956,10 @@ Add to `mod tests` in `src/discography/mod.rs`:
             }
         ));
 
+        assert_eq!(
+            provider.requested_group_mbids.lock().unwrap().as_slice(),
+            ["16b97aaa-d7c0-469f-8c97-47c705b2d02f"]
+        );
         let entry = db.get_discography_cache("ils").unwrap().unwrap();
         assert_eq!(entry.artist_mbid, "16b97aaa-d7c0-469f-8c97-47c705b2d02f");
         assert_eq!(entry.canonical_artist, "Ils");
@@ -974,10 +1089,10 @@ Add to `mod tests` in `src/discography/mod.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the new tests (regression pins)**
 
-Run: `cargo test -p seakarr --lib discography::tests::dominant_selection_persists_the_chosen_mbid discography::tests::unresolved_dominance -v`
-Expected: FAIL on the assertions — the chosen MBID is not yet persisted by the new path, and the legacy reason wording is not yet produced.
+Run: `cargo test -p seakarr --lib discography::tests::dominant_selection_persists_the_chosen_mbid -v`
+Expected: PASS immediately. `cargo test` accepts only one test filter, so run each of the five filters separately. These tests assert behaviour that Tasks 3 and 4 already implement, so they are regression pins rather than a RED step. A temporary reversion of the Task 3 discovery branch made `dominant_selection_logs_its_evidence_at_info` (from Task 4) plus the Task 5 tests `dominant_selection_persists_the_chosen_mbid` and `unresolved_dominance_without_cache_reports_legacy_fallback` fail; the stale-cache, configured-MBID, and fresh-cache tests correctly passed under both resolvers because they pin unchanged precedence.
 
 - [ ] **Step 3: Confirm the production code already satisfies them**
 
@@ -1023,8 +1138,9 @@ with:
   significant, so `AC/DC` and `AC DC` are distinct. One exact match is used directly. When several canonical
   exact names match, seakarr selects one only when it is uniquely dominant: a MusicBrainz search score of 100
   with a lead of at least 10 points over the runner-up. Tied top scores, a missing score, a score below 100,
-  and a margin below 10 stay unresolved and fall back as described below. Aliases, sort names, artist tags,
-  and catalog size never participate. Use `discography.artist_mbids` to pin an ambiguous name to a MusicBrainz
+  and a margin below 10 stay unresolved and fall back as described below. Invalid, out-of-range, or fractional
+  score data rejects that refresh and follows the same stale-cache/legacy fallback. Aliases, sort names, artist
+  tags, and catalog size never participate. Use `discography.artist_mbids` to pin an ambiguous name to a MusicBrainz
   artist UUID; a configured ID always takes precedence over name search.
 ```
 
@@ -1080,11 +1196,11 @@ Expected: all hooks pass.
 
 ```bash
 rg -n 'REQUIRED_TOP_SCORE|REQUIRED_SCORE_MARGIN' src/discography/mod.rs
-rg -n 'fn dominance_|fn unique_exact_name_still_resolves|fn weak_or_incomplete' src/discography/mod.rs
-rg -n 'fn artist_search_retains_scores|fn artist_search_rejects_out_of_range' src/discography/musicbrainz.rs
+rg -n 'fn exact_artist_resolution|fn dominance_|fn unique_exact_name_resolves|fn weak_or_incomplete|fn non_exact_higher_score' src/discography/mod.rs
+rg -n 'fn artist_search_retains_scores|fn artist_search_rejects_out_of_range|fn artist_search_rejects_a_mixed_page' src/discography/musicbrainz.rs
 ```
 
-Expected: constants defined once, eight resolver tests present, two provider tests present.
+Expected: the two constant definitions are present, all eight resolver tests are listed, and all three provider score tests are listed.
 
 - [ ] **Step 5: Confirm no scope creep**
 

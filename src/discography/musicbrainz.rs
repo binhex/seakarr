@@ -28,6 +28,46 @@ struct ArtistPage {
 struct ArtistWire {
     id: String,
     name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_score")]
+    score: Option<u8>,
+}
+
+/// Decode a MusicBrainz artist-search score.
+///
+/// The search API returns a JSON integer, while MusicBrainz's MMD JSON
+/// examples show a numeric string; JSON numbers with an integral value are
+/// equivalent, so all three encodings are accepted. Anything else, and
+/// any value outside the documented 0-100 range, is a decoding error: a score
+/// must never be clamped, defaulted, or silently discarded, because the
+/// resolver treats a missing score as "cannot rank" and an invented score
+/// would change which artist is selected.
+fn deserialize_optional_score<'de, D>(deserializer: D) -> std::result::Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let score = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|value| value.fract() == 0.0)
+                .map(|value| value as i64)
+        }),
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    match score {
+        Some(score) if (0..=100).contains(&score) => Ok(Some(score as u8)),
+        Some(invalid) => Err(serde::de::Error::custom(format!(
+            "artist search score {invalid} is outside the 0-100 range"
+        ))),
+        None => Err(serde::de::Error::custom(
+            "artist search score is not an integer",
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +276,7 @@ impl MusicBrainzProvider {
             .map(|wire| ArtistCandidate {
                 id: wire.id,
                 name: wire.name,
+                score: wire.score,
             })
             .collect())
     }
@@ -256,9 +297,12 @@ impl MusicBrainzProvider {
                 wire.id
             )));
         }
+        // The lookup-by-MBID endpoint has no search relevance score, and a
+        // configured MBID needs no ranking.
         Ok(ArtistCandidate {
             id: wire.id,
             name: wire.name,
+            score: None,
         })
     }
 
@@ -499,7 +543,7 @@ mod tests {
         let artists = provider.search_artists("AC/DC").await.unwrap();
         assert_eq!(artists[0].name, "AC/DC");
         assert!(
-            super::super::resolve_exact_artist("AC DC", &artists).is_err(),
+            super::super::resolve_artist("AC DC", &artists).is_err(),
             "sort names, aliases, and scores must not widen canonical-name matching"
         );
     }
@@ -1225,5 +1269,92 @@ mod tests {
             "expected three attempts with 1s then 2s backoffs, finished after {advanced:?}"
         );
         assert_eq!(start.elapsed(), advanced);
+    }
+
+    #[tokio::test]
+    async fn artist_search_retains_scores_and_tolerates_missing_or_string_scores() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 5,
+                "offset": 0,
+                "artists": [
+                    { "id": "16b97aaa-d7c0-469f-8c97-47c705b2d02f", "name": "Ils", "score": 100 },
+                    { "id": "638e9183-2cde-4c07-b1d5-1f0e0361ed1c", "name": "Ils", "score": "86" },
+                    { "id": "cc54a811-a221-49f1-b93d-ed42f1affbb0", "name": "Ils", "score": 83.0 },
+                    { "id": "5323e64e-008f-4b5c-affc-f410b3746908", "name": "Ils", "score": null },
+                    { "id": "0dd756ed-e253-45e6-b95f-dc08ac87018d", "name": "Ils" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let artists = provider.search_artists("Ils").await.unwrap();
+
+        assert_eq!(artists[0].score, Some(100));
+        assert_eq!(artists[1].score, Some(86));
+        assert_eq!(artists[2].score, Some(83));
+        assert_eq!(artists[3].score, None);
+        assert_eq!(artists[4].score, None);
+    }
+
+    #[tokio::test]
+    async fn artist_search_rejects_out_of_range_and_non_numeric_scores() {
+        for invalid in [
+            serde_json::json!(101),
+            serde_json::json!(-1),
+            serde_json::json!(86.5),
+            serde_json::json!("high"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/ws/2/artist"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "count": 1,
+                    "offset": 0,
+                    "artists": [
+                        { "id": "16b97aaa-d7c0-469f-8c97-47c705b2d02f", "name": "Ils", "score": invalid }
+                    ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+            assert!(
+                matches!(
+                    provider.search_artists("Ils").await,
+                    Err(DiscographyError::Decode(_))
+                ),
+                "score {invalid} must fail decoding rather than be clamped or ignored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artist_search_rejects_a_mixed_page_with_one_invalid_score() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 2,
+                "offset": 0,
+                "artists": [
+                    { "id": "16b97aaa-d7c0-469f-8c97-47c705b2d02f", "name": "Ils", "score": 100 },
+                    { "id": "not-an-exact-match", "name": "Somebody Else", "score": "high" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        assert!(matches!(
+            provider.search_artists("Ils").await,
+            Err(DiscographyError::Decode(_))
+        ));
     }
 }

@@ -2294,6 +2294,7 @@ mod tests {
             Ok(vec![ArtistCandidate {
                 id: "11111111-1111-1111-1111-111111111111".to_string(),
                 name: artist.to_string(),
+                score: None,
             }])
         }
 
@@ -2307,6 +2308,7 @@ mod tests {
             Ok(ArtistCandidate {
                 id: artist_mbid.to_string(),
                 name: "Test Artist".to_string(),
+                score: None,
             })
         }
 

@@ -498,11 +498,15 @@ stale.
 Artist-only manual runs resolve the artist on MusicBrainz and process conceptual release groups rather than
 arbitrary Soulseek folders:
 
-- Automatic resolution accepts only one unique exact artist name match. Matching uses Unicode NFKC
-  normalization, lowercase conversion, trimming, and whitespace collapse, but punctuation stays significant,
-  so `AC/DC` and `AC DC` are distinct. Zero matches or multiple matches are unresolved: seakarr does not pick
-  the highest-scored result, it falls back as described below. Use `discography.artist_mbids` to pin an
-  ambiguous name to a MusicBrainz artist UUID; a configured ID always takes precedence over name search.
+- Automatic resolution accepts only candidates whose canonical MusicBrainz name matches exactly. Matching uses
+  Unicode NFKC normalization, lowercase conversion, trimming, and whitespace collapse, but punctuation stays
+  significant, so `AC/DC` and `AC DC` are distinct. One exact match is used directly. When several canonical
+  exact names match, seakarr selects one only when it is uniquely dominant: a MusicBrainz search score of 100
+  with a lead of at least 10 points over the runner-up. Tied top scores, a missing score, a score below 100,
+  and a margin below 10 stay unresolved and fall back as described below. Invalid, out-of-range, or fractional
+  score data rejects that refresh and follows the same stale-cache/legacy fallback. Aliases, sort names, artist
+  tags, and catalog size never participate. Use `discography.artist_mbids` to pin an ambiguous name to a MusicBrainz
+  artist UUID; a configured ID always takes precedence over name search.
 - Only release groups matching `discography.allowed_types` are eligible, and a group carrying several
   recognised classifications must match all of them. The default `[studio_album]` accepts MusicBrainz primary
   type `Album` with no secondary type, so live albums, compilations, remixes, soundtracks, DJ mixes,

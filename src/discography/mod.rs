@@ -24,6 +24,10 @@ pub(crate) fn normalize_catalog_key(value: &str) -> String {
 pub struct ArtistCandidate {
     pub id: String,
     pub name: String,
+    /// MusicBrainz artist-search relevance score in the documented 0-100
+    /// range. `None` when the response omitted a score, which is normal for
+    /// lookups by MBID and for a single unambiguous search result.
+    pub score: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,28 +81,142 @@ pub trait DiscographyProvider: Send + Sync {
     ) -> std::result::Result<Vec<ReleaseGroup>, DiscographyError>;
 }
 
+/// MusicBrainz search score a duplicate canonical exact-name candidate must
+/// reach before it may be selected automatically.
+const REQUIRED_TOP_SCORE: u8 = 100;
+
+/// Minimum lead over the runner-up canonical exact-name candidate.
+const REQUIRED_SCORE_MARGIN: u8 = 10;
+
+/// Evidence that duplicate canonical exact-name candidates were resolved by
+/// MusicBrainz search-score dominance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DominanceEvidence {
+    pub exact_matches: usize,
+    pub top_score: u8,
+    pub runner_up_score: u8,
+    pub margin: u8,
+}
+
+/// Why an artist candidate was accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtistResolution {
+    /// Exactly one candidate matched the requested canonical name.
+    UniqueExactName,
+    /// Duplicate exact names resolved by a dominant search score.
+    ScoreDominance(DominanceEvidence),
+}
+
+/// A resolved artist and the reason it was accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtist {
+    pub candidate: ArtistCandidate,
+    pub resolution: ArtistResolution,
+}
+
 /// Resolve the artist whose canonical name normalizes to `artist_key`.
-/// Returns the sole match, or `ArtistUnresolved` naming zero or the exact
-/// duplicate count otherwise.
-pub fn resolve_exact_artist(
+///
+/// One canonical exact-name match is accepted as before. Duplicate exact-name
+/// matches are accepted only when every candidate carries a score, the
+/// canonical names compare equal after `normalize_catalog_key`, exactly one
+/// candidate holds the highest score, that score is `REQUIRED_TOP_SCORE`, and
+/// it leads the runner-up by at least `REQUIRED_SCORE_MARGIN`.
+///
+/// Aliases, sort names, and descriptive metadata never widen eligibility, and
+/// provider response order never decides the winner. A score above 100 is
+/// rejected rather than clamped, because clamping would invent provider data.
+pub fn resolve_artist(
     artist_key: &str,
     candidates: &[ArtistCandidate],
-) -> std::result::Result<ArtistCandidate, DiscographyError> {
+) -> std::result::Result<ResolvedArtist, DiscographyError> {
     let key = normalize_catalog_key(artist_key);
     let matches: Vec<&ArtistCandidate> = candidates
         .iter()
         .filter(|candidate| normalize_catalog_key(&candidate.name) == key)
         .collect();
     match matches.as_slice() {
-        [only] => Ok((*only).clone()),
         [] => Err(DiscographyError::ArtistUnresolved(format!(
             "no candidate matches {artist_key:?}"
         ))),
-        _ => Err(DiscographyError::ArtistUnresolved(format!(
-            "{} candidates match {artist_key:?}",
-            matches.len()
-        ))),
+        [only] => Ok(ResolvedArtist {
+            candidate: (*only).clone(),
+            resolution: ArtistResolution::UniqueExactName,
+        }),
+        many => resolve_dominant_artist(artist_key, many),
     }
+}
+
+/// Apply the dominance rules to two or more canonical exact-name matches.
+fn resolve_dominant_artist(
+    artist_key: &str,
+    matches: &[&ArtistCandidate],
+) -> std::result::Result<ResolvedArtist, DiscographyError> {
+    let exact_matches = matches.len();
+    // Reject invalid provider data before absent data, and scan the whole set
+    // rather than returning on the first offending candidate: the reported
+    // reason, including the quoted invalid value, must not depend on the order
+    // MusicBrainz returned candidates in.
+    if let Some(invalid) = matches
+        .iter()
+        .filter_map(|candidate| candidate.score)
+        .filter(|score| *score > REQUIRED_TOP_SCORE)
+        .max()
+    {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and one reports the invalid score {invalid}"
+        )));
+    }
+    if matches.iter().any(|candidate| candidate.score.is_none()) {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and at least one has no search score"
+        )));
+    }
+    // Both defect classes were rejected above, so every score is present and in
+    // range here.
+    let mut scored: Vec<(u8, &ArtistCandidate)> = matches
+        .iter()
+        .filter_map(|candidate| candidate.score.map(|score| (score, *candidate)))
+        .collect();
+    debug_assert_eq!(scored.len(), exact_matches);
+    // Sort by score, then MBID, so the comparison never depends on the order
+    // MusicBrainz returned the candidates in.
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    let (top_score, top) = scored[0];
+    let leaders = scored
+        .iter()
+        .filter(|(score, _)| *score == top_score)
+        .count();
+    if leaders != 1 {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} with a tied top score of {top_score}"
+        )));
+    }
+    if top_score < REQUIRED_TOP_SCORE {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and the highest score {top_score} is below {REQUIRED_TOP_SCORE}"
+        )));
+    }
+    let runner_up_score = scored[1].0;
+    let margin = top_score - runner_up_score;
+    if margin < REQUIRED_SCORE_MARGIN {
+        return Err(DiscographyError::ArtistUnresolved(format!(
+            "{exact_matches} candidates match {artist_key:?} and the leading margin {margin} is below {REQUIRED_SCORE_MARGIN}"
+        )));
+    }
+    Ok(ResolvedArtist {
+        candidate: top.clone(),
+        resolution: ArtistResolution::ScoreDominance(DominanceEvidence {
+            exact_matches,
+            top_score,
+            runner_up_score,
+            margin,
+        }),
+    })
 }
 
 fn secondary_category(value: &str) -> Option<DiscographyReleaseType> {
@@ -385,7 +503,20 @@ pub(crate) async fn discover_artist_albums_at(
             Some(mbid) => provider.artist_by_id(mbid).await?,
             None => {
                 let candidates = provider.search_artists(artist).await?;
-                resolve_exact_artist(&artist_key, &candidates)?
+                let resolved = resolve_artist(&artist_key, &candidates)?;
+                if let ArtistResolution::ScoreDominance(evidence) = &resolved.resolution {
+                    tracing::info!(
+                        artist = %artist,
+                        selected_name = %resolved.candidate.name,
+                        selected_mbid = %resolved.candidate.id,
+                        exact_matches = evidence.exact_matches,
+                        top_score = evidence.top_score,
+                        runner_up_score = evidence.runner_up_score,
+                        margin = evidence.margin,
+                        "resolved duplicate canonical artist name by search-score dominance"
+                    );
+                }
+                resolved.candidate
             }
         };
         let groups = provider.release_groups(&resolved.id).await?;
@@ -549,6 +680,25 @@ mod tests {
         }
     }
 
+    fn scored(id: &str, name: &str, score: Option<u8>) -> ArtistCandidate {
+        ArtistCandidate {
+            id: id.to_string(),
+            name: name.to_string(),
+            score,
+        }
+    }
+
+    /// The live MusicBrainz artist search for `Ils`: four canonical exact-name
+    /// candidates scored 100, 86, 83, 83.
+    fn ils_candidates() -> Vec<ArtistCandidate> {
+        vec![
+            scored("16b97aaa-d7c0-469f-8c97-47c705b2d02f", "Ils", Some(100)),
+            scored("638e9183-2cde-4c07-b1d5-1f0e0361ed1c", "Ils", Some(86)),
+            scored("cc54a811-a221-49f1-b93d-ed42f1affbb0", "ILS", Some(83)),
+            scored("5323e64e-008f-4b5c-affc-f410b3746908", "ILS", Some(83)),
+        ]
+    }
+
     #[test]
     fn catalog_key_uses_nfkc_case_and_whitespace_without_dropping_punctuation() {
         assert_eq!(normalize_catalog_key("  ＡC/DC  "), "ac/dc");
@@ -564,28 +714,203 @@ mod tests {
             ArtistCandidate {
                 id: "1".into(),
                 name: "ＡC/DC".into(),
+                score: None,
             },
             ArtistCandidate {
                 id: "2".into(),
                 name: "AC DC".into(),
+                score: None,
             },
         ];
-        assert_eq!(resolve_exact_artist("ac/dc", &candidates).unwrap().id, "1");
-        assert!(resolve_exact_artist(
+        let resolved = resolve_artist("ac/dc", &candidates).unwrap();
+        assert_eq!(resolved.candidate.id, "1");
+        assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
+
+        // Two exact matches stay unresolved without a dominant score.
+        assert!(resolve_artist(
             "AC DC",
             &[
                 ArtistCandidate {
                     id: "2".into(),
-                    name: "AC DC".into()
+                    name: "AC DC".into(),
+                    score: Some(100),
                 },
                 ArtistCandidate {
                     id: "3".into(),
-                    name: " ac dc ".into()
+                    name: " ac dc ".into(),
+                    score: Some(100),
                 },
             ]
         )
         .is_err());
-        assert!(resolve_exact_artist("Missing", &candidates).is_err());
+        let error = resolve_artist("Missing", &candidates).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no candidate matches \"Missing\""));
+    }
+
+    #[test]
+    fn dominance_selects_the_unique_score_100_candidate() {
+        let resolved = resolve_artist("ils", &ils_candidates()).unwrap();
+        assert_eq!(
+            resolved.candidate.id,
+            "16b97aaa-d7c0-469f-8c97-47c705b2d02f"
+        );
+        assert_eq!(
+            resolved.resolution,
+            ArtistResolution::ScoreDominance(DominanceEvidence {
+                exact_matches: 4,
+                top_score: 100,
+                runner_up_score: 86,
+                margin: 14,
+            })
+        );
+    }
+
+    #[test]
+    fn dominance_selects_the_bonobo_shaped_winner() {
+        let candidates = vec![
+            scored("b1000000-0000-0000-0000-000000000001", "Bonobo", Some(100)),
+            scored("b1000000-0000-0000-0000-000000000002", "Bonobo", Some(78)),
+            scored("b1000000-0000-0000-0000-000000000003", "Bonobo", Some(77)),
+            scored("b1000000-0000-0000-0000-000000000004", "Bonobo", Some(77)),
+        ];
+        let resolved = resolve_artist("bonobo", &candidates).unwrap();
+        assert_eq!(
+            resolved.candidate.id,
+            "b1000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(
+            resolved.resolution,
+            ArtistResolution::ScoreDominance(DominanceEvidence {
+                exact_matches: 4,
+                top_score: 100,
+                runner_up_score: 78,
+                margin: 22,
+            })
+        );
+    }
+
+    #[test]
+    fn dominance_is_independent_of_response_order() {
+        fn assert_all_permutations(
+            candidates: &mut [ArtistCandidate],
+            index: usize,
+            expected: &ResolvedArtist,
+            visited: &mut usize,
+        ) {
+            if index == candidates.len() {
+                assert_eq!(resolve_artist("ils", candidates).unwrap(), *expected);
+                *visited += 1;
+                return;
+            }
+            for swap_index in index..candidates.len() {
+                candidates.swap(index, swap_index);
+                assert_all_permutations(candidates, index + 1, expected, visited);
+                candidates.swap(index, swap_index);
+            }
+        }
+
+        let expected = resolve_artist("ils", &ils_candidates()).unwrap();
+        let mut candidates = ils_candidates();
+        let mut visited = 0;
+        assert_all_permutations(&mut candidates, 0, &expected, &mut visited);
+        assert_eq!(visited, 24, "four candidates must produce 4! permutations");
+    }
+
+    #[test]
+    fn unique_exact_name_resolves_with_or_without_a_score() {
+        for score in [None, Some(60)] {
+            let candidates = vec![scored("only", "Nils Frahm", score)];
+            let resolved = resolve_artist("nils frahm", &candidates).unwrap();
+            assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
+            assert_eq!(resolved.candidate.id, "only");
+        }
+    }
+
+    #[test]
+    fn weak_or_incomplete_dominance_is_unresolved() {
+        let cases: Vec<(&str, Vec<ArtistCandidate>, &str)> = vec![
+            (
+                "top score below 100",
+                vec![scored("a", "Ils", Some(99)), scored("b", "Ils", Some(70))],
+                "highest score 99 is below 100",
+            ),
+            (
+                "margin below 10",
+                vec![scored("a", "Ils", Some(100)), scored("b", "Ils", Some(91))],
+                "leading margin 9 is below 10",
+            ),
+            (
+                "tied top score",
+                vec![
+                    scored("a", "Ils", Some(100)),
+                    scored("b", "Ils", Some(100)),
+                    scored("c", "Ils", Some(70)),
+                ],
+                "tied top score of 100",
+            ),
+            (
+                "missing competing score",
+                vec![scored("a", "Ils", Some(100)), scored("b", "Ils", None)],
+                "at least one has no search score",
+            ),
+            (
+                "invalid score above the range",
+                vec![scored("a", "Ils", Some(255)), scored("b", "Ils", Some(70))],
+                "invalid score 255",
+            ),
+            (
+                "invalid score takes precedence over a later missing score",
+                vec![scored("a", "Ils", Some(255)), scored("b", "Ils", None)],
+                "invalid score 255",
+            ),
+            (
+                "invalid score takes precedence over an earlier missing score",
+                vec![scored("a", "Ils", None), scored("b", "Ils", Some(255))],
+                "invalid score 255",
+            ),
+            (
+                "highest invalid score is reported regardless of order",
+                vec![scored("a", "Ils", Some(101)), scored("b", "Ils", Some(255))],
+                "invalid score 255",
+            ),
+            (
+                "no exact match",
+                vec![scored("a", "Somebody Else", Some(100))],
+                "no candidate matches \"ils\"",
+            ),
+        ];
+
+        for (label, candidates, expected_reason) in cases {
+            let error = resolve_artist("ils", &candidates).unwrap_err();
+            assert!(
+                matches!(error, DiscographyError::ArtistUnresolved(_)),
+                "{label} must stay unresolved, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_reason),
+                "{label} must explain the failed rule, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dominance_margin_boundary_is_inclusive() {
+        let candidates = vec![scored("a", "Ils", Some(100)), scored("b", "Ils", Some(90))];
+        let resolved = resolve_artist("ils", &candidates).unwrap();
+        assert_eq!(resolved.candidate.id, "a");
+    }
+
+    #[test]
+    fn non_exact_higher_score_cannot_win() {
+        let candidates = vec![
+            scored("canonical", "Ils", None),
+            scored("alias", "Illian Walker", Some(100)),
+        ];
+        let resolved = resolve_artist("ils", &candidates).unwrap();
+        assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
+        assert_eq!(resolved.candidate.id, "canonical");
     }
 
     #[test]
@@ -812,6 +1137,7 @@ mod tests {
         artist_responses:
             Mutex<VecDeque<std::result::Result<Vec<ArtistCandidate>, DiscographyError>>>,
         group_responses: Mutex<VecDeque<std::result::Result<Vec<ReleaseGroup>, DiscographyError>>>,
+        requested_group_mbids: Mutex<Vec<String>>,
         artist_calls: AtomicUsize,
         lookup_calls: AtomicUsize,
         group_calls: AtomicUsize,
@@ -831,6 +1157,7 @@ mod tests {
                 artist_responses: Mutex::new(VecDeque::from([Ok(vec![ArtistCandidate {
                     id: "11111111-1111-1111-1111-111111111111".to_string(),
                     name: "Artist".to_string(),
+                    score: None,
                 }])])),
                 group_responses: Mutex::new(VecDeque::from([Ok(groups)])),
                 ..Self::default()
@@ -879,14 +1206,19 @@ mod tests {
             Ok(ArtistCandidate {
                 id: artist_mbid.to_string(),
                 name: "Artist".to_string(),
+                score: None,
             })
         }
 
         async fn release_groups(
             &self,
-            _artist_mbid: &str,
+            artist_mbid: &str,
         ) -> std::result::Result<Vec<ReleaseGroup>, DiscographyError> {
             self.group_calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_group_mbids
+                .lock()
+                .unwrap()
+                .push(artist_mbid.to_string());
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -1283,5 +1615,225 @@ mod tests {
             matches!(outcome, DiscoveryOutcome::LegacyFallback { .. }),
             "an oversized payload without a cache must fall back to legacy"
         );
+    }
+
+    #[test]
+    fn dominant_selection_logs_its_evidence_at_info() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(ils_candidates())])),
+            group_responses: Mutex::new(VecDeque::from([Ok(vec![group(
+                "1",
+                "Studio",
+                Some("2000"),
+                Some("Album"),
+                &[],
+            )])])),
+            ..FakeProvider::default()
+        };
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturingWriter(Arc::clone(&buffer)))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(discover_artist_albums_at(
+                    &provider,
+                    &db,
+                    "Ils",
+                    &DiscographyConfig::default(),
+                    1_000,
+                ))
+        });
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::Authoritative {
+                provenance: DiscoveryProvenance::Refreshed,
+                ..
+            }
+        ));
+
+        let logs = buffer.lock().unwrap().clone();
+        assert!(logs.contains(" INFO "), "got: {logs}");
+        assert!(
+            logs.contains("resolved duplicate canonical artist name by search-score dominance"),
+            "got: {logs}"
+        );
+        assert!(logs.contains("artist=Ils"), "got: {logs}");
+        assert!(logs.contains("selected_name=Ils"), "got: {logs}");
+        assert!(
+            logs.contains("selected_mbid=16b97aaa-d7c0-469f-8c97-47c705b2d02f"),
+            "log must name the selected MBID field, got: {logs}"
+        );
+        assert!(logs.contains("exact_matches=4"), "got: {logs}");
+        assert!(logs.contains("top_score=100"), "got: {logs}");
+        assert!(logs.contains("runner_up_score=86"), "got: {logs}");
+        assert!(logs.contains("margin=14"), "got: {logs}");
+    }
+
+    #[tokio::test]
+    async fn dominant_selection_persists_the_chosen_mbid() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(ils_candidates())])),
+            group_responses: Mutex::new(VecDeque::from([Ok(vec![group(
+                "1",
+                "Studio",
+                Some("2000"),
+                Some("Album"),
+                &[],
+            )])])),
+            ..FakeProvider::default()
+        };
+
+        let outcome =
+            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_000)
+                .await;
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::Authoritative {
+                provenance: DiscoveryProvenance::Refreshed,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            provider.requested_group_mbids.lock().unwrap().as_slice(),
+            ["16b97aaa-d7c0-469f-8c97-47c705b2d02f"]
+        );
+        let entry = db.get_discography_cache("ils").unwrap().unwrap();
+        assert_eq!(entry.artist_mbid, "16b97aaa-d7c0-469f-8c97-47c705b2d02f");
+        assert_eq!(entry.canonical_artist, "Ils");
+    }
+
+    #[tokio::test]
+    async fn unresolved_dominance_prefers_stale_cache() {
+        let db = Database::open_in_memory().unwrap();
+        let groups = vec![group("1", "Studio", Some("2000"), Some("Album"), &[])];
+        cache_groups(
+            &db,
+            "ils",
+            "16b97aaa-d7c0-469f-8c97-47c705b2d02f",
+            0,
+            &groups,
+        );
+        // 100 versus 100 is a tied top score, so the refresh cannot resolve.
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(vec![
+                scored("16b97aaa-d7c0-469f-8c97-47c705b2d02f", "Ils", Some(100)),
+                scored("638e9183-2cde-4c07-b1d5-1f0e0361ed1c", "Ils", Some(100)),
+            ])])),
+            ..FakeProvider::default()
+        };
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Ils",
+            &DiscographyConfig::default(),
+            31 * 86_400,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::Authoritative {
+                provenance: DiscoveryProvenance::StaleCache { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unresolved_dominance_without_cache_reports_legacy_fallback() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(vec![
+                scored("a", "Ils", Some(99)),
+                scored("b", "Ils", Some(98)),
+            ])])),
+            ..FakeProvider::default()
+        };
+
+        let outcome =
+            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_000)
+                .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback { reason }
+                if reason.contains("artist could not be resolved safely")
+                    && reason.contains("below 100")
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_mbid_bypasses_score_ranking() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider {
+            group_responses: Mutex::new(VecDeque::from([Ok(vec![group(
+                "1",
+                "Studio",
+                Some("2000"),
+                Some("Album"),
+                &[],
+            )])])),
+            ..FakeProvider::default()
+        };
+        let mut config = DiscographyConfig::default();
+        config.artist_mbids.insert(
+            "Ils".to_string(),
+            "16b97aaa-d7c0-469f-8c97-47c705b2d02f".to_string(),
+        );
+
+        let outcome = discover_artist_albums_at(&provider, &db, "Ils", &config, 1_000).await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::Authoritative {
+                provenance: DiscoveryProvenance::Refreshed,
+                ..
+            }
+        ));
+        assert_eq!(provider.artist_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.lookup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_skips_dominance_ranking() {
+        let db = Database::open_in_memory().unwrap();
+        let groups = vec![group("1", "Studio", Some("2000"), Some("Album"), &[])];
+        cache_groups(
+            &db,
+            "ils",
+            "16b97aaa-d7c0-469f-8c97-47c705b2d02f",
+            1_000,
+            &groups,
+        );
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(ils_candidates())])),
+            ..FakeProvider::default()
+        };
+
+        let outcome =
+            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_100)
+                .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::Authoritative {
+                provenance: DiscoveryProvenance::FreshCache,
+                ..
+            }
+        ));
+        assert_eq!(provider.total_calls(), 0);
     }
 }
