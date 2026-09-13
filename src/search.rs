@@ -61,12 +61,48 @@ pub(crate) struct ArtistAlbumResults {
 const ARTIST_STOP_WORDS: &[&str] = &["the", "a", "an"];
 
 /// Words allowed between the significant words of a repeated artist prefix.
-const ARTIST_PREFIX_NOISE_WORDS: &[&str] = &["the", "a", "an", "and"];
+/// `n` is included because sharers write "Guns N Roses", "Guns & Roses", and
+/// "Guns and Roses" for the same artist.
+const ARTIST_PREFIX_NOISE_WORDS: &[&str] = &["the", "a", "an", "and", "n"];
 
 /// Explicit audio/source labels that do not distinguish an album title.
 const ALBUM_FORMAT_SUFFIXES: &[&str] = &[
     "flac", "mp3", "wav", "ape", "alac", "aiff", "m4a", "ogg", "lossless", "320", "320kbps",
     "24bit",
+];
+
+/// Generic container words that carry no album-title information.
+const ALBUM_STRUCTURAL_WORDS: &[&str] = &["album", "albums"];
+
+/// Bracketed annotation words that name a genuine edition. Annotations
+/// containing any of these are preserved so deluxe, remastered, limited, and
+/// expanded releases remain separate albums instead of collapsing into the
+/// base release.
+const ALBUM_EDITION_KEYWORDS: &[&str] = &[
+    "deluxe",
+    "remaster",
+    "remastered",
+    "edition",
+    "limited",
+    "anniversary",
+    "reissue",
+    "expanded",
+    "special",
+    "collector",
+    "live",
+    "instrumental",
+    "acoustic",
+    "demo",
+    "single",
+    "version",
+    "remix",
+    "remixes",
+    "session",
+    "sessions",
+    "tour",
+    "part",
+    "mix",
+    "mixtape",
 ];
 
 /// Stable artist identity used by processed-history reconciliation.
@@ -80,7 +116,13 @@ pub(crate) fn artist_identity_key(artist: &str) -> String {
     let mut words: Vec<String> = normalized
         .split_whitespace()
         .filter(|word| !ARTIST_STOP_WORDS.contains(word))
-        .map(str::to_string)
+        .map(|word| {
+            if word == "n" {
+                "and".to_string()
+            } else {
+                word.to_string()
+            }
+        })
         .collect();
     words.sort();
     if words.is_empty() {
@@ -90,18 +132,53 @@ pub(crate) fn artist_identity_key(artist: &str) -> String {
     }
 }
 
+/// Initial letters of the significant words of a multi-word artist name, as in
+/// `K` and `D` for "Kruder & Dorfmeister". Returns an empty vector when the
+/// artist has fewer than two significant words, which disables initials
+/// matching for single-word artists ("Nirvana", "Blur") so that a title such
+/// as "B - Sides" is not mistaken for an artist-prefixed one.
+fn artist_initials(artist: &str) -> Vec<String> {
+    let significant: Vec<String> = canonical_artist_words(artist)
+        .into_iter()
+        .filter(|word| !ARTIST_PREFIX_NOISE_WORDS.contains(&word.as_str()))
+        .collect();
+    if significant.len() < 2 {
+        return Vec::new();
+    }
+    significant
+        .iter()
+        .filter_map(|word| word.chars().next().map(|initial| initial.to_string()))
+        .collect()
+}
+
 /// Return the title after an explicit `Artist - Title` or `Artist: Title`
 /// prefix. Single-word artists require this boundary to avoid treating titles
-/// such as `Doors Open` as artist-prefixed.
+/// such as `Doors Open` as artist-prefixed. An abbreviated prefix written as
+/// the artist's initials (`K&D - The K&D Sessions`) is accepted only here,
+/// where the separator proves the prefix is deliberate.
 fn strip_explicit_artist_prefix<'a>(album: &'a str, artist: &str) -> Option<&'a str> {
+    let initials = artist_initials(artist);
     [" - ", ": ", " – ", " — "]
         .into_iter()
         .find_map(|separator| {
             let (prefix, title) = album.split_once(separator)?;
-            (artist_identity_key(prefix) == artist_identity_key(artist)).then_some(title)
+            let matches_artist = artist_identity_key(prefix) == artist_identity_key(artist);
+            let matches_initials = !initials.is_empty()
+                && canonical_artist_words(prefix)
+                    .into_iter()
+                    .filter(|word| !ARTIST_PREFIX_NOISE_WORDS.contains(&word.as_str()))
+                    .collect::<Vec<_>>()
+                    == initials;
+            (matches_artist || matches_initials).then_some(title)
         })
 }
 
+/// True when `value` contains a non-ASCII alphanumeric character after NFKD
+/// decomposition, which selects the Unicode identity path. Accented letters
+/// that decompose to ASCII (`é` -> `e`) take the ASCII path instead, and are
+/// therefore not counted here. Letters with no decomposition at all (`ß`, `æ`,
+/// `œ`, `ø`, `ł`, Cyrillic, CJK) are counted here and take the Unicode path,
+/// where the match arms fold them.
 fn contains_non_ascii_alphanumeric(value: &str) -> bool {
     value
         .nfkd()
@@ -117,14 +194,49 @@ fn unicode_identity_key(value: &str) -> String {
             'ß' => folded.push_str("ss"),
             'ø' => folded.push('o'),
             'ł' => folded.push('l'),
-            _ => folded.push(character),
+            // Latin letters with no NFKD decomposition, transliterated so an
+            // ASCII spelling of the same title yields the same key.
+            'đ' | 'ð' => folded.push('d'),
+            'þ' => folded.push_str("th"),
+            'ı' => folded.push('i'),
+            'ħ' => folded.push('h'),
+            'ŧ' => folded.push('t'),
+            'ŋ' => folded.push('n'),
+            '&' | '+' => folded.push_str(" and "),
+            '.' | ',' | '\'' | '"' | '`' => {}
+            _ => {
+                // Fold to ASCII where possible. A decomposition may mix ASCII
+                // and non-ASCII parts (`ǆ` -> `d` + `ž`), so fold each part in
+                // turn and keep the result; a character with no ASCII part at
+                // all (`й`, `中`) is kept verbatim.
+                let mut parts = String::new();
+                let mut has_ascii = false;
+                for part in character.nfkd() {
+                    if part.is_ascii_alphanumeric() {
+                        parts.push(part);
+                        has_ascii = true;
+                    } else if part.is_alphanumeric() {
+                        let nested: String =
+                            part.nfkd().filter(char::is_ascii_alphanumeric).collect();
+                        if nested.is_empty() {
+                            parts.push(part);
+                        } else {
+                            parts.push_str(&nested);
+                            has_ascii = true;
+                        }
+                    }
+                }
+                if has_ascii {
+                    folded.push_str(&parts);
+                } else if character.is_alphanumeric() {
+                    folded.push(character);
+                } else {
+                    folded.push(' ');
+                }
+            }
         }
     }
-    folded
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// True for a bare four-digit year token such as "1998".
@@ -149,9 +261,9 @@ fn strip_ascii_trademark_suffix(value: &str) -> &str {
 
 /// Drop a leading run of tokens that repeats the requested artist name, so
 /// "Kruder & Dorfmeister - The K&D Sessions" and "Kruder Dorfmeister - ..."
-/// both reduce to the album title. Nothing is dropped unless at least one
-/// artist token was matched.
-fn strip_artist_prefix(tokens: &mut Vec<String>, artist: &str) {
+/// both reduce to the album title. Returns true when the prefix was stripped;
+/// nothing is dropped unless at least one artist token was matched.
+fn strip_artist_prefix(tokens: &mut Vec<String>, artist: &str) -> bool {
     let artist_words = canonical_artist_words(artist);
     let significant: Vec<&str> = artist_words
         .iter()
@@ -161,7 +273,7 @@ fn strip_artist_prefix(tokens: &mut Vec<String>, artist: &str) {
     // A single shared word is too weak: artist "The Doors" has an album
     // "Doors Open", which must not collapse into a separate "Open" album.
     if significant.len() < 2 {
-        return;
+        return false;
     }
     let mut index = 0usize;
     for expected in significant {
@@ -172,7 +284,7 @@ fn strip_artist_prefix(tokens: &mut Vec<String>, artist: &str) {
             index += 1;
         }
         if tokens.get(index).map(String::as_str) != Some(expected) {
-            return;
+            return false;
         }
         index += 1;
     }
@@ -183,16 +295,19 @@ fn strip_artist_prefix(tokens: &mut Vec<String>, artist: &str) {
         index += 1;
     }
     tokens.drain(..index);
+    true
 }
 
 /// Strip an abbreviated multi-word artist prefix only when it directly
 /// precedes a bare-year album title (`K+D 1995` for Kruder & Dorfmeister).
+///
+/// The year requirement is deliberate: `K&D Sessions` must keep the word
+/// `sessions` in its key, because stripping to a bare `sessions` would collide
+/// with a different album literally titled "Sessions". Initials followed by an
+/// explicit separator prefix are handled by [`strip_explicit_artist_prefix`]
+/// instead.
 fn strip_artist_initials_before_year_title(tokens: &mut Vec<String>, artist: &str) {
-    let initials: Vec<String> = canonical_artist_words(artist)
-        .into_iter()
-        .filter(|word| !ARTIST_PREFIX_NOISE_WORDS.contains(&word.as_str()))
-        .filter_map(|word| word.chars().next().map(|initial| initial.to_string()))
-        .collect();
+    let initials = artist_initials(artist);
     if initials.len() < 2 {
         return;
     }
@@ -208,6 +323,65 @@ fn strip_artist_initials_before_year_title(tokens: &mut Vec<String>, artist: &st
     }
     if tokens.len() == index + 1 && is_year_token(&tokens[index]) {
         tokens.drain(..index);
+    }
+}
+
+/// Drop a trailing run of tokens that repeats the requested artist name — the
+/// mirror of [`strip_artist_prefix`] — so "Days to Come - Bonobo" reduces to
+/// the title. A suffix may match a single significant artist word because its
+/// end position is an explicit boundary; the prefix rule remains stricter to
+/// protect titles such as "Doors Open". Nothing is dropped when that would
+/// leave the title empty, which keeps a self-titled release named after the
+/// artist.
+fn strip_artist_suffix(tokens: &mut Vec<String>, artist: &str) {
+    let artist_words = canonical_artist_words(artist);
+    let significant: Vec<&str> = artist_words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !ARTIST_PREFIX_NOISE_WORDS.contains(word))
+        .collect();
+    if significant.is_empty() {
+        return;
+    }
+    let mut index = tokens.len();
+    for expected in significant.iter().rev() {
+        while index > 0
+            && tokens
+                .get(index - 1)
+                .is_some_and(|token| ARTIST_PREFIX_NOISE_WORDS.contains(&token.as_str()))
+        {
+            index -= 1;
+        }
+        if index == 0 || tokens.get(index - 1).map(String::as_str) != Some(*expected) {
+            return;
+        }
+        index -= 1;
+    }
+    while index > 0
+        && tokens
+            .get(index - 1)
+            .is_some_and(|token| ARTIST_PREFIX_NOISE_WORDS.contains(&token.as_str()))
+    {
+        index -= 1;
+    }
+    if index == 0 {
+        return;
+    }
+    tokens.truncate(index);
+}
+
+/// Drop generic container words such as "Album". A title that consists only of
+/// them keeps them, so a release genuinely named "Album" still has an identity.
+fn strip_structural_words(tokens: &mut Vec<String>) {
+    let title_word_count = tokens
+        .iter()
+        .filter(|token| {
+            !ALBUM_STRUCTURAL_WORDS.contains(&token.as_str())
+                && !ARTIST_STOP_WORDS.contains(&token.as_str())
+        })
+        .count();
+    if title_word_count >= 2 {
+        tokens.retain(|token| !ALBUM_STRUCTURAL_WORDS.contains(&token.as_str()));
     }
 }
 
@@ -241,6 +415,13 @@ fn strip_format_suffixes(tokens: &mut Vec<String>) {
     }
 }
 
+/// Drop a trailing space-separated `TM` token, which is publishing noise.
+fn strip_trailing_trademark(tokens: &mut Vec<String>) {
+    if tokens.len() > 1 && tokens.last().is_some_and(|token| token == "tm") {
+        tokens.pop();
+    }
+}
+
 /// Drop leading articles so "The K&D Sessions" equals "K&D Sessions".
 fn strip_leading_article(tokens: &mut Vec<String>) {
     let articles = tokens
@@ -258,28 +439,79 @@ fn strip_bracketed_years(value: &str) -> std::borrow::Cow<'_, str> {
     bracketed_year.replace_all(value, " ")
 }
 
-/// Tokenize an album folder name for identity comparison: fold case, drop
-/// publishing marks, treat `&`/`+` as the word "and", and remove bracketed
-/// release years.
+/// Drop a leading release year followed by an explicit separator. Doing this
+/// before tokenization distinguishes metadata such as "2001 - A Funk Odyssey"
+/// from a year that is title text, as in "2001: A Space Odyssey".
+fn strip_leading_release_year_separator(value: &str) -> std::borrow::Cow<'_, str> {
+    static LEADING_YEAR: OnceLock<Regex> = OnceLock::new();
+    let leading_year = LEADING_YEAR.get_or_init(|| {
+        Regex::new(r"^\s*(?:19|20)\d{2}\s*[-–—]\s*").expect("valid leading-year regex")
+    });
+    leading_year.replace(value, "")
+}
+
+/// Drop full ISO release dates, as in "2006-10-02 - Days to Come".
+fn strip_iso_release_dates(value: &str) -> std::borrow::Cow<'_, str> {
+    static ISO_DATE: OnceLock<Regex> = OnceLock::new();
+    let iso_date = ISO_DATE.get_or_init(|| {
+        Regex::new(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b").expect("valid ISO date regex")
+    });
+    iso_date.replace_all(value, " ")
+}
+
+/// Drop a release year that sits between two separators, as in
+/// "Album - 2006 - Title". A year at the very start is handled by the leading
+/// year rule, and a year inside a title ("Blade Runner 2049") is left alone
+/// because it has no leading separator.
+fn strip_interior_release_years(value: &str) -> std::borrow::Cow<'_, str> {
+    static INTERIOR_YEAR: OnceLock<Regex> = OnceLock::new();
+    let interior_year = INTERIOR_YEAR.get_or_init(|| {
+        Regex::new(r"[-–—]\s*(?:19|20)\d{2}\s*[-–—]").expect("valid interior-year regex")
+    });
+    interior_year.replace_all(value, " - ")
+}
+
+/// Drop bracketed annotations that carry no edition information, such as label
+/// catalog codes and source labels ("[ZENCD119, flac]"). Annotations naming an
+/// edition are preserved so deluxe and remastered releases stay distinct.
+fn strip_bracketed_annotations(value: &str) -> std::borrow::Cow<'_, str> {
+    static ANNOTATION: OnceLock<Regex> = OnceLock::new();
+    let annotation = ANNOTATION
+        .get_or_init(|| Regex::new(r"[\[({][^\]})]*[\])}]").expect("valid annotation regex"));
+    annotation.replace_all(value, |captures: &regex::Captures<'_>| {
+        let text = captures[0].to_lowercase();
+        if unicode_identity_key(&text)
+            .split_whitespace()
+            .any(|word| ALBUM_EDITION_KEYWORDS.contains(&word))
+        {
+            captures[0].to_string()
+        } else {
+            " ".to_string()
+        }
+    })
+}
+
+/// Tokenize an album title for identity comparison: treat `&`/`+` as the word
+/// "and" and split on non-alphanumeric characters. Release dates, bracketed
+/// years, bracketed annotations, and publishing marks are removed by the caller
+/// before tokenizing; a space-separated trailing `TM` token is dropped after.
 fn album_identity_tokens(album: &str) -> Vec<String> {
-    // Trademark and registered marks are publishing noise, not title text.
-    let without_marks: String = album
-        .chars()
-        .filter(|c| !matches!(c, '\u{2122}' | '\u{00ae}' | '\u{00a9}'))
-        .collect();
-    let without_marks = strip_ascii_trademark_suffix(&without_marks);
-    // A bracketed bare year is release metadata rather than title text.
-    let without_years = strip_bracketed_years(without_marks);
-    let normalized = normalize_search_term(&without_years).to_lowercase();
-    let mut tokens: Vec<String> = normalized
+    let normalized = normalize_search_term(album).to_lowercase();
+    normalized
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .collect();
-    if tokens.len() > 1 && tokens.last().is_some_and(|token| token == "tm") {
-        tokens.pop();
-    }
-    tokens
+        .collect()
+}
+
+/// Drop publishing marks (`™`, `®`, `©`). This runs before tokenizing because
+/// NFKC compatibility-folds `™` to the letters `TM`, which would otherwise fuse
+/// with the preceding word ("альбом™" -> "альбомtm").
+fn strip_publishing_marks(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '\u{2122}' | '\u{00ae}' | '\u{00a9}'))
+        .collect()
 }
 
 /// Identity key that collapses the different textual representations of one
@@ -298,20 +530,64 @@ pub(crate) fn album_identity_key(album: &str, artist: &str) -> String {
         crate::discs::strip_embedded_disc_marker(album).unwrap_or_else(|| album.trim().to_string());
     let title = strip_explicit_artist_prefix(&logical_album, artist).unwrap_or(&logical_album);
     let title = strip_ascii_trademark_suffix(title);
-    let mut tokens = if contains_non_ascii_alphanumeric(title) {
-        unicode_identity_key(&strip_bracketed_years(title))
+    let title = strip_iso_release_dates(title);
+    let title = strip_leading_release_year_separator(&title);
+    let title = strip_interior_release_years(&title);
+    let title = strip_bracketed_years(&title);
+    let title = strip_bracketed_annotations(&title);
+    let title = strip_publishing_marks(&title);
+    let mut tokens = if contains_non_ascii_alphanumeric(&title) {
+        unicode_identity_key(&title)
             .split_whitespace()
             .map(str::to_string)
             .collect()
     } else {
-        album_identity_tokens(title)
+        album_identity_tokens(&title)
     };
-    let normalized_fallback = tokens.join(" ");
+    // A space-separated trailing `TM` is publishing noise in either path.
+    strip_trailing_trademark(&mut tokens);
+    // Normalize release metadata before capturing the fallback, so a
+    // self-titled folder written as "1998 Artist" or "Artist FLAC" falls back to
+    // the artist identity rather than to a year or a format tag.
     strip_release_years(&mut tokens);
-    strip_artist_prefix(&mut tokens, artist);
-    strip_release_years(&mut tokens);
-    strip_artist_initials_before_year_title(&mut tokens, artist);
     strip_format_suffixes(&mut tokens);
+    strip_trailing_trademark(&mut tokens);
+    // Capture the fallback before artist stripping; the trailing-year case is
+    // corrected below once the prefix match has been confirmed.
+    let mut fallback_tokens = tokens.clone();
+    let stripped_prefix = strip_artist_prefix(&mut tokens, artist);
+    strip_release_years(&mut tokens);
+    // "Artist 1998" is the self-titled release plus a trailing release year, so
+    // the year is metadata: fall back to the artist identity rather than the
+    // bare year, which would also collide with an album literally named "1998".
+    if stripped_prefix && tokens.len() == 1 && is_year_token(&tokens[0]) {
+        tokens.clear();
+        if fallback_tokens.len() > 1
+            && fallback_tokens
+                .last()
+                .is_some_and(|token| is_year_token(token))
+        {
+            fallback_tokens.pop();
+        }
+    }
+    let normalized_fallback = fallback_tokens
+        .iter()
+        .map(|token| if token == "n" { "and" } else { token.as_str() })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // A trailing artist name and a trailing format label can hide each other
+    // ("Title - Artist FLAC"), so settle both until the list stops shrinking.
+    loop {
+        let before = tokens.len();
+        strip_artist_suffix(&mut tokens, artist);
+        strip_format_suffixes(&mut tokens);
+        strip_trailing_trademark(&mut tokens);
+        if tokens.len() == before {
+            break;
+        }
+    }
+    strip_artist_initials_before_year_title(&mut tokens, artist);
+    strip_structural_words(&mut tokens);
     strip_leading_article(&mut tokens);
 
     if tokens.is_empty() {
@@ -414,22 +690,29 @@ fn artist_album_name(path: &str, artist: &str) -> Option<String> {
     (!album.is_empty()).then(|| album.to_owned())
 }
 
-/// Match the requested artist against one directory component, ignoring
-/// common articles but rejecting extra artist words such as `Other Artist`
-/// when the target is only `Artist`.
+/// Split an artist name into folded words (see [`unicode_identity_key`] for
+/// non-ASCII names), mapping a bare `n` to `and`.
 fn canonical_artist_words(value: &str) -> Vec<String> {
-    normalize_search_term(value)
+    let normalized = if contains_non_ascii_alphanumeric(value) {
+        unicode_identity_key(value)
+    } else {
+        normalize_search_term(value).to_lowercase()
+    };
+    normalized
         .split_whitespace()
         .map(|word| {
-            if word.eq_ignore_ascii_case("n") {
+            if word == "n" {
                 "and".to_string()
             } else {
-                word.to_lowercase()
+                word.to_string()
             }
         })
         .collect()
 }
 
+/// Match the requested artist against one directory component, ignoring
+/// common articles but rejecting extra artist words such as `Other Artist`
+/// when the target is only `Artist`.
 fn artist_directory_matches(components: &[&str], artist: &str) -> bool {
     let artist_words = canonical_artist_words(artist);
     if artist_words.is_empty() {
@@ -564,8 +847,8 @@ async fn search_fallback_tier(
 /// Tier 1c retries with punctuation normalised via [`normalize_search_term`]
 /// (case preserved; skipped when normalisation changes nothing). Tier 2 falls
 /// back to an album-name-only search for artist+album queries (artist `""`),
-/// keeping only results whose file paths match the artist via
-/// [`path_matches_artist`]. It is skipped when the artist is already empty
+/// keeping only results whose file paths contain an exact artist directory via
+/// [`retain_artist_files`]. It is skipped when the artist is already empty
 /// because Tier 1 is already an album-only search.
 ///
 /// A tier is accepted only when it yields at least one result that passes the
@@ -1124,9 +1407,10 @@ pub fn record_search(
 /// not substrings, so "Prince" does not match "Princess". If an artist is
 /// made entirely of stop-words, every stop-word token must be present.
 ///
-/// Used by the album-only fallback tier and artist-only album discovery to
-/// verify that a search result belongs to the target artist. Empty or blank
-/// artist names never match.
+/// This token-level helper is exercised by tests and kept for callers that
+/// match a bare filename; the production search tiers instead use
+/// [`retain_artist_files`] / [`path_matches_artist_directory`], which require an
+/// exact artist *directory* component. Empty or blank artist names never match.
 pub fn path_matches_artist(path: &str, artist: &str) -> bool {
     if artist.trim().is_empty() {
         return false;
@@ -1460,6 +1744,17 @@ mod tests {
     }
 
     #[test]
+    fn test_group_artist_results_recognises_artist_initials_before_album_title() {
+        let variants = [
+            r"MUSIC\Kruder & Dorfmeister\K&D - The K&D Sessions\01.flac",
+            r"MUSIC\Kruder & Dorfmeister\The K&D Sessions\01.flac",
+        ];
+        let albums =
+            group_artist_results(&album_variant_results(&variants), "Kruder & Dorfmeister");
+        assert_eq!(albums.len(), 1, "got {albums:?}");
+    }
+
+    #[test]
     fn test_group_artist_results_folds_accents_consistently() {
         let variants = [
             r"MUSIC\Test Artist\Café del Mar\01.flac",
@@ -1548,15 +1843,222 @@ mod tests {
     }
 
     #[test]
+    fn test_album_identity_applies_ascii_punctuation_rules_after_unicode_folding() {
+        assert_eq!(
+            album_identity_key("Ø.K.", "Artist"),
+            album_identity_key("O.K.", "Artist")
+        );
+        assert_eq!(
+            album_identity_key("Møme & Friends", "Artist"),
+            album_identity_key("Mome and Friends", "Artist")
+        );
+    }
+
+    #[test]
     fn test_artist_identity_is_never_empty_for_article_only_names() {
         assert_ne!(artist_identity_key("A"), artist_identity_key("The The"));
     }
 
     #[test]
+    fn test_artist_identity_normalizes_n_and_and() {
+        assert_eq!(
+            artist_identity_key("Guns N Roses"),
+            artist_identity_key("Guns and Roses")
+        );
+    }
+
+    #[test]
     fn test_album_identity_preserves_year_as_part_of_title() {
         assert_ne!(
-            album_identity_key("2001 - A Space Odyssey", "Artist"),
-            album_identity_key("Space Odyssey", "Artist")
+            album_identity_key("2001: A Space Odyssey", "Artist"),
+            album_identity_key("A Space Odyssey", "Artist")
+        );
+        assert_eq!(
+            album_identity_key("2001 - A Funk Odyssey", "Artist"),
+            album_identity_key("A Funk Odyssey", "Artist")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_keeps_the_yes_album_distinct_from_yes() {
+        assert_ne!(
+            album_identity_key("The Yes Album", "Yes"),
+            album_identity_key("Yes", "Yes")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_folds_n_and_and_in_artist_name() {
+        for spelling in ["Guns N Roses", "Guns and Roses", "Guns & Roses"] {
+            assert_eq!(
+                album_identity_key(
+                    &format!("Appetite for Destruction - {spelling}"),
+                    "Guns & Roses"
+                ),
+                album_identity_key("Appetite for Destruction", "Guns & Roses"),
+                "{spelling} must collapse to the album title"
+            );
+        }
+    }
+
+    #[test]
+    fn test_album_identity_folds_accents_in_mixed_titles() {
+        assert_eq!(
+            album_identity_key("Møme Café", "Artist"),
+            album_identity_key("Mome Cafe", "Artist")
+        );
+    }
+
+    #[test]
+    fn test_canonical_artist_words_folds_non_ascii_spellings() {
+        // Artist `Møme` must match a share whose folder is spelled `Mome`, and a
+        // Cyrillic artist name must survive word extraction instead of folding
+        // to nothing (which would prune every result).
+        assert_eq!(canonical_artist_words("Møme"), vec!["mome"]);
+        assert_eq!(canonical_artist_words("Кино"), vec!["кино"]);
+        assert!(artist_directory_matches(&["Mome"], "Møme"));
+        assert!(path_matches_artist_directory(
+            r"MUSIC\Mome\Album\01.flac",
+            "Møme"
+        ));
+    }
+
+    #[test]
+    fn test_album_identity_keeps_multi_part_releases_distinct() {
+        // A multi-part release is distinct content; merging the parts would
+        // download only one of them.
+        assert_ne!(
+            album_identity_key("Album (Part 1)", "Artist"),
+            album_identity_key("Album (Part 2)", "Artist")
+        );
+        assert_ne!(
+            album_identity_key("Album (Part 1)", "Artist"),
+            album_identity_key("Album", "Artist")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_does_not_strip_single_letter_prefix() {
+        // A single-letter prefix must not be read as the artist's initials for
+        // a one-word artist, or "B - Sides" would key as "sides" while
+        // "B-Sides" keys as "b sides".
+        assert_eq!(
+            album_identity_key("B - Sides", "Blur"),
+            album_identity_key("B-Sides", "Blur")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_strips_publishing_marks_on_unicode_titles() {
+        for spelling in ["Чёрный альбом™", "Чёрный альбом TM", "Чёрный альбом"]
+        {
+            assert_eq!(
+                album_identity_key(spelling, "Кино"),
+                album_identity_key("Чёрный альбом", "Кино"),
+                "{spelling} must collapse to the plain title"
+            );
+        }
+    }
+
+    #[test]
+    fn test_album_identity_recognises_initials_before_year_with_format_suffix() {
+        assert_eq!(
+            album_identity_key("2020 - K+D 1995 FLAC", "Kruder & Dorfmeister"),
+            album_identity_key("1995", "Kruder & Dorfmeister")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_folds_self_titled_artist_spellings() {
+        assert_eq!(
+            album_identity_key("Guns N Roses", "Guns & Roses"),
+            album_identity_key("Guns & Roses", "Guns & Roses")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_falls_back_to_artist_after_release_year() {
+        // A leading release year must not leak into the self-titled fallback.
+        assert_eq!(
+            album_identity_key("1998 Kruder & Dorfmeister", "Kruder & Dorfmeister"),
+            album_identity_key("Kruder & Dorfmeister", "Kruder & Dorfmeister")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_settles_trailing_artist_and_format_labels() {
+        assert_eq!(
+            album_identity_key("Days to Come - Bonobo FLAC", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+        assert_eq!(
+            album_identity_key("Days to Come FLAC Bonobo", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+        assert_eq!(
+            album_identity_key("Days to Come TM 320", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+        assert_eq!(
+            album_identity_key("Kruder & Dorfmeister FLAC", "Kruder & Dorfmeister"),
+            album_identity_key("Kruder & Dorfmeister", "Kruder & Dorfmeister")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_folds_non_decomposable_latin_letters() {
+        assert_eq!(
+            album_identity_key("Đorđe", "Artist"),
+            album_identity_key("Dorde", "Artist")
+        );
+        assert_eq!(
+            album_identity_key("Þorn", "Artist"),
+            album_identity_key("Thorn", "Artist")
+        );
+    }
+
+    /// Reachability of the `æ`/`œ`/`ß` arms: these letters have no NFKD
+    /// decomposition, so a title containing one takes the Unicode path and the
+    /// arm folds it; the pure-ASCII spelling must then produce the same key.
+    #[test]
+    fn test_album_identity_folds_special_letters_for_mixed_titles() {
+        // NFKC re-composes æ/œ/ß, so these arms are only reachable when the
+        // title also contains a letter NFKC keeps (here `ø`).
+        assert_eq!(
+            album_identity_key("Møme æ", "Artist"),
+            album_identity_key("Mome ae", "Artist")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_folds_digraph_codepoints() {
+        // Assert the literal key so the mixed-decomposition fold is pinned, not
+        // merely compared against an equivalent spelling.
+        assert_eq!(album_identity_key("ǆep", "Artist"), "dzep");
+        assert_eq!(
+            album_identity_key("ǆep", "Artist"),
+            album_identity_key("Džep", "Artist")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_falls_back_to_artist_after_trailing_year() {
+        assert_eq!(
+            album_identity_key("Kruder & Dorfmeister 1998", "Kruder & Dorfmeister"),
+            album_identity_key("Kruder & Dorfmeister", "Kruder & Dorfmeister")
+        );
+        // An album genuinely titled "1998" must stay a distinct release.
+        assert_ne!(
+            album_identity_key("1998", "Kruder & Dorfmeister"),
+            album_identity_key("Kruder & Dorfmeister", "Kruder & Dorfmeister")
+        );
+    }
+
+    #[test]
+    fn test_artist_prefixed_bare_year_matches_bare_year_album() {
+        assert_eq!(
+            album_identity_key("Kruder & Dorfmeister - 1995", "Kruder & Dorfmeister"),
+            album_identity_key("1995", "Kruder & Dorfmeister")
         );
     }
 
@@ -1577,6 +2079,100 @@ mod tests {
         assert_ne!(
             album_identity_key("1812 Overture", "Artist"),
             album_identity_key("Overture", "Artist")
+        );
+    }
+
+    /// Regression built from the reported Bonobo run
+    /// (`downloads/staging/bonobo/`): the seven ways that run spelled one
+    /// release must collapse to a single album.
+    #[test]
+    fn test_group_artist_results_collapses_reported_bonobo_days_to_come_folders() {
+        let folders = [
+            "2006 - Days To Come",
+            "2006 - Days To Come (bonus disc)",
+            "2006 - Days to Come - Bonobo",
+            "2006-10-02 - Days to Come",
+            "2006-10-02 - Days to Come [ZENCD119, flac]",
+            "Bonobo - Album - 2006 - Days to Come",
+            "Days to Come - Album - 2006 - FLAC",
+        ];
+        let paths: Vec<String> = folders
+            .iter()
+            .map(|folder| format!(r"MUSIC\bonobo\{folder}\01 - track.flac"))
+            .collect();
+        let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+
+        let albums = group_artist_results(&album_variant_results(&borrowed), "bonobo");
+
+        assert_eq!(
+            albums.len(),
+            1,
+            "every spelling of one release must group into a single album, got {:?}",
+            albums
+                .iter()
+                .map(|album| album.album.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(albums[0].results.len(), folders.len());
+    }
+
+    #[test]
+    fn test_album_identity_strips_full_iso_release_dates() {
+        assert_eq!(
+            album_identity_key("2006-10-02 - Days to Come", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_strips_trailing_artist_name() {
+        assert_eq!(
+            album_identity_key("Days to Come - Bonobo", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_strips_structural_album_word_and_interior_year() {
+        assert_eq!(
+            album_identity_key("Bonobo - Album - 2006 - Days to Come", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+        assert_eq!(
+            album_identity_key("Days to Come - Album - 2006 - FLAC", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_strips_bracketed_catalog_codes() {
+        assert_eq!(
+            album_identity_key("Days to Come [ZENCD119, flac]", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
+        );
+    }
+
+    #[test]
+    fn test_album_identity_keeps_edition_annotations_distinct() {
+        for annotation in [
+            "Deluxe Edition",
+            "Remastered",
+            "Live",
+            "Instrumental",
+            "Acoustic",
+            "Demo",
+            "Remixes",
+            "Bonus Track Version",
+        ] {
+            assert_ne!(
+                album_identity_key(&format!("Days to Come ({annotation})"), "bonobo"),
+                album_identity_key("Days to Come", "bonobo"),
+                "{annotation} must remain a distinct release identity"
+            );
+        }
+        assert_eq!(
+            album_identity_key("Days to Come (bonus disc)", "bonobo"),
+            album_identity_key("Days to Come", "bonobo")
         );
     }
 

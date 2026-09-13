@@ -536,16 +536,32 @@ Fallback precedence is fresh cache, successful refresh, stale cache, then the le
 - Set `discography.enabled: false` to select the legacy heuristic deliberately. That choice is logged as an
   explicit configuration choice without an outage warning.
 
-The legacy heuristic normalizes common folder-name variations (explicit artist
-prefixes, leading release years, punctuation, common Latin variants, trademark
-marks, audio-format suffixes, and folder disc markers) so one release is
-processed once. A separator-less prefix for a single-word artist remains
-significant (`Nirvana Nevermind` differs from `Nevermind`) to avoid collapsing
-titles such as `Doors Open` into `Open`. This is a conservative text heuristic,
-not edition metadata: genuinely distinct releases whose names differ only by a
-stripped marker can collapse into one candidate, while a trailing bare year
-remains significant to avoid merging titles such as `Blade Runner` and
-`Blade Runner 2049`.
+The legacy heuristic normalizes common folder-name variations so one release is
+processed once. It strips explicit artist prefixes (including an abbreviated
+`K+D` prefix before a bare-year title), leading, separator-enclosed, and full
+ISO release years (`2006 - Days To Come`, `Album - 2006 - Title`,
+`2006-10-02 - Days To Come`, `Days to Come (2006)`), the structural word
+`Album`, a trailing artist name (`Days to Come - Bonobo`), punctuation, common
+Latin variants and non-decomposable Latin letters (`ø`, `đ`, `þ`), trademark
+marks, audio-format suffixes, and folder disc markers. Release years, format
+labels, `TM` marks, and a trailing artist name are stripped repeatedly, so
+their order in the folder name does not matter, and a self-titled folder keeps
+the artist identity (`Kruder & Dorfmeister 1998` and
+`Kruder & Dorfmeister FLAC` both reduce to the artist).
+
+Bracketed annotations are stripped only when they carry no edition meaning:
+catalog codes, source labels, and disc notes (`[ZENCD119, flac]`,
+`(bonus disc)`) collapse into the base release, while annotations naming an
+edition (`(Deluxe Edition)`, `(Remastered)`, `(Live)`, `(Instrumental)`,
+`(Demo)`, `(Remixes)`, `(Limited Edition)`, `(Part 2)`) stay distinct releases.
+
+Two conservatisms remain: a separator-less prefix for a single-word artist
+stays significant (`Nirvana Nevermind` differs from `Nevermind`) to avoid
+collapsing titles such as `Doors Open` into `Open`, and a trailing bare year
+stays significant to avoid merging `Blade Runner` with `Blade Runner 2049`.
+This is a conservative text heuristic, not edition metadata: genuinely distinct
+releases whose names differ only by a stripped marker can still collapse into
+one candidate.
 
 For legacy artist-only discovery, folder-marked single-disc peers are rejected
 when another candidate advertises a larger, self-consistent disc set. If every
