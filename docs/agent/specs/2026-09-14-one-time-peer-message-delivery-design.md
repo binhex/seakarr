@@ -173,11 +173,16 @@ no acknowledgement is sent.
 
 ### Disconnected-channel test
 
-Drop the receiver, invoke the handler for both true and false flags, and assert
-that the handler returns without panic. Logging capture may additionally prove
-that acknowledgement failure is DEBUG-only and omits the body if the existing
-logger test utilities support deterministic capture without adding a new
-dependency.
+Drop the receiver and invoke the handler for both true and false flags. Capture
+logs with the project's existing test logger, without adding a dependency, and
+assert:
+
+1. the handler returns without panic;
+2. the new-message case records the existing API-forwarding ERROR;
+3. both cases record a DEBUG acknowledgement failure, proving the handler still
+   attempted the acknowledgement after API forwarding failed;
+4. the acknowledgement failure line contains the message ID and username;
+5. the acknowledgement failure line does not contain the message body.
 
 ### Existing tests
 
@@ -199,7 +204,8 @@ In-code comments in `message_user.rs` must state:
 
 - new messages are delivered before acknowledgement;
 - replayed messages are acknowledged without redisplay;
-- acknowledgement failures are DEBUG-only and body-free.
+- acknowledgement failures use a stable body-free DEBUG message naming only
+  the message ID, username, and channel error.
 
 ## Acceptance criteria
 
