@@ -4,18 +4,18 @@
 > to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for
 > tracking.
 
-**Goal:** Stop server-replayed Soulseek private messages from appearing on every
-seakarr run, while genuinely new messages are still shown once, buffered once,
-and then cleared server-side.
+**Goal:** Display every Soulseek private message delivered to the client, then
+acknowledge its server ID so it does not reappear on later seakarr runs.
 
-**Architecture:** Branch on the existing `new_message` flag inside the vendored
-server code-22 handler. A new message is logged and forwarded to the client
-buffer first, then acknowledged; a replay is acknowledged silently with no log
-and no client delivery. All parsing and message-factory behaviour is reused.
+**Architecture:** Server code 22 always logs and forwards the parsed
+`UserMessage`, preserving the protocol's `new_message` flag, then sends code 23
+to acknowledge the original ID. The flag does not suppress delivery because
+protocol documentation says false can mean a message re-sent after the recipient
+was offline, which may be this client's first visible delivery.
 
-**Tech Stack:** Rust, `std::sync::mpsc`, the crate's own `Message`,
-`MessageFactory`, `ServerMessage`, and `UserMessage` types, plus the
-`crate::message::framed` test helper.
+**Tech Stack:** Rust, `std::sync::mpsc`, the crate's `Message`,
+`MessageFactory`, `ServerMessage`, `UserMessage`, and `crate::message::framed`
+test helper.
 
 **Spec:** `docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md`
 
@@ -25,129 +25,75 @@ and no client delivery. All parsing and message-factory behaviour is reused.
 
 ## Scope Check
 
-Single subsystem: one handler in one vendored file, plus one documentation
-amendment. It does not touch the client API, the actor, configuration, the
-database, or chat-room messages. No decomposition into separate plans is needed.
+Single subsystem: one vendored server-message handler plus the approved design
+document. No client API, actor, configuration, database, schema, chat-room, or
+persistence changes.
 
 ## File Structure
 
 | File | Responsibility | Change |
 | --- | --- | --- |
-| `vendor/soulseek-rs-lib/src/message/server/message_user.rs` | Decode server code 22, decide delivery vs replay, emit INFO and acknowledgement | Modify: reorder to deliver-then-acknowledge, acknowledge replays, add a pure body-free failure helper, add a `#[cfg(test)] mod tests` |
-| `docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md` | Approved design | Modify: replace the log-capture test clause with behavioural and pure-helper coverage |
+| `vendor/soulseek-rs-lib/src/message/server/message_user.rs` | Parse server code 22, display/forward it, then acknowledge code 23 | Modify handler and add local unit tests |
+| `docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md` | Approved behavioral contract | Amend false-flag semantics using protocol evidence and document behavioural diagnostic testing |
 
-No other file changes. The client API (`take_private_messages`), `MessageFactory`,
-`UserMessage`, and `ServerMessage` are reused unchanged.
+## Protocol premise
 
-## Codebase facts this plan depends on
+Nicotine+'s reverse-engineered Soulseek protocol documentation defines the last
+code-22 boolean as: "True if message is new, false if message is re-sent (e.g.
+if recipient was offline)." Code 23 confirms receipt; without it the server
+keeps sending the message.
 
-Verified in the working tree; do not re-derive or guess these:
+Therefore `new_message: false` must still be displayed and buffered. It can be
+the first delivery this client process sees after being offline. The fix for
+repetition is acknowledgement after delivery, not suppression.
 
-- The handler currently acknowledges only when `new_message` is true, and it
-  sends that acknowledgement **before** forwarding the message.
-- `crate::message::framed(|m| { ... })` is a `#[cfg(test)]` helper that builds a
-  message with the 8-byte frame header and parks the read pointer at the payload.
-- `MessageFactory::build_message_acked(id)` produces exactly
-  `[23, 0, 0, 0, <id as 4-byte LE>]`.
-- `UserMessage` exposes `id()`, `timestamp()`, `username()`, `message()`, and
-  `is_new()`.
-- Test log output is not assertable: `LOG_LEVEL` is a private `static mut`
-  defaulting to `Warn`, and `BUFFER` has no read accessor. Tests must not depend
-  on log lines. (This is why Task 1 amends the spec.)
-- The default `Warn` level also means the handler's `info!` and `debug!` calls
-  are silent during tests. The `error!` call for a dropped client channel is
-  visible, so Task 4's dropped-receiver test prints one ERROR line to stderr;
-  that is expected and is not a failure.
-
----
-
-### Task 1: Amend the spec's test clause to match the codebase
-
-The approved spec requires capturing log output, which this crate's logger
-cannot support. The user chose behavioural plus pure-helper coverage instead.
+## Task 1: Amend the design contract
 
 **Files:**
 
 - Modify: `docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md`
 
-- [ ] **Step 1: Replace the disconnected-channel test subsection**
+- [ ] **Step 1: Correct false-flag semantics**
 
-In `docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md`,
-replace this subsection:
+Document that both flag values are logged and forwarded before acknowledgement.
+A false flag is preserved as `UserMessage::is_new() == false` but does not
+suppress display, because it can represent a first local delivery after the
+client was offline.
 
-```markdown
-### Disconnected-channel test
+- [ ] **Step 2: Reconcile diagnostic testing**
 
-Drop the receiver and invoke the handler for both true and false flags. Capture
-logs with the project's existing test logger, without adding a dependency, and
-assert:
+State that the crate logger has no readable test capture. Pin acknowledgement
+failure through a no-panic channel test and a pure
+`acknowledgement_failure(id, username)` helper whose output includes ID and
+username but excludes the body.
 
-1. the handler returns without panic;
-2. the new-message case records the existing API-forwarding ERROR;
-3. both cases record a DEBUG acknowledgement failure, proving the handler still
-   attempted the acknowledgement after API forwarding failed;
-4. the acknowledgement failure line contains the message ID and username;
-5. the acknowledgement failure line does not contain the message body.
+- [ ] **Step 3: Lint the amended spec**
+
+Run:
+
+```bash
+markdownlint --fix docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md
+markdownlint docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md
 ```
 
-with:
-
-```markdown
-### Disconnected-channel and diagnostic-privacy test
-
-The crate logger cannot be read back in tests: `LOG_LEVEL` is a private
-`static mut` that defaults to `Warn`, and the buffered output has no read
-accessor. The diagnostic guarantee is therefore pinned two ways.
-
-First, behaviourally: drop the receiver and invoke the handler for both true and
-false flags, then assert the handler returns without panic, proving
-acknowledgement enqueue failure is non-fatal.
-
-Second, structurally: the acknowledgement failure text is built by a pure
-`acknowledgement_failure(id, username)` helper. The test asserts that text
-contains the message ID and the sender name and does **not** contain the message
-body. Because the handler has exactly one acknowledgement-failure `debug!` call
-site, which logs that helper's output plus the channel error, the body-free
-guarantee follows from the helper assertion.
-
-Suppressing the INFO line on replay is proven by the replay test's event stream
-(no `PrivateMessageReceived`), together with the INFO call sitting inside the
-`new_message` branch.
-```
-
-- [ ] **Step 2: Lint the documentation**
-
-Run: `markdownlint --fix docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md && markdownlint docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md`
 Expected: exit 0, no output.
-
-- [ ] **Step 3: Confirm no stale log-capture wording remains**
-
-Run: `rg -n 'Capture logs|records a DEBUG|log-capture' docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md`
-Expected: no output.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add docs/agent/specs/2026-09-14-one-time-peer-message-delivery-design.md
-git commit -m "docs: pin peer-message diagnostics with behavioural coverage"
+git commit -m "docs: correct offline peer-message delivery semantics"
 ```
 
----
-
-### Task 2: Write the failing regression tests
-
-The second test in this task is the direct regression for the reported bug: a
-`new_message: false` replay must produce an acknowledgement and nothing else.
+## Task 2: Write the failing protocol regression tests
 
 **Files:**
 
 - Modify: `vendor/soulseek-rs-lib/src/message/server/message_user.rs`
 
-- [ ] **Step 1: Append the test module**
+- [ ] **Step 1: Add framed-payload test helpers**
 
-Add this module to the end of
-`vendor/soulseek-rs-lib/src/message/server/message_user.rs`. Do **not** add the
-`acknowledgement_failure` helper yet; Task 3 introduces it.
+Append a `#[cfg(test)] mod tests` using the crate's existing `framed` helper:
 
 ```rust
 #[cfg(test)]
@@ -171,7 +117,6 @@ mod tests {
         })
     }
 
-    /// An acknowledgement is server code 23 followed by the original id.
     fn assert_acknowledges(acknowledgement: &Message) {
         let data = acknowledgement.get_data();
         assert_eq!(data.len(), 8, "acknowledgement is code plus id");
@@ -186,12 +131,15 @@ mod tests {
             "acknowledgement carries the original id"
         );
     }
+```
 
+- [ ] **Step 2: Add the new-message ordering test**
+
+```rust
     #[test]
     fn a_new_message_is_delivered_before_it_is_acknowledged() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut message = message_payload(true);
-
         MessageUser.handle(&mut message, sender);
 
         match receiver.try_recv() {
@@ -204,217 +152,182 @@ mod tests {
             }
             other => panic!("first event must be the delivery, got {other:?}"),
         }
-
         match receiver.try_recv() {
-            Ok(ServerMessage::SendMessage(acknowledgement)) => {
-                assert_acknowledges(&acknowledgement);
-            }
+            Ok(ServerMessage::SendMessage(ack)) => assert_acknowledges(&ack),
             other => panic!("second event must be the acknowledgement, got {other:?}"),
         }
-
-        assert!(
-            receiver.try_recv().is_err(),
-            "a new message produces exactly two events"
-        );
+        assert!(receiver.try_recv().is_err());
     }
+```
 
+- [ ] **Step 3: Add the resent-offline-message test**
+
+```rust
     #[test]
-    fn a_replayed_message_is_acknowledged_without_being_delivered_again() {
+    fn a_resent_offline_message_is_delivered_then_acknowledged() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut message = message_payload(false);
-
         MessageUser.handle(&mut message, sender);
 
         match receiver.try_recv() {
-            Ok(ServerMessage::SendMessage(acknowledgement)) => {
-                assert_acknowledges(&acknowledgement);
+            Ok(ServerMessage::PrivateMessageReceived(delivered)) => {
+                assert_eq!(delivered.id(), MESSAGE_ID);
+                assert_eq!(delivered.timestamp(), TIMESTAMP);
+                assert_eq!(delivered.username(), SENDER);
+                assert_eq!(delivered.message(), BODY);
+                assert!(!delivered.is_new());
             }
-            other => panic!("a replay must only be acknowledged, got {other:?}"),
+            other => panic!("first event must deliver the offline message, got {other:?}"),
         }
-
-        assert!(
-            receiver.try_recv().is_err(),
-            "a replay must not be delivered to the client again"
-        );
+        match receiver.try_recv() {
+            Ok(ServerMessage::SendMessage(ack)) => assert_acknowledges(&ack),
+            other => panic!("second event must acknowledge the offline message, got {other:?}"),
+        }
+        assert!(receiver.try_recv().is_err());
     }
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail for the right reasons**
+- [ ] **Step 4: Run RED**
 
-Run: `cargo test -p soulseek-rs-lib --lib message_user -v`
-Expected: FAIL, both tests, with these messages:
+Run:
 
-- `a_replayed_message_is_acknowledged_without_being_delivered_again` fails with
-  `a replay must only be acknowledged, got PrivateMessageReceived(...)` because
-  the current handler forwards a replay and never acknowledges it.
-- `a_new_message_is_delivered_before_it_is_acknowledged` fails with
-  `first event must be the delivery, got SendMessage(...)` because the current
-  handler acknowledges before forwarding.
+```bash
+cargo test -p soulseek-rs-lib --lib message::server::message_user::tests -- --nocapture
+```
 
-Do not proceed while either test passes, and do not weaken an assertion to make
-it pass.
+Expected: two failures against the old handler:
 
-- [ ] **Step 3: Do not commit yet**
+- new message: `first event must be the delivery, got Ok(SendMessage(...))`;
+- false/offline message: its first delivery succeeds, but the second event is
+  absent because the old handler never sends code 23.
 
-These tests are intentionally red. They are committed together with the
-implementation in Task 3 Step 4 so every commit stays green.
+Do not weaken either ordering or acknowledgement assertion.
 
----
-
-### Task 3: Deliver new messages first and acknowledge every delivery
+## Task 3: Deliver then acknowledge every code-22 message
 
 **Files:**
 
 - Modify: `vendor/soulseek-rs-lib/src/message/server/message_user.rs`
 
-- [ ] **Step 1: Replace the handler body**
-
-Replace the entire current contents of
-`vendor/soulseek-rs-lib/src/message/server/message_user.rs` with:
+- [ ] **Step 1: Add the body-free failure helper**
 
 ```rust
-use crate::actor::server_actor::{ServerMessage, UserMessage};
-use crate::message::server::MessageFactory;
-use crate::message::{Message, MessageHandler};
-use crate::{debug, error, info};
-
-use std::sync::mpsc::Sender;
-
-pub struct MessageUser;
-
-/// Body-free diagnostic for an acknowledgement that could not be queued.
-///
-/// Kept as a pure function so the privacy guarantee is directly testable: the
-/// crate logger exposes no readable capture, so a test asserts this text names
-/// the message and sender without repeating the message body.
 fn acknowledgement_failure(id: u32, username: &str) -> String {
     format!("[MessageUser] could not acknowledge message {id} from {username}")
 }
+```
 
-impl MessageHandler<ServerMessage> for MessageUser {
-    fn get_code(&self) -> u8 {
-        22
-    }
+- [ ] **Step 2: Replace `MessageUser::handle`**
 
-    fn handle(&self, message: &mut Message, sender: Sender<ServerMessage>) {
-        let id = message.read_int32();
-        let timestamp = message.read_int32();
-        let username = message.read_string();
-        let message_content = message.read_string();
-        let new_message = message.read_bool();
+After parsing the existing fields, use this sequence:
 
-        // Deliver before acknowledging. The INFO line is the user-visible
-        // delivery, so clearing the message server-side first would risk losing
-        // it if local forwarding then failed.
-        if new_message {
-            let user_message =
-                UserMessage::new(id, timestamp, username.clone(), message_content, new_message);
+```rust
+        let user_message = UserMessage::new(
+            id,
+            timestamp,
+            username.clone(),
+            message_content,
+            new_message,
+        );
 
-            info!("[MessageUser] User message received:{:?}", user_message);
+        info!("[MessageUser] User message received:{:?}", user_message);
 
-            // Surface the message to the client so it can be read via the API.
-            if let Err(error) = sender.send(ServerMessage::PrivateMessageReceived(user_message)) {
-                error!(
-                    "[server] Error forwarding private message to client: {}",
-                    error
-                );
-            }
+        if let Err(error) = sender.send(ServerMessage::PrivateMessageReceived(user_message)) {
+            error!(
+                "[MessageUser] could not forward private message to client: {}",
+                error
+            );
         }
 
-        // Acknowledge every delivery, including replays. The server keeps
-        // re-sending a message it still holds, which is why a replayed private
-        // message used to reappear on every run.
         if let Err(error) = sender.send(ServerMessage::SendMessage(
             MessageFactory::build_message_acked(id),
         )) {
             debug!("{}: {}", acknowledgement_failure(id, &username), error);
         }
-    }
-}
 ```
 
-- [ ] **Step 2: Run the focused tests to verify they pass**
+Import macros with `use crate::{debug, error, info};`. Add comments explaining:
 
-Run: `cargo test -p soulseek-rs-lib --lib message_user -v`
-Expected: PASS for both tests, plus the pre-existing
-`message::server::message_factory::tests::test_build_message_acked` when the
-wider filter is used.
+- both flag values are delivered because false can mean queued while offline;
+- INFO display occurs before server-side clearing;
+- acknowledgement is attempted even when client forwarding fails;
+- the server repeats unacknowledged messages on later runs.
 
-- [ ] **Step 3: Run the whole vendored library suite**
+- [ ] **Step 3: Run GREEN**
+
+Run:
+
+```bash
+cargo test -p soulseek-rs-lib --lib message::server::message_user::tests -- --nocapture
+```
+
+Expected: both tests pass.
+
+- [ ] **Step 4: Run the vendored library suite**
 
 Run: `cargo test -p soulseek-rs-lib --lib`
 Expected: all tests pass with 0 failures.
 
-- [ ] **Step 4: Commit the tests and the implementation together**
+- [ ] **Step 5: Commit tests and implementation together**
 
 ```bash
 git add vendor/soulseek-rs-lib/src/message/server/message_user.rs
-git commit -m "fix: acknowledge replayed peer messages so they stop reappearing"
+git commit -m "fix: acknowledge delivered peer messages so they stop reappearing"
 ```
 
----
-
-### Task 4: Prove acknowledgement failure is non-fatal and body-free
+## Task 4: Pin failure privacy and non-fatal behavior
 
 **Files:**
 
-- Modify: `vendor/soulseek-rs-lib/src/message/server/message_user.rs` (`mod tests`)
+- Modify: `vendor/soulseek-rs-lib/src/message/server/message_user.rs`
 
-- [ ] **Step 1: Add the disconnected-channel and privacy test**
-
-Append this test inside the existing `mod tests` block in
-`vendor/soulseek-rs-lib/src/message/server/message_user.rs`, after
-`a_replayed_message_is_acknowledged_without_being_delivered_again`:
+- [ ] **Step 1: Add the disconnected-channel test**
 
 ```rust
     #[test]
     fn a_disconnected_channel_is_non_fatal_and_the_diagnostic_omits_the_body() {
-        // Ack enqueue failure must not panic, for a new message or a replay.
         for new_message in [true, false] {
             let (sender, receiver) = std::sync::mpsc::channel();
             drop(receiver);
             let mut message = message_payload(new_message);
-
             MessageUser.handle(&mut message, sender);
         }
 
-        // The failure text names the message and sender, never the body.
         let failure = acknowledgement_failure(MESSAGE_ID, SENDER);
         assert!(failure.contains("292923"), "got: {failure}");
         assert!(failure.contains(SENDER), "got: {failure}");
-        assert!(
-            !failure.contains(BODY),
-            "acknowledgement diagnostics must not repeat the body, got: {failure}"
-        );
+        assert!(!failure.contains(BODY), "got: {failure}");
     }
 ```
 
-- [ ] **Step 2: Run the test**
+- [ ] **Step 2: Run the exact test**
 
-Run: `cargo test -p soulseek-rs-lib --lib message_user::tests::a_disconnected_channel_is_non_fatal_and_the_diagnostic_omits_the_body -- --exact`
-Expected: PASS. One `ERROR` line about the dropped client channel is printed to
-stderr because the default log level is `Warn`; that output is expected.
+```bash
+cargo test -p soulseek-rs-lib --lib message::server::message_user::tests::a_disconnected_channel_is_non_fatal_and_the_diagnostic_omits_the_body -- --exact
+```
 
-This test cannot start red: it exercises a helper and a no-panic property that
-Task 3 introduced. It is a regression pin for the privacy and non-fatal
-guarantees, not a TDD step. Say so plainly rather than claiming a red phase.
+Expected: PASS. Add `--nocapture` to see two forwarding ERROR lines, one for
+each flag value; acknowledgement DEBUG lines remain suppressed at the default
+Warn level.
 
-- [ ] **Step 3: Run the full message module**
+This test is a regression pin, not a RED step: it tests a helper and no-panic
+property introduced in Task 3.
 
-Run: `cargo test -p soulseek-rs-lib --lib message:: -- -v`
-Expected: PASS for all message handler, factory, and reader tests.
+- [ ] **Step 3: Run the message module**
+
+Run: `cargo test -p soulseek-rs-lib --lib message::`
+Expected: all message handler, factory, and reader tests pass. Do not pass `-v`;
+libtest rejects it.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add vendor/soulseek-rs-lib/src/message/server/message_user.rs
-git commit -m "test: cover peer-message acknowledgement failure and diagnostic privacy"
+git commit -m "test: cover peer-message acknowledgement failure and privacy"
 ```
 
----
-
-### Task 5: Final verification
+## Task 5: Final verification
 
 **Files:** none (verification only)
 
@@ -426,96 +339,80 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Expected: exit 0 for all three, zero warnings.
+Expected: exit 0, zero warnings.
 
-- [ ] **Step 2: Full workspace test suite**
+- [ ] **Step 2: Run all tests**
 
-```bash
-cargo test --workspace
-```
+Run: `cargo test --workspace`
+Expected: all suites pass. Record whether
+`a_private_message_is_delivered_between_users` actually ran: it self-skips when
+neither `SOULSEEK_TEST_SERVER` nor a soulfind binary is available, and a skip
+still reports as a passing test process.
 
-Expected: every suite passes with 0 failures, including the vendored library
-tests and the end-to-end `a_private_message_is_delivered_between_users` test.
+- [ ] **Step 3: Run pre-commit**
 
-- [ ] **Step 3: Pre-commit gate**
-
-```bash
-pre-commit run --all-files
-```
-
+Run: `pre-commit run --all-files`
 Expected: all hooks pass.
 
-- [ ] **Step 4: Confirm the acceptance criteria by inspection**
+- [ ] **Step 4: Inspect acceptance structure**
+
+Run:
 
 ```bash
-rg -n 'acknowledgement_failure|MessageFactory::build_message_acked|PrivateMessageReceived|if new_message' vendor/soulseek-rs-lib/src/message/server/message_user.rs
+awk '/#\[cfg\(test\)\]/{exit} {print}' vendor/soulseek-rs-lib/src/message/server/message_user.rs \
+  | rg -n 'acknowledgement_failure|PrivateMessageReceived|build_message_acked|User message received'
 ```
 
-Expected: exactly one `acknowledgement_failure` definition, one code-23
-acknowledgement call site, one `PrivateMessageReceived` call site inside the
-`if new_message` branch, and no second acknowledgement site.
+Expected: five production matches: one helper definition, one INFO display, one
+client-forwarding call, one code-23 acknowledgement call, and one DEBUG failure
+call that invokes the helper.
 
-- [ ] **Step 5: Confirm nothing outside scope changed**
+- [ ] **Step 5: Confirm scope**
+
+With the chain's deferred-commit policy, run:
 
 ```bash
-git diff --stat origin/main..HEAD
+git diff --name-only HEAD
 ```
 
-Expected: only `vendor/soulseek-rs-lib/src/message/server/message_user.rs` and
-the amended spec document, plus this plan.
+Expected: only the handler, amended spec, and this plan. If the plan's commit
+steps were executed instead, use `git diff --name-only origin/main..HEAD` and
+expect the same three files.
 
 - [ ] **Step 6: Report**
 
-If Steps 1-3 changed any file, commit it:
-
-```bash
-git add -A
-git commit -m "chore: format after peer-message acknowledgement fix"
-```
-
----
+Do not add a format commit unless Step 1 changes a file. The chain's finalising
+step owns integration commits.
 
 ## Self-Review
 
 ### Spec coverage
 
-| Spec requirement | Task |
+| Requirement | Task |
 | --- | --- |
-| Branch on the existing `new_message` flag | 3 |
-| New message: log once, buffer once, then acknowledge | 3 |
-| Delivery event precedes acknowledgement | 3 (ordering assertions in Task 2) |
-| Delivery happens before the acknowledgement attempt | 3 |
-| Replay: no INFO, no client forwarding, acknowledgement only | 2, 3 |
-| Acknowledgement uses code 23 and the original id | 2 (`assert_acknowledges`), 3 |
-| API-forwarding failure does not block acknowledgement | 3 (acknowledgement is outside the branch) |
-| Acknowledgement failure is DEBUG-only and body-free | 3 (single `debug!` call site plus pure helper), 4 |
-| Acknowledgement failure is non-fatal | 4 |
-| No message-ID store, config key, schema change, or public API change | 1-5 (no such file touched) |
-| Existing private-message and workspace tests stay green | 3, 5 |
-| In-code comments explain delivery order, replay suppression, and DEBUG-only failures | 3 |
-| Spec's log-capture clause reconciled with the codebase | 1 |
-
-No spec section is left without a task.
+| Show and buffer every delivered code-22 message | 2, 3 |
+| Preserve true/false flag on `UserMessage` | 2, 3 |
+| Deliver before acknowledgement | 2, 3 |
+| Acknowledge every original message ID | 2, 3 |
+| Stop later server redelivery | 2, 3 |
+| Forward failure does not block acknowledgement | 3 (call-site structure), 5 (Step 4 inspection) |
+| Ack failure DEBUG-only and body-free | 3, 4 |
+| Ack failure non-fatal | 4 |
+| No persistence/config/API change | 1-5 |
+| Existing tests stay green | 3-5 |
+| Protocol premise documented | 1 |
+| In-code comments explain both flag values, ordering, and failure behavior | 3 |
 
 ### Placeholder scan
 
-No `TBD`, `TODO`, or "implement later" text. Every code step contains the code
-to write, every command shows its expected result, and the two intentionally
-red tests in Task 2 have their exact expected failure messages recorded.
+No placeholders or deferred implementation. Every code change is shown and
+every command has an expected result.
 
 ### Type consistency
 
-- `acknowledgement_failure(id: u32, username: &str) -> String` is defined in
-  Task 3 and called identically in Task 3's handler and Task 4's test.
-- `message_payload(new_message: bool) -> Message` and
-  `assert_acknowledges(acknowledgement: &Message)` are defined once in Task 2 and
-  reused in Task 4.
-- Constants `MESSAGE_ID`, `TIMESTAMP`, `SENDER`, `BODY` are defined once in
-  Task 2 and referenced in Tasks 2 and 4 with the same names.
-- Accessors used line up with the real API: `id()`, `timestamp()`,
-  `username()`, `message()`, `is_new()`.
-- `ServerMessage::SendMessage(Message)` and
-  `ServerMessage::PrivateMessageReceived(UserMessage)` are used exactly as the
-  enum defines them.
-- The acknowledgement byte layout `[23, 0, 0, 0, id LE]` matches
-  `MessageFactory::build_message_acked`, which the existing factory test pins.
+- `UserMessage::new` receives `(u32, u32, String, String, bool)`.
+- Tests use real accessors: `id()`, `timestamp()`, `username()`, `message()`,
+  `is_new()`.
+- `ServerMessage::PrivateMessageReceived(UserMessage)` precedes
+  `ServerMessage::SendMessage(Message)` for both flag values.
+- Code 23 and original ID byte layout remain pinned by `assert_acknowledges`.
