@@ -9,13 +9,13 @@ use crate::client::SoulseekClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::discography::{
-    discover_artist_albums, DiscographyProvider, DiscoveryOutcome, DiscoveryProvenance,
-    MusicBrainzProvider,
+    discover_artist_albums, DiscographyProvider, DiscoveryFailure, DiscoveryOutcome,
+    DiscoveryProvenance, MusicBrainzProvider,
 };
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, RunReport};
-use crate::{download, filter, notifier, organizer, scanner, search};
+use crate::{discover, download, filter, notifier, organizer, scanner, search};
 
 /// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
 ///
@@ -288,7 +288,10 @@ async fn process_album_internal(
     }
     if presearched && remove_incomplete_split_disc_candidates(&mut results) {
         mark_album_processed_if_identifiable(db, artist, album, "failed")?;
-        return Ok(AlbumOutcome::Failed {
+        // No download was attempted, so this is a no-candidate outcome rather
+        // than a failed attempt. It keeps the discover budget honest if this
+        // path is ever reached from a presearched work list.
+        return Ok(AlbumOutcome::NoCandidates {
             reason: "multi-disc album is split across peers; no complete candidate available"
                 .into(),
         });
@@ -443,7 +446,7 @@ async fn process_album_internal(
                 }
             }
             mark_album_processed_if_identifiable(db, artist, album, "failed")?;
-            return Ok(AlbumOutcome::Failed {
+            return Ok(AlbumOutcome::NoCandidates {
                 reason: "no results found".into(),
             });
         }
@@ -479,7 +482,7 @@ async fn process_album_internal(
             rejection_summary.summary_line(),
         );
         mark_album_processed_if_identifiable(db, artist, album, "failed")?;
-        return Ok(AlbumOutcome::Failed {
+        return Ok(AlbumOutcome::NoCandidates {
             reason: "no results passed filters".into(),
         });
     }
@@ -1072,6 +1075,20 @@ async fn run_legacy_artist_only_mode(
         tracing::warn!("{artist} — (all): failed to record search history: {e}");
     }
 
+    // Skip albums the library already holds, exactly as the authoritative path
+    // does. The documented promise is that --artist X fetches only what is
+    // missing, and this heuristic path is both the explicit opt-out and the
+    // automatic fallback during a MusicBrainz outage.
+    let index = match discover::index_from_paths(&config.library.paths, &config.filters) {
+        Ok(index) => index,
+        Err(error) => {
+            tracing::warn!(
+                "{artist}: library scan failed ({error}); skipping the already-present check"
+            );
+            discover::LibraryIndex::default()
+        }
+    };
+
     let albums = search::group_artist_results(&outcome.results, artist);
     if albums.is_empty() {
         let reason = if cancel.load(Ordering::SeqCst) {
@@ -1090,8 +1107,29 @@ async fn run_legacy_artist_only_mode(
         });
     }
 
+    let present = albums
+        .iter()
+        .filter(|album| index.contains_album(artist, &album.album))
+        .count();
+    if present > 0 && present == albums.len() {
+        return Ok(ArtistOnlyRun {
+            outcomes: Vec::new(),
+            notice: Some(format!(
+                "Artist-only run: all {present} eligible album(s) already present"
+            )),
+        });
+    }
+    let notice = if present > 0 {
+        Some(format!(
+            "Artist-only run: {present} album(s) already present; skipped"
+        ))
+    } else {
+        None
+    };
+
     let work = albums
         .into_iter()
+        .filter(|album| !index.contains_album(artist, &album.album))
         .map(|album| (album.album, Some(album.results)))
         .collect();
     let outcomes = process_artist_album_work(
@@ -1106,10 +1144,7 @@ async fn run_legacy_artist_only_mode(
         work,
     )
     .await?;
-    Ok(ArtistOnlyRun {
-        outcomes,
-        notice: None,
-    })
+    Ok(ArtistOnlyRun { outcomes, notice })
 }
 
 /// Artist-only manual mode against an injected authoritative discography
@@ -1134,13 +1169,42 @@ async fn run_artist_only_mode_with_provider(
             if let DiscoveryProvenance::StaleCache {
                 age_days,
                 refresh_error,
+                ..
             } = &provenance
             {
                 tracing::warn!(
                     "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache"
                 );
             }
-            let work = albums
+            // A failing scan must not break artist-only manual mode, which
+            // worked without a library before: warn and filter nothing.
+            let index = match discover::index_from_paths(&config.library.paths, &config.filters) {
+                Ok(index) => index,
+                Err(error) => {
+                    tracing::warn!(
+                        "{artist}: library scan failed ({error}); skipping the already-present check"
+                    );
+                    discover::LibraryIndex::default()
+                }
+            };
+            let missing = discover::missing_albums(&index, artist, &albums);
+            let present = albums.len() - missing.len();
+            if present > 0 && missing.is_empty() {
+                return Ok(ArtistOnlyRun {
+                    outcomes: Vec::new(),
+                    notice: Some(format!(
+                        "Artist-only run: all {present} eligible album(s) already present"
+                    )),
+                });
+            }
+            let notice = if present > 0 {
+                Some(format!(
+                    "Artist-only run: {present} album(s) already present; skipped"
+                ))
+            } else {
+                None
+            };
+            let work = missing
                 .into_iter()
                 .map(|album| (album.title, None))
                 .collect();
@@ -1156,15 +1220,13 @@ async fn run_artist_only_mode_with_provider(
                 work,
             )
             .await?;
-            Ok(ArtistOnlyRun {
-                outcomes,
-                notice: None,
-            })
+            Ok(ArtistOnlyRun { outcomes, notice })
         }
         DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
             if let DiscoveryProvenance::StaleCache {
                 age_days,
                 refresh_error,
+                ..
             } = &provenance
             {
                 tracing::warn!(
@@ -1178,7 +1240,7 @@ async fn run_artist_only_mode_with_provider(
                 )),
             })
         }
-        DiscoveryOutcome::LegacyFallback { reason } => {
+        DiscoveryOutcome::LegacyFallback { reason, .. } => {
             tracing::warn!(
                 "{artist}: authoritative discography unavailable ({reason}); falling back to heuristic folder-based album discovery"
             );
@@ -1195,9 +1257,17 @@ async fn run_artist_only_mode_with_provider(
             .await?;
             Ok(ArtistOnlyRun {
                 outcomes: run.outcomes,
-                notice: Some(format!(
-                    "Authoritative discography unavailable: {reason}; album names were discovered heuristically from Soulseek folders"
-                )),
+                notice: Some(match run.notice {
+                    // Keep the legacy run's own notice, for example "all albums
+                    // already present": replacing it would hide why the run did
+                    // no work.
+                    Some(notice) => format!(
+                        "Authoritative discography unavailable: {reason}; album names were discovered heuristically from Soulseek folders; {notice}"
+                    ),
+                    None => format!(
+                        "Authoritative discography unavailable: {reason}; album names were discovered heuristically from Soulseek folders"
+                    ),
+                }),
             })
         }
     }
@@ -1253,9 +1323,16 @@ async fn run_artist_only_mode(
             .await?;
             return Ok(ArtistOnlyRun {
                 outcomes: run.outcomes,
-                notice: Some(format!(
-                    "Authoritative discography unavailable: {error}; album names were discovered heuristically from Soulseek folders"
-                )),
+                notice: Some(match run.notice {
+                    // Keep the legacy run's own notice, as in the LegacyFallback
+                    // arm: dropping it would hide why the run did no work.
+                    Some(notice) => format!(
+                        "Authoritative discography unavailable: {error}; album names were discovered heuristically from Soulseek folders; {notice}"
+                    ),
+                    None => format!(
+                        "Authoritative discography unavailable: {error}; album names were discovered heuristically from Soulseek folders"
+                    ),
+                }),
             });
         }
     };
@@ -1271,6 +1348,330 @@ async fn run_artist_only_mode(
         &provider,
     )
     .await
+}
+
+/// Whether a completed album attempt consumes one unit of the discover
+/// download budget.
+///
+/// Only work that reached the download stage is charged: a completed transfer,
+/// or a transfer that was attempted and failed. Everything else is free, and
+/// deliberately so. An album skipped because a success record already exists,
+/// or whose search produced no admissible candidate, performed no download; if
+/// such albums charged the budget, a fixed prefix of the work list would spend
+/// every run's allowance and no download would ever start.
+/// This helper covers the `Ok` outcomes only; `charges_after_error` covers the
+/// `Err` case.
+fn charges_download_budget(outcome: &AlbumOutcome) -> bool {
+    matches!(
+        outcome,
+        AlbumOutcome::Downloaded { .. } | AlbumOutcome::Failed { .. }
+    )
+}
+
+/// Whether an error returned by `process_album` means the download stage was
+/// reached and must therefore be charged.
+///
+/// Only database failures qualify. Inside `process_album` the database writes sit
+/// around a transfer — recording its success or its failure — so a transfer that
+/// happened surfaces here as a database error, including when the post-download
+/// write is what failed. Every other error class comes from the search stage,
+/// raised before any transfer was attempted; charging those would let a run whose
+/// searches keep failing spend its whole allowance without attempting a download.
+///
+/// The converse does not hold: a database failure can also be raised before any
+/// transfer, by the processed-record check or the `--ignore-processed` deletion
+/// when the database itself is locked or corrupt. That case is charged too. The
+/// two cannot be told apart without stage-marking every pipeline error, and the
+/// direction of the resulting error is the safe one: a broken database stops the
+/// run at its cap instead of letting it exceed the cap.
+fn charges_after_error(error: &SeakarrError) -> bool {
+    matches!(error, SeakarrError::Database(_))
+}
+
+/// Report a discover run that the provider circuit breaker aborted, and build
+/// the error to return.
+fn abort_discover_run(
+    report: &mut RunReport,
+    counters: &discover::DiscoverCounters,
+    progress: Option<&ProgressDisplay>,
+    listener: &tokio::task::JoinHandle<()>,
+) -> SeakarrError {
+    for notice in discover::discover_notices(counters) {
+        report.add_notice(notice);
+    }
+    if let Some(display) = progress {
+        display.clear();
+    }
+    report.print_summary();
+    listener.abort();
+    SeakarrError::MusicBrainz(format!(
+        "{DISCOVER_PROVIDER_FAILURE_LIMIT} consecutive MusicBrainz failures; aborting discover run"
+    ))
+}
+
+/// Consecutive provider failures tolerated before a discover run aborts.
+const DISCOVER_PROVIDER_FAILURE_LIMIT: u32 = 3;
+
+/// Run discover mode: derive artists from the library, ask MusicBrainz what
+/// each one is missing, and download only those albums.
+///
+/// Auto mode's upgrade pass is untouched: this mode never replaces an album it
+/// considers present.
+pub async fn run_discover_mode(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+    artist_filter: Option<&str>,
+    ignore_processed: bool,
+) -> Result<()> {
+    if !config.discography.enabled {
+        return Err(SeakarrError::Config(
+            "discover mode requires discography.enabled: true".into(),
+        ));
+    }
+    if config.library.paths.is_empty() {
+        return Err(SeakarrError::Config(
+            "library.paths is empty - discover mode needs a library to derive artists from".into(),
+        ));
+    }
+    let provider = MusicBrainzProvider::new().map_err(|error| {
+        SeakarrError::MusicBrainz(format!("could not construct the provider: {error}"))
+    })?;
+    run_discover_mode_with_provider(
+        client,
+        config,
+        db,
+        artist_filter,
+        ignore_processed,
+        Path::new(&config.storage.staging_dir),
+        &provider,
+    )
+    .await
+}
+
+/// Timeline-free core of discover mode, with the provider injected.
+#[allow(clippy::too_many_arguments)]
+async fn run_discover_mode_with_provider(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+    artist_filter: Option<&str>,
+    ignore_processed: bool,
+    staging_dir: &Path,
+    provider: &dyn DiscographyProvider,
+) -> Result<()> {
+    if !config.discography.enabled {
+        return Err(SeakarrError::Config(
+            "discover mode requires discography.enabled: true".into(),
+        ));
+    }
+    if config.library.paths.is_empty() {
+        return Err(SeakarrError::Config(
+            "library.paths is empty - discover mode needs a library to derive artists from".into(),
+        ));
+    }
+
+    let scanned = scanner::scan_library(&config.library.paths, &config.filters)?;
+    let index = discover::build_index(&scanned);
+    let selection =
+        discover::select_artists(&index, &config.discover.exclude_artists, artist_filter)?;
+
+    let mut counters = discover::DiscoverCounters {
+        excluded: selection.excluded.len(),
+        budget_limit: config.discover.max_cycle_downloads,
+        artists_total: selection.artists.len(),
+        ..discover::DiscoverCounters::default()
+    };
+    let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
+    let mut report = RunReport::new();
+    let mut consecutive_provider_failures: u32 = 0;
+
+    let progress = if is_interactive() {
+        Some(ProgressDisplay::new())
+    } else {
+        None
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+
+    for artist in &selection.artists {
+        if budget.exhausted() {
+            // Only the first write names the artist where the budget ran out;
+            // a later artist was never examined, so it must not rename it.
+            counters
+                .budget_reached_at
+                .get_or_insert_with(|| artist.clone());
+            break;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            // Cancellation is not a budget stop. Conflating the two would print
+            // a false "download budget reached" notice for a run the user
+            // interrupted.
+            break;
+        }
+        counters.artists_examined += 1;
+        match discover_artist_albums(provider, db, artist, &config.discography).await {
+            DiscoveryOutcome::Authoritative { albums, provenance } => {
+                if let DiscoveryProvenance::StaleCache {
+                    age_days,
+                    refresh_error,
+                    kind,
+                } = &provenance
+                {
+                    tracing::warn!(
+                        "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache"
+                    );
+                    // Only a genuine outage counts. A refresh that failed because
+                    // the artist no longer resolves means MusicBrainz answered and
+                    // the cached work list below is still usable, so the counter
+                    // resets rather than aborting a run over a name problem.
+                    if *kind == DiscoveryFailure::Provider {
+                        consecutive_provider_failures += 1;
+                        if consecutive_provider_failures >= DISCOVER_PROVIDER_FAILURE_LIMIT {
+                            return Err(abort_discover_run(
+                                &mut report,
+                                &counters,
+                                progress.as_ref(),
+                                &_listener,
+                            ));
+                        }
+                    } else {
+                        consecutive_provider_failures = 0;
+                    }
+                } else {
+                    consecutive_provider_failures = 0;
+                }
+                let missing = discover::missing_albums(&index, artist, &albums);
+                counters.present += albums.len() - missing.len();
+                for target in missing {
+                    if budget.exhausted() {
+                        counters
+                            .budget_reached_at
+                            .get_or_insert_with(|| artist.clone());
+                        break;
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let result = process_album(
+                        client,
+                        artist,
+                        Some(&target.title),
+                        ignore_processed,
+                        config,
+                        db,
+                        staging_dir,
+                        progress.as_ref(),
+                        Some(&cancel),
+                        None,
+                        None,
+                    )
+                    .await;
+                    match result {
+                        Ok(outcome) => {
+                            if charges_download_budget(&outcome) {
+                                budget.charge();
+                            }
+                            report.record(artist, &target.title, outcome);
+                        }
+                        Err(error) => {
+                            // Matches auto mode: an environment error is
+                            // recorded and the run continues to the next album.
+                            tracing::error!(
+                                "Album processing failed: {artist} - {}: {error}",
+                                target.title
+                            );
+                            // An error can arrive after a completed download,
+                            // because the post-download bookkeeping writes can
+                            // fail. `charges_after_error` draws that line from
+                            // the error class rather than from an index the run
+                            // has already mutated: the snapshot taken before the
+                            // run cannot see albums organised during it.
+                            if charges_after_error(&error) {
+                                budget.charge();
+                            }
+                            report.record(
+                                artist,
+                                &target.title,
+                                AlbumOutcome::Failed {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                    }
+                    if budget.exhausted() {
+                        counters
+                            .budget_reached_at
+                            .get_or_insert_with(|| artist.clone());
+                        break;
+                    }
+                }
+            }
+            DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
+                if let DiscoveryProvenance::StaleCache {
+                    age_days,
+                    refresh_error,
+                    kind,
+                } = &provenance
+                {
+                    tracing::warn!(
+                        "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); no eligible authoritative albums"
+                    );
+                    if *kind == DiscoveryFailure::Provider {
+                        consecutive_provider_failures += 1;
+                        if consecutive_provider_failures >= DISCOVER_PROVIDER_FAILURE_LIMIT {
+                            return Err(abort_discover_run(
+                                &mut report,
+                                &counters,
+                                progress.as_ref(),
+                                &_listener,
+                            ));
+                        }
+                    } else {
+                        consecutive_provider_failures = 0;
+                    }
+                } else {
+                    consecutive_provider_failures = 0;
+                }
+                counters.no_eligible_albums += 1;
+            }
+            DiscoveryOutcome::LegacyFallback { reason, kind } => match kind {
+                DiscoveryFailure::Unresolved => {
+                    // MusicBrainz answered for this artist, so the provider is
+                    // reachable. Reset the consecutive-failure count and keep
+                    // the circuit breaker for genuine outages only.
+                    consecutive_provider_failures = 0;
+                    tracing::warn!(
+                        "{artist}: artist could not be resolved on MusicBrainz: {reason}"
+                    );
+                    counters.unresolved.push(artist.clone());
+                }
+                DiscoveryFailure::Provider => {
+                    consecutive_provider_failures += 1;
+                    tracing::warn!("{artist}: MusicBrainz unavailable ({reason}); artist skipped");
+                    counters.provider_failed.push((artist.clone(), reason));
+                    if consecutive_provider_failures >= DISCOVER_PROVIDER_FAILURE_LIMIT {
+                        return Err(abort_discover_run(
+                            &mut report,
+                            &counters,
+                            progress.as_ref(),
+                            &_listener,
+                        ));
+                    }
+                }
+            },
+        }
+    }
+
+    for notice in discover::discover_notices(&counters) {
+        report.add_notice(notice);
+    }
+    if let Some(ref display) = progress {
+        display.clear();
+    }
+    report.print_summary();
+    _listener.abort();
+    Ok(())
 }
 
 /// Run in manual mode: process a single artist and/or album search target.
@@ -1591,8 +1992,8 @@ mod tests {
         .await;
         assert!(result.is_ok());
         match result.unwrap() {
-            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+            AlbumOutcome::NoCandidates { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::NoCandidates, got: {other:?}"),
         }
         assert!(
             !db.is_album_processed("Test Artist", "Test Album").unwrap(),
@@ -1656,7 +2057,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Ok(AlbumOutcome::Failed { .. })));
+        assert!(matches!(result, Ok(AlbumOutcome::NoCandidates { .. })));
         assert_eq!(
             db.get_album_status("Test Artist", "Test Album").unwrap(),
             Some("failed".to_string())
@@ -2125,7 +2526,7 @@ mod tests {
 
         assert!(matches!(
             &run.outcomes[0].1,
-            AlbumOutcome::Failed { reason }
+            AlbumOutcome::NoCandidates { reason }
                 if reason.contains("multi-disc album is split across peers")
         ));
         assert!(client.download_filenames.lock().unwrap().is_empty());
@@ -2264,6 +2665,8 @@ mod tests {
     struct FakeDiscographyProvider {
         groups: Vec<ReleaseGroup>,
         failure: Option<String>,
+        /// `None` echoes the requested artist back as the only candidate.
+        candidate_names: Option<Vec<String>>,
     }
 
     impl FakeDiscographyProvider {
@@ -2271,6 +2674,7 @@ mod tests {
             Self {
                 groups,
                 failure: None,
+                candidate_names: None,
             }
         }
 
@@ -2278,6 +2682,17 @@ mod tests {
             Self {
                 groups: Vec::new(),
                 failure: Some(reason.to_string()),
+                candidate_names: None,
+            }
+        }
+
+        /// A provider whose artist search returns only non-matching names, so
+        /// resolution fails as `DiscoveryFailure::Unresolved`.
+        fn unresolvable() -> Self {
+            Self {
+                groups: Vec::new(),
+                failure: None,
+                candidate_names: Some(vec!["Somebody Else".to_string()]),
             }
         }
     }
@@ -2291,11 +2706,19 @@ mod tests {
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
-            Ok(vec![ArtistCandidate {
-                id: "11111111-1111-1111-1111-111111111111".to_string(),
-                name: artist.to_string(),
-                score: None,
-            }])
+            let names = self
+                .candidate_names
+                .clone()
+                .unwrap_or_else(|| vec![artist.to_string()]);
+            Ok(names
+                .into_iter()
+                .enumerate()
+                .map(|(position, name)| ArtistCandidate {
+                    id: format!("1111111{position}-1111-1111-1111-111111111111"),
+                    name,
+                    score: None,
+                })
+                .collect())
         }
 
         async fn artist_by_id(
@@ -2609,7 +3032,7 @@ mod tests {
             "album queries must stay in chronological order, got {queries:?}"
         );
         assert!(
-            matches!(run.outcomes[0].1, AlbumOutcome::Failed { .. }),
+            matches!(run.outcomes[0].1, AlbumOutcome::NoCandidates { .. }),
             "the empty older album must fail"
         );
         assert!(
@@ -2876,6 +3299,599 @@ mod tests {
         );
     }
 
+    /// A library fixture with `<root>/Artist/Album/track.flac` directories.
+    fn library_with(albums: &[(&str, &str)]) -> TempDir {
+        let library = TempDir::new().unwrap();
+        for (artist, album) in albums {
+            let dir = library.path().join(artist).join(album);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("01 - track.flac"), b"fake flac data").unwrap();
+        }
+        library
+    }
+
+    fn discover_fixture(albums: &[(&str, &str)]) -> (Config, Database, TempDir, TempDir) {
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(albums);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        (config, db, staging, library)
+    }
+
+    fn search_index(soulseek: &MockClient, artist: &str, queries: &[(&str, &str)]) {
+        let mut map = soulseek.search_results_by_query.lock().unwrap();
+        for (query, album) in queries {
+            map.insert((*query).to_string(), vec![album_result(artist, album)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_artist_only_mode_skips_albums_already_present() {
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist".into(),
+            vec![album_result("Test Artist", "Present")],
+        );
+        // A failing provider forces the legacy folder heuristic, which is the
+        // documented opt-out and the automatic outage fallback.
+        let provider = FakeDiscographyProvider::failing("offline");
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            run.outcomes.is_empty(),
+            "an album already in the library must not be reprocessed on the legacy path: {:?}",
+            run.outcomes
+        );
+        assert!(
+            run.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already present")),
+            "expected an all-present notice, got {:?}",
+            run.notice
+        );
+        let queries = soulseek.search_queries.lock().unwrap().clone();
+        assert!(
+            !queries.iter().any(|query| query == "Test Artist Present"),
+            "no per-album search may follow the broad artist query; queries: {queries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_skips_albums_already_in_the_library() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("present", "Present", "1999"),
+            release_group("missing", "Missing", "2005"),
+        ]);
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Missing"],
+            "an album present in the library must not be re-downloaded"
+        );
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(matches!(run.outcomes[0].1, AlbumOutcome::Downloaded { .. }));
+        assert!(
+            run.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("1 album(s) already present")),
+            "expected an aggregate notice, got {:?}",
+            run.notice
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_with_everything_present_issues_no_search() {
+        let soulseek = MockClient::new();
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("present", "Present", "1999")]);
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+        assert!(run.outcomes.is_empty());
+        assert!(
+            run.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already present")),
+            "expected an all-present notice, got {:?}",
+            run.notice
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_manual_still_runs_when_the_library_path_is_missing() {
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1999")]);
+        let (mut config, db, staging) = artist_only_fixture();
+        config.library.paths = vec!["/definitely/not/here".to_string()];
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Album"],
+            "an unusable library path must not stop artist-only manual mode"
+        );
+        assert!(matches!(run.outcomes[0].1, AlbumOutcome::Downloaded { .. }));
+    }
+
+    #[tokio::test]
+    async fn discover_downloads_only_albums_the_library_lacks() {
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Test Artist", &[("Test Artist Newer", "Newer")]);
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("old", "Older", "1999"),
+            release_group("new", "Newer", "2005"),
+        ]);
+        let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Older")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Newer"],
+            "an album already in the library must never be searched"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_skips_an_album_with_no_candidates_without_charging_the_budget() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Second", "Second")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("first", "First", "1999"),
+            release_group("second", "Second", "2005"),
+        ]);
+        let (mut config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        config.discover.max_cycle_downloads = 1;
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek
+                .search_queries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query == "Test Artist Second"),
+            "the empty first album must not consume the only budget slot; queries: {:?}",
+            soulseek.search_queries.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_stops_at_the_budget_and_leaves_later_artists_unexamined() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Alpha Artist",
+            &[("Alpha Artist Missing", "Missing")],
+        );
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Alpha Artist", "Present"), ("Beta Artist", "Present")]);
+        config.discover.max_cycle_downloads = 1;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Alpha Artist Missing"],
+            "the budget must stop the run before the second artist"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_excludes_configured_artists_before_any_lookup() {
+        let soulseek = MockClient::new();
+        // The album is deliberately absent from the library, so if the artist
+        // were not excluded a search for it would be issued. The earlier fixture
+        // had the album present, which made the test pass with or without the
+        // exclusion logic.
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Various Artists", "Present")]);
+        config.discover.exclude_artists = vec!["Various Artists".to_string()];
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "an excluded artist must not be searched even when it has a missing album"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_does_not_charge_the_budget_for_already_processed_albums() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Second", "Second")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("first", "First", "1999"),
+            release_group("second", "Second", "2005"),
+        ]);
+        let (mut config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        config.discover.max_cycle_downloads = 1;
+        // The first album never reaches the download stage: a success record
+        // already exists, so process_album returns Skipped. It must not spend
+        // the only budget slot, or the run would stop before the second album
+        // and never advance on any later run either.
+        db.mark_album_processed("Test Artist", "First", "success")
+            .unwrap();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek
+                .search_queries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query == "Test Artist Second"),
+            "an already-processed album must not consume the budget; queries: {:?}",
+            soulseek.search_queries.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_narrows_to_the_requested_artist() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Beta Artist",
+            &[("Beta Artist Missing", "Missing")],
+        );
+        let (config, db, staging, _library) =
+            discover_fixture(&[("Alpha Artist", "Present"), ("Beta Artist", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Beta Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Beta Artist Missing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_a_filter_artist_absent_from_the_library() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[("Alpha Artist", "Present")]);
+        let provider = FakeDiscographyProvider::with_groups(vec![]);
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Nobody"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
+        assert!(error.to_string().contains("not found in the library"));
+    }
+
+    #[tokio::test]
+    async fn discover_skips_an_unresolved_artist_without_searching() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "an unresolved artist must never trigger a broad artist search"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_aborts_after_three_consecutive_provider_failures() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[
+            ("Alpha Artist", "Present"),
+            ("Beta Artist", "Present"),
+            ("Gamma Artist", "Present"),
+        ]);
+        let provider = FakeDiscographyProvider::failing("connection reset");
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::MusicBrainz(_)),
+            "expected a MusicBrainz error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn only_database_failures_charge_the_budget_after_an_error() {
+        // A post-download bookkeeping failure is a database error and means the
+        // transfer happened; a search-stage failure is not and means it did not.
+        assert!(charges_after_error(&SeakarrError::Database(
+            rusqlite::Error::InvalidQuery
+        )));
+        assert!(!charges_after_error(&SeakarrError::Client(
+            "search failed".into()
+        )));
+        assert!(!charges_after_error(&SeakarrError::Download(
+            "cancelled by user".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn discover_breaker_counts_stale_cache_fallbacks() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[
+            ("Alpha Artist", "Present"),
+            ("Beta Artist", "Present"),
+            ("Gamma Artist", "Present"),
+        ]);
+        // Every artist has a warm but stale cache, and the provider always
+        // fails, so each artist falls back to its cache. Those failures are
+        // still failures: without counting them the run would walk the entire
+        // library issuing one failing request per artist.
+        for artist in ["Alpha Artist", "Beta Artist", "Gamma Artist"] {
+            db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+                artist_key: crate::discography::normalize_catalog_key(artist),
+                artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
+                canonical_artist: artist.to_string(),
+                fetched_at: 1,
+                release_groups_json: serde_json::to_string(&vec![release_group(
+                    "present", "Present", "1999",
+                )])
+                .unwrap(),
+            })
+            .unwrap();
+        }
+        let provider = FakeDiscographyProvider::failing("offline");
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::MusicBrainz(_)),
+            "an outage hidden behind a stale cache must still trip the breaker, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_breaker_ignores_a_stale_cache_whose_refresh_stopped_resolving() {
+        // MusicBrainz answered the request; it simply no longer resolves this
+        // artist. That is not an outage, so the breaker must not abort, and the
+        // cached work list must still be used.
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[
+            ("Alpha Artist", "Present"),
+            ("Beta Artist", "Present"),
+            ("Gamma Artist", "Present"),
+        ]);
+        for artist in ["Alpha Artist", "Beta Artist", "Gamma Artist"] {
+            db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+                artist_key: crate::discography::normalize_catalog_key(artist),
+                artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
+                canonical_artist: artist.to_string(),
+                fetched_at: 1,
+                release_groups_json: serde_json::to_string(&vec![release_group(
+                    "present", "Present", "1999",
+                )])
+                .unwrap(),
+            })
+            .unwrap();
+        }
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        let result = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an unresolvable artist is not an outage and must not trip the breaker: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_requires_an_enabled_discography() {
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        config.discography.enabled = false;
+        let provider = FakeDiscographyProvider::with_groups(vec![]);
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("discography.enabled"),
+            "got {error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_primary_search_issues_single_query() {
         let client = Arc::new(MockClient::new());
@@ -2902,8 +3918,8 @@ mod tests {
         .await;
         assert!(result.is_ok());
         match result.unwrap() {
-            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+            AlbumOutcome::NoCandidates { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::NoCandidates, got: {other:?}"),
         }
 
         let queries = client.search_queries.lock().unwrap().clone();
@@ -2959,13 +3975,13 @@ mod tests {
         .await;
         assert!(result.is_ok());
         match result.unwrap() {
-            AlbumOutcome::Failed { reason } => {
+            AlbumOutcome::NoCandidates { reason } => {
                 assert!(
                     reason.contains("no results passed filters"),
                     "Expected 'no results passed filters', got: {reason}"
                 );
             }
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+            other => panic!("Expected AlbumOutcome::NoCandidates, got: {other:?}"),
         }
 
         // The cascade ran all tiers (primary, lowercase, album-only) because
@@ -3196,8 +4212,8 @@ mod tests {
         .await;
         assert!(result.is_ok());
         match result.unwrap() {
-            AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
-            other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+            AlbumOutcome::NoCandidates { reason } => assert_eq!(reason, "no results found"),
+            other => panic!("Expected AlbumOutcome::NoCandidates, got: {other:?}"),
         }
 
         // Only the three album searches ran (primary + lowercase fallback +

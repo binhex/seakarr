@@ -40,6 +40,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub search: SearchConfig,
     pub discography: DiscographyConfig,
+    pub discover: DiscoverConfig,
     pub filters: FilterConfig,
     pub download: DownloadConfig,
     pub database: DatabaseConfig,
@@ -264,6 +265,39 @@ impl Default for DiscographyConfig {
             cache_days: default_discography_cache_days(),
             allowed_types: default_discography_release_types(),
             artist_mbids: BTreeMap::new(),
+        }
+    }
+}
+
+/// Gap-filling (`discover` mode) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverConfig {
+    /// Download attempts allowed per run. `0` means unlimited.
+    #[serde(default = "default_discover_max_cycle_downloads")]
+    pub max_cycle_downloads: u32,
+    /// Artist keys skipped before any MusicBrainz lookup. Matched as whole
+    /// normalised keys, never as substrings.
+    #[serde(default = "default_discover_exclude_artists")]
+    pub exclude_artists: Vec<String>,
+}
+
+fn default_discover_max_cycle_downloads() -> u32 {
+    5
+}
+
+fn default_discover_exclude_artists() -> Vec<String> {
+    vec![
+        "Various Artists".to_string(),
+        "VA".to_string(),
+        "Unknown Artist".to_string(),
+    ]
+}
+
+impl Default for DiscoverConfig {
+    fn default() -> Self {
+        Self {
+            max_cycle_downloads: default_discover_max_cycle_downloads(),
+            exclude_artists: default_discover_exclude_artists(),
         }
     }
 }
@@ -1085,6 +1119,7 @@ impl Default for Config {
                 batch: BatchConfig::default(),
             },
             discography: DiscographyConfig::default(),
+            discover: DiscoverConfig::default(),
             filters: FilterConfig {
                 allowed_extensions: default_extensions(),
                 min_bit_rate: 0,
@@ -2609,5 +2644,57 @@ search:
         assert!(contents.contains("discography:"));
         assert!(contents.contains("cache_days: 30"));
         assert!(contents.contains("studio_album"));
+    }
+
+    // ── discover tests ──
+
+    #[test]
+    fn discover_defaults_are_conservative() {
+        let config = Config::default();
+        assert_eq!(config.discover.max_cycle_downloads, 5);
+        assert_eq!(
+            config.discover.exclude_artists,
+            vec![
+                "Various Artists".to_string(),
+                "VA".to_string(),
+                "Unknown Artist".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn default_config_file_documents_the_discover_block() {
+        let dir = TempDir::new().unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let yaml = fs::read_to_string(dir.path().join("seakarr.yml")).unwrap();
+        assert!(yaml.contains("discover:"), "got:\n{yaml}");
+        assert!(yaml.contains("max_cycle_downloads: 5"), "got:\n{yaml}");
+        assert_eq!(config.discover.max_cycle_downloads, 5);
+    }
+
+    #[test]
+    fn a_config_without_the_discover_block_still_loads() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "soulseek:\n  username: user\n  password: pass\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(config.discover.max_cycle_downloads, 5);
+        assert!(!config.discover.exclude_artists.is_empty());
+    }
+
+    #[test]
+    fn discovered_exclusions_may_be_disabled_with_an_empty_list() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "discover:\n  exclude_artists: []\n",
+        )
+        .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        assert!(config.discover.exclude_artists.is_empty());
+        assert_eq!(config.discover.max_cycle_downloads, 5);
     }
 }

@@ -61,6 +61,13 @@ pub enum DiscographyError {
     IncompletePagination(String),
     #[error("artist could not be resolved safely: {0}")]
     ArtistUnresolved(String),
+    /// The provider answered, but its candidate data was unusable: a search
+    /// score outside the documented range, or a missing score where one is
+    /// required. This is a provider defect, not an artist that genuinely cannot
+    /// be resolved, so it must not be reported as an unresolved artist where it
+    /// would hide a MusicBrainz outage from the circuit breaker.
+    #[error("MusicBrainz returned unusable artist candidate data: {0}")]
+    InvalidCandidateData(String),
 }
 
 #[async_trait]
@@ -162,12 +169,12 @@ fn resolve_dominant_artist(
         .filter(|score| *score > REQUIRED_TOP_SCORE)
         .max()
     {
-        return Err(DiscographyError::ArtistUnresolved(format!(
+        return Err(DiscographyError::InvalidCandidateData(format!(
             "{exact_matches} candidates match {artist_key:?} and one reports the invalid score {invalid}"
         )));
     }
     if matches.iter().any(|candidate| candidate.score.is_none()) {
-        return Err(DiscographyError::ArtistUnresolved(format!(
+        return Err(DiscographyError::InvalidCandidateData(format!(
             "{exact_matches} candidates match {artist_key:?} and at least one has no search score"
         )));
     }
@@ -443,7 +450,37 @@ pub enum DiscoveryProvenance {
     StaleCache {
         age_days: u64,
         refresh_error: String,
+        /// Why the refresh failed. Kept so callers can tell a genuine outage
+        /// from a refresh that merely stopped resolving the artist: only the
+        /// former is an outage for circuit-breaker purposes.
+        kind: DiscoveryFailure,
     },
+}
+
+/// Why authoritative discovery could not supply albums.
+///
+/// The distinction matters to callers that must not treat an unresolvable
+/// artist like an outage: `discover` aborts after consecutive
+/// [`DiscoveryFailure::Provider`] failures but keeps going past any number of
+/// [`DiscoveryFailure::Unresolved`] artists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryFailure {
+    /// The artist could not be resolved to exactly one MusicBrainz candidate.
+    Unresolved,
+    /// MusicBrainz could not be reached, or returned unusable data.
+    Provider,
+}
+
+impl DiscoveryFailure {
+    /// Only an artist-resolution failure is an artist problem; every other
+    /// provider error (transport, HTTP status, decode, pagination, or unusable
+    /// candidate data) is an outage problem.
+    fn from_error(error: &DiscographyError) -> Self {
+        match error {
+            DiscographyError::ArtistUnresolved(_) => Self::Unresolved,
+            _ => Self::Provider,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +494,7 @@ pub enum DiscoveryOutcome {
     },
     LegacyFallback {
         reason: String,
+        kind: DiscoveryFailure,
     },
 }
 
@@ -650,11 +688,13 @@ fn stale_or_legacy(
 ) -> DiscoveryOutcome {
     let Some(cached) = cached else {
         return DiscoveryOutcome::LegacyFallback {
+            kind: DiscoveryFailure::from_error(&refresh_error),
             reason: refresh_error.to_string(),
         };
     };
     let provenance = DiscoveryProvenance::StaleCache {
         age_days: stale_age_days(now, cached.entry.fetched_at),
+        kind: DiscoveryFailure::from_error(&refresh_error),
         refresh_error: refresh_error.to_string(),
     };
     select_outcome(&cached.groups, allowed, provenance)
@@ -851,6 +891,33 @@ mod tests {
                 "tied top score of 100",
             ),
             (
+                "no exact match",
+                vec![scored("a", "Somebody Else", Some(100))],
+                "no candidate matches \"ils\"",
+            ),
+        ];
+
+        for (label, candidates, expected_reason) in cases {
+            let error = resolve_artist("ils", &candidates).unwrap_err();
+            assert!(
+                matches!(error, DiscographyError::ArtistUnresolved(_)),
+                "{label} must stay unresolved, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_reason),
+                "{label} must explain the failed rule, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unusable_candidate_data_is_not_reported_as_unresolved() {
+        // Invalid or missing search scores are provider data defects rather than
+        // an artist that cannot be resolved. Classifying them with the
+        // resolution failures would hide a broken provider from the discover
+        // circuit breaker.
+        let cases = vec![
+            (
                 "missing competing score",
                 vec![scored("a", "Ils", Some(100)), scored("b", "Ils", None)],
                 "at least one has no search score",
@@ -875,18 +942,13 @@ mod tests {
                 vec![scored("a", "Ils", Some(101)), scored("b", "Ils", Some(255))],
                 "invalid score 255",
             ),
-            (
-                "no exact match",
-                vec![scored("a", "Somebody Else", Some(100))],
-                "no candidate matches \"ils\"",
-            ),
         ];
 
         for (label, candidates, expected_reason) in cases {
             let error = resolve_artist("ils", &candidates).unwrap_err();
             assert!(
-                matches!(error, DiscographyError::ArtistUnresolved(_)),
-                "{label} must stay unresolved, got {error:?}"
+                matches!(error, DiscographyError::InvalidCandidateData(_)),
+                "{label} must be classed as a provider data defect, got {error:?}"
             );
             assert!(
                 error.to_string().contains(expected_reason),
@@ -1317,8 +1379,9 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            DiscoveryOutcome::LegacyFallback { reason }
-                if reason.contains("artist could not be resolved safely")
+            DiscoveryOutcome::LegacyFallback { reason, kind }
+                if kind == DiscoveryFailure::Unresolved
+                    && reason.contains("artist could not be resolved safely")
         ));
     }
 
@@ -1769,8 +1832,9 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            DiscoveryOutcome::LegacyFallback { reason }
-                if reason.contains("artist could not be resolved safely")
+            DiscoveryOutcome::LegacyFallback { reason, kind }
+                if kind == DiscoveryFailure::Unresolved
+                    && reason.contains("artist could not be resolved safely")
                     && reason.contains("below 100")
         ));
     }
@@ -1835,5 +1899,72 @@ mod tests {
             }
         ));
         assert_eq!(provider.total_calls(), 0);
+    }
+
+    #[test]
+    fn unusable_candidate_data_is_classified_as_a_provider_failure() {
+        // A malformed response must count towards the circuit breaker. Calling
+        // it "unresolved" would let a broken provider outrun the breaker and
+        // grind through the whole library, which is what the breaker prevents.
+        let invalid = DiscographyError::InvalidCandidateData("invalid score 255".into());
+        assert_eq!(
+            DiscoveryFailure::from_error(&invalid),
+            DiscoveryFailure::Provider
+        );
+        // A wrong page is a provider defect too, so it must reach the breaker.
+        let pagination = DiscographyError::IncompletePagination("non-zero offset".into());
+        assert_eq!(
+            DiscoveryFailure::from_error(&pagination),
+            DiscoveryFailure::Provider
+        );
+        let unresolved = DiscographyError::ArtistUnresolved("no candidate matches".into());
+        assert_eq!(
+            DiscoveryFailure::from_error(&unresolved),
+            DiscoveryFailure::Unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_artist_reports_the_unresolved_kind() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider::artists(Vec::new());
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &DiscographyConfig::default(),
+            1_000,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                kind: DiscoveryFailure::Unresolved,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_error_reports_the_provider_kind() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider::failing("connection reset");
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            1_000,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                kind: DiscoveryFailure::Provider,
+                ..
+            }
+        ));
     }
 }

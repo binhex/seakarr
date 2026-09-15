@@ -54,7 +54,7 @@ struct Cli {
     #[arg(long)]
     listen_port: Option<u16>,
 
-    /// Override search mode (auto|manual|batch)
+    /// Override search mode (auto|manual|batch|discover)
     #[arg(long)]
     mode: Option<String>,
 
@@ -440,6 +440,9 @@ async fn dispatch_execution_plan(
         }
         ExecutionPlan::Batch { file_path } => {
             run_batch_mode(client, file_path, config, db, ignore_processed).await
+        }
+        ExecutionPlan::Discover { artist } => {
+            runner::run_discover_mode(client, config, db, artist.as_deref(), ignore_processed).await
         }
     }
 }

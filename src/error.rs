@@ -23,6 +23,9 @@ pub enum SeakarrError {
     #[error("scanner error: {0}")]
     Scanner(String),
 
+    #[error("musicbrainz error: {0}")]
+    MusicBrainz(String),
+
     #[error("download error: {0}")]
     Download(String),
 

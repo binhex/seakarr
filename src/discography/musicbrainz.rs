@@ -258,12 +258,20 @@ impl MusicBrainzProvider {
             )
             .await?;
         if page.offset != 0 {
-            return Err(DiscographyError::ArtistUnresolved(format!(
+            // The request never sends an offset, so a non-zero one means the
+            // provider (or an intermediary) answered with the wrong page. That
+            // is a provider defect, not an artist that cannot be resolved:
+            // classifying it as unresolved would hide a broken provider from
+            // the discover circuit breaker and let a run grind on.
+            return Err(DiscographyError::IncompletePagination(format!(
                 "artist search returned a non-zero offset {}",
                 page.offset
             )));
         }
         if page.count != page.artists.len() {
+            // Deliberately unresolved rather than a provider defect: the
+            // reported total exceeds the page we read, so the exact-name match
+            // cannot be proven from the candidates in hand.
             return Err(DiscographyError::ArtistUnresolved(format!(
                 "artist search returned {} candidates but reported {}",
                 page.artists.len(),
@@ -914,6 +922,34 @@ mod tests {
         assert!(matches!(
             provider.search_artists("Artist").await,
             Err(DiscographyError::ArtistUnresolved(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn artist_search_with_a_non_zero_offset_is_a_provider_failure() {
+        // The request never sends an offset, so a non-zero one means the
+        // provider answered with the wrong page. It must be classed as a
+        // provider failure, or the discover circuit breaker could never trip on
+        // a misbehaving provider and the run would grind on.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1,
+                "offset": 5,
+                "artists": [{
+                    "id": "artist-0",
+                    "name": "Artist"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        assert!(matches!(
+            provider.search_artists("Artist").await,
+            Err(DiscographyError::IncompletePagination(_))
         ));
     }
 

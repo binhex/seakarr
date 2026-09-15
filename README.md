@@ -11,11 +11,18 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Automatic mode** — for each album needing an upgrade, searches the Soulseek network, ranks
   candidates by speed × free slots × bitrate, downloads the best match, and organises the result into your
   library.
+- **Discover mode** — derives the artist list from your library (tags first,
+  folder names as the fallback), asks MusicBrainz which conceptual albums each
+  artist is missing, and downloads only those. Albums already present are never
+  searched or re-downloaded, and each run stops after
+  `discover.max_cycle_downloads` download attempts so a large library fills in
+  over successive runs. Release types come from `discography.allowed_types`.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
 - **Authoritative artist discography** — artist-only manual runs resolve conceptual albums from MusicBrainz
   release groups (cached locally for 30 days) and then run one sequential `Artist Album` Soulseek search per
-  eligible album, oldest first. Release categories and optional MusicBrainz artist IDs are configurable; the
+  eligible album, oldest first. The same authoritative resolution powers `discover` mode for every artist
+  derived from your library. Release categories and optional MusicBrainz artist IDs are configurable; the
   previous folder heuristic remains the explicit opt-out and the visible fallback.
 - **Quality filtering** — filter Soulseek results by file extension, minimum
   bitrate, excluded keywords, and upload availability. With
@@ -37,9 +44,9 @@ Automated Soulseek music downloader with library quality upgrading.
   duplicate handling.
 - **SQLite persistence** — tracks processed albums, download queue, peer reputation, and search history
   across restarts and schedule cycles.
-- **Scheduled mode** — run the selected auto, manual, or batch operation immediately, then repeat it after a
-  configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle cancellation or
-  stops the scheduler while it is waiting between cycles.
+- **Scheduled mode** — run the selected auto, manual, batch, or discover operation immediately, then repeat
+  it after a configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle
+  cancellation or stops the scheduler while it is waiting between cycles.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
   directory.
 - **Notifications** — sends alerts via any [Apprise](https://github.com/caronc/apprise)-compatible service
@@ -146,25 +153,31 @@ All options are optional overrides. When an option is omitted, the value from `s
 
 | Option | Description | Default |
 | ------ | ----------- | ------- |
-| `--mode <mode>` | Select `auto`, `manual`, or `batch`: library scan, target search, or batch file. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). | *(from config)* |
+| `--mode <mode>` | Select `auto`, `manual`, `batch`, or `discover`. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
-| `--schedule` | Run immediately, then repeat the same validated auto, manual, or batch operation after each interval. | `false` |
+| `--schedule` | Run immediately, then repeat the same validated auto, manual, batch, or discover operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
 
-`--ignore-processed` applies to one-shot auto, manual, and batch modes. It is a
-CLI-only override: it does not persist to configuration YAML, it leaves search
-history and unrelated albums untouched, and it is intended for replacing corrupt
-or otherwise invalid downloaded files. The matching successful database record is
-deleted before the attempt; if the retry fails, the album remains eligible for
-normal future retries. In manual and batch modes, use `storage.organize: true` if
-the replacement should be moved into the library; otherwise it remains in staging.
-In auto mode, only albums selected by the existing upgrade scanner are eligible.
-The flag cannot be combined with `--schedule` (or configured scheduled mode), so a
-forced reprocess is never repeated automatically on every cycle. If a forced
-search fails before completing, the album is recorded as failed and remains
-eligible for normal future retries.
+`--ignore-processed` applies to one-shot auto, manual, batch, and discover modes.
+In `discover` mode, and in artist-only manual runs (`--artist` without
+`--album`), it is honoured for processed-record checks but it never bypasses the
+library-presence check, so it cannot re-download an album you already own. To
+force a replacement of a file you believe is corrupt, name the album explicitly
+(`--artist X --album Y`), which is never filtered by library presence. It is a
+CLI-only override: it does not persist to configuration
+YAML, it leaves search history and unrelated albums untouched, and it is
+intended for replacing corrupt or otherwise invalid downloaded files. The
+matching successful database record is deleted before the attempt; if the retry
+fails, the album remains eligible for normal future retries. In manual and
+batch modes, use `storage.organize: true` if the replacement should be moved
+into the library; otherwise it remains in staging. In auto mode, only albums
+selected by the existing upgrade scanner are eligible. The flag cannot be
+combined with `--schedule` (or configured scheduled mode), so a forced reprocess
+is never repeated automatically on every cycle. If a forced search fails before
+completing, the album is recorded as failed and remains eligible for normal
+future retries.
 
 ## Configuration
 
@@ -206,7 +219,7 @@ mode are ignored. CLI values take precedence over values in the selected section
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `default_mode` | Default search mode. Choices: `auto`, `manual`, `batch`. | `auto` |
+| `default_mode` | Default search mode. Choices: `auto`, `manual`, `batch`, `discover`. | `auto` |
 | `timeout_secs` | How long to wait for Soulseek search responses. | `15` |
 | `response_limit` | Maximum search results to collect. *(Reserved for future use — not yet enforced.)* | `1000` |
 | `type` | Filter results by track count. `any` (no restriction), `album` (5+ tracks), `single` (1–4 tracks). *(Reserved for future use — not yet enforced.)* | `any` |
@@ -221,10 +234,12 @@ mode are ignored. CLI values take precedence over values in the selected section
 
 ### `discography`
 
-Controls authoritative MusicBrainz discovery for artist-only manual runs. The
-artist's conceptual release groups are resolved before any Soulseek search;
-explicit artist-plus-album, album-only, batch, auto, and library-upgrade flows
-are unchanged. The MusicBrainz API needs no account or API key.
+Controls authoritative MusicBrainz discovery. Artist-only manual runs resolve
+the artist's conceptual release groups before any Soulseek search, and
+`discover` mode applies the same resolution to every eligible artist derived
+from your library. Explicit artist-plus-album, album-only, batch, auto, and
+library-upgrade flows are unchanged. The MusicBrainz API needs no account or API
+key.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
@@ -232,6 +247,22 @@ are unchanged. The MusicBrainz API needs no account or API key.
 | `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
 | `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. | `[studio_album]` |
 | `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. | `{}` |
+
+### `discover`
+
+Controls `discover` mode, which fills gaps in your library for artists you
+already have.
+
+| Key | Description | Default |
+| --- | ----------- | ------- |
+| `max_cycle_downloads` | Download attempts allowed per run. `0` means unlimited. Only work that reached the download stage is charged: albums skipped because they are already present, albums already recorded as processed, and albums whose search produced no admissible candidate all cost nothing. A transfer that fails is charged and retried on a later run, so a cluster of permanently unavailable albums can consume successive runs before later artists are reached. | `5` |
+| `exclude_artists` | Artist names skipped before any MusicBrainz lookup, matched as whole names ignoring case and spacing, which prevents aggregator folders from expanding into hundreds of releases when `compilation` or `live_album` is enabled. An explicit `--artist` overrides this list for that one artist. | `[Various Artists, VA, Unknown Artist]` |
+
+An album counts as present when a matching `artist/album` folder holds at least
+one audio file. Matching is exact after case, spacing, and Unicode folding, so
+punctuation is significant and an album you hold only as a deluxe or remastered
+edition does not satisfy the plain album. Quality is not considered: replacing
+lossy files remains `auto` mode's job.
 
 ### `filters`
 
@@ -324,7 +355,7 @@ seakarr saves the original as `seakarr.yml.bak`. Explicit values already under
 
 ## How it works
 
-Seakarr has three operating modes:
+Seakarr has four operating modes:
 
 ### Automatic mode (default)
 
@@ -366,7 +397,9 @@ then runs through the normal targeted `Artist Album` search, sequentially and
 oldest first; editions and remasters of the same conceptual album are
 deduplicated before searching. At least one target is required; CLI values take
 precedence over `search.manual.artist` and `search.manual.album`, and album-only
-searches are supported.
+searches are supported. Artist-only manual runs also skip every album that is
+already present in the library, so `--artist X` fetches only what you are
+missing rather than re-downloading albums you already own.
 
 Explicit artist-plus-album and album-only manual searches, batch mode, automatic
 mode, and the library-upgrade workflow are unchanged and never consult
@@ -380,9 +413,22 @@ with a WARN and a run-summary notice.
 Reads a newline-separated text file of `artist - album` lines and performs steps 3–7 for each line. Reports
 success and failure counts on completion. Lines starting with `#` are treated as comments.
 
+### Discover mode
+
+Fills in what an existing library is missing. Seakarr walks `library.paths` once and derives
+the artist list from tags where present, falling back to folder names. Each artist is resolved
+on MusicBrainz using the same authoritative resolution as artist-only manual mode, and the
+release groups in `discography.allowed_types` are the only candidates. Albums already present
+in the library are skipped, and the remainder runs through the same search, ranking,
+download, organisation, and notification pipeline as the other modes, oldest album first.
+`discover.exclude_artists` skips aggregator names before any lookup, `--artist` optionally
+narrows the run to one artist already in the library, and the run stops after
+`discover.max_cycle_downloads` download attempts so a large library fills in over successive
+runs.
+
 ### Scheduled mode
 
-When `--schedule` or `schedule.enabled` is set, the same validated auto, manual, or batch
+When `--schedule` or `schedule.enabled` is set, the same validated auto, manual, batch, or discover
 plan runs immediately in a foreground loop. After each cycle completes, seakarr waits for
 `schedule.interval_mins` before dispatching that unchanged plan again. SIGTERM received at
 any time stops the scheduler after the active cycle and removes the PID file. Ctrl+C during
@@ -613,6 +659,31 @@ The integration deliberately favors safe fallback over guessing:
   refresh replaces that artist's row atomically.
 - `Retry-After` accepts integer delay-seconds from 0 through 30. HTTP-date, malformed, or larger values are
   treated as provider unavailability so an external response cannot cause an unbounded wait.
+
+**Q: What happens when MusicBrainz cannot resolve an artist from my library?**
+
+In `discover` mode the artist is skipped for that run and reported in the run
+summary: no broad Soulseek artist search is issued and no folder-derived
+discovery is attempted, so albums are never downloaded from an unverified
+identity. `discography.artist_mbids` is the supported fix for a name MusicBrainz
+cannot resolve on its own. Three consecutive MusicBrainz request failures abort
+the run instead, so a provider outage cannot grind through the rest of the
+library.
+
+**Q: How do I fill in missing albums for one artist only?**
+
+Run `--mode discover --artist "Artist Name"`. The name must already exist in
+your library; discover only narrows the list it derives from your library, it
+never adds an artist you do not have. To fetch a specific album instead, use
+`--mode manual --artist "Artist Name" --album "Album Title"`.
+
+**Q: Can I run auto mode and discover mode on a schedule at the same time?**
+
+No. seakarr holds a single PID lock and a single Soulseek session, and a second
+login with the same username displaces the running instance. A scheduled
+instance performs one job: either upgrading what you have (`--mode auto`) or
+filling gaps (`--mode discover`). Alternating between them across separate runs
+is the supported approach.
 
 ___
 If you appreciate my work, then please consider buying me a beer  :D

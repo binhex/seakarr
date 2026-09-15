@@ -176,8 +176,9 @@ mod tests {
         ]);
         assert_eq!(index.artist_keys().collect::<Vec<_>>(), ["the beatles"]);
         assert!(index.contains_album("THE BEATLES", "abbey road"));
+        assert!(index.contains_album("The Beatles", "Abbey Road!"));
         assert!(
-            !index.contains_album("The Beatles", "Abbey Road!"),
+            !index.contains_album("The Beatles", "Abbey-Road"),
             "punctuation must remain significant"
         );
     }
@@ -1229,9 +1230,9 @@ Add to the `tests` module in `src/discover.rs`:
             no_eligible_albums: 1,
             provider_failed: vec![("Offline Artist".to_string(), "connection reset".to_string())],
             budget_reached_at: Some("Beta Band".to_string()),
+            budget_limit: 5,
             artists_total: 10,
             artists_examined: 4,
-            ..DiscoverCounters::default()
         };
         assert_eq!(
             discover_notices(&counters),
@@ -1391,7 +1392,7 @@ pub fn index_from_paths(paths: &[String], filters: &FilterConfig) -> Result<Libr
 
 Run: `cargo test -p seakarr --lib discover -v`
 
-Expected: PASS, 26 tests.
+Expected: PASS, 28 `discover::tests` (the filtered run reports more, because the filter also matches other modules' test names).
 
 - [ ] **Step 5: Extend the runner test double**
 
@@ -1478,12 +1479,12 @@ tests:
         (config, db, staging, library)
     }
 
-    fn search_index(soulseek: &MockClient, queries: &[(&str, &str)]) {
+    fn search_index(soulseek: &MockClient, artist: &str, queries: &[(&str, &str)]) {
         let mut map = soulseek.search_results_by_query.lock().unwrap();
         for (query, album) in queries {
             map.insert(
                 (*query).to_string(),
-                vec![album_result("Test Artist", album)],
+                vec![album_result(artist, album)],
             );
         }
     }
@@ -1491,7 +1492,7 @@ tests:
     #[tokio::test]
     async fn discover_downloads_only_albums_the_library_lacks() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Test Artist Newer", "Newer")]);
+        search_index(&soulseek, "Test Artist", &[("Test Artist Newer", "Newer")]);
         let provider = FakeDiscographyProvider::with_groups(vec![
             release_group("old", "Older", "1999"),
             release_group("new", "Newer", "2005"),
@@ -1521,7 +1522,7 @@ tests:
     #[tokio::test]
     async fn discover_skips_an_album_with_no_candidates_without_charging_the_budget() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Test Artist Second", "Second")]);
+        search_index(&soulseek, "Test Artist", &[("Test Artist Second", "Second")]);
         let provider = FakeDiscographyProvider::with_groups(vec![
             release_group("first", "First", "1999"),
             release_group("second", "Second", "2005"),
@@ -1556,7 +1557,7 @@ tests:
     #[tokio::test]
     async fn discover_stops_at_the_budget_and_leaves_later_artists_unexamined() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Alpha Artist Missing", "Missing")]);
+        search_index(&soulseek, "Alpha Artist", &[("Alpha Artist Missing", "Missing")]);
         let (mut config, db, staging, _library) =
             discover_fixture(&[("Alpha Artist", "Present"), ("Beta Artist", "Present")]);
         config.discover.max_cycle_downloads = 1;
@@ -1612,7 +1613,7 @@ tests:
     #[tokio::test]
     async fn discover_narrows_to_the_requested_artist() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Beta Artist Missing", "Missing")]);
+        search_index(&soulseek, "Beta Artist", &[("Beta Artist Missing", "Missing")]);
         let (config, db, staging, _library) =
             discover_fixture(&[("Alpha Artist", "Present"), ("Beta Artist", "Present")]);
         let provider = FakeDiscographyProvider::with_groups(vec![release_group(
@@ -1841,7 +1842,9 @@ async fn run_discover_mode_with_provider(
 
     for artist in &selection.artists {
         if cancel.load(Ordering::SeqCst) || budget.exhausted() {
-            counters.budget_reached_at = Some(artist.clone());
+            // Only the first write names the artist where the budget ran out;
+            // a later artist was never examined, so it must not rename it.
+            counters.budget_reached_at.get_or_insert_with(|| artist.clone());
             break;
         }
         counters.artists_examined += 1;
@@ -1861,7 +1864,7 @@ async fn run_discover_mode_with_provider(
                 counters.present += albums.len() - missing.len();
                 for target in missing {
                     if cancel.load(Ordering::SeqCst) || budget.exhausted() {
-                        counters.budget_reached_at = Some(artist.clone());
+                        counters.budget_reached_at.get_or_insert_with(|| artist.clone());
                         break;
                     }
                     let result = process_album(
@@ -1903,7 +1906,7 @@ async fn run_discover_mode_with_provider(
                         }
                     }
                     if budget.exhausted() {
-                        counters.budget_reached_at = Some(artist.clone());
+                        counters.budget_reached_at.get_or_insert_with(|| artist.clone());
                         break;
                     }
                 }
@@ -1966,9 +1969,9 @@ crate::discography::{...}` import list in `src/runner.rs`.
 
 Run: `cargo test -p seakarr --lib runner::tests::discover -v`
 
-Expected: PASS, 10 tests.
+Expected: PASS, 12 tests.
 
-Then: `cargo test -p seakarr --lib discover -v` (26 tests) and
+Then: `cargo test -p seakarr --lib discover -v` (28 `discover::tests`) and
 `cargo test --workspace`.
 
 - [ ] **Step 10: Commit**
@@ -2360,7 +2363,7 @@ Add to the `mod tests` in `src/runner.rs`:
     #[tokio::test]
     async fn artist_only_manual_skips_albums_already_in_the_library() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Test Artist Missing", "Missing")]);
+        search_index(&soulseek, "Test Artist", &[("Test Artist Missing", "Missing")]);
         let provider = FakeDiscographyProvider::with_groups(vec![
             release_group("present", "Present", "1999"),
             release_group("missing", "Missing", "2005"),
@@ -2527,7 +2530,7 @@ Add to the `mod tests` in `src/runner.rs`:
     #[tokio::test]
     async fn artist_only_manual_still_runs_when_the_library_path_is_missing() {
         let soulseek = MockClient::new();
-        search_index(&soulseek, &[("Test Artist Album", "Album")]);
+        search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
         let provider =
             FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1999")]);
         let (mut config, db, staging) = artist_only_fixture();

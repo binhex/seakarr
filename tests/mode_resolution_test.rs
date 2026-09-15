@@ -409,3 +409,93 @@ fn ignore_processed_with_legacy_daemon_warns_and_fails_before_login() {
     assert!(combined.contains("cannot be used with scheduled mode"));
     assert!(!combined.contains("Connecting to Soulseek"));
 }
+
+#[test]
+fn test_discover_mode_with_library_passes_validation() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    let library = temp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        format!(
+            "soulseek:\n  username: user\n  password: pass\nlibrary:\n  paths:\n    - {}\n",
+            library.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--mode",
+            "discover",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected --test to accept a discover plan, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Configuration is valid."),
+        "got:\n{combined}"
+    );
+}
+
+#[test]
+fn test_discover_mode_rejects_album_selector() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    let library = temp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        format!(
+            "soulseek:\n  username: user\n  password: pass\nlibrary:\n  paths:\n    - {}\n",
+            library.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--mode",
+            "discover",
+            "--album",
+            "Album",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(output.status.code(), Some(0), "got:\n{combined}");
+    assert!(
+        combined.contains("--album is incompatible with discover mode"),
+        "got:\n{combined}"
+    );
+}

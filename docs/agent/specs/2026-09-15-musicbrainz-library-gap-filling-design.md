@@ -169,8 +169,16 @@ do not block retries (`is_album_processed` returns true only for `success`), so
 with a deterministic album order the same cap-exhausting albums would consume
 the budget on every run and no download would ever start. The distinction is
 made explicit rather than inferred from reason strings: `AlbumOutcome` gains
-`NoCandidates { reason }` for those two paths, and the budget is charged for
-every outcome except that one.
+`NoCandidates { reason }` for those two paths. The budget is charged for exactly
+`Downloaded` and `Failed` outcomes — the two that reached the download stage —
+and for nothing else. `NoCandidates` and `Skipped` are both free.
+
+An error returned by the album pipeline is charged only when it is a database
+failure. The database writes around a transfer are what record its success or
+failure, so a transfer that happened surfaces as a database error even when the
+post-download write is what failed. Every other error class comes from the search
+stage before any transfer, and charging those would let a run whose searches keep
+failing spend its whole allowance without attempting a download.
 
 `NoCandidates` is an internal discriminant, not a new user-visible outcome. The
 run report renders it in the existing `Failed` section with its reason, so
@@ -180,6 +188,10 @@ When the budget is exhausted, the run stops examining further artists instead of
 continuing MusicBrainz lookups it cannot act on. The report therefore states how
 many of the selected artists were examined and which artist the run stopped at,
 rather than claiming a total number of remaining gaps it has not discovered.
+
+The stopping artist is recorded with the first write only: every later artist in
+the selected list was skipped without being examined, so letting an outer-loop
+guard assign the name again would report an artist the run never looked at.
 
 ### Unresolved artists are skipped and reported
 
@@ -197,13 +209,23 @@ supported fix for a persistently unresolved artist.
 ### Provider errors skip rather than fall back
 
 A provider error (transport failure, HTTP status, oversized or malformed
-response, incomplete pagination) is reported as a skipped artist for that run.
-Cached discographies are unaffected, so an outage only costs the artists that
-need a network refresh.
+response, incomplete pagination, or unusable candidate data) is reported as a
+skipped artist for that run. Cached discographies are unaffected, so an outage
+only costs the artists that need a network refresh.
 
-If three consecutive uncached artists fail a provider request, the run aborts
-with an error instead of grinding through the remainder of the library against a
-dead API.
+If three consecutive artists fail a provider request, the run aborts with an
+error instead of grinding through the remainder of the library against a dead
+API. An artist served from a *stale* cache counts as a failure whenever the
+refresh failed for a provider reason, because the provider was unreachable
+behind it; without that rule a warm 30-day cache would hide an outage and the
+run would walk the whole library issuing one failing request per artist. A
+refresh that failed because the artist no longer resolves is not an outage: it
+resets the count, and the cached work list is still used.
+
+A wrong page is treated as a provider defect rather than an unresolvable artist
+for the same reason. The one deliberate exception is a search response whose
+reported total exceeds the candidates returned: the exact-name match cannot be
+proven from the candidates in hand, so that case stays a resolution failure.
 
 ### Deterministic artist ordering and spelling
 
@@ -223,6 +245,11 @@ substrings, so an entry can never silently drop an unrelated artist whose name
 happens to contain it. The default covers the common aggregator names that would
 otherwise expand into hundreds of releases if `compilation` or `live_album` were
 enabled.
+
+An explicit `--artist` filter overrides the exclusion list for that one artist.
+Naming an artist on the command line is a deliberate act, so it is honoured even
+when the configured exclusion list would otherwise skip it; the exclusion is not
+also reported for that artist, because it was not applied.
 
 ### `--artist` is an optional narrowing filter
 
@@ -360,7 +387,8 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
    b. `missing_albums` removes every album already present.
    c. For each remaining album, oldest first: run `process_album`, which
       searches, ranks, downloads, organises, and notifies exactly as it does
-      elsewhere, and charge the budget unless the outcome is `NoCandidates`.
+      elsewhere, and charge the budget when the outcome is `Downloaded` or
+      `Failed` — the two outcomes that reached the download stage.
 
 5. Aggregate counts are added to the run report as notices, and the summary is
    printed once.
@@ -369,6 +397,7 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
 
 Notices emitted by a discover run, in this order when present:
 
+- `discover: no eligible library artists found; nothing to do`
 - `discover: <N> album(s) already present; skipped`
 - `discover: excluded <N> artist(s) by discover.exclude_artists`
 - `discover: <N> artist(s) unresolved on MusicBrainz: <name>, ...` (first ten
@@ -439,6 +468,29 @@ Per-album outcome sections and per-album downloads are unchanged.
   artist MusicBrainz cannot resolve automatically.
 - **No per-artist cap.** A single prolific artist can consume the whole
   `max_cycle_downloads` budget in one run.
+- **A database failure is charged even when it happened before a transfer.**
+  Charging cannot distinguish a post-transfer bookkeeping failure from a locked
+  or corrupt database failing the processed-record check, because the pipeline
+  does not stage-mark its errors. The resulting bias is toward stopping the run
+  at its cap rather than exceeding it, which is the safe direction, but a
+  database fault can therefore be reported as budget exhaustion.
+- **A provider that always reports more matches than it returns stalls coverage.**
+  A search response whose total exceeds the candidates returned is treated as an
+  unresolvable artist, not a provider failure, so such a provider reports every
+  artist as unresolved and never trips the circuit breaker. Bounding that case
+  separately is future work.
+- **A fixed prefix of failing albums can starve later artists.** A failed
+  transfer consumes budget, and failures never become processed successes, so
+  the same earliest missing albums are retried and charged on every run. With a
+  small `max_cycle_downloads` and a cluster of permanently unavailable albums,
+  later artists are reached slowly or not at all. Rotating the work list, or
+  capping per-album retries, is future work.
+- **A tag/folder name mismatch reads as missing, but is skipped cheaply.**
+  Presence is derived from the scanner, which prefers the embedded tag artist and
+  album, while organisation writes the MusicBrainz title into the folder. An
+  album downloaded into a folder whose tag says something else is therefore
+  reported as missing on later runs, but its success record makes the album a
+  no-op `Skipped` that consumes no budget, so it is not re-downloaded.
 - **No quality judgement.** Discover never replaces a lossy or low-bitrate
   album it considers present.
 - **No second provider.** Discogs and others remain future work.

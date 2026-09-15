@@ -183,8 +183,8 @@ async fn test_full_pipeline_auto_mode_no_results() {
     // Should succeed even with no results (marked as failed, not skipped)
     assert!(result.is_ok());
     match result.unwrap() {
-        AlbumOutcome::Failed { reason } => assert_eq!(reason, "no results found"),
-        other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
+        AlbumOutcome::NoCandidates { reason } => assert_eq!(reason, "no results found"),
+        other => panic!("Expected AlbumOutcome::NoCandidates, got: {other:?}"),
     }
 
     // Only the primary search fires (no fallback).

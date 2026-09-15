@@ -1,12 +1,13 @@
 use crate::config::{CliOverrides, Config};
 use crate::error::{Result, SeakarrError};
 
-/// The three operations that seakarr can execute.
+/// The search modes that seakarr can execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     Auto,
     Manual,
     Batch,
+    Discover,
 }
 
 /// Validated mode and the criteria needed by that mode.
@@ -20,6 +21,10 @@ pub enum ExecutionPlan {
     Batch {
         file_path: String,
     },
+    /// Gap filling: artists come from the library, optionally narrowed to one.
+    Discover {
+        artist: Option<String>,
+    },
 }
 
 impl ExecutionPlan {
@@ -29,6 +34,7 @@ impl ExecutionPlan {
             Self::Auto => SearchMode::Auto,
             Self::Manual { .. } => SearchMode::Manual,
             Self::Batch { .. } => SearchMode::Batch,
+            Self::Discover { .. } => SearchMode::Discover,
         }
     }
 }
@@ -110,9 +116,10 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
         "auto" => SearchMode::Auto,
         "manual" => SearchMode::Manual,
         "batch" => SearchMode::Batch,
+        "discover" => SearchMode::Discover,
         value => {
             return Err(SeakarrError::Config(format!(
-                "invalid search mode '{value}' (must be auto, manual, or batch)"
+                "invalid search mode '{value}' (must be auto, manual, batch, or discover)"
             )));
         }
     };
@@ -154,7 +161,7 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                     config,
                     mode_from_cli,
                     "--artist/--album",
-                    "use --mode manual",
+                    "use --mode manual or --mode discover",
                 )));
             }
             if has_batch_cli_selector {
@@ -205,6 +212,47 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                 ));
             };
             Ok(ExecutionPlan::Batch { file_path })
+        }
+        SearchMode::Discover => {
+            if !config.discography.enabled {
+                return Err(SeakarrError::Config(
+                    "discover mode requires discography.enabled: true".into(),
+                ));
+            }
+            // Mode resolution runs before CliOverrides are merged into the
+            // Config, so the effective value must be computed here: a
+            // --library-path override has to satisfy discover exactly as it
+            // satisfies auto mode, whose equivalent check runs after the merge.
+            let library_paths_empty = cli
+                .library_path
+                .as_deref()
+                .map_or_else(|| config.library.paths.is_empty(), |paths| paths.is_empty());
+            if library_paths_empty {
+                return Err(SeakarrError::Config(
+                    "discover mode requires at least one library.paths entry".into(),
+                ));
+            }
+            if cli.album.is_some() {
+                return Err(SeakarrError::Config(
+                    "--album is incompatible with discover mode; use --mode manual".into(),
+                ));
+            }
+            if has_batch_cli_selector {
+                return Err(SeakarrError::Config(
+                    "--batch-file is incompatible with discover mode; use --mode batch".into(),
+                ));
+            }
+            if cli
+                .artist
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(SeakarrError::Config(
+                    "--artist must not be blank in discover mode; omit it to process the whole library"
+                        .into(),
+                ));
+            }
+            Ok(ExecutionPlan::Discover { artist: cli_artist })
         }
     }
 }
@@ -642,7 +690,7 @@ mod tests {
         assert_config_error(
             &config,
             &cli(None, None, None, None),
-            "must be auto, manual, or batch",
+            "must be auto, manual, batch, or discover",
         );
     }
 
@@ -654,7 +702,7 @@ mod tests {
         assert_config_error(
             &config,
             &cli(Some(""), None, None, None),
-            "must be auto, manual, or batch",
+            "must be auto, manual, batch, or discover",
         );
     }
 
@@ -745,5 +793,109 @@ mod tests {
         overrides.ignore_processed = true;
         let plan = resolve_execution_plan(&config, &overrides).unwrap();
         assert_eq!(plan, ExecutionPlan::Auto);
+    }
+
+    #[test]
+    fn discover_mode_resolves_without_a_selector() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
+        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
+        assert_eq!(plan.mode(), SearchMode::Discover);
+    }
+
+    #[test]
+    fn discover_mode_accepts_an_optional_artist_filter() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        let plan =
+            resolve_execution_plan(&config, &cli(None, Some("Autechre"), None, None)).unwrap();
+        assert_eq!(
+            plan,
+            ExecutionPlan::Discover {
+                artist: Some("Autechre".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn discover_mode_rejects_an_album_selector() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        assert_config_error(
+            &config,
+            &cli(None, None, Some("Album"), None),
+            "--album is incompatible with discover mode",
+        );
+    }
+
+    #[test]
+    fn discover_mode_rejects_a_batch_file() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        assert_config_error(
+            &config,
+            &cli(None, None, None, Some("wantlist.txt")),
+            "--batch-file is incompatible with discover mode",
+        );
+    }
+
+    #[test]
+    fn discover_mode_rejects_a_blank_artist_selector() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        assert_config_error(
+            &config,
+            &cli(None, Some("   "), None, None),
+            "must not be blank in discover mode",
+        );
+    }
+
+    #[test]
+    fn discover_mode_requires_an_enabled_discography() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        config.discography.enabled = false;
+        assert_config_error(
+            &config,
+            &cli(None, None, None, None),
+            "requires discography.enabled",
+        );
+    }
+
+    #[test]
+    fn discover_mode_requires_library_paths() {
+        let config = config_with_mode("discover");
+        assert_config_error(&config, &cli(None, None, None, None), "library.paths");
+    }
+
+    #[test]
+    fn discover_mode_accepts_a_library_path_override() {
+        // resolve_execution_plan runs before CliOverrides are merged, so the
+        // override has to be honoured during validation or --library-path
+        // would be rejected even though it supplies the missing paths.
+        let config = config_with_mode("discover");
+        let mut overrides = cli(None, None, None, None);
+        overrides.library_path = Some(vec!["/override".to_string()]);
+        let plan = resolve_execution_plan(&config, &overrides).unwrap();
+        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
+    }
+
+    #[test]
+    fn discover_mode_rejects_an_empty_library_path_override() {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/configured".to_string()];
+        let mut overrides = cli(None, None, None, None);
+        overrides.library_path = Some(Vec::new());
+        assert_config_error(&config, &overrides, "library.paths");
+    }
+
+    #[test]
+    fn discover_mode_is_reachable_from_the_cli() {
+        let mut config = config_with_mode("auto");
+        config.library.paths = vec!["/library".to_string()];
+        let plan =
+            resolve_execution_plan(&config, &cli(Some("discover"), None, None, None)).unwrap();
+        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
     }
 }

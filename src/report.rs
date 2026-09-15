@@ -3,9 +3,23 @@
 /// Outcome of processing a single album.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlbumOutcome {
-    Downloaded { track_count: usize },
+    Downloaded {
+        track_count: usize,
+    },
     Skipped,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
+    /// Search produced nothing, or nothing that survived filtering, so no
+    /// download was attempted.
+    ///
+    /// Rendered in the summary exactly like [`AlbumOutcome::Failed`]. It exists
+    /// as a distinct variant so `discover` can tell an album that never reached
+    /// the download stage from one that did, and decline to charge its download
+    /// budget for work that never happened.
+    NoCandidates {
+        reason: String,
+    },
 }
 
 /// Collects album outcomes during a run and prints a summary.
@@ -32,7 +46,7 @@ impl RunReport {
             AlbumOutcome::Skipped => {
                 self.skipped.push((artist.to_string(), album.to_string()));
             }
-            AlbumOutcome::Failed { reason } => {
+            AlbumOutcome::Failed { reason } | AlbumOutcome::NoCandidates { reason } => {
                 self.failed
                     .push((artist.to_string(), album.to_string(), reason));
             }
@@ -161,6 +175,28 @@ mod tests {
         assert_eq!(report.downloaded_count(), 0);
         assert_eq!(report.skipped_count(), 0);
         assert_eq!(report.failed_count(), 1);
+    }
+
+    #[test]
+    fn no_candidates_renders_in_the_failed_section() {
+        let mut report = RunReport::new();
+        report.record(
+            "Artist",
+            "Album",
+            AlbumOutcome::NoCandidates {
+                reason: "no results found".into(),
+            },
+        );
+        assert_eq!(report.failed_count(), 1);
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "=== Run summary ===".to_string(),
+                "Failed (1):".to_string(),
+                // The renderer joins artist and album with U+2014.
+                "  Artist \u{2014} Album (no results found)".to_string(),
+            ]
+        );
     }
 
     #[test]
