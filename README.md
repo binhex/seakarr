@@ -209,7 +209,7 @@ A default config is created automatically on first run. The file is divided into
 | --- | ----------- | ------- |
 | `staging_dir` | Directory where in-progress downloads land before organisation. Auto-created if missing. | `downloads/staging` |
 | `organize` | Automatically move completed downloads into the library. | `false` |
-| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%`. | `%artist%/%album%/%track% - %title%.%ext%` |
+| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%`. Must be relative and free of `..` components. Discover mode also uses it to shape placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
 
 ### `search`
 
@@ -425,6 +425,21 @@ download, organisation, and notification pipeline as the other modes, oldest alb
 narrows the run to one artist already in the library, and the run stops after
 `discover.max_cycle_downloads` download attempts so a large library fills in over successive
 runs.
+
+Each completed album is placed in the artist's own library folder — the directory that artist's
+existing albums were scanned from — using `storage.organize_pattern`, with `%artist%` expanded to the
+artist folder name that is actually on disk and `%album%` to the MusicBrainz title. Placement is
+unconditional in discover mode: it does not depend on `storage.organize` or on
+`library_upgrade.enabled`, and `library_upgrade.delete_lesser_quality` never applies to it. Once the
+copy succeeds the staging directory for that album is removed, so discover leaves nothing behind.
+The scanner resolves the artist folder, album folder, and library location positionally and steps
+over one dedicated disc folder (`CD 01`, `Disc 2`), so nested layouts such as
+`<root>/Genre/Artist/Album` and albums whose discs sit in dedicated disc folders place correctly.
+An album split across marker-shaped folders (`Gold (Disc 1)/`, `Gold (Disc 2)/` under one album
+folder) reads as two albums and is documented as a limit rather than corrected. Only discover mode
+places albums beside the artist's folder: an artist-only manual run (`--mode manual --artist "Name"`) does not, so with
+`storage.organize: true` it organizes its downloads under `library.paths[0]` and with `organize` off they stay in
+`staging_dir`.
 
 ### Scheduled mode
 
@@ -676,6 +691,21 @@ Run `--mode discover --artist "Artist Name"`. The name must already exist in
 your library; discover only narrows the list it derives from your library, it
 never adds an artist you do not have. To fetch a specific album instead, use
 `--mode manual --artist "Artist Name" --album "Album Title"`.
+
+**Q: Where do discover downloads end up?**
+
+In the artist's own library folder, beside the albums that artist already has. Discover derives the
+destination from the same scan that produces its artist list, so a nested library such as
+`Music/<user>/Albums/<genre>/<style>/<artist>/` keeps its layout instead of writing a second artist
+tree under `library.paths[0]`. The staging copy is deleted once the album is placed. Placement never replaces a file
+that already parses as audio, because the album folder may belong to a different edition of the album — only a
+truncated leftover from an interrupted run is replaced. A placement failure (a read-only or otherwise blocked
+destination) keeps the staging copy, records the album as failed, and counts against
+`discover.max_cycle_downloads`. The album is retried when no audio file reached the folder; once any file landed the
+album counts as present when its tags match the folder the placement wrote to, so a mismatch between an embedded album
+tag and the MusicBrainz title can still cause one more download. Note that a later auto run with `library_upgrade.enabled` removes every leftover staging
+directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a
+permanent one.
 
 **Q: Can I run auto mode and discover mode on a schedule at the same time?**
 

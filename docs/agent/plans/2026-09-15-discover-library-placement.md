@@ -53,7 +53,10 @@ without leaving the feature half-working.
 | `src/runner.rs` | Mode runners and the shared per-album pipeline | Add `LibraryTarget`; rework the copy-back block; gate auto mode at its caller; place in the discover loop; tests |
 | `README.md` | User documentation | Document placement, the pattern's role, and the artist-only limit |
 
-No new files. `src/main.rs`, `src/mode.rs`, and `src/config.rs` are untouched.
+No new files. `src/mode.rs` is untouched. `src/config.rs` gains the
+`storage.organize_pattern` containment check (see Task 8 Step 6 below) plus its
+tests, and `src/main.rs` changes only in a comment that named the removed
+parameter.
 
 ---
 
@@ -139,9 +142,10 @@ Add to `src/discs.rs`, immediately after `parse_disc_label`:
 ///
 /// The album component is the one holding the files. A dedicated disc folder
 /// ("CD 01", "Disc 2") is stepped over, so the album is the folder above it.
-/// Embedded markers ("Gold (Disc 1)") are not peeled here — the leaf keeps the
-/// marker and callers strip it with [`strip_embedded_disc_marker`], matching
-/// the peer-side parser.
+/// Embedded markers ("Gold (Disc 1)") are not peeled here — the album component
+/// is the folder holding the files, and each caller decides what to do with a
+/// marker: the peer-side parser folds it with `strip_embedded_disc_marker`,
+/// while the library scanner keeps the on-disk folder name verbatim.
 ///
 /// Returns `None` when no artist component would remain above the album, which
 /// leaves the caller to decide whether that shape is an album folder (a library
@@ -374,7 +378,9 @@ Add to the `#[cfg(test)] mod tests` block in `src/scanner.rs`:
     }
 
     #[test]
-    fn test_scan_strips_an_embedded_disc_marker_from_the_album_folder() {
+    fn test_scan_keeps_an_embedded_marker_in_the_album_folder_name() {
+        // The album name is the identity the auto-mode upgrade copies into and
+        // the root the quality-deletion pass walks, so it is kept verbatim.
         let dir = TempDir::new().unwrap();
         let album_dir = dir.path().join("Artist").join("Gold (Disc 1)");
         fs::create_dir_all(&album_dir).unwrap();
@@ -383,8 +389,9 @@ Add to the `#[cfg(test)] mod tests` block in `src/scanner.rs`:
         let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
-        assert_eq!(albums[0].album, "Gold");
+        assert_eq!(albums[0].album, "Gold (Disc 1)");
         assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().to_path_buf());
     }
 ```
 
@@ -398,7 +405,7 @@ Expected failures: `test_scan_resolves_nested_layout_names_positionally` (gets
 `"Genre"`/`"Artist"`), `test_scan_steps_over_one_disc_folder` (gets `artist ==
 "Artist"`, `album == "CD 01"`, `path == <root>/Artist`),
 `test_scan_steps_over_a_disc_folder_in_a_nested_layout`,
-`test_scan_strips_an_embedded_disc_marker_from_the_album_folder`.
+`test_scan_keeps_an_embedded_marker_in_the_album_folder_name`.
 `test_scan_keeps_a_disc_named_folder_directly_under_the_artist` passes both
 before and after (it is the preserved shape).
 
@@ -444,8 +451,12 @@ with
                 },
             };
             let artist_dir = components[album_index - 1].to_string();
-            let album = crate::discs::strip_embedded_disc_marker(components[album_index])
-                .unwrap_or_else(|| components[album_index].to_string());
+            // Keep the on-disk album folder name verbatim. It is the identity
+            // the auto-mode upgrade copies into and the root the
+            // quality-deletion pass walks, so stripping an embedded marker here
+            // would move the copy into a new folder and leave the replaced
+            // files behind in the old one.
+            let album = components[album_index].to_string();
 ```
 
 Then replace the tag-preference and location lines
@@ -709,9 +720,11 @@ and in the `select_artists` loop, replace
 ```rust
         // Every indexed album registers a destination, so the lookup cannot
         // fail for a key drawn from `artist_keys`. The guard is belt and
-        // braces, never a silent drop of a real artist.
+        // braces, never a silent drop of a real artist, and it warns rather
+        // than asserting so an invariant breach stays visible in release
+        // builds.
         let Some((library_root, artist_dir)) = index.artist_destination(key) else {
-            debug_assert!(false, "artist {key:?} has albums but no destination");
+            tracing::warn!("artist {key:?} has albums but no destination; skipping");
             continue;
         };
         selection.artists.push(SelectedArtist {
@@ -1033,10 +1046,11 @@ arm followed by its closing braces, with:
             // No completeness gate: a new album has no library track count to
             // compare against, and presence already treats any audio file under
             // the album folder as present. No quality deletion either — nothing
-            // is being replaced. The `%artist%` component is the folder that
-            // already exists on disk, so the album lands inside it instead of
-            // creating a second spelling beside it.
-            match organizer::copy_to_library(
+            // is being replaced. `place_into_library` uses the folder name that
+            // already exists on disk verbatim, so the album lands inside it
+            // instead of beside a rewritten copy of it, and it never replaces a
+            // destination file that parses as audio.
+            match organizer::place_into_library(
                 &downloaded,
                 root,
                 &config.storage.organize_pattern,
@@ -1092,10 +1106,17 @@ with
                 // on `library_upgrade.enabled` and carries the library's own
                 // track count as the completeness reference. With the flag off
                 // there is no target and the generic organize path runs.
-                let target = config.library_upgrade.enabled.then(|| LibraryTarget::Upgrade {
-                    root: library_path.as_path(),
-                    expected_tracks: library_track_count,
-                });
+                //
+                // `then_some` rather than `then(|| ...)`: the construction has
+                // no side effects and `clippy -D warnings` rejects the lazy
+                // closure as `unnecessary_lazy_evaluations`.
+                let target = config
+                    .library_upgrade
+                    .enabled
+                    .then_some(LibraryTarget::Upgrade {
+                        root: library_path.as_path(),
+                        expected_tracks: library_track_count,
+                    });
 ```
 
 and replace the last two arguments of that `process_album` call
@@ -1298,15 +1319,21 @@ and alongside the other `run_discover_mode_with_provider` tests:
     }
 ```
 
-Note on inherited coverage: `organizer`'s tests already cover the mechanics that
-placement reuses — staging preserved (`test_copy_to_library_preserves_staging`),
-multi-disc subdirectories
+Note on inherited coverage: `organizer`'s tests cover the mechanics that
+placement reuses — staging preserved (`test_copy_to_library_preserves_staging`)
+and multi-disc subdirectories
 (`test_copy_to_library_preserves_multi_disc_subdirectories`,
-`test_copy_to_library_preserves_embedded_marker_disc_subdirectories`), and the
-never-downgrade guard
-(`test_copy_to_library_keeps_higher_quality_existing_file`,
-`test_copy_to_library_replaces_lower_quality_existing_file`). Do not duplicate
-them here. The tag/folder spelling mismatch is covered at the unit level by
+`test_copy_to_library_preserves_embedded_marker_disc_subdirectories`). The
+placement-specific rules are **not** inherited and need their own coverage:
+placement uses a verbatim artist component and never replaces a destination file
+that parses as audio, which is deliberately not the upgrade path's
+never-downgrade guard, so add
+`test_place_into_library_uses_the_artist_folder_name_verbatim`,
+`test_place_into_library_never_replaces_a_readable_existing_file`,
+`test_place_into_library_replaces_an_unreadable_existing_file`,
+`test_place_into_library_does_not_cascade_placeholders_from_the_folder_name` and
+`test_place_into_library_rejects_an_artist_value_that_is_not_one_component`. The
+tag/folder spelling mismatch is covered at the unit level by
 `destination_keeps_the_on_disk_artist_folder_spelling` in Task 4, because
 `MockClient` writes untagged bytes.
 
@@ -1459,7 +1486,7 @@ git commit -m "feat: place discover downloads in the artist's library folder"
 In the `### storage` table, replace the `organize_pattern` row with:
 
 ```markdown
-| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%`. Discover mode also uses it to shape placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
+| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%`. Must be relative and free of `..` components. Discover mode also uses it to shape placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
 ```
 
 - [ ] **Step 2: Document placement in the Discover mode section**
@@ -1476,8 +1503,11 @@ unconditional in discover mode: it does not depend on `storage.organize` or on
 copy succeeds the staging directory for that album is removed, so discover leaves nothing behind.
 The scanner resolves the artist folder, album folder, and library location positionally and steps
 over one dedicated disc folder (`CD 01`, `Disc 2`), so nested layouts such as
-`<root>/Genre/Artist/Album` and multi-disc albums place correctly. Only discover mode places
-albums: an artist-only manual run (`--mode manual --artist "Name"`) still leaves new downloads in
+`<root>/Genre/Artist/Album` and albums whose discs sit in dedicated disc folders place correctly.
+An album split across marker-shaped folders (`Gold (Disc 1)/`, `Gold (Disc 2)/` under one album
+folder) reads as two albums and is documented as a limit rather than corrected. Only discover mode
+places albums beside the artist's folder: an artist-only manual run (`--mode manual --artist "Name"`) does not, so with
+`storage.organize: true` it organizes its downloads under `library.paths[0]` and with `organize` off they stay in
 `staging_dir`.
 ```
 
@@ -1492,9 +1522,16 @@ add:
 In the artist's own library folder, beside the albums that artist already has. Discover derives the
 destination from the same scan that produces its artist list, so a nested library such as
 `Music/<user>/Albums/<genre>/<style>/<artist>/` keeps its layout instead of writing a second artist
-tree under `library.paths[0]`. The staging copy is deleted once the album is placed. A placement
+tree under `library.paths[0]`. The staging copy is deleted once the album is placed. Placement never
+replaces a file that already parses as audio, because the album folder may belong to a different
+edition of the album — only a truncated leftover from an interrupted run is replaced. A placement
 failure (a read-only or otherwise blocked destination) keeps the staging copy, records the album as
-failed, and counts against `discover.max_cycle_downloads`, so the retry happens on a later run.
+failed, and counts against `discover.max_cycle_downloads`. The album is retried when no audio file
+reached the folder; once any file landed the album counts as present when its tags match the folder
+the placement wrote to, so a mismatch between an embedded album tag and the MusicBrainz title can
+still cause one more download. Note that a later auto run with `library_upgrade.enabled` removes
+every leftover staging directory whose album is not recorded as successful, so a retained copy is a
+short-lived safeguard rather than a permanent one.
 ```
 
 - [ ] **Step 4: Lint the documentation**
@@ -1579,12 +1616,12 @@ MusicBrainz run was performed.
 | `LibraryTarget` replaces the loose parameter | 5 |
 | Gating moves to `run_auto_mode` | 5 (Steps 6–7 + characterisation test) |
 | `SelectedArtist` carries the destination | 4 |
-| Reuse `copy_to_library`, no gate, no deletion | 5 (both arms), 6 (integration tests) |
+| Reuse `copy_into_library` behind `place_into_library`, no gate, no deletion | 5 (both arms), 6 (integration tests) |
 | Album folder named from the MusicBrainz title | 6 (`Missing` from `release_group`) |
 | Staging removed after a successful copy | 6 (first test), 5 (`finish_library_write`) |
 | Placement failure = charged `Failed`, staging kept | 6 (third test) |
 | Auto mode unchanged in both flag states | 5 (Steps 1–2, 8) |
-| No new config keys, no schema change | no task, by construction (only `src/main.rs`, `mode.rs`, `config.rs` untouched) |
+| No new config keys, no schema change | `src/config.rs` gains the `organize_pattern` containment check (Task 8 Step 6) |
 | README documentation | 7 |
 | Deliberate limits (artist-only manual still stages) | 6 (Step 5 asserts unchanged artist-only tests), 7 (documented) |
 

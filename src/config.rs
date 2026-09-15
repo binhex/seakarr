@@ -896,6 +896,29 @@ impl Config {
                 u64::MAX / 60
             )));
         }
+        // The organize pattern is joined onto the library root. An absolute
+        // pattern, a parent component, or a Windows root-only or prefix-only
+        // pattern can all write outside the library — `Path::join` discards
+        // part or all of the root for those forms. This matters most on the
+        // discover placement path, whose documented contract is to write inside
+        // the artist's own library folder.
+        let pattern_components: Vec<std::path::Component<'_>> =
+            Path::new(&self.storage.organize_pattern)
+                .components()
+                .collect();
+        let pattern_is_contained = !pattern_components.is_empty()
+            && pattern_components.iter().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            });
+        if !pattern_is_contained {
+            return Err(SeakarrError::Config(format!(
+                "storage.organize_pattern must be a non-empty relative path inside the library and must not contain \"..\" components, got {:?}",
+                self.storage.organize_pattern
+            )));
+        }
         self.validate_discography()?;
         Ok(())
     }
@@ -1902,6 +1925,63 @@ library_upgrade:
         config.library_upgrade.enabled = true;
         config.library.paths = vec!["/music".into()];
         assert!(config.validate().is_ok());
+    }
+
+    fn pattern_error(pattern: &str) -> Option<String> {
+        let mut config = Config::default();
+        config.soulseek.username = "u".into();
+        config.soulseek.password = "p".into();
+        config.storage.organize_pattern = pattern.to_string();
+        config.validate().err().map(|error| error.to_string())
+    }
+
+    #[test]
+    fn test_organize_pattern_must_stay_inside_the_library() {
+        for pattern in [
+            "/tmp/outside/%album%/%track%.%ext%",
+            "../outside/%album%/%track%.%ext%",
+            "%artist%/../../%album%/%track%.%ext%",
+            "",
+        ] {
+            let err = pattern_error(pattern)
+                .unwrap_or_else(|| panic!("pattern {pattern:?} must be rejected"));
+            assert!(
+                err.contains("storage.organize_pattern"),
+                "pattern {pattern:?} produced: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_organize_pattern_inside_the_library_is_accepted() {
+        for pattern in [
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "./%artist%/%album%/%ext%",
+            "%artist%/%album%/",
+        ] {
+            assert!(
+                pattern_error(pattern).is_none(),
+                "pattern {pattern:?} must be accepted, got {:?}",
+                pattern_error(pattern)
+            );
+        }
+    }
+
+    /// Windows: a root-only or prefix-only pattern escapes the library even
+    /// though `is_absolute()` is false for it, because `Path::join` discards
+    /// part or all of the base path. On Unix both strings are single ordinary
+    /// components and are contained, which is why this case is platform-gated.
+    #[cfg(windows)]
+    #[test]
+    fn test_organize_pattern_rejects_windows_root_only_forms() {
+        for pattern in [
+            r"\evil\%album%\%track%.%ext%",
+            r"D:evil\%album%\%track%.%ext%",
+        ] {
+            let err = pattern_error(pattern)
+                .unwrap_or_else(|| panic!("pattern {pattern:?} must be rejected"));
+            assert!(err.contains("storage.organize_pattern"), "got: {err}");
+        }
     }
 
     // CLI merging keeps the effective in-memory Config consistent with the

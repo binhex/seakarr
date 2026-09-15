@@ -5,6 +5,7 @@
 //! download budget. The caller owns all I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::discography::{normalize_catalog_key, AlbumTarget};
 use crate::error::{Result, SeakarrError};
@@ -17,6 +18,10 @@ struct IndexedArtist {
     spellings: BTreeMap<String, usize>,
     /// Normalised album titles.
     albums: BTreeSet<String>,
+    /// Library root and on-disk artist folder to number of albums found there.
+    /// A library whose artist sits under one genre root has a single entry; an
+    /// artist split across roots has several and the majority wins.
+    destinations: BTreeMap<(String, String), usize>,
 }
 
 /// What the library already holds, keyed exactly like MusicBrainz catalog keys.
@@ -65,6 +70,24 @@ impl LibraryIndex {
             .min_by_key(|(spelling, albums)| (std::cmp::Reverse(**albums), spelling.as_str()))
             .map(|(spelling, _)| spelling.as_str())
     }
+
+    /// The library root and on-disk artist folder to place this artist's
+    /// downloads under: the pair covering the most albums, with ties broken
+    /// alphabetically so the destination never depends on walk order.
+    pub fn artist_destination(&self, artist_key: &str) -> Option<(&str, &str)> {
+        let entry = self.artists.get(artist_key)?;
+        entry
+            .destinations
+            .iter()
+            .min_by_key(|((root, directory), albums)| {
+                (
+                    std::cmp::Reverse(**albums),
+                    root.as_str(),
+                    directory.as_str(),
+                )
+            })
+            .map(|((root, directory), _)| (root.as_str(), directory.as_str()))
+    }
 }
 
 /// Index scanned albums by normalised artist key and album title.
@@ -79,6 +102,13 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
         let entry = index.artists.entry(artist_key).or_default();
         *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
         entry.albums.insert(album_key);
+        *entry
+            .destinations
+            .entry((
+                album.path.to_string_lossy().into_owned(),
+                album.artist_dir.clone(),
+            ))
+            .or_insert(0) += 1;
     }
     index
 }
@@ -101,11 +131,24 @@ pub fn missing_albums(
         .collect()
 }
 
+/// One artist selected for gap filling: what to ask MusicBrainz, and where the
+/// completed downloads belong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedArtist {
+    /// Spelling to query MusicBrainz.
+    pub name: String,
+    /// Parent directory of the artist's existing library folder.
+    pub library_root: PathBuf,
+    /// On-disk name of the artist's existing library folder.
+    pub artist_dir: String,
+}
+
 /// The artists selected for gap filling, plus the exclusions that were applied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArtistSelection {
-    /// Library spellings to query, in normalised-key order.
-    pub artists: Vec<String>,
+    /// Library spellings to query, in normalised-key order, each with the
+    /// destination its downloads belong under.
+    pub artists: Vec<SelectedArtist>,
     /// Library spellings skipped because an exclusion matched their key.
     pub excluded: Vec<String>,
 }
@@ -155,7 +198,20 @@ pub fn select_artists(
             selection.excluded.push(name.to_string());
             continue;
         }
-        selection.artists.push(name.to_string());
+        // Every indexed album registers a destination, so the lookup cannot
+        // fail for a key drawn from `artist_keys`. The guard is belt and
+        // braces, never a silent drop of a real artist — and it warns rather
+        // than asserting, so an invariant breach stays visible in release
+        // builds instead of silently shrinking the work list.
+        let Some((library_root, artist_dir)) = index.artist_destination(key) else {
+            tracing::warn!("artist {key:?} has albums but no destination; skipping");
+            continue;
+        };
+        selection.artists.push(SelectedArtist {
+            name: name.to_string(),
+            library_root: PathBuf::from(library_root),
+            artist_dir: artist_dir.to_string(),
+        });
     }
     Ok(selection)
 }
@@ -313,16 +369,29 @@ mod tests {
     use std::path::PathBuf;
 
     fn scanned(artist: &str, album: &str) -> ScannedAlbum {
+        scanned_at(artist, album, "/library", artist)
+    }
+
+    fn scanned_at(artist: &str, album: &str, root: &str, artist_dir: &str) -> ScannedAlbum {
         ScannedAlbum {
-            path: PathBuf::from("/library"),
+            path: PathBuf::from(root),
             artist: artist.to_string(),
             album: album.to_string(),
+            artist_dir: artist_dir.to_string(),
             track_count: 1,
             needs_upgrade: 0,
             min_bitrate: Some(900),
             max_bitrate: Some(900),
             formats: vec!["flac".to_string()],
         }
+    }
+
+    fn selected_names(selection: &ArtistSelection) -> Vec<&str> {
+        selection
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect()
     }
 
     fn target(title: &str) -> AlbumTarget {
@@ -368,6 +437,68 @@ mod tests {
             .expect("artist must be indexed")
             .collect();
         assert_eq!(albums, ["album", "other"]);
+    }
+
+    #[test]
+    fn destination_is_recorded_per_artist_from_the_scan() {
+        let index = build_index(&[
+            scanned_at("Metallica", "72 Seasons", "/library/Metal", "Metallica"),
+            scanned_at("Metallica", "Reload", "/library/Metal", "Metallica"),
+        ]);
+        assert_eq!(
+            index.artist_destination("metallica"),
+            Some(("/library/Metal", "Metallica"))
+        );
+    }
+
+    #[test]
+    fn destination_majority_wins_and_ties_break_alphabetically() {
+        let index = build_index(&[
+            scanned_at("Artist", "One", "/library/Metal", "Artist"),
+            scanned_at("Artist", "Two", "/library/Metal", "Artist"),
+            scanned_at("Artist", "Three", "/library/Collections", "Artist"),
+            scanned_at("Artist", "Four", "/library/Zoo", "Artist"),
+        ]);
+        assert_eq!(
+            index.artist_destination("artist"),
+            Some(("/library/Metal", "Artist")),
+            "two albums beat one, and the single-album tie breaks alphabetically"
+        );
+    }
+
+    #[test]
+    fn destination_keeps_the_on_disk_artist_folder_spelling() {
+        let index = build_index(&[scanned_at(
+            "Guns 'n' Roses",
+            "Appetite for Destruction",
+            "/library/Rock",
+            "Guns N Roses",
+        )]);
+        assert_eq!(
+            index.artist_destination("guns 'n' roses"),
+            Some(("/library/Rock", "Guns N Roses")),
+            "the folder that exists on disk wins over the tag spelling"
+        );
+    }
+
+    #[test]
+    fn destination_tie_breaks_alphabetically_when_counts_are_equal() {
+        // Equal album counts are the case the walk-order-independence claim
+        // rests on, and the only case where the tie-break itself decides.
+        let index = build_index(&[
+            scanned_at("Artist", "One", "/library/Zoo", "Artist"),
+            scanned_at("Artist", "Two", "/library/Metal", "Artist"),
+        ]);
+        assert_eq!(
+            index.artist_destination("artist"),
+            Some(("/library/Metal", "Artist")),
+            "the alphabetically first root wins a tie regardless of insert order"
+        );
+    }
+
+    #[test]
+    fn an_unknown_artist_has_no_destination() {
+        assert_eq!(build_index(&[]).artist_destination("nobody"), None);
     }
 
     #[test]
@@ -473,7 +604,7 @@ mod tests {
     fn artists_come_back_in_normalised_key_order() {
         let selection = select_artists(&library_fixture(), &[], None).unwrap();
         assert_eq!(
-            selection.artists,
+            selected_names(&selection),
             ["Alpha Artist", "Beta Band", "Live", "Live Band"]
         );
         assert!(selection.excluded.is_empty());
@@ -484,7 +615,7 @@ mod tests {
         let selection = select_artists(&library_fixture(), &["live".to_string()], None).unwrap();
         // "Live Band" survives: only the whole key "live" is excluded.
         assert_eq!(
-            selection.artists,
+            selected_names(&selection),
             ["Alpha Artist", "Beta Band", "Live Band"]
         );
         assert_eq!(selection.excluded, ["Live"]);
@@ -494,14 +625,36 @@ mod tests {
     fn exclusion_matching_ignores_case_and_whitespace() {
         let selection =
             select_artists(&library_fixture(), &["  BETA   BAND ".to_string()], None).unwrap();
-        assert_eq!(selection.artists, ["Alpha Artist", "Live", "Live Band"]);
+        assert_eq!(
+            selected_names(&selection),
+            ["Alpha Artist", "Live", "Live Band"]
+        );
         assert_eq!(selection.excluded, ["Beta Band"]);
     }
 
     #[test]
     fn a_filter_narrows_the_run_to_one_artist() {
         let selection = select_artists(&library_fixture(), &[], Some("beta band")).unwrap();
-        assert_eq!(selection.artists, ["Beta Band"]);
+        assert_eq!(selected_names(&selection), ["Beta Band"]);
+    }
+
+    #[test]
+    fn a_selected_artist_carries_its_destination() {
+        let index = build_index(&[scanned_at(
+            "Beta Band",
+            "Album One",
+            "/library/Indie",
+            "Beta Band",
+        )]);
+        let selection = select_artists(&index, &[], None).unwrap();
+        assert_eq!(
+            selection.artists,
+            vec![SelectedArtist {
+                name: "Beta Band".to_string(),
+                library_root: PathBuf::from("/library/Indie"),
+                artist_dir: "Beta Band".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -532,7 +685,7 @@ mod tests {
     fn an_explicit_filter_overrides_the_exclusion_list() {
         let selection =
             select_artists(&library_fixture(), &["live".to_string()], Some("Live")).unwrap();
-        assert_eq!(selection.artists, ["Live"]);
+        assert_eq!(selected_names(&selection), ["Live"]);
         assert!(
             selection.excluded.is_empty(),
             "an explicitly requested artist must not also be reported as excluded"

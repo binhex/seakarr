@@ -51,6 +51,31 @@ fn parse_disc_label(label: &str) -> Option<u32> {
     }
 }
 
+/// Index of the album component in a slash-split path, peeling one dedicated
+/// disc folder.
+///
+/// The album component is the one holding the files. A dedicated disc folder
+/// ("CD 01", "Disc 2") is stepped over, so the album is the folder above it.
+/// Embedded markers ("Gold (Disc 1)") are not peeled here — the album
+/// component is the folder holding the files, and each caller decides what to
+/// do with a marker: the peer-side parser folds it with
+/// [`strip_embedded_disc_marker`], while the library scanner keeps the on-disk
+/// folder name verbatim because it is the identity the upgrade copy and the
+/// quality-deletion root use.
+///
+/// Returns `None` when no artist component would remain above the album, which
+/// leaves the caller to decide whether that shape is an album folder (a library
+/// folder named like a disc) or unusable (a peer share path).
+pub fn album_index(components: &[&str]) -> Option<usize> {
+    let index = components.len().checked_sub(2)?;
+    let index = if is_disc_folder(components[index]) {
+        index.checked_sub(1)?
+    } else {
+        index
+    };
+    (index > 0).then_some(index)
+}
+
 /// Strip a trailing embedded disc marker from an album folder name, e.g.
 /// "Gold (Disc 1)" -> "Gold", "Album - CD 2" -> "Album", "Gold [Disc 1]"
 /// -> "Gold", "1998 K And D Sessions {cd1}" -> "1998 K And D Sessions".
@@ -210,5 +235,58 @@ mod tests {
         assert!(is_disc_designator("Album {CD 2}"));
         assert!(is_disc_designator("CD 02"));
         assert!(!is_disc_designator("1998 K And D Sessions"));
+    }
+
+    #[test]
+    fn album_index_finds_the_album_component_for_flat_and_nested_paths() {
+        assert_eq!(
+            album_index(&["Artist", "Album", "01 - track.flac"]),
+            Some(1)
+        );
+        assert_eq!(
+            album_index(&["Genre", "Artist", "Album", "01 - track.flac"]),
+            Some(2)
+        );
+        assert_eq!(
+            album_index(&["A", "B", "Artist", "Album", "01 - track.flac"]),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn album_index_peels_one_dedicated_disc_folder() {
+        assert_eq!(
+            album_index(&["Artist", "Album", "CD 01", "01 - track.flac"]),
+            Some(1)
+        );
+        assert_eq!(
+            album_index(&["Genre", "Artist", "Album", "{cd2}", "01 - track.flac"]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn album_index_declines_when_no_artist_component_would_remain() {
+        // The album component is itself a disc folder directly under the
+        // artist folder: whether that is an album folder or unusable is the
+        // caller's decision, so the helper declines instead of guessing.
+        assert_eq!(album_index(&["Artist", "CD 01", "01 - track.flac"]), None);
+        // Two components cannot supply an artist folder, an album folder, and
+        // a file.
+        assert_eq!(album_index(&["Album", "01 - track.flac"]), None);
+        assert_eq!(album_index(&["01 - track.flac"]), None);
+        assert_eq!(album_index(&[]), None);
+    }
+
+    #[test]
+    fn album_index_does_not_mistake_an_ordinary_folder_for_a_disc_folder() {
+        assert_eq!(
+            album_index(&["Artist", "Album (Disc 1)", "01 - track.flac"]),
+            Some(1)
+        );
+        assert_eq!(
+            album_index(&["Artist", "Album", "01 - track.flac"]),
+            Some(1)
+        );
     }
 }

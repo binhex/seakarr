@@ -13,6 +13,11 @@ pub struct ScannedAlbum {
     pub path: PathBuf,
     pub artist: String,
     pub album: String,
+    /// On-disk name of the artist folder this album was found in. Path-derived
+    /// (unlike `artist`, which prefers the embedded tag), so a caller that
+    /// writes back into the library reuses the folder that already exists
+    /// instead of creating a second spelling beside it.
+    pub artist_dir: String,
     /// Total number of audio files grouped into this album (all formats).
     pub track_count: usize,
     /// Number of files that fail the quality/format gate and therefore need
@@ -79,15 +84,44 @@ pub fn scan_library(
                 continue;
             }
 
-            // Infer artist/album from directory structure: <root>/Artist/Album/tracks
+            // Infer the artist folder, album folder, and library location from
+            // the directory structure. The album folder is the one holding the
+            // files, one dedicated disc folder is stepped over so a multi-disc
+            // album resolves to its album folder, and the artist folder is the
+            // one directly above it. For a nested layout such as
+            // <root>/Genre/Artist/Album this keeps every component correct
+            // instead of naming the genre after the artist.
             let relative = path.strip_prefix(lib_path).unwrap_or(path);
             let components: Vec<&str> = relative.iter().filter_map(|c| c.to_str()).collect();
 
-            if components.len() < 3 {
-                continue; // Need at least Artist/Album/file
-            }
-            let artist = components[0].to_string();
-            let album = components[1].to_string();
+            // A folder named like a disc is stepped over so a multi-disc album
+            // resolves to its album folder, matching the peer-side rule. The
+            // folder holding the files is read as a disc whenever a component
+            // above it can serve as the album, so
+            // <root>/Genre/Artist/CD 01/track.flac resolves to the artist
+            // "Genre" with the album "Artist"; only at the minimum depth,
+            // <root>/Artist/CD 01/track.flac, is the disc-named folder itself
+            // read as the album, because peeling there would leave the artist
+            // component with nothing above it to be the artist (the peer-side
+            // parser refuses that shape outright). Anything with no album
+            // component left at all is not a library album layout and is
+            // skipped.
+            let album_index = match crate::discs::album_index(&components) {
+                Some(index) => index,
+                _ => match components.len().checked_sub(2) {
+                    Some(index) if index >= 1 => index,
+                    _ => continue, // Need at least Artist/Album/file
+                },
+            };
+            let artist_dir = components[album_index - 1].to_string();
+            // The on-disk album folder name, kept verbatim. It is the identity
+            // the upgrade path copies into and the root the quality-deletion
+            // pass walks, so stripping an embedded disc marker here would move
+            // the write into a new folder and leave the replaced files behind
+            // in the old one — the album would then be re-upgraded on every
+            // run. Merging marker-variant folders into one album is a presence
+            // and identity concern, not a path concern.
+            let album = components[album_index].to_string();
 
             // Read audio tags if available
             let (tag_artist, tag_album, bitrate) = read_audio_tags(path);
@@ -103,7 +137,7 @@ pub fn scan_library(
                     && (bitrate.is_none() || bitrate.unwrap() < filters.min_bit_rate));
 
             // Prefer tag metadata over directory name
-            let final_artist = tag_artist.unwrap_or(artist);
+            let final_artist = tag_artist.unwrap_or_else(|| artist_dir.clone());
             let final_album = tag_album.unwrap_or(album);
 
             let key = (final_artist.clone(), final_album.clone());
@@ -114,14 +148,9 @@ pub fn scan_library(
             // runner so the library upgrade copies new files back into the
             // exact directory the album was found in — not the root of the
             // library path.
-            let album_location = components
-                .get(..components.len().saturating_sub(3))
-                .map(|extra| {
-                    extra
-                        .iter()
-                        .fold(lib_path.to_path_buf(), |acc, c| acc.join(c))
-                })
-                .unwrap_or_else(|| lib_path.to_path_buf());
+            let album_location = components[..album_index - 1]
+                .iter()
+                .fold(lib_path.to_path_buf(), |acc, c| acc.join(c));
             albums
                 .entry(key)
                 .and_modify(|a| {
@@ -141,6 +170,7 @@ pub fn scan_library(
                     path: album_location,
                     artist: final_artist,
                     album: final_album,
+                    artist_dir: artist_dir.clone(),
                     track_count: 1,
                     needs_upgrade: usize::from(file_needs_upgrade),
                     min_bitrate: bitrate,
@@ -278,6 +308,7 @@ mod tests {
                 path: PathBuf::new(),
                 artist: "Artist1".into(),
                 album: "Album1".into(),
+                artist_dir: "Artist1".into(),
                 track_count: 3,
                 needs_upgrade: 3,
                 min_bitrate: Some(128),
@@ -288,6 +319,7 @@ mod tests {
                 path: PathBuf::new(),
                 artist: "Artist2".into(),
                 album: "Album2".into(),
+                artist_dir: "Artist2".into(),
                 track_count: 5,
                 needs_upgrade: 0,
                 min_bitrate: Some(900),
@@ -377,8 +409,10 @@ mod tests {
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
         assert_eq!(to_upgrade.len(), 1);
-        assert_eq!(to_upgrade[0].0, "Pop"); // dir-derived artist (no tags in fake bytes)
-        assert_eq!(to_upgrade[0].1, "Alesha Dixon"); // dir-derived album
+        // Artist and album now come from the two folders above the file, so a
+        // nested layout no longer reports the genre as the artist.
+        assert_eq!(to_upgrade[0].0, "Alesha Dixon"); // artist folder, not the genre
+        assert_eq!(to_upgrade[0].1, "The Alesha Show"); // album folder
         assert_eq!(to_upgrade[0].2, 1); // needs_upgrade: single ogg file fails the gate
                                         // The upgrade target must be the directory above the artist folder
                                         // (<root>/Pop), not the library root — this is what preserves the
@@ -392,6 +426,7 @@ mod tests {
             path: PathBuf::new(),
             artist: "Artist".into(),
             album: "Album".into(),
+            artist_dir: "Artist".into(),
             track_count: 2,
             needs_upgrade: 2,
             min_bitrate: Some(320),
@@ -464,5 +499,127 @@ mod tests {
         // The runner's peer-track-count / completeness gates use this count:
         // a peer offering the 12 replacement FLACs is accepted.
         assert_eq!(to_upgrade[0].2, 12);
+    }
+
+    #[test]
+    fn test_scan_resolves_nested_layout_names_positionally() {
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Genre").join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "Album");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().join("Genre"));
+    }
+
+    #[test]
+    fn test_scan_steps_over_one_disc_folder() {
+        let dir = TempDir::new().unwrap();
+        for disc in ["CD 01", "CD 02"] {
+            let disc_dir = dir.path().join("Artist").join("Album").join(disc);
+            fs::create_dir_all(&disc_dir).unwrap();
+            fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+        }
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1, "both discs are one album");
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "Album");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().to_path_buf());
+        assert_eq!(albums[0].track_count, 2);
+    }
+
+    #[test]
+    fn test_scan_steps_over_a_disc_folder_in_a_nested_layout() {
+        let dir = TempDir::new().unwrap();
+        let disc_dir = dir
+            .path()
+            .join("Genre")
+            .join("Artist")
+            .join("Album")
+            .join("Disc 2");
+        fs::create_dir_all(&disc_dir).unwrap();
+        fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "Album");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().join("Genre"));
+    }
+
+    #[test]
+    fn test_scan_resolves_a_deeply_nested_layout() {
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir
+            .path()
+            .join("Genre")
+            .join("Style")
+            .join("Artist")
+            .join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "Album");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().join("Genre").join("Style"));
+    }
+
+    #[test]
+    fn test_scan_skips_a_file_without_an_artist_and_album_folder() {
+        // A file at the library root cannot supply an artist folder, an album
+        // folder, and a file, so it must not enter the index.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert!(albums.is_empty());
+    }
+
+    #[test]
+    fn test_scan_keeps_a_disc_named_folder_directly_under_the_artist() {
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("CD 01");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(
+            albums.len(),
+            1,
+            "an album folder named like a disc must stay in the index"
+        );
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "CD 01");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_scan_keeps_an_embedded_marker_in_the_album_folder_name() {
+        // Regression: the album name is the identity the auto-mode upgrade
+        // copies into and the root the quality-deletion pass walks. Stripping
+        // the marker here moves the copy into a new folder while the replaced
+        // files stay in the old one, so the album was re-upgraded every run.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Gold (Disc 1)");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Artist");
+        assert_eq!(albums[0].album, "Gold (Disc 1)");
+        assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(albums[0].path, dir.path().to_path_buf());
     }
 }

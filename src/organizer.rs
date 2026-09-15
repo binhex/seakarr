@@ -6,7 +6,7 @@ use lofty::file::AudioFile;
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Result, SeakarrError};
 
 // ── Library upgrade: format classification and quality scoring ──
 
@@ -103,6 +103,10 @@ pub fn organize_name_from_stem(stem: &str) -> (String, String) {
 
 /// Expand an organization pattern with metadata placeholders.
 /// Placeholders: %artist%, %album%, %track%, %title%, %ext%, %user%
+///
+/// Every value is sanitised, so remote metadata cannot inject path segments.
+/// Callers that already hold a filesystem-derived component use the placement
+/// entry point instead, which substitutes it verbatim.
 pub fn expand_pattern(
     pattern: &str,
     artist: &str,
@@ -112,13 +116,39 @@ pub fn expand_pattern(
     ext: &str,
     user: &str,
 ) -> String {
+    expand_pattern_inner(
+        pattern,
+        &sanitize_component(artist),
+        album,
+        track,
+        title,
+        ext,
+        user,
+    )
+}
+
+/// Expand a pattern whose artist value is already final, such as the on-disk
+/// name of an existing artist folder.
+///
+/// `%artist%` is substituted last so a value that itself contains a placeholder
+/// cannot cascade into another field's value. Sanitised callers are unaffected
+/// because [`sanitize_component`] removes `%` before substitution.
+fn expand_pattern_inner(
+    pattern: &str,
+    artist: &str,
+    album: &str,
+    track: &str,
+    title: &str,
+    ext: &str,
+    user: &str,
+) -> String {
     pattern
-        .replace("%artist%", &sanitize_component(artist))
         .replace("%album%", &sanitize_component(album))
         .replace("%track%", &sanitize_component(track))
         .replace("%title%", &sanitize_component(title))
         .replace("%ext%", &sanitize_component(ext))
         .replace("%user%", &sanitize_component(user))
+        .replace("%artist%", artist)
 }
 
 /// Remove path separators, null bytes, percent signs (to prevent cascading
@@ -212,6 +242,33 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
 
 // ── Library upgrade: copy, quality-aware deletion, and recovery ──
 
+/// How the `%artist%` component of a pattern is produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtistComponent {
+    /// Tag-derived name: sanitised like every other metadata value.
+    Sanitized,
+    /// An existing on-disk folder name, used verbatim as a single path
+    /// component. Rewriting it (percent signs, double dots, backslashes) would
+    /// place the album beside the real artist folder instead of inside it.
+    /// Callers only pass one component produced by the library walk, so it
+    /// cannot introduce a path separator.
+    Verbatim,
+}
+
+/// What to do when the destination file already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingFile {
+    /// Upgrade semantics: replace the existing file unless it scores strictly
+    /// higher, because the destination belongs to the album being replaced.
+    ReplaceUnlessBetter,
+    /// Placement semantics: keep any existing file that parses as audio,
+    /// because the destination folder may hold a different edition of the
+    /// album. Only a file that does not parse (a truncated copy from an
+    /// interrupted run) is replaced, so a retry can still finish a partial
+    /// copy.
+    KeepWhenValid,
+}
+
 /// Copy downloaded files from staging into the library directory, applying
 /// the organize pattern for naming. The staging files are preserved (this is
 /// a copy, not a move). Track numbers are zero-padded to two digits and the
@@ -219,7 +276,9 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
 /// produces clean names like "01 - Song.flac".
 ///
 /// A destination that already holds a strictly better file is kept (see the
-/// per-file guard below); otherwise the copy replaces it.
+/// per-file guard in the shared implementation below); otherwise the copy
+/// replaces it. Used by the library upgrade path, where the artist name is
+/// tag-derived and every metadata value is sanitised.
 pub fn copy_to_library(
     downloaded: &[PathBuf],
     library_root: &Path,
@@ -227,12 +286,86 @@ pub fn copy_to_library(
     artist: &str,
     album: &str,
 ) -> Result<Vec<PathBuf>> {
+    copy_into_library(
+        downloaded,
+        library_root,
+        pattern,
+        artist,
+        album,
+        ArtistComponent::Sanitized,
+        ExistingFile::ReplaceUnlessBetter,
+    )
+}
+
+/// Place newly downloaded files beside an artist's existing albums.
+///
+/// Two differences from [`copy_to_library`], both required because placement
+/// adds a new album rather than replacing a known one:
+///
+/// - `artist_dir` is an on-disk folder name used verbatim, so the album lands
+///   inside the folder that already exists instead of beside a rewritten copy
+///   of its name;
+/// - a destination file that parses as audio is never replaced, because the
+///   destination folder may hold a different edition of the album.
+///
+/// `artist_dir` must be a single ordinary path component. It is substituted
+/// into the pattern without sanitisation, so a value carrying a separator or
+/// `..` would write outside the library; the discover loop only ever passes the
+/// artist folder name produced by the library walk.
+///
+/// # Errors
+///
+/// [`SeakarrError::Config`] when `artist_dir` is not a single ordinary path
+/// component, and any filesystem error the copy or directory creation returns.
+pub fn place_into_library(
+    downloaded: &[PathBuf],
+    library_root: &Path,
+    pattern: &str,
+    artist_dir: &str,
+    album: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut components = Path::new(artist_dir).components();
+    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_normal {
+        return Err(SeakarrError::Config(format!(
+            "artist folder {artist_dir:?} must be a single path component"
+        )));
+    }
+    copy_into_library(
+        downloaded,
+        library_root,
+        pattern,
+        artist_dir,
+        album,
+        ArtistComponent::Verbatim,
+        ExistingFile::KeepWhenValid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_into_library(
+    downloaded: &[PathBuf],
+    library_root: &Path,
+    pattern: &str,
+    artist: &str,
+    album: &str,
+    artist_component: ArtistComponent,
+    existing_file: ExistingFile,
+) -> Result<Vec<PathBuf>> {
     let mut dests = Vec::with_capacity(downloaded.len());
     for src in downloaded {
         let stem = src.file_stem().unwrap_or_default().to_string_lossy();
         let ext = src.extension().unwrap_or_default().to_string_lossy();
         let (track, title) = organize_name_from_stem(&stem);
-        let relative = expand_pattern(pattern, artist, album, &track, &title, &ext, "unknown");
+        let relative = match artist_component {
+            ArtistComponent::Sanitized => {
+                expand_pattern(pattern, artist, album, &track, &title, &ext, "unknown")
+            }
+            ArtistComponent::Verbatim => {
+                expand_pattern_inner(pattern, artist, album, &track, &title, &ext, "unknown")
+            }
+        };
         let mut dest = library_root.join(&relative);
         // Preserve the per-disc structure for multi-disc albums: when a
         // source file lives in a disc subdirectory under staging (a dedicated
@@ -251,24 +384,47 @@ pub fn copy_to_library(
             fs::create_dir_all(parent)?;
         }
         if dest.exists() {
-            // Never downgrade an existing library file. When the destination
-            // already holds a copy that is strictly better than the new
-            // download (e.g. the library has a 24-bit FLAC and the flagged
-            // album's peer copy is 16-bit), keep the existing file and do
-            // not record the destination as newly written — the quality
-            // deletion pass must not treat it as a protected new file while
-            // its own score already exceeds the new baseline. Unparseable
-            // files score 0, so a parseable new download still replaces a
-            // corrupt or mislabelled stale file. Equal scores copy (the new
-            // download is in the same quality tier and becomes the new
-            // baseline).
-            let existing_score = file_quality_score(&dest).unwrap_or(0);
-            let new_score = file_quality_score(src).unwrap_or(0);
-            if existing_score > new_score {
-                tracing::info!(
-                    "Keeping higher-quality existing file {} (score {existing_score} > {new_score})",
-                    dest.display()
-                );
+            let keep_existing = match existing_file {
+                // Never downgrade an existing library file. When the
+                // destination already holds a copy that is strictly better than
+                // the new download (e.g. the library has a 24-bit FLAC and the
+                // flagged album's peer copy is 16-bit), keep the existing file
+                // and do not record the destination as newly written — the
+                // quality deletion pass must not treat it as a protected new
+                // file while its own score already exceeds the new baseline.
+                // Unparseable files score 0, so a parseable new download still
+                // replaces a corrupt or mislabelled stale file. Equal scores
+                // copy (the new download is in the same quality tier and
+                // becomes the new baseline).
+                ExistingFile::ReplaceUnlessBetter => {
+                    let existing_score = file_quality_score(&dest).unwrap_or(0);
+                    let new_score = file_quality_score(src).unwrap_or(0);
+                    if existing_score > new_score {
+                        tracing::info!(
+                            "Keeping higher-quality existing file {} (score {existing_score} > {new_score})",
+                            dest.display()
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // The probe is deliberate rather than a quality score: a valid
+                // file in a format with no score (DSF, for example) must still
+                // count as audio the library already holds.
+                ExistingFile::KeepWhenValid => {
+                    if parses_as_audio(&dest) {
+                        tracing::info!(
+                            "Keeping existing file {} (placement never replaces a file that parses as audio)",
+                            dest.display()
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if keep_existing {
                 continue;
             }
         }
@@ -276,6 +432,16 @@ pub fn copy_to_library(
         dests.push(dest);
     }
     Ok(dests)
+}
+
+/// True when lofty can open and parse the file, i.e. the library already holds
+/// an audio file at this path. Unlike quality scoring this does not depend on
+/// the format being scoreable, so a valid DSF or DFF file, which has no entry
+/// in [`format_from_extension`], still counts.
+fn parses_as_audio(path: &Path) -> bool {
+    lofty::probe::Probe::open(path)
+        .and_then(|probe| probe.read())
+        .is_ok()
 }
 
 /// Return the disc subdirectory component of a staging source path, if the
@@ -725,6 +891,163 @@ mod tests {
     }
 
     // ── Library upgrade tests ──
+
+    #[test]
+    fn test_place_into_library_uses_the_artist_folder_name_verbatim() {
+        // Placement must reuse the folder that already exists on disk. The
+        // upgrade path sanitises the artist because it is tag-derived; a folder
+        // name such as "100% Hits.." must not be rewritten, because the
+        // rewritten name would be a second artist folder beside the real one.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let artist_dir = library.path().join("100% Hits..");
+        fs::create_dir_all(&artist_dir).unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        let dests = place_into_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "100% Hits..",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(
+            dests[0],
+            artist_dir.join("Test Album").join("01 - Track One.flac"),
+            "the on-disk artist folder name must be used verbatim"
+        );
+        assert!(dests[0].exists());
+    }
+
+    #[test]
+    fn test_place_into_library_never_replaces_a_readable_existing_file() {
+        // The destination folder may hold a different edition of the album, so
+        // placement keeps any file it finds that parses as audio. The upgrade
+        // path replaces an equal-quality file; placement must not.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Artist").join("Test Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let existing = album_dir.join("01 - Track One.flac");
+        write_real_flac(&existing);
+        let existing_bytes = fs::read(&existing).unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        write_real_flac(&src);
+
+        let dests = place_into_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert!(
+            dests.is_empty(),
+            "an existing readable file must not be reported as newly written"
+        );
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            existing_bytes,
+            "the existing file must be byte-identical after placement"
+        );
+        assert!(src.exists(), "staging file preserved (copy, not move)");
+    }
+
+    #[test]
+    fn test_place_into_library_replaces_an_unreadable_existing_file() {
+        // A truncated copy left by an interrupted run must stay replaceable,
+        // otherwise a retry could never finish the album.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Artist").join("Test Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let existing = album_dir.join("01 - Track One.flac");
+        fs::write(&existing, b"truncated").unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        write_real_flac(&src);
+        let src_bytes = fs::read(&src).unwrap();
+
+        let dests = place_into_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(dests.len(), 1, "an unreadable file is replaced");
+        assert_eq!(fs::read(&existing).unwrap(), src_bytes);
+    }
+
+    #[test]
+    fn test_place_into_library_does_not_cascade_placeholders_from_the_folder_name() {
+        // A folder legitimately named "%album%" must stay a literal component.
+        // %artist% is substituted last for exactly this reason: substituting it
+        // first would let the folder name expand into the album field.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let artist_dir = library.path().join("%album%");
+        fs::create_dir_all(&artist_dir).unwrap();
+
+        let src = staging.path().join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        let dests = place_into_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "%album%",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dests[0],
+            artist_dir.join("Test Album").join("01 - Track One.flac"),
+            "the literal folder name must not expand into the album component"
+        );
+    }
+
+    #[test]
+    fn test_place_into_library_rejects_an_artist_value_that_is_not_one_component() {
+        // `artist_dir` is substituted verbatim, so a value carrying a separator
+        // or a parent component would write outside the library.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let src = staging.path().join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        for artist_dir in ["../outside", "a/b", "/absolute", "", ".", ".."] {
+            let error = place_into_library(
+                std::slice::from_ref(&src),
+                library.path(),
+                "%artist%/%album%/%track% - %title%.%ext%",
+                artist_dir,
+                "Test Album",
+            )
+            .expect_err("a non-component artist folder must be rejected");
+            assert!(
+                error.to_string().contains("single path component"),
+                "{artist_dir:?} produced: {error}"
+            );
+        }
+        assert!(
+            !library.path().join("..").join("outside").exists(),
+            "nothing may be created outside the library"
+        );
+    }
 
     /// Write a minimal but valid FLAC file ("fLaC" marker + STREAMINFO block:
     /// 44100 Hz, stereo, 16-bit) that lofty can actually parse, so quality

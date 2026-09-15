@@ -118,13 +118,18 @@ already share, so library-side and peer-side grouping cannot disagree about
 which component is the album. Only one disc level is peeled, matching the
 peer-side rule.
 
-Two shapes are deliberately preserved rather than "corrected":
+Two shapes are called out because the positional rule handles them in ways
+that are easy to misread:
 
-- a folder named like a disc *directly* under the artist folder
-  (`<root>/Artist/CD 01/track.flac`) is kept as an album folder — the scanner's
-  current reading — instead of being discarded; the peer-side parser declines
-  this shape, and that difference is deliberate, because dropping it would
-  remove a real album from the presence index and invite a re-download;
+- a folder named like a disc *directly* above the files is read as a disc
+  whenever a component above it can serve as the album, matching the peer-side
+  rule: `<root>/Genre/Artist/CD 01/track.flac` resolves to artist `Genre`,
+  album `Artist`, album location `<root>`. Only at the minimum depth,
+  `<root>/Artist/CD 01/track.flac`, is that folder itself the album: peeling
+  there would leave `Artist` as the album with nothing above it to be the
+  artist. The peer-side parser declines that shape outright, and keeping it in
+  the index is deliberate, because dropping it would remove a real album and
+  invite a re-download;
 - extra directory levels above the artist folder (`Genre/Style/Artist/Album/`)
   need no special handling, because the rule is positional.
 
@@ -133,9 +138,10 @@ Consequences, all deliberate:
 - a disc-nested album's library location becomes correct, which also fixes the
   auto-mode upgrade destination for those albums;
 - for untagged files the folder fallback now names the real artist and album
-  folders at any nesting depth, instead of the first two components;
-- an album folder carrying an embedded marker (`Gold (Disc 1)`) resolves to the
-  stripped name, matching what the peer-side parser produces.
+  folders at any nesting depth, instead of the first two components, and the
+  album folder name is kept verbatim — including an embedded marker such as
+  `Gold (Disc 1)`, which is the identity the upgrade copy and the
+  quality-deletion root use.
 
 ### `LibraryTarget` replaces the loose target parameter
 
@@ -168,11 +174,15 @@ The `if config.library_upgrade.enabled` wrapper is removed from
 is on:
 
 ```rust
-let target = config.library_upgrade.enabled.then(|| LibraryTarget::Upgrade {
-    root: library_path,
+let target = config.library_upgrade.enabled.then_some(LibraryTarget::Upgrade {
+    root: library_path.as_path(),
     expected_tracks: library_track_count,
 });
 ```
+
+`then_some` rather than `then(|| ...)`: the construction has no side effects, and
+`clippy -D warnings` rejects the lazy-closure form as
+`unnecessary_lazy_evaluations`.
 
 With the flag off, auto mode passes no target and takes the generic organize
 path exactly as it does today, so auto-mode behaviour is unchanged in both flag
@@ -197,14 +207,32 @@ Because every indexed album contributes a destination, a selected artist always
 has one, and "artist selected but no destination known" is not representable —
 the same reasoning that removes the target/count failure arm above.
 
-### The copy path is reused unchanged, with no gate and no deletion
+### Placement writes through its own entry point
 
-Placement calls the existing `organizer::copy_to_library`, so it inherits
-`sanitize_component` on every metadata value (path separators, null bytes, `..`,
-and `%` cannot inject path segments), parent-directory creation, multi-disc
-subdirectory preservation, cross-filesystem safety (copy, not rename), and the
-never-downgrade guard: a destination file that is strictly better than the
-incoming one is kept, and an equal-quality tier is replaced.
+Placement calls `organizer::place_into_library`, which shares one implementation
+with the upgrade path's `organizer::copy_to_library` and differs in exactly two
+ways:
+
+- the `%artist%` component is the on-disk artist folder name used *verbatim*,
+  not passed through `sanitize_component`. Rewriting it (a folder named
+  `100% Hits..` would become `100％ Hits．．`) places the album beside the real
+  artist folder instead of inside it — the failure this design exists to
+  prevent. The value is a single path component produced by the library walk, so
+  it cannot introduce a separator, and `%artist%` is substituted last so a name
+  containing a placeholder cannot cascade into another field;
+- an existing destination file that parses as audio is never replaced, because
+  the destination folder may hold a different edition of the album (an existing
+  folder named after the MusicBrainz title whose files carry different tags).
+  Only a file that does not parse — a truncated copy from an interrupted run —
+  is replaced, so a retry can finish an album whose copy was interrupted before
+  any complete file landed. The gap: placement is not transactional, so a crash
+  after at least one file lands leaves an album the presence index already
+  treats as present (see Deliberate limits). The upgrade path keeps its existing
+  rule: replace unless the destination scores strictly higher.
+
+Everything else is inherited: `sanitize_component` on the album, track, title,
+and extension values, parent-directory creation, multi-disc subdirectory
+preservation, cross-filesystem safety, and the commit order.
 
 There is no completeness gate. A new album has no library track-count baseline,
 and presence semantics already treat any audio file under the album folder as
@@ -264,6 +292,10 @@ when that flag is on; for discover it also shapes placement. The pattern is
 honoured verbatim, so a pattern without `%artist%` places the album directly
 under the scanned root — the same as any other organize write.
 
+The pattern is validated: it must be non-empty, relative, and free of `..`
+components, because `Path::join` discards the library root for an absolute
+pattern and either form can write outside the library.
+
 ## Architecture
 
 ### `src/discs.rs`
@@ -292,8 +324,8 @@ behaviour change — its current `album_index == 0` refusal becomes the helper's
 - The path-derived branch becomes positional: the album component is
   `discs::album_index`, the artist component is the one directly above it, the
   library location is everything above that, and the album name is the album
-  component with any trailing embedded disc marker removed (the artist and album
-  names remain tag-preferred, with these values as the fallback).
+  component kept verbatim. The artist and album names remain tag-preferred, with
+  these values as the fallback.
 - When the helper declines because the album component itself looks like a disc
   folder with the artist directly above it, the unpeeled reading is kept. A file
   that cannot supply an artist component, an album component, and a file is
@@ -329,9 +361,12 @@ behaviour change — its current `album_index == 0` refusal becomes the helper's
 - The discover loop builds `LibraryTarget::Place { root, artist_dir }` from the
   selected artist's `library_root` and `artist_dir` for every missing album.
 
-### `src/main.rs`, `src/mode.rs`, `src/config.rs`
+### `src/config.rs`, `src/main.rs`, `src/mode.rs`
 
-Unchanged.
+`src/config.rs` gains the `storage.organize_pattern` containment check
+described under Configuration. `src/mode.rs` is unchanged. `src/main.rs`
+changes only in a comment that named the removed parameter alongside a `None`
+argument.
 
 ## Data flow
 
@@ -348,7 +383,7 @@ Unchanged.
    3. For each remaining album, oldest first, `process_album` runs with
       `library_track_count: None` and the artist's `LibraryTarget::Place`.
 5. Inside `process_album_internal`, after a successful download:
-   `copy_to_library(root, organize_pattern, on-disk artist directory, album
+   `place_into_library(root, organize_pattern, on-disk artist directory, album
    title)` → remove the staging album directory → record `success` → notify →
    `Downloaded { track_count }`, which charges the budget as it already does.
 
@@ -356,11 +391,20 @@ Unchanged.
 
 - **Placement copy or directory creation fails** — `Failed` with
   `library placement failed: <cause>`; staging retained; album recorded
-  `failed`; budget charged; retried next run.
+  `failed`; budget charged. The album is retried on a later run only when no
+  audio file reached the album folder: a failure after the first file landed
+  leaves a folder the presence index treats as present, so that album is
+  reported as already present from then on. The retained copy is also not
+  guaranteed to survive: a later auto run whose recovery scan is enabled
+  (`library_upgrade.enabled`) removes every leftover staging directory whose
+  album is not recorded `success`, so the album is re-downloaded from scratch.
 - **Staging removal fails after a successful copy** — warning only; the album
-  stays a success, as in the upgrade path.
-- **Destination file already present and strictly better** — kept; the incoming
-  file is not copied, and the album still counts as placed.
+  stays a success. The recovery scan then treats that leftover as an
+  interrupted upgrade and re-copies it into `library.paths[0]` on the next auto
+  run, which is the outcome removal was meant to prevent; because the album is
+  already recorded successful it is not re-downloaded.
+- **Destination file already present and parseable** — kept; the incoming file
+  is not copied, and the album still counts as placed.
 - **Artist destination unavailable** — not representable for a selected artist;
   every indexed album contributes a destination pair, and selection is drawn
   from the index.
@@ -378,12 +422,19 @@ Unchanged.
   level deeper. This is the same disc rule the peer-side parser already applies.
 - Untagged libraries: flat layouts keep their current keys. Nested layouts now
   derive the real artist and album folder names instead of the first two path
-  components, and an album folder carrying an embedded disc marker resolves to
-  the stripped name. Both are corrections to path-derived names that only apply
-  when tags are missing or unreadable; tagged libraries are unaffected.
+  components. Both are corrections to path-derived names that only apply when
+  tags are missing or unreadable; tagged libraries are unaffected. An album
+  folder carrying an embedded disc marker keeps that marker in its name, because
+  the name is the destination the upgrade copy and the quality-deletion root
+  use; folding marker variants into one album identity is the peer-side parser's
+  job and a separate concern.
 - Artist-only manual, explicit manual, and batch modes are untouched; only the
   `process_album` signature they call changes.
-- Existing configuration files remain valid; no key changes meaning or default.
+- Existing configuration files remain valid, with one exception: a
+  `storage.organize_pattern` that was empty, absolute, or carried `..` used to
+  run and is now rejected at startup, because `Path::join` discards part or all
+  of the library root for those forms. Every other key keeps its meaning and
+  default.
 - The database schema is unchanged. Discover still writes the same
   processed-album records.
 - The reporting contract is unchanged: no new notices, and placement failures
@@ -391,24 +442,50 @@ Unchanged.
 
 ## Deliberate limits
 
-- **Artist-only manual runs still strand new downloads in staging.** Only
-  discover mode places albums. An artist-only manual run for an artist already
-  in the library has a known destination and is a candidate follow-up.
+- **Artist-only manual runs do not place albums in the artist's folder.** Only
+  discover mode places albums. An artist-only manual run organizes into
+  `library.paths[0]` when `storage.organize` is on and leaves the download in
+  staging when it is off — the pre-existing behaviour. Giving artist-only
+  manual the same placement is a candidate follow-up.
 - **A destination album folder that already exists under a different spelling
   is not reused.** The never-downgrade guard protects files, not folder
   identity, so a differently named edition folder beside it is possible.
 - **Placement is not transactional.** A crash mid-copy leaves a partial album
-  folder; the album is recorded `failed`, and the retry's never-downgrade guard
-  keeps the better copy of any file already written.
+  folder; the album is recorded `failed`, and a retry keeps whatever it finds
+  (placement never replaces a file that parses as audio). The retry only happens
+  when no audio file landed: presence treats any audio file under the album
+  folder as present, so a crash after the first file leaves an album that later
+  runs report as already present rather than completing it.
 - **No quality deletion on the placement path.** `delete_lesser_quality`
   remains an upgrade-only action.
 - **Presence semantics are untouched.** A partially placed album counts as
   present, so it is never completed by a later run.
-- **Only one disc level is peeled.** `<root>/Artist/Album/CD 01/CD 02/track.flac`
-  is out of convention and keeps resolving one level short.
-- **The album component must hold the files.** A path with unrelated
-  subdirectories between the album folder and the file resolves the album
-  component one level deep, exactly as today.
+- **A marker-shaped subfolder under an album folder reads as the artist folder.**
+  For `<root>/Artist/Gold/Gold (Disc 1)/track.flac` the album component is the
+  marker folder, so the artist folder resolves to `Gold` and the destination
+  pair is (`<root>/Artist`, `Gold`). A placement for that artist would therefore
+  write an album inside the existing `Gold` folder rather than beside it. The
+  shape is structurally identical to
+  `<root>/Genre/Artist/Gold (Disc 1)/track.flac`, where the marker folder *is*
+  the album folder and the current reading (artist `Artist`) is the correct one,
+  so no positional rule can separate them. The index prefers the majority
+  destination, so the bogus pair only wins when marker-shaped albums are the
+  artist's only source. Folding marker variants into one album identity is work
+  for a future presence-and-identity change, not a path change.
+- **Only one disc level is peeled, and only when a component above the file
+  can serve as the album.** `Album/CD 01/CD 02/track.flac` keeps resolving one
+  level short, and `<root>/Genre/Artist/CD 01/track.flac` reads `CD 01` as a
+  disc of the album `Artist` — the same reading the peer-side parser makes. The
+  two readings are structurally ambiguous; the rule follows the peer side.
+- **The album component must hold the files.** A non-disc subdirectory between
+  the album folder and the file (`<root>/Artist/Album/Extras/track.flac`)
+  resolves the album component one level deep, so the derived names become
+  artist `Album`, album `Extras`; the previous rule derived artist `Artist`,
+  album `Album`. The new reading keeps the library location correct, but in auto
+  mode the Soulseek query uses the wrong artist, and in discover the presence
+  index gains a key named after the album folder while the real album is
+  counted missing. Both readings are wrong for that out-of-convention layout,
+  and neither is silently corrected.
 
 ## Testing
 
@@ -438,8 +515,9 @@ Unchanged.
   location to the library root, the artist directory to `Artist`, and groups
   both discs into one album.
 - A nested disc-nested variant resolves the location to `<root>/Genre`.
-- An album folder carrying an embedded marker (`Gold (Disc 1)`) resolves to the
-  stripped album name for untagged files.
+- An album folder carrying an embedded marker (`Gold (Disc 1)`) keeps the
+  on-disk folder name, so the upgrade copy and the quality-deletion root stay in
+  the folder the album was found in.
 - `<root>/Artist/CD 01/track.flac` keeps its current reading: the album is
   `CD 01` under artist `Artist`, and it remains indexed.
 - Files that cannot supply an artist folder, an album folder, and a file are
@@ -460,25 +538,45 @@ Unchanged.
 
 - A completed discover album is copied to
   `<root>/<on-disk artist dir>/<MusicBrainz title>/`, the staging directory is
-  gone, `success` is recorded, and exactly one notification fires.
+  gone, and `success` is recorded.
 - Placement lands beside the artist's existing albums in a nested library.
 - Placement happens with `storage.organize: false` and
   `library_upgrade.enabled: false`.
-- The destination uses the on-disk artist directory when folder and tag
-  spellings differ.
-- A single-track peer group places successfully with `min_tracks: 0`, proving
-  there is no completeness gate.
-- A destination file of strictly better quality is kept rather than
-  overwritten.
+- The destination uses the on-disk artist directory, including when it contains
+  characters that `sanitize_component` would rewrite or a placeholder such as
+  `%album%`: covered by the `organizer` placement tests and by
+  `destination_keeps_the_on_disk_artist_folder_spelling` in `discover`.
+- A single-track peer group places successfully, so placement applies no
+  completeness gate against a library track count.
+- A destination file that parses as audio is kept rather than overwritten, and
+  one that does not parse is replaced: covered by the `organizer` placement
+  tests.
 - Multi-disc staging keeps its `CD 01`/`CD 02` structure under the placed
-  album.
+  album: inherited from `copy_into_library` and covered by its `organizer`
+  tests.
 - A blocked destination yields `Failed`, retains staging, charges the budget,
   and records `failed`.
-- Auto mode regression: `Upgrade` still enforces the completeness gate, still
-  honours `delete_lesser_quality`, and still takes the generic organize path
-  when `library_upgrade.enabled` is false.
+- Auto mode regression: `Upgrade` still enforces both halves of the
+  completeness gate — `test_library_upgrade_completeness_uses_library_track_count_not_peer_folder_size`
+  for the accepted case and `test_library_upgrade_rejects_an_incomplete_download`
+  for the rejected one — and still takes the generic organize path when
+  `library_upgrade.enabled` is false.
 - Auto mode regression: a disc-nested album's upgrade copy lands at
-  `<root>/<artist>/<album>/`.
+  `<root>/<artist>/<album>/`
+  (`test_auto_mode_upgrade_of_a_disc_nested_album_lands_in_the_album_folder`).
+- Auto mode regression: a marker-named album folder (`Gold (Disc 1)`) keeps its
+  on-disk folder name, so the upgrade copy and the quality-deletion root stay in
+  the folder the album was found in
+  (`test_scan_keeps_an_embedded_marker_in_the_album_folder_name` in `scanner`,
+  which is the derivation that name comes from).
+
+The `Upgrade` arm's call into `delete_lesser_quality_files` is unchanged by this
+design and its mechanics are covered by the three `organizer` tests for that
+function (`test_delete_lesser_quality_removes_worse_files`,
+`test_delete_lesser_quality_preserves_better_files`,
+`test_delete_lesser_quality_disabled_noop`). A runner-level assertion is not
+possible with the current mock: it writes non-audio bytes, so the new files
+score 0 and nothing is ever deletable.
 
 ### Mode and CLI tests
 

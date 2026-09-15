@@ -674,13 +674,7 @@ fn artist_album_name(path: &str, artist: &str) -> Option<String> {
         .split(['/', '\\'])
         .filter(|part| !part.is_empty())
         .collect();
-    let mut album_index = components.len().checked_sub(2)?;
-    if crate::discs::is_disc_folder(components[album_index]) {
-        album_index = album_index.checked_sub(1)?;
-    }
-    if album_index == 0 {
-        return None;
-    }
+    let album_index = crate::discs::album_index(&components)?;
     if !artist_directory_matches(&components[album_index - 1..album_index], artist) {
         return None;
     }
