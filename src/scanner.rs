@@ -35,10 +35,16 @@ pub struct ScannedAlbum {
 /// Recognised audio file extensions that the scanner should pick up.
 /// This is broader than `filters.allowed_extensions` — the scanner needs to
 /// see *all* audio files so it can detect albums that contain formats outside
-/// the user's quality target.
-const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "wma", "ape", "mpc", "wv", "aiff", "aif",
-    "dsf", "dff", "spx",
+/// the user's quality target. Shared with the search-side library lookup so both
+/// agree on what counts as a library track.
+///
+/// Not every entry here is scoreable: `organizer::format_from_extension` covers
+/// the common formats plus `oga`/`alac`, but returns `None` for `dsf`, `dff` and
+/// `mpc`, which are therefore counted as library tracks yet never scored or
+/// deleted as lesser quality.
+pub(crate) const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "wma", "ape", "mpc", "wv", "aiff",
+    "aif", "alac", "dsf", "dff", "spx",
 ];
 
 /// Walk library directories, group audio files by artist/album, collect
@@ -58,7 +64,13 @@ pub fn scan_library(
         .map(|e| e.to_lowercase())
         .collect();
 
-    for lib_path_str in library_paths {
+    // Which root supplied each album's recorded location. `library.paths` order
+    // decides, so the first listed entry wins when the same album exists under
+    // several roots (a backup listed afterwards must not take over).
+    let mut location_root: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+
+    for (root_index, lib_path_str) in library_paths.iter().enumerate() {
         let lib_path = Path::new(lib_path_str);
         if !lib_path.exists() {
             return Err(SeakarrError::Scanner(format!(
@@ -151,9 +163,33 @@ pub fn scan_library(
             let album_location = components[..album_index - 1]
                 .iter()
                 .fold(lib_path.to_path_buf(), |acc, c| acc.join(c));
+            // The same artist/album key can appear under several roots, and under
+            // one root in several folders. The earliest listed root wins, and
+            // inside one root the lexicographically smallest folder wins, so the
+            // recorded pair (used by placement and by the auto-mode upgrade root)
+            // never depends on filesystem walk order.
+            let take_location = match albums.get(&key) {
+                None => true,
+                Some(existing) => match location_root.get(&key) {
+                    // An earlier root already supplied the location.
+                    Some(taken) if *taken < root_index => false,
+                    Some(taken) if *taken == root_index => {
+                        (&album_location, &artist_dir) < (&existing.path, &existing.artist_dir)
+                    }
+                    _ => true,
+                },
+            };
+            if take_location {
+                location_root.insert(key.clone(), root_index);
+            }
+
             albums
                 .entry(key)
                 .and_modify(|a| {
+                    if take_location {
+                        a.path = album_location.clone();
+                        a.artist_dir = artist_dir.clone();
+                    }
                     a.track_count += 1;
                     if file_needs_upgrade {
                         a.needs_upgrade += 1;
@@ -208,7 +244,10 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
 }
 
 /// Determine which albums need upgrading based on filter config.
-/// An album is flagged if ANY track is below quality thresholds or in a non-allowed format.
+/// An album is flagged if any track is in a non-allowed format, or when
+/// `min_bit_rate` is set and the album's lowest reported bitrate is missing or
+/// below it. A file with no reported bitrate counts towards `needs_upgrade`
+/// per file, but only flags the album when no file reports one.
 /// Returns (artist, album, replacement_count, library_location) where
 /// `replacement_count` is the number of files failing the quality gate
 /// (computed per-file during the scan, see [`ScannedAlbum::needs_upgrade`]) —
@@ -262,6 +301,7 @@ pub fn find_albums_to_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{write_minimal_flac, write_minimal_flac_with_tags};
     use std::fs;
     use tempfile::TempDir;
 
@@ -421,6 +461,86 @@ mod tests {
     }
 
     #[test]
+    fn test_one_root_holding_two_folders_for_the_same_album_keeps_the_smallest() {
+        // Inside one root the same artist/album key (here via tags) can come from
+        // two folders. The lexicographically smaller location wins, so the
+        // recorded pair never depends on walk order.
+        let dir = TempDir::new().unwrap();
+        for genre in ["B", "A"] {
+            // The genre folder is the album location, and the tag fixes the key,
+            // so both copies are one album with two candidate locations.
+            let album_dir = dir.path().join(genre).join("Tagged").join("Album");
+            fs::create_dir_all(&album_dir).unwrap();
+            write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Tagged", "Album");
+        }
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+
+        assert_eq!(albums.len(), 1, "the tagged copies are one album");
+        assert_eq!(
+            albums[0].path,
+            dir.path().join("A"),
+            "the smaller location wins"
+        );
+        assert_eq!(albums[0].artist_dir, "Tagged");
+        assert_eq!(albums[0].track_count, 2);
+    }
+
+    #[test]
+    fn test_the_first_listed_root_wins_over_a_lower_sorting_one() {
+        // `library.paths` order is the primary rule, so a backup directory listed
+        // second must not take over just because its path sorts first.
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let (smaller, larger) = if first.path() < second.path() {
+            (first.path(), second.path())
+        } else {
+            (second.path(), first.path())
+        };
+        for root in [smaller, larger] {
+            let album_dir = root.join("Artist").join("Album");
+            fs::create_dir_all(&album_dir).unwrap();
+            fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+        }
+
+        let albums = scan_library(
+            &[
+                larger.to_string_lossy().into_owned(),
+                smaller.to_string_lossy().into_owned(),
+            ],
+            &FilterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(albums.len(), 1);
+        assert_eq!(
+            albums[0].path, larger,
+            "the first listed root wins, regardless of path ordering"
+        );
+    }
+
+    #[test]
+    fn test_find_albums_to_upgrade_ignores_bit_depth() {
+        // Auto mode's upgrade scan reads formats and bitrate only, so a library of
+        // 16-bit FLAC must not be flagged by `min_bit_depth: 24`; the setting only
+        // rejects candidates at filter/verify time.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac(&album_dir.join("01 - track.flac"));
+
+        let filters = FilterConfig {
+            min_bit_depth: 24,
+            ..FilterConfig::default()
+        };
+        let albums = scan_library(&library_paths(dir.path()), &filters).unwrap();
+        assert!(
+            find_albums_to_upgrade(&albums, &filters).is_empty(),
+            "bit depth must not flag an album for upgrade"
+        );
+    }
+
+    #[test]
     fn test_find_albums_to_upgrade_wrong_format() {
         let albums = vec![ScannedAlbum {
             path: PathBuf::new(),
@@ -572,6 +692,26 @@ mod tests {
         assert_eq!(albums[0].album, "Album");
         assert_eq!(albums[0].artist_dir, "Artist");
         assert_eq!(albums[0].path, dir.path().join("Genre").join("Style"));
+    }
+
+    #[test]
+    fn test_scan_reads_a_non_disc_subfolder_as_the_album() {
+        // The album component is the folder that holds the file (one dedicated
+        // disc folder is stepped over), so a format or extra sub-folder inside
+        // the album folder shifts the reading: the sub-folder becomes the album
+        // and its parent becomes the artist. Pinned because untagged auto-mode
+        // queries and the discover destination pair both derive from this.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album").join("FLAC");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Album");
+        assert_eq!(albums[0].album, "FLAC");
+        assert_eq!(albums[0].artist_dir, "Album");
+        assert_eq!(albums[0].path, dir.path().join("Artist"));
     }
 
     #[test]

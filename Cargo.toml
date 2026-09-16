@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2021"
 
 # The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
@@ -15,7 +15,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-config = "0.14"
 soulseek-rs-lib = { path = "vendor/soulseek-rs-lib" }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -36,8 +35,6 @@ sha2 = "0.11.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-rstest = "0.22"
 tempfile = "3"
-assert_cmd = "2"
 wiremock = "0.6"
 libc = "0.2"

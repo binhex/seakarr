@@ -369,14 +369,18 @@ async fn process_album_internal(
     );
     // Track which results were last filtered (for rejection summary)
     let mut last_filtered_results: Vec<crate::client::SearchResult> = results.clone();
-    // Title-search fallback: when the primary search returned no usable results
-    // by the cleaned title of the album's alphabetically-first library track
-    // and keep only results containing the album's library track titles.
-    // Only fires when the local library holds the album (enabling the title
-    // list), the title search is enabled, an album is being processed, and the
-    // manual target includes an artist for the library-path lookup.
+    // Title-search fallback: when the primary search returned no usable results,
+    // search again by the cleaned title of the album's alphabetically-first
+    // library track and keep only the results that contain the album's library
+    // track titles. Only fires when the local library holds the album (enabling
+    // the title list), the title search is enabled, an album is being processed,
+    // and the manual target includes an artist for the library-path lookup.
     // Track whether the title-search tier actually fired
     let mut title_search_attempted = false;
+    // True once the title-search results are what `last_filtered_results` holds.
+    // A tier that fired but returned nothing leaves the primary set in place, and
+    // the album gate still explains those rejections.
+    let mut summarising_title_results = false;
 
     if filtered.is_empty()
         && !presearched
@@ -404,9 +408,10 @@ async fn process_album_internal(
                         );
                     } else {
                         title_search_attempted = true;
-                        // the Soulseek lib otherwise gives no clue that this is a
-                        // track-title fallback (and for which album). Log it up
-                        // front so the user can tie the query to the album.
+                        // Without this line the Soulseek lib gives no clue that
+                        // this is a track-title fallback, nor for which album, so
+                        // log it up front and let the user tie the query to the
+                        // album.
                         tracing::info!(
                             "{artist} — {album_name}: no usable primary results, falling back to track-title search"
                         );
@@ -440,6 +445,7 @@ async fn process_album_internal(
                                         config.download.max_queue_length,
                                     );
                                     last_filtered_results = title_results.clone();
+                                    summarising_title_results = true;
                                 }
                                 let title_duration_ms = title_start.elapsed().as_millis() as u64;
                                 if let Err(e) = search::record_search(
@@ -483,9 +489,9 @@ async fn process_album_internal(
                 "No results for {artist} — {}{tried_suffix}",
                 album.unwrap_or("(all)")
             );
-            // If the title tier ran and found results that were rejected
-            // by filters, print a rejection summary so the user knows WHY.
-            if title_search_attempted && !last_filtered_results.is_empty() {
+            // If the title tier produced results that were rejected by filters,
+            // print a rejection summary so the user knows WHY.
+            if summarising_title_results && !last_filtered_results.is_empty() {
                 let rejection_summary = filter::summarize_rejections_with_queue_limit(
                     &last_filtered_results,
                     &config.filters,
@@ -515,8 +521,9 @@ async fn process_album_internal(
             &last_filtered_results,
             &config.filters,
             library_track_count,
-            // When the title-search fallback fired, no album gate applies.
-            if title_search_attempted {
+            // The album gate applies only while the summarised set is the
+            // primary one.
+            if summarising_title_results {
                 None
             } else {
                 filter_album
@@ -717,7 +724,28 @@ async fn process_album_internal(
                 artist_dir,
                 album.unwrap_or("Unknown"),
             ) {
-                Ok(_) => {
+                Ok(dests) => {
+                    // `place_into_library` reports only the files it wrote, so an
+                    // empty list means every destination already held a file that
+                    // parses as audio. The design contract for that state is that
+                    // the album still counts as placed, because the library holds
+                    // audio at every path placement would have written. Failing
+                    // instead does not converge: the album folder the presence
+                    // check looks for is still absent, so the next run downloads
+                    // the album again and keeps the same files again, charging the
+                    // download budget every time.
+                    //
+                    // Warn rather than stay silent, because any track whose
+                    // incoming copy was not written is only reported per file at
+                    // INFO while the staging copy is removed below.
+                    if dests.len() < downloaded.len() {
+                        tracing::warn!(
+                            "{artist} - {}: only {} of {} downloaded file(s) were written; the rest were kept because the destination already holds audio for them, from an earlier run or because another track or album of this artist maps onto the same path - check storage.organize_pattern distinguishes the tracks. The staging copy is removed",
+                            album.unwrap_or("?"),
+                            dests.len(),
+                            downloaded.len()
+                        );
+                    }
                     let track_count = downloaded.len();
                     return finish_library_write(
                         config,
@@ -1898,20 +1926,9 @@ mod tests {
     use crate::client::{FileInfo, MockClient, SearchResult};
     use crate::config::Config;
     use crate::db::Database;
-    use std::collections::HashMap;
+    use crate::test_support::{make_file, write_minimal_flac, write_minimal_flac_with_tags};
     use std::sync::Arc;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
-        let mut attribs = HashMap::new();
-        attribs.insert(0, bitrate);
-        FileInfo {
-            name: name.into(),
-            size,
-            attribs,
-        }
-    }
 
     // Regression guard: the organize step must derive names exactly like the
     // auto-upgrade copy path — zero-padded track number and the title
@@ -1941,6 +1958,26 @@ mod tests {
         assert_eq!(
             organizer::organize_name_from_stem("2001 - A Space Odyssey"),
             ("01".to_string(), "2001 - A Space Odyssey".to_string())
+        );
+        // A DISC-TRACK stem: the track number is the second token, and it must
+        // not survive into the title, or the name would read "11 - 11 - ...".
+        assert_eq!(
+            organizer::organize_name_from_stem("1-11 - Steel Bars"),
+            ("11".to_string(), "Steel Bars".to_string())
+        );
+        assert_eq!(
+            organizer::organize_name_from_stem("2-03 - Title"),
+            ("03".to_string(), "Title".to_string())
+        );
+        // A title that merely begins with its own track number keeps that word:
+        // the DISC-TRACK form is recognised by the hyphen, not by the value.
+        assert_eq!(
+            organizer::organize_name_from_stem("01 - 1 Thing"),
+            ("01".to_string(), "1 Thing".to_string())
+        );
+        assert_eq!(
+            organizer::organize_name_from_stem("07 - 7 Seconds"),
+            ("07".to_string(), "7 Seconds".to_string())
         );
     }
 
@@ -3227,64 +3264,63 @@ mod tests {
     fn stale_cache_warns_without_legacy_notice() {
         use crate::db::DiscographyCacheEntry;
 
-        let buf = Arc::new(Mutex::new(String::new()));
-        let writer = CapturingWriter(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .finish();
+        let capture = crate::test_support::LogCapture::start();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let soulseek = MockClient::new();
+            let provider = FakeDiscographyProvider::failing("service unavailable");
+            let (config, db, staging) = artist_only_fixture();
+            db.upsert_discography_cache(&DiscographyCacheEntry {
+                artist_key: "test artist".to_string(),
+                artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
+                canonical_artist: "Test Artist".to_string(),
+                fetched_at: 0,
+                release_groups_json: serde_json::to_string(&[release_group(
+                    "old",
+                    "Old Album",
+                    "1998",
+                )])
+                .unwrap(),
+            })
+            .unwrap();
 
-        tracing::subscriber::with_default(subscriber, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let soulseek = MockClient::new();
-                let provider = FakeDiscographyProvider::failing("service unavailable");
-                let (config, db, staging) = artist_only_fixture();
-                db.upsert_discography_cache(&DiscographyCacheEntry {
-                    artist_key: "test artist".to_string(),
-                    artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
-                    canonical_artist: "Test Artist".to_string(),
-                    fetched_at: 0,
-                    release_groups_json: serde_json::to_string(&[release_group(
-                        "old",
-                        "Old Album",
-                        "1998",
-                    )])
-                    .unwrap(),
-                })
-                .unwrap();
+            let run = run_artist_only_mode_with_provider(
+                &soulseek,
+                "Test Artist",
+                false,
+                &config,
+                &db,
+                staging.path(),
+                None,
+                &Arc::new(AtomicBool::new(false)),
+                &provider,
+            )
+            .await
+            .unwrap();
 
-                let run = run_artist_only_mode_with_provider(
-                    &soulseek,
-                    "Test Artist",
-                    false,
-                    &config,
-                    &db,
-                    staging.path(),
-                    None,
-                    &Arc::new(AtomicBool::new(false)),
-                    &provider,
-                )
-                .await
-                .unwrap();
-
-                let captured = buf.lock().unwrap().clone();
+            let captured = capture.text();
+                // One record, so neither half of this warning can be supplied by
+                // the other stale-cache tests' records, and the level is asserted
+                // on that record too: the harness captures at DEBUG, so without
+                // this a downgrade to debug! would pass while the outage warning
+                // disappeared from the operator's log.
+                let record = captured
+                    .lines()
+                    .find(|line| {
+                        line.contains("day(s) old and refresh failed (MusicBrainz transport error: service unavailable); using stale cache")
+                    })
+                    .unwrap_or_else(|| panic!("no stale-cache WARN record, got:\n{captured}"));
                 assert!(
-                    captured.contains("day(s) old")
-                        && captured.contains("service unavailable")
-                        && captured.contains("stale"),
-                    "the stale-cache WARN must name the age and refresh error, got:\n{captured}"
+                    record.contains(" WARN "),
+                    "the stale cache must be reported at WARN, got: {record}"
                 );
-                assert!(
-                    run.notice.is_none(),
-                    "a stale cache must not produce a legacy-fallback notice"
-                );
-            });
+            assert!(
+                run.notice.is_none(),
+                "a stale cache must not produce a legacy-fallback notice"
+            );
         });
     }
 
@@ -3427,10 +3463,12 @@ mod tests {
     #[tokio::test]
     async fn discover_places_a_download_in_the_artist_library_folder() {
         let soulseek = MockClient::new();
+        // The peer's folder is named differently from the MusicBrainz title, so
+        // this also pins which of the two names the placed folder takes.
         search_index(
             &soulseek,
             "Test Artist",
-            &[("Test Artist Missing", "Missing")],
+            &[("Test Artist Missing", "2006 - Missing")],
         );
         // Real bytes so the placement copy has content.
         *soulseek.write_files.lock().unwrap() = true;
@@ -3460,7 +3498,15 @@ mod tests {
                 .join("Missing")
                 .join("01 - track.flac")
                 .exists(),
-            "the album must be placed beside the artist's existing albums"
+            "the album must be placed beside the artist's existing albums, in a folder named from the MusicBrainz title"
+        );
+        assert!(
+            !library
+                .path()
+                .join("Test Artist")
+                .join("2006 - Missing")
+                .exists(),
+            "the peer's folder spelling must not name the placed folder"
         );
         assert!(
             !staging.path().join("Test Artist--Missing").exists(),
@@ -3522,6 +3568,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_placement_without_the_artist_placeholder_writes_beside_the_folder() {
+        // README: the folder comes from `%artist%`, so a pattern that omits it
+        // writes beside the artist's folder — under that folder's parent, which
+        // in a nested library is the genre directory, not the library root.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let existing = library
+            .path()
+            .join("Metal")
+            .join("Test Artist")
+            .join("Present");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("01 - track.flac"), b"fake flac data").unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize_pattern = "%album%/%track% - %title%.%ext%".to_string();
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Metal")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "without %artist% the album lands beside the artist folder, under its parent"
+        );
+        assert!(
+            !library
+                .path()
+                .join("Metal")
+                .join("Test Artist")
+                .join("Missing")
+                .exists(),
+            "the artist folder must not be used when the pattern omits %artist%"
+        );
+        assert!(
+            !library.path().join("Missing").exists(),
+            "the library root is not the placement base for a nested layout"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_placement_ignores_the_organize_flag() {
+        // README: placement is unconditional in discover mode and does not
+        // depend on `storage.organize`. With the flag on, the album must still be
+        // placed once by the placement path rather than organized a second time
+        // under the library root, which would leave a duplicate-suffixed copy.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let (mut config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        config.storage.organize = true;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let album_dir = library.path().join("Test Artist").join("Missing");
+        assert!(
+            album_dir.join("01 - track.flac").exists(),
+            "the album must be placed in the artist's folder"
+        );
+        assert!(
+            !album_dir.join("01 - track (1).flac").exists(),
+            "the organize block must not run after an early placement return"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_placement_failure_retains_staging_and_charges_the_budget() {
         let soulseek = MockClient::new();
         search_index(
@@ -3576,6 +3725,334 @@ mod tests {
             soulseek.search_queries.lock().unwrap().as_slice(),
             ["Alpha Artist Missing"],
             "the failed placement charges the budget and stops the run there"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_placement_that_writes_nothing_still_counts_as_placed() {
+        // Design contract: "Destination file already present and parseable —
+        // kept; the incoming file is not copied, and the album still counts as
+        // placed." A pattern without `%album%` can map every track onto a file
+        // the library already holds, so the kept list comes back empty. That
+        // state must complete as placed: it is what presence itself means, and
+        // failing it would re-download the album on every run because no album
+        // folder satisfying presence is ever created.
+        let capture = crate::test_support::LogCapture::start();
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let (mut config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        // Dropping %album% hides the album identity from the destination path.
+        config.storage.organize_pattern = "%artist%/%track% - %title%.%ext%".to_string();
+        // The staged file is "01 - track.flac", so this is the destination the
+        // pattern produces: a real audio file that placement must not replace.
+        write_minimal_flac(&library.path().join("Test Artist").join("01 - track.flac"));
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_album_status("Test Artist", "Missing")
+                .unwrap()
+                .as_deref(),
+            Some("success"),
+            "a placement whose destinations already hold audio still counts as placed"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Missing").exists(),
+            "a placed album removes its staging copy"
+        );
+        // The warning is the only signal that no incoming file was written while
+        // the staging copy was removed, so assert it rather than trusting the
+        // branch to stay loud.
+        let logs = capture.text();
+        let record = logs
+            .lines()
+            .find(|line| line.contains("downloaded file(s) were written"))
+            .unwrap_or_else(|| panic!("the all-kept placement was not reported, got:\n{logs}"));
+        assert!(
+            record.contains(" WARN ")
+                && record.contains("Test Artist - Missing")
+                && record.contains("only 0 of 1"),
+            "the all-kept placement must be reported at WARN, naming the album and both counts, got: {record}"
+        );
+
+        // Convergence. No album folder that presence can see was created, so the
+        // recorded success is what stops the album being downloaded again; a
+        // failure record would leave it missing and re-download it every run,
+        // charging one unit of the discover budget each time.
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Missing"],
+            "the placed album must not be downloaded again on the next run"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_placement_keeps_existing_tracks_and_writes_the_rest() {
+        // Partial keep: the destination already holds one track that parses as
+        // audio, so that track is left alone while the missing track is written.
+        // The album completes as placed and the kept destination stays
+        // byte-identical.
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Test Artist Missing".into(),
+            vec![SearchResult {
+                username: "peer".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![
+                    make_file(r"Test Artist\Missing\01 - track.flac", 900, 10_000_000),
+                    make_file(r"Test Artist\Missing\02 - other.flac", 900, 10_000_000),
+                ],
+            }],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let capture = crate::test_support::LogCapture::start();
+        let (mut config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        // A pattern without %album% is what makes a per-track collision possible:
+        // with %album% the destination folder would itself satisfy presence and
+        // the album would never be searched for in the first place.
+        config.storage.organize_pattern = "%artist%/%track% - %title%.%ext%".to_string();
+        // Quality deletion is an upgrade-mode concern; placement must ignore it
+        // and leave the destination that already holds audio alone.
+        config.library_upgrade.delete_lesser_quality = true;
+        let artist_dir = library.path().join("Test Artist");
+        let kept = artist_dir.join("01 - track.flac");
+        write_minimal_flac(&kept);
+        let kept_bytes = std::fs::read(&kept).unwrap();
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_album_status("Test Artist", "Missing")
+                .unwrap()
+                .as_deref(),
+            Some("success"),
+            "one written track is enough for the album to count as placed"
+        );
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            kept_bytes,
+            "the destination that already parsed as audio must be untouched"
+        );
+        assert!(
+            artist_dir.join("02 - other.flac").exists(),
+            "the track with no existing destination must be written"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Missing").exists(),
+            "a placed album removes its staging copy"
+        );
+        // A partial keep must be reported as well as the all-kept case: the kept
+        // track's incoming copy is discarded while the album completes.
+        let logs = capture.text();
+        let record = logs
+            .lines()
+            .find(|line| line.contains("downloaded file(s) were written"))
+            .unwrap_or_else(|| panic!("the partial placement was not reported, got:\n{logs}"));
+        assert!(
+            record.contains(" WARN ") && record.contains("only 1 of 2"),
+            "a partial placement must warn with both counts, got: {record}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placed_album_counts_as_present_on_the_next_discover_run() {
+        // The convergence property placement exists for: once the album sits in
+        // the artist's folder, the next run must treat it as present. A fresh
+        // database is used for the second run, so only the library scan can
+        // suppress the search — the processed-album record must not be what
+        // makes this pass.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let (config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "the first run must place the album"
+        );
+
+        let fresh = Database::open_in_memory().unwrap();
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &fresh,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Test Artist Missing"],
+            "the placed album must count as present, so the second run searches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_uses_the_on_disk_artist_folder_not_the_tag_spelling() {
+        // The scanner prefers tag metadata over the directory name, so the
+        // MusicBrainz query can use a spelling the artist folder does not have.
+        // The destination must still be the folder the walk saw: writing the tag
+        // spelling would create a second artist tree beside the real one.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Guns 'n' Roses",
+            &[("Guns 'n' Roses Missing", "Missing")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let existing = library
+            .path()
+            .join("Rock")
+            .join("Guns N Roses")
+            .join("Present");
+        std::fs::create_dir_all(&existing).unwrap();
+        write_minimal_flac_with_tags(
+            &existing.join("01 - track.flac"),
+            "Guns 'n' Roses",
+            "Present",
+        );
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Rock")
+                .join("Guns N Roses")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must land inside the on-disk artist folder"
+        );
+        assert!(
+            !library.path().join("Rock").join("Guns 'n' Roses").exists(),
+            "the tag spelling must never create a second artist folder"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_mode_leaves_the_download_in_staging() {
+        // Only discover mode places files in the library. Artist-only, manual and
+        // batch runs keep their completed download in staging, so this locks the
+        // "only discover places" contract against a future reroute of
+        // artist-only runs through the placement path.
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
+        *soulseek.write_files.lock().unwrap() = true;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1998")]);
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        assert!(!config.storage.organize, "the organize step must stay off");
+
+        run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--Album")
+                .join("01 - track.flac")
+                .exists(),
+            "artist-only mode must leave the completed download in staging"
+        );
+        assert!(
+            !library.path().join("Test Artist").exists(),
+            "artist-only mode must not place anything into the library"
         );
     }
 
@@ -4595,29 +5072,6 @@ mod tests {
 
     // ── Log-capture harness ──
 
-    #[derive(Clone)]
-    struct CapturingWriter(Arc<Mutex<String>>);
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(buf));
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     // Regression: when primary and album-only searches return nothing and
     // the title-search fallback fires, the bare "Searching for X" line from
     // the soulseek lib must be preceded by a clear, contextual log line that
@@ -4632,19 +5086,7 @@ mod tests {
     // body runs on a different/runtime thread.
     #[tokio::test(flavor = "current_thread")]
     async fn test_title_search_fallback_logs_contextual_message() {
-        let buf = Arc::new(Mutex::new(String::new()));
-        let writer = CapturingWriter(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        // Use a global default so all threads' tracing calls are captured.
-        // This is the only test in the suite that installs a subscriber, so
-        // it is safe to set the process-wide default here.
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("global tracing subscriber must be set exactly once");
+        let capture = crate::test_support::LogCapture::start();
 
         let client = Arc::new(MockClient::new());
         // Library track "01 - I Miss You.mp3" cleans to "i miss you", the
@@ -4665,8 +5107,13 @@ mod tests {
 
         let mut config = make_test_config();
         config.search.search_title_match = 70;
+        // A distinctive artist and album spelling: the sibling test
+        // `test_title_search_fallback_when_primary_empty` drives the same code
+        // path with the same fixture under the plain "Adele"/"25" names, and a
+        // test that is not capturing still contributes records to an open
+        // capture window. These values keep the guard out of its reach.
         let tmp = TempDir::new().unwrap();
-        let album_dir = tmp.path().join("Adele").join("25");
+        let album_dir = tmp.path().join("Adele Probe").join("25 Probe");
         std::fs::create_dir_all(&album_dir).unwrap();
         std::fs::write(album_dir.join("01 - I Miss You.mp3"), b"fake mp3").unwrap();
         std::fs::write(album_dir.join("02 - Hello.mp3"), b"fake mp3").unwrap();
@@ -4677,8 +5124,8 @@ mod tests {
 
         let result = process_album(
             client.as_ref() as &dyn crate::client::SoulseekClient,
-            "Adele",
-            Some("25"),
+            "Adele Probe",
+            Some("25 Probe"),
             false,
             &config,
             &db,
@@ -4692,14 +5139,21 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
 
-        let captured = buf.lock().unwrap().clone();
+        // Assert on the record itself, not on the buffer: another test's record
+        // could hold either half of this, while a record naming this artist and
+        // album can only come from this run. The lookup also requires this test's
+        // artist, so a sibling's line for the plain "Adele" album can never be
+        // selected and then reported as a mismatch.
+        let captured = capture.text();
+        let record = captured
+            .lines()
+            .find(|line| {
+                line.contains("falling back to track-title search") && line.contains("Adele Probe")
+            })
+            .unwrap_or_else(|| panic!("expected a contextual fallback log line, got:\n{captured}"));
         assert!(
-            captured.contains("falling back to track-title search"),
-            "expected a contextual fallback log line, got:\n{captured}"
-        );
-        assert!(
-            captured.contains("Adele"),
-            "expected the fallback log line to name the artist,\n{captured}"
+            record.contains("Adele Probe — 25 Probe"),
+            "the fallback record must name the artist and album it refers to, got:\n{record}"
         );
     }
 

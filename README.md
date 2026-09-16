@@ -7,10 +7,17 @@ Automated Soulseek music downloader with library quality upgrading.
 
 - **Library quality scanner** — walks your music library directories, reads audio tags (FLAC, MP3, AAC,
   OGG, Opus, WAV, WMA, and more via [lofty](https://crates.io/crates/lofty)), and identifies albums
-  whose tracks fall below configurable bitrate threshold or are in a lossy format.
+  whose tracks are in a format outside `filters.allowed_extensions` or fall below the
+  configurable bitrate threshold.
 - **Automatic mode** — for each album needing an upgrade, searches the Soulseek network, ranks
-  candidates by speed × free slots × bitrate, downloads the best match, and organises the result into your
-  library.
+  candidates by advertised speed (adjusted by measured-throughput reputation), free-slot bonus, bitrate bonus,
+  album-name match and peer reliability, and downloads the best match. The result is written into your
+  library when `storage.organize` or `library_upgrade.enabled` is on; at the shipped defaults of `false` it
+  stays in `storage.staging_dir`. An upgrade whose every destination already holds a strictly better file
+  keeps those files and still completes the album, so the staging copy is removed without a new file being
+  written. A candidate whose files omit the bitrate attribute scores zero on the bitrate bonus once
+  `filters.min_bit_rate` is set, so a peer that reports one is preferred; it is still admitted, because its
+  real quality is verified after download.
 - **Discover mode** — derives the artist list from your library (tags first,
   folder names as the fallback), asks MusicBrainz which conceptual albums each
   artist is missing, and downloads only those. Albums already present are never
@@ -42,15 +49,17 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Post-download organisation** — move completed files from a staging directory into your library using a
   configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
   duplicate handling.
-- **SQLite persistence** — tracks processed albums, download queue, peer reputation, and search history
+- **SQLite persistence** — tracks processed albums, peer reputation, and search history
   across restarts and schedule cycles.
 - **Scheduled mode** — run the selected auto, manual, batch, or discover operation immediately, then repeat
   it after a configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle
   cancellation or stops the scheduler while it is waiting between cycles.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
   directory.
-- **Notifications** — sends alerts via any [Apprise](https://github.com/caronc/apprise)-compatible service
-  (ntfy, Discord, Telegram, email, and more) on each successful album download.
+- **Notifications** — sends alerts for each successful album download by POSTing a small JSON body
+  (`title`, `message`, `type`) to every configured `notifications.urls` entry. Only `http(s)` endpoints are
+  delivered: an Apprise-style scheme URL such as `ntfy://my-topic` is accepted by configuration but never
+  delivered, and the failure is logged as a warning rather than failing the run.
 - **Config-driven** — all behaviour is controlled by a single `seakarr.yml` YAML file; a default is
   created automatically on first run. The CLI exposes only essential overrides.
 
@@ -172,7 +181,10 @@ intended for replacing corrupt or otherwise invalid downloaded files. The
 matching successful database record is deleted before the attempt; if the retry
 fails, the album remains eligible for normal future retries. In manual and
 batch modes, use `storage.organize: true` if the replacement should be moved
-into the library; otherwise it remains in staging. In auto mode, only albums
+into the library; otherwise it remains in staging until a later auto run with
+`library_upgrade.enabled: true` runs its recovery scan, which adopts a staging
+leftover with a matching successful record into `library.paths[0]` and deletes a
+leftover with no record. In auto mode, only albums
 selected by the existing upgrade scanner are eligible. The flag cannot be
 combined with `--schedule` (or configured scheduled mode), so a forced reprocess
 is never repeated automatically on every cycle. If a forced search fails before
@@ -191,8 +203,8 @@ A default config is created automatically on first run. The file is divided into
 | `username` | Soulseek account username. Required. Overridden by `--soulseek-user`. | `""` |
 | `password` | Soulseek account password. Required. Overridden by `--soulseek-password`. | `""` |
 | `server` | Soulseek server address. | `server.slsknet.org:2242` |
-| `login_retries` | Maximum login attempts with exponential backoff. | `3` |
-| `login_retry_delay_secs` | Initial backoff delay in seconds (doubles each retry). | `5` |
+| `login_retries` | Maximum login attempts with exponential backoff. At most `10`. | `3` |
+| `login_retry_delay_secs` | Initial backoff delay in seconds (doubles each retry, capped at 10 minutes per wait). At most `300`. | `5` |
 | `listen_port` | Incoming peer port for accepting connections from other Soulseek clients. Set to `0` to disable the listener (firewalled mode). Requires port forwarding at your router for values > 0. | `2234` |
 | `max_peers` | Maximum simultaneous peer connections (minimum 1). Each connection uses a 256 KB actor thread. Higher values allow more parallel search/download candidates but use more memory. | `64` |
 
@@ -200,16 +212,16 @@ A default config is created automatically on first run. The file is divided into
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `paths` | Root directories to scan for music files. Each path should contain `Artist/Album` subdirectories. Overridden by `--library-path`. | `[]` |
+| `paths` | Root directories to scan for music files, in priority order. Each path should contain `Artist/Album` subdirectories. When the same album is found under more than one root, the earliest listed entry supplies the location an upgrade writes back to, while the track counts from all copies are summed (so keep the entries non-overlapping: overlapping roots inflate the count the peer-completeness gate compares against). Discover placement is artist-level instead: it uses the root holding most of that artist's albums, with ties broken alphabetically. Overridden by `--library-path`. | `[]` |
 | `scan_on_startup` | Rescan the library on startup (auto mode). *(Reserved for future use — not yet enforced.)* | `true` |
 
 ### `storage`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `staging_dir` | Directory where in-progress downloads land before organisation. Auto-created if missing. | `downloads/staging` |
+| `staging_dir` | Directory where in-progress downloads land before organisation. Auto-created if missing. Keep it outside every `library.paths` entry: a staging folder inside a library root is scanned as if it were albums of its own artist. | `downloads/staging` |
 | `organize` | Automatically move completed downloads into the library. | `false` |
-| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%`. Must be relative and free of `..` components. Discover mode also uses it to shape placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
+| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%` (always expands to `unknown` today). Must be non-empty, relative, contain at least one ordinary path component, be free of `..` components, and must not end with a path separator. It must also expand to a distinct path per track: unlike the organize step, the library copy paths resolve a collision with the keep/overwrite rules instead of a `(1)` suffix, so a pattern that does not distinguish the tracks (for example one with neither `%track%` nor `%title%`) lets one track stand in for the rest. A pattern whose expansion names a path that already exists as a directory — `%artist%` alone, or `%artist%/%album%` when those match the on-disk folders — cannot be copied to at all, so every track fails with `Is a directory`. Discover placement warns when only some of the downloaded files were written; the upgrade path logs each kept file at INFO instead. Discover mode also uses it to shape placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
 
 ### `search`
 
@@ -229,7 +241,7 @@ mode are ignored. CLI values take precedence over values in the selected section
 | `manual.artist` | Manual artist fallback, used only in `manual` mode. | `""` |
 | `manual.album` | Manual album fallback, used only in `manual` mode. | `""` |
 | `batch.file_path` | Batch file fallback, used only in `batch` mode. | `""` |
-| `search_title_match` | Minimum percentage of the album's non-generic track titles that a title-search result must contain for the title-search fallback tier to keep it. Set `0` to disable the tier. | `70` |
+| `search_title_match` | Minimum percentage of the album's non-generic track titles that a title-search result must contain for the title-search fallback tier to keep it. Set `0` to disable the tier. At most `100`. | `70` |
 | `peer_reputation` | Blend measured speed + reliability into search ranking. Set to `false` to rank by advertised speed only. | `true` |
 
 ### `discography`
@@ -245,8 +257,8 @@ key.
 | --- | ----------- | ------- |
 | `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
 | `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
-| `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. | `[studio_album]` |
-| `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. | `{}` |
+| `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. Must not be empty while `enabled` is true. | `[studio_album]` |
+| `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. Keys must be unique after normalization, so `Nirvana` and ` nirvana ` cannot both appear. | `{}` |
 
 ### `discover`
 
@@ -262,7 +274,12 @@ An album counts as present when a matching `artist/album` folder holds at least
 one audio file. Matching is exact after case, spacing, and Unicode folding, so
 punctuation is significant and an album you hold only as a deluxe or remastered
 edition does not satisfy the plain album. Quality is not considered: replacing
-lossy files remains `auto` mode's job.
+lossy files remains `auto` mode's job. The match is a whole title, so a folder
+that also carries a release year, the artist name, or a format label
+(`2006 - Days to Come`, `Days to Come - Bonobo`, `Days to Come [FLAC]`) is a
+different key from the plain title MusicBrainz reports, and discover can place
+one extra copy beside it; keeping folder names close to the MusicBrainz title
+avoids that.
 
 ### `filters`
 
@@ -270,29 +287,29 @@ Controls which Soulseek search results pass the quality gate.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `allowed_extensions` | Only consider files with these extensions (lowercase, no dot). | `[flac]` |
-| `min_bit_rate` | Minimum bitrate in kbps. Lossy files whose actual bitrate is below this value are rejected (verified after download when the peer omits the bitrate attribute). `0` disables. | `0` |
-| `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. | `0` |
+| `allowed_extensions` | Only consider files with these extensions. Entries must be bare extensions of ASCII letters and digits (so `flac`, `mp3`, `m4a`); an empty list, or an entry such as `.flac` or `flac, mp3` that could never match, aborts startup. | `[flac]` |
+| `min_bit_rate` | Minimum bitrate in kbps. At candidate selection, any file whose advertised bitrate is below this value is rejected, lossless included; the post-download verification is what applies to lossy files only, and it also runs when the peer omitted the bitrate attribute. `0` disables. | `0` |
+| `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. Auto mode's upgrade scan does not read bit depth, so a library of 16-bit files is never flagged for upgrade because of this setting; it only rejects candidates whose advertised or measured depth is lower. | `0` |
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
-| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered or multi-disc collections. | `true` |
+| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. | `true` |
 | `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. | `3` |
-| `peer_track_count` | In auto mode, reject search results whose usable track count is below the library's existing track count for the same album. Prevents silent downgrades when the library already has a more complete copy. Also applies in manual mode when the album is already present in the library (a library track count is derived there); batch mode has no library track count. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
+| `peer_track_count` | In auto mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that auto mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `concurrent` | Maximum simultaneous album downloads. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
+| `concurrent` | Maximum simultaneous album downloads, between `1` and `8`. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
 | `max_queue_length` | `0` requires a free upload slot during candidate selection; later telemetry does not retroactively reject an admitted free-slot peer. A positive value also permits zero-slot peers only when a reported positive queue position is at or below the limit. Unknown positions and wire position `0` do not prove a zero-slot peer is within the limit. | `0` |
 | `max_start_time_secs` | Maximum seconds from first reaching queue position `1` until the first transfer progress. `0` disables this queue-head limit. | `120` |
 | `max_queue_time_secs` | Maximum total seconds from enqueue until the first transfer progress. `0` disables this total queue limit. | `1800` |
 | `min_upload_speed_kbps` | Cancel transfers where measured speed drops below this threshold. `0` disables the speed check. | `250` |
 | `speed_check_wait_secs` | Seconds to wait after a transfer starts before measuring speed. | `30` |
-| `timeout_secs` | Post-start inactivity timeout — starts at the first `InProgress` status, resets only on later `InProgress` events, and is not reset by a paused status. Cancels the transfer when no update arrives within this period. | `180` |
+| `timeout_secs` | Post-start inactivity timeout — starts at the first `InProgress` status, resets only on later `InProgress` events, and is not reset by a paused status. Cancels the transfer when no update arrives within this period. `0` disables the inactivity timeout, like the queue limits. | `180` |
 | `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. *(Reserved for future use — not yet enforced.)* | `120` |
-| `max_retries` | Per-file retry attempts on the same peer before falling back to the next candidate. `0` disables retries. | `4` |
-| `retry_delay_secs` | Seconds to wait between retry attempts. | `30` |
+| `max_retries` | Per-file retry attempts on the same peer before falling back to the next candidate. `0` disables retries. At most `10`. | `4` |
+| `retry_delay_secs` | Seconds to wait between retry attempts. At most `300`. | `30` |
 | `min_filtered_users` | Minimum number of filtered candidates required to apply the speed check. *(Reserved for future use — not yet enforced.)* | `10` |
 | `skip_retry_hours` | Cooldown in hours before re-attempting a transiently-failed album on the next run. *(Reserved for future use — not yet enforced.)* | `24` |
 
@@ -301,10 +318,15 @@ Controls which Soulseek search results pass the quality gate.
 Auto-mode workflow that finds library albums failing the quality gate and re-downloads them from a
 better source, replacing the existing files.
 
+The destination is derived from the album's tags, not from the folder the album was found in, so a tag
+spelling that differs from the folder name (`Guns 'n' Roses` versus `Guns N Roses`) writes into a second
+artist folder and leaves the original files where they are. Discover mode is not affected: it places
+under the on-disk artist folder.
+
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `enabled` | Enable the library-upgrade workflow (auto mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. | `false` |
-| `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly downloaded copies (non-audio files are never deleted). | `false` |
+| `enabled` | Enable the library-upgrade workflow (auto mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. Requires at least one `library.paths` entry. | `false` |
+| `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly written copies (non-audio files are never deleted). The pass walks `<artist>/<album>` under the directory the album was found in (the library root itself only for a flat `<root>/Artist/Album` layout) and compares against the best written file, so two cases behave differently from the name: a pattern that writes outside that album folder leaves the old files judged against a replacement stored elsewhere, and a file kept because it scored higher than its own incoming copy can still be deleted when another track of the album scored higher. | `false` |
 
 ### `database`
 
@@ -331,10 +353,12 @@ better source, replacing the existing files.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `urls` | List of [Apprise](https://github.com/caronc/apprise) service URLs. A success notification is sent for each completed album. Leave empty to disable. | `[]` |
+| `urls` | List of webhook endpoints. A success notification is POSTed to each one for every completed album, as JSON `{title, message, type}`. Only `http`/`https` URLs are delivered; Apprise-style scheme URLs (`ntfy://`, `discord://`) are accepted but never delivered, and the failure is logged as a warning. Leave empty to disable. | `[]` |
 
-Apprise supports ntfy, Discord, Telegram, email, Slack, and many other services. Example:
-`ntfy://my-topic`, `discord://webhook-id/webhook-token`.
+The endpoint must be `http` or `https` and must accept a JSON body. An Apprise API server works: point the
+URL at its `/notify` endpoint. Bare Apprise scheme URLs such as `ntfy://my-topic` or
+`discord://webhook-id/webhook-token` are parsed as configuration but cannot be delivered, because the
+notification is a plain HTTP POST; use each service's HTTP webhook URL instead.
 
 ### `schedule`
 
@@ -360,18 +384,22 @@ Seakarr has four operating modes:
 ### Automatic mode (default)
 
 1. **Scan** — walks every path in `library.paths`, reads audio tags via `lofty`, and groups tracks by
-   artist and album. Prefers tag metadata over directory names.
+   artist and album. Prefers tag metadata over directory names. Folder-derived artist and album names
+   assume UTF-8 path components: a non-UTF-8 component is skipped, which shifts the derived names for
+   that album, so keep library folder names in UTF-8.
 2. **Detect upgrades** — for each album, checks whether any track is in a non-allowed format or below
-   `min_bit_rate`. Albums with tagged bitrate `None` are also flagged (unknown quality).
+   `min_bit_rate`. When `min_bit_rate` is set, an album whose files all report no bitrate is flagged too,
+   because its quality cannot be verified.
 3. **Search** — queries the Soulseek network for each flagged album.
 4. **Filter & rank** — filters results by extension, bitrate, excluded words,
    and upload availability: with `download.max_queue_length: 0` a peer must
    offer a free upload slot, while a positive limit also admits zero-slot peers
    whose queue position is validated during download. When
    `filters.contiguous_tracks` is enabled, results whose downloadable track
-   numbers have gaps (or none at all) are discounted.
-   Ranks candidates by `speed × slot_bonus × bitrate_bonus × reliability_factor` (reliability and measured-speed
-   reputation adjust the advertised speed).
+   numbers have gaps (or none at all) are rejected before ranking.
+   Ranks candidates by `speed × slot_bonus × bitrate_bonus × album_bonus × reliability_factor` (reliability and
+   measured-speed reputation adjust the advertised speed; `album_bonus` is 1.5 when the peer's folder matches the
+   album name, 1.1 when the name appears elsewhere in the path, 1.0 otherwise).
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer
    speed in real time. While a transfer waits in a remote queue, seakarr asks
    the peer for its position immediately and every five minutes.
@@ -386,8 +414,8 @@ Seakarr has four operating modes:
    the same peer before falling back to the next candidate.
 6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
    into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
-7. **Persist & notify** — the album is marked as processed in SQLite and an Apprise notification is sent
-   (if configured).
+7. **Persist & notify** — the album is marked as processed in SQLite and the success payload is POSTed to each
+   configured `notifications.urls` webhook (if any).
 
 ### Manual mode
 
@@ -434,9 +462,18 @@ unconditional in discover mode: it does not depend on `storage.organize` or on
 copy succeeds the staging directory for that album is removed, so discover leaves nothing behind.
 The scanner resolves the artist folder, album folder, and library location positionally and steps
 over one dedicated disc folder (`CD 01`, `Disc 2`), so nested layouts such as
-`<root>/Genre/Artist/Album` and albums whose discs sit in dedicated disc folders place correctly.
+`<root>/Genre/Artist/Album` and albums whose discs sit in dedicated disc folders place correctly. The
+album folder must hold the files itself: for an untagged `<root>/Artist/Album/FLAC/01.flac` the
+sub-folder is read as the album (`Album` becomes the artist and `FLAC` the album), so keep format or
+extra sub-folders outside the album folder.
 An album split across marker-shaped folders (`Gold (Disc 1)/`, `Gold (Disc 2)/` under one album
-folder) reads as two albums and is documented as a limit rather than corrected. Only discover mode
+folder) reads as two albums and is documented as a limit rather than corrected; the derived artist
+folder is then the marker folder's parent (`Gold/`), which also feeds the discover destination pair
+when those are the artist's only albums. A placed album that keeps a marker folder is therefore
+indexed under the marker name, not the album title, so a later run with a cleared database or
+`--ignore-processed` can download it again. On the upgrade path the same shape can also nest one
+level too deep, giving `<artist>/Gold (Disc 1)/Gold (Disc 1)/...`, because the disc folder is
+preserved under an album whose own name is that marker. Only discover mode
 places albums beside the artist's folder: an artist-only manual run (`--mode manual --artist "Name"`) does not, so with
 `storage.organize: true` it organizes its downloads under `library.paths[0]` and with `organize` off they stay in
 `staging_dir`.
@@ -479,6 +516,15 @@ pre-commit run --all-files
 
 ## FAQ
 
+**Q: What happens when the Soulseek session drops?**
+
+A dropped connection is reconnected transparently, using `soulseek.login_retries` and
+`soulseek.login_retry_delay_secs` for the login attempts. A reconnect that fails for a transient reason
+is retried after a short cooldown; one rejected because the credentials are no longer accepted is not
+retried at all, so fixing the credentials and restarting is required. A session displaced by another
+login with the same username is different again: seakarr reports the takeover and stops using that
+session rather than reconnecting, because logging in again would evict the other instance.
+
 **Q: Why do some albums fail with "no results passed filters"?**
 
 `filters.contiguous_tracks` (default `true`) rejects search results whose track numbers have gaps,
@@ -487,14 +533,25 @@ fused to letters) or without numbers are treated as unnumbered. If your collecti
 naming, set `filters.contiguous_tracks: false` in `seakarr.yml`.
 
 These albums appear in the "Failed" section of the run summary with the reason
-"no results passed filters". Albums with zero search results at all appear with the reason
-"no results found". Both are retried on subsequent runs.
+"no results passed filters". Albums where every search tier came back empty appear with the reason
+"no results found" instead, and that includes an album whose only results came from the track-title fallback
+and were all rejected (the rejection summary is written to the log). Both are retried on subsequent runs.
 
-Two known limitations of the heuristic, also solvable with `contiguous_tracks: false`: (1) the
+Two known limitations of the heuristic. (1) The
 first number in the filename wins, so artist names containing digits (`Maroon 5`, `50 Cent`,
-`Blink 182`) are parsed instead of the track number and can mask gaps; (2) disc-track numbering
-(`1-01`, `2-03`) is parsed per disc — each disc's tracks are validated independently, so a
-partial multi-disc share (missing a whole disc) is rejected rather than silently passing.
+`Blink 182`) can be read as the track number instead — every file in such a share then yields the same
+number, which the duplicate-tolerant check accepts, so a share with real gaps can pass. Disabling
+`contiguous_tracks` does not help there: the verdict is already a pass. The exception is a hyphenated
+disc-track name such as `1-11 - Title.flac`, where the second number is the track and the disc number is
+dropped from the written name; a share that writes the disc and track numbers apart (`2 - 05 - Title.flac`)
+is read by the first-number rule instead. (2) A gap inside any one disc
+is rejected, because each disc's tracks are validated independently, but a share that omits an entire
+disc is not detected by this heuristic — a peer advertising only `CD 01` forms one contiguous group,
+so a multi-disc album can be completed from it and recorded as present. Turning the gate off does not
+help there: it is a false acceptance, so disabling the check only accepts more shares. In auto mode,
+and in manual mode when the album is already in the library, the peer track-count gate is what rejects
+a peer that supplies fewer tracks than the album needs; discover and batch runs have no such baseline,
+because neither derives a library track count for the album.
 
 **Q: How should I organise my music library?**
 
@@ -514,8 +571,11 @@ names. Files without readable tags fall back to the directory naming convention.
 
 **Q: What formats can seakarr scan?**
 
-All formats supported by the [lofty](https://crates.io/crates/lofty) crate: FLAC, MP3, AAC, OGG, Opus,
-WAV, WMA, APE, MPC, Speex, and more. Bitrate and format information is extracted from file headers and tags.
+The extensions the scanner recognises, all readable by the [lofty](https://crates.io/crates/lofty)
+crate: FLAC, MP3, M4A/AAC, OGG/OGA, Opus, WAV, WMA, APE, MPC, WavPack, AIFF, ALAC, DSF/DFF and Speex. A
+file whose extension is not in that list is skipped even if lofty could read it, so an unusual container
+(say `.mp4` or `.m4b`) is invisible to the scanner. Bitrate and format information is extracted from file
+headers and tags.
 
 **Q: What formats will seakarr download?**
 
@@ -529,8 +589,10 @@ positive limit to try zero-slot peers whose reported positive queue position
 is within that bound. Unknown and out-of-bound positions fail closed and move
 to the next candidate without retrying the same peer. A wire position of `0`
 means the peer has no actionable queue entry; it is treated as unknown and
-never proves a zero-slot peer eligible. A peer admitted with an advertised free
-slot is not retroactively rejected by later telemetry. `max_queue_time_secs`
+never proves a zero-slot peer eligible. With `max_queue_length: 0`, a peer
+admitted with an advertised free slot is not retroactively rejected by later
+telemetry; a positive limit applies the position check to every candidate.
+`max_queue_time_secs`
 limits total queue wait, `max_start_time_secs` limits the wait after reaching
 position `1`, and `timeout_secs` controls inactivity only after transfer
 progress begins. With the defaults, a silent pre-start wait can therefore last
@@ -550,9 +612,12 @@ the correct library location regardless of filesystem layout.
 
 **Q: Can I run multiple instances of seakarr at once?**
 
-No — the PID lock prevents concurrent runs. If a second instance starts, it detects the existing PID file,
-checks whether the process is still alive, and exits with an error. Delete the PID file manually if it is
-stale.
+No — the PID lock prevents concurrent runs. If a second instance starts, it detects the existing PID file and
+checks whether that process is still alive. A PID that is running aborts with an error; a PID whose liveness can
+be established and that is no longer running is treated as a stale lock and replaced automatically, so the run
+continues. Delete the PID file by hand when its contents cannot be read, or when liveness cannot be determined —
+that happens when the liveness probe itself fails or its message is not recognised, and the error names the file
+to delete.
 
 **Q: How does artist-only manual mode choose which albums to download?**
 
@@ -563,9 +628,11 @@ arbitrary Soulseek folders:
   Unicode NFKC normalization, lowercase conversion, trimming, and whitespace collapse, but punctuation stays
   significant, so `AC/DC` and `AC DC` are distinct. One exact match is used directly. When several canonical
   exact names match, seakarr selects one only when it is uniquely dominant: a MusicBrainz search score of 100
-  with a lead of at least 10 points over the runner-up. Tied top scores, a missing score, a score below 100,
-  and a margin below 10 stay unresolved and fall back as described below. Invalid, out-of-range, or fractional
-  score data rejects that refresh and follows the same stale-cache/legacy fallback. Aliases, sort names, artist
+  with a lead of at least 10 points over the runner-up. Tied top scores, a score below 100, and a margin below
+  10 stay unresolved and fall back as described below. A missing score, and invalid, out-of-range or fractional
+  score data, are treated as unusable provider data instead: the refresh is rejected and the same
+  stale-cache/legacy fallback follows, and in discover mode the artist counts towards the consecutive
+  provider-failure breaker. Aliases, sort names, artist
   tags, and catalog size never participate. Use `discography.artist_mbids` to pin an ambiguous name to a MusicBrainz
   artist UUID; a configured ID always takes precedence over name search.
 - Only release groups matching `discography.allowed_types` are eligible, and a group carrying several
@@ -578,12 +645,17 @@ arbitrary Soulseek folders:
 - Conceptual albums are deduplicated by normalized title and processed oldest first, so different editions or
   remasters of the same album produce one targeted `Artist Album` search. Undated albums are processed after
   dated ones, sorted by title.
-- Each eligible album runs through the existing targeted search cascade sequentially; one album's failure does
-  not block the remaining albums, and cancellation stops scheduling later ones.
+- Each eligible album runs through the existing targeted search cascade sequentially; an album whose run ends in a
+  failed download or no usable candidate does not block the remaining albums, and cancellation stops scheduling later
+  ones. A search-stage error (a lost session, for example) does abort the rest of the artist's albums, because the
+  client state it fails on would affect every later search too.
 
 **Q: What happens when MusicBrainz cannot be reached or returns nothing?**
 
-Fallback precedence is fresh cache, successful refresh, stale cache, then the legacy heuristic:
+Fallback precedence is fresh cache, successful refresh, stale cache, then the legacy heuristic. The last
+step applies to artist-only manual mode; discover mode instead reports the artist as skipped and aborts the
+run after repeated provider failures (see the discover answer below), and `discography.enabled: false` is a
+configuration error for discover.
 
 - A cached discography is fresh for `discography.cache_days` complete 24-hour periods (30 by default). `0`
   attempts a refresh on every run but still keeps the cached copy as a stale fallback. Boundary equality is
@@ -594,12 +666,15 @@ Fallback precedence is fresh cache, successful refresh, stale cache, then the le
   stale cache instead.
 - If no compatible cache exists, seakarr logs a prominent WARN, records a run-summary notice naming the exact
   reason, and uses the legacy single-query folder heuristic; the notice states that album names were discovered
-  heuristically from Soulseek folders.
+  heuristically from Soulseek folders. This is the artist-only manual behaviour: discover never falls back to the
+  heuristic, it warns, records the artist as skipped or provider-failed, and stops the run after
+  `DISCOVER_PROVIDER_FAILURE_LIMIT` consecutive provider failures.
 - A valid authoritative empty result — zero release groups, or zero albums left after `allowed_types`
   filtering — is not an error: no Soulseek search runs, there is no heuristic fallback, and the run summary
   shows a neutral notice instead of a failed or skipped album.
-- Set `discography.enabled: false` to select the legacy heuristic deliberately. That choice is logged as an
-  explicit configuration choice without an outage warning.
+- Set `discography.enabled: false` to select the legacy heuristic deliberately in artist-only manual mode. That
+  choice is logged as an explicit configuration choice without an outage warning. Discover mode requires a
+  configured discography and refuses to start without it.
 
 The legacy heuristic normalizes common folder-name variations so one release is
 processed once. It strips explicit artist prefixes (including an abbreviated
@@ -697,13 +772,22 @@ never adds an artist you do not have. To fetch a specific album instead, use
 In the artist's own library folder, beside the albums that artist already has. Discover derives the
 destination from the same scan that produces its artist list, so a nested library such as
 `Music/<user>/Albums/<genre>/<style>/<artist>/` keeps its layout instead of writing a second artist
-tree under `library.paths[0]`. The staging copy is deleted once the album is placed. Placement never replaces a file
-that already parses as audio, because the album folder may belong to a different edition of the album — only a
-truncated leftover from an interrupted run is replaced. A placement failure (a read-only or otherwise blocked
+tree under `library.paths[0]`. The folder itself comes from `%artist%` in `storage.organize_pattern`, expanded to the on-disk artist folder name, so a pattern that omits `%artist%` writes beside that folder — under its parent directory, which is the library root only in a flat `<root>/Artist/Album` layout — instead of inside it. Likewise, a pattern that keeps `%artist%` but omits `%album%` (for example `%artist%/%track% - %title%.%ext%`) writes every album directly into the artist's folder, so tracks from different albums can sit side by side there; keep `%album%` in the pattern for that reason. The staging copy is deleted once the album is placed. Placement never replaces a file
+that already parses as audio, because the album folder may belong to a different edition of the album — only a file
+that cannot be opened at all (junk bytes, an empty file, an unrelated format) is replaced. The check reads the metadata
+header, so a copy interrupted after that header still parses: it is kept as it stands and the incoming file for that
+track is not written, while the tracks with no destination are copied normally. Whenever fewer files were written than
+downloaded — whether every destination was kept or only some were — the run warns with both counts and still completes
+the album as placed, so a later run does not download it again.
+A placement failure (a read-only or otherwise blocked
 destination) keeps the staging copy, records the album as failed, and counts against
 `discover.max_cycle_downloads`. The album is retried when no audio file reached the folder; once any file landed the
 album counts as present when its tags match the folder the placement wrote to, so a mismatch between an embedded album
-tag and the MusicBrainz title can still cause one more download. Note that a later auto run with `library_upgrade.enabled` removes every leftover staging
+tag and the MusicBrainz title can still cause one more download. Presence is also keyed by the artist spelling the scan
+indexed, so a new album whose files are untagged (or tagged with a third spelling) is indexed under a different artist
+key when the library's own artist folder is spelled differently from its tags: later runs then see it as missing and
+re-download it. The processed-album record still suppresses that for the run that placed it, and `--ignore-processed`
+can bring it back. Note that a later auto run with `library_upgrade.enabled` removes every leftover staging
 directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a
 permanent one.
 

@@ -541,8 +541,10 @@ async fn download_once(
                     }
                 }
                 // Real progress is the only thing that starts (and resets)
-                // `timeout_secs`; queue wait never counts against it.
-                transfer_deadline = now.checked_add(Duration::from_secs(config.timeout_secs));
+                // `timeout_secs`; queue wait never counts against it. As with
+                // `max_queue_length` and `max_start_time_secs`, `0` disables the
+                // inactivity timeout instead of expiring immediately.
+                transfer_deadline = enabled_deadline(now, config.timeout_secs);
                 last_total_bytes = total_bytes;
                 // Speed check: only after the transfer has actually started
                 // transferring (not just queued), and past the wait period.
@@ -748,10 +750,6 @@ pub(crate) fn verify_downloaded_quality(
     Ok(())
 }
 
-/// Download all files for an album from the best candidate, with fallback.
-/// Tries each candidate in ranked order until one succeeds (or all fail).
-/// Only downloads files that are safe (no path traversal) and pass the
-/// configured extension filters.
 /// Group files by their share-relative parent directory path and return
 /// the largest group (most files). A peer's search result can span
 /// multiple album directories when the query matches several of their
@@ -763,7 +761,8 @@ pub(crate) fn verify_downloaded_quality(
 /// so `Abba\Greatest Hits\...` and `Bee Gees\Greatest Hits\...` form
 /// separate groups despite sharing the leaf directory name "Greatest Hits".
 ///
-/// Ties are broken by lexicographic key order for determinism.
+/// Ties are broken by lexicographic key order — `max_by` keeps the
+/// lexicographically larger key — so the same album wins on every run.
 pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInfo> {
     let mut groups: std::collections::HashMap<String, Vec<&'a FileInfo>> = Default::default();
     for f in files {
@@ -781,9 +780,10 @@ pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInf
         let key = album_group_key(parent);
         groups.entry(key).or_default().push(f);
     }
-    // Deterministic tie-breaking: prefer the larger group; on equal size
-    // prefer lexicographically earlier key so the same album wins on
-    // every run.
+    // Deterministic tie-breaking: prefer the larger group; on equal size the
+    // lexicographically larger key wins, because `max_by` keeps the greater of
+    // two distinct keys. Either key would do; what matters is that the same
+    // album is chosen on every run.
     groups
         .into_iter()
         .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| ak.cmp(bk)))
@@ -818,6 +818,10 @@ fn album_group_key(parent: &str) -> String {
     parent.to_string()
 }
 
+/// Download all files for an album from the best candidate, with fallback.
+/// Tries each candidate in ranked order until one succeeds (or all fail).
+/// Only downloads files that are safe (no path traversal) and pass the
+/// configured extension filters.
 #[allow(clippy::too_many_arguments)]
 pub async fn download_album(
     client: &dyn SoulseekClient,
@@ -1006,21 +1010,12 @@ mod tests {
     use super::*;
     use crate::client::{DownloadHandle, FileInfo, MockClient, SearchResult};
     use crate::config::{DownloadConfig, FilterConfig};
+    use crate::test_support::{make_file, write_minimal_flac};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
-
-    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
-        let mut attribs = HashMap::new();
-        attribs.insert(0, bitrate);
-        FileInfo {
-            name: name.into(),
-            size,
-            attribs,
-        }
-    }
 
     fn default_dl_config() -> DownloadConfig {
         DownloadConfig {
@@ -2664,30 +2659,6 @@ mod tests {
 
     // ── Post-download quality verification ──
 
-    /// Minimal valid FLAC (same bytes as organizer.rs's write_real_flac):
-    /// "fLaC" marker + STREAMINFO block with 44100 Hz, stereo, 16-bit —
-    /// parseable by lofty.
-    fn write_real_flac(path: &Path) {
-        let mut bytes = Vec::with_capacity(42);
-        bytes.extend_from_slice(b"fLaC");
-        // STREAMINFO metadata block header: last-block flag (0x80) + type 0,
-        // content length 34 (0x22).
-        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
-        // min/max block size (4096).
-        bytes.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
-        // min/max frame size (unknown = 0).
-        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        // 20-bit sample rate (44100) | channels-1 (1) | bits-per-sample-1 (15)
-        // | top 4 bits of total samples (0).
-        bytes.extend_from_slice(&0x0AC4_42F0u32.to_be_bytes());
-        // Remaining 32 bits of the 36-bit total sample count (44100).
-        bytes.extend_from_slice(&0x0000_AC44u32.to_be_bytes());
-        // MD5 signature of unencoded audio (unknown = zeros).
-        bytes.extend_from_slice(&[0u8; 16]);
-        assert_eq!(bytes.len(), 42);
-        std::fs::write(path, bytes).unwrap();
-    }
-
     #[tokio::test]
     async fn test_download_skips_verification_when_min_not_set() {
         let client = MockClient::new();
@@ -2758,7 +2729,7 @@ mod tests {
         // is not feasible to generate in a unit test — see final report.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("track.flac");
-        write_real_flac(&path);
+        write_minimal_flac(&path);
 
         // Peer did NOT provide bitrate metadata (empty attribs) — the
         // post-download verification must kick in and pass the lossless
@@ -2787,7 +2758,7 @@ mod tests {
         // set to 24 — the actual bitdepth (16) is below the minimum.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("track.flac");
-        write_real_flac(&path);
+        write_minimal_flac(&path);
 
         let file = FileInfo {
             name: "track.flac".into(),
@@ -3166,6 +3137,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn zero_transfer_timeout_disables_the_inactivity_check() {
+        // `timeout_secs: 0` means disabled, as it does for the queue limits, so a
+        // long stall must not cancel the transfer.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, in_progress(1_024)),
+            status_step(Duration::from_secs(600), in_progress(1_024)),
+            status_step(Duration::from_millis(10), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 0;
+        config.max_queue_time_secs = 10;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        assert!(
+            result.is_ok(),
+            "timeout_secs 0 must disable the inactivity timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn zero_queue_timers_allow_delayed_start() {
         let client = ScriptedClient::new(vec![vec![
             status_step(Duration::from_secs(2), in_progress(1_024)),
@@ -3220,6 +3213,27 @@ mod tests {
         assert!(
             reason.contains('4') && reason.contains('3'),
             "the reason must name the observed position and the cap: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_positive_cap_applies_the_position_check_even_with_a_free_slot() {
+        // The free-slot exemption is scoped to `max_queue_length: 0`. With a
+        // positive cap, an advertised free slot does not exempt a candidate from
+        // the reported-position check — the README states exactly that.
+        let client =
+            ScriptedClient::new(vec![vec![status_step(Duration::ZERO, queue_position(4))]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.timeout_secs = 60;
+        config.max_queue_length = 3;
+
+        let (_dir, result) = download_with_script(&client, 1, 1_024, &config, None).await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains('4') && reason.contains('3'),
+            "a free-slot candidate above the cap must still be rejected by position: {reason}"
         );
     }
 

@@ -20,3 +20,6 @@ pub mod runner;
 pub mod scanner;
 pub mod search;
 pub mod tracks;
+
+#[cfg(test)]
+pub(crate) mod test_support;

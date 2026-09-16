@@ -5,7 +5,7 @@
 //! download budget. The caller owns all I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::discography::{normalize_catalog_key, AlbumTarget};
 use crate::error::{Result, SeakarrError};
@@ -21,7 +21,11 @@ struct IndexedArtist {
     /// Library root and on-disk artist folder to number of albums found there.
     /// A library whose artist sits under one genre root has a single entry; an
     /// artist split across roots has several and the majority wins.
-    destinations: BTreeMap<(String, String), usize>,
+    ///
+    /// The root is kept as a `PathBuf`, never a `String`: a lossy round trip
+    /// through UTF-8 would turn a non-UTF-8 library path into a replacement
+    /// character, and placement would create a second tree beside the real one.
+    destinations: BTreeMap<(PathBuf, String), usize>,
 }
 
 /// What the library already holds, keyed exactly like MusicBrainz catalog keys.
@@ -46,6 +50,14 @@ impl LibraryIndex {
     }
 
     /// True when this artist/album pair is present in the library.
+    ///
+    /// Matching is a whole normalised title match, not an identity match: a
+    /// library folder carrying a release year, the artist name, or a format
+    /// label is a different key, so `2006 - Days to Come` does not satisfy the
+    /// target `Days to Come`. Punctuation stays significant by design (see the
+    /// README), and the search-side `album_identity_key` heuristic is not
+    /// applied here. The README documents the consequence: such a release can be
+    /// downloaded again and placed beside the folder that already holds it.
     pub fn contains_album(&self, artist: &str, album: &str) -> bool {
         self.artists
             .get(&normalize_catalog_key(artist))
@@ -74,7 +86,7 @@ impl LibraryIndex {
     /// The library root and on-disk artist folder to place this artist's
     /// downloads under: the pair covering the most albums, with ties broken
     /// alphabetically so the destination never depends on walk order.
-    pub fn artist_destination(&self, artist_key: &str) -> Option<(&str, &str)> {
+    pub fn artist_destination(&self, artist_key: &str) -> Option<(&Path, &str)> {
         let entry = self.artists.get(artist_key)?;
         entry
             .destinations
@@ -82,11 +94,11 @@ impl LibraryIndex {
             .min_by_key(|((root, directory), albums)| {
                 (
                     std::cmp::Reverse(**albums),
-                    root.as_str(),
+                    root.as_os_str(),
                     directory.as_str(),
                 )
             })
-            .map(|((root, directory), _)| (root.as_str(), directory.as_str()))
+            .map(|((root, directory), _)| (root.as_path(), directory.as_str()))
     }
 }
 
@@ -104,10 +116,7 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
         entry.albums.insert(album_key);
         *entry
             .destinations
-            .entry((
-                album.path.to_string_lossy().into_owned(),
-                album.artist_dir.clone(),
-            ))
+            .entry((album.path.clone(), album.artist_dir.clone()))
             .or_insert(0) += 1;
     }
     index
@@ -209,7 +218,7 @@ pub fn select_artists(
         };
         selection.artists.push(SelectedArtist {
             name: name.to_string(),
-            library_root: PathBuf::from(library_root),
+            library_root: library_root.to_path_buf(),
             artist_dir: artist_dir.to_string(),
         });
     }
@@ -426,6 +435,21 @@ mod tests {
     }
 
     #[test]
+    fn a_year_prefixed_folder_does_not_satisfy_the_plain_title() {
+        // Documented limitation (README): presence is a whole normalised title
+        // match, so a folder written as "2006 - Days to Come" is a different
+        // album from the target "Days to Come" and discover may place a second
+        // copy beside it. Folding the search-side identity heuristic in here
+        // would also make punctuation insignificant, which the README rules out.
+        let index = build_index(&[scanned("Bonobo", "2006 - Days To Come")]);
+        assert!(index.contains_album("Bonobo", "2006 - Days To Come"));
+        assert!(
+            !index.contains_album("Bonobo", "Days to Come"),
+            "the plain MusicBrainz title is not satisfied by the year-prefixed folder"
+        );
+    }
+
+    #[test]
     fn albums_are_deduplicated_per_artist() {
         let index = build_index(&[
             scanned("Artist", "Album"),
@@ -439,6 +463,14 @@ mod tests {
         assert_eq!(albums, ["album", "other"]);
     }
 
+    /// The destination pair as owned strings, so an assertion reads the same way
+    /// regardless of the `PathBuf` the index keeps internally.
+    fn destination(index: &LibraryIndex, artist_key: &str) -> Option<(String, String)> {
+        index
+            .artist_destination(artist_key)
+            .map(|(root, directory)| (root.to_string_lossy().into_owned(), directory.to_string()))
+    }
+
     #[test]
     fn destination_is_recorded_per_artist_from_the_scan() {
         let index = build_index(&[
@@ -446,8 +478,8 @@ mod tests {
             scanned_at("Metallica", "Reload", "/library/Metal", "Metallica"),
         ]);
         assert_eq!(
-            index.artist_destination("metallica"),
-            Some(("/library/Metal", "Metallica"))
+            destination(&index, "metallica"),
+            Some(("/library/Metal".to_string(), "Metallica".to_string()))
         );
     }
 
@@ -460,8 +492,8 @@ mod tests {
             scanned_at("Artist", "Four", "/library/Zoo", "Artist"),
         ]);
         assert_eq!(
-            index.artist_destination("artist"),
-            Some(("/library/Metal", "Artist")),
+            destination(&index, "artist"),
+            Some(("/library/Metal".to_string(), "Artist".to_string())),
             "two albums beat one, and the single-album tie breaks alphabetically"
         );
     }
@@ -475,8 +507,8 @@ mod tests {
             "Guns N Roses",
         )]);
         assert_eq!(
-            index.artist_destination("guns 'n' roses"),
-            Some(("/library/Rock", "Guns N Roses")),
+            destination(&index, "guns 'n' roses"),
+            Some(("/library/Rock".to_string(), "Guns N Roses".to_string())),
             "the folder that exists on disk wins over the tag spelling"
         );
     }
@@ -490,8 +522,8 @@ mod tests {
             scanned_at("Artist", "Two", "/library/Metal", "Artist"),
         ]);
         assert_eq!(
-            index.artist_destination("artist"),
-            Some(("/library/Metal", "Artist")),
+            destination(&index, "artist"),
+            Some(("/library/Metal".to_string(), "Artist".to_string())),
             "the alphabetically first root wins a tie regardless of insert order"
         );
     }

@@ -25,10 +25,10 @@ location positionally, peeling one dedicated disc folder via a new
 
 **Spec:** `docs/agent/specs/2026-09-15-discover-library-placement-design.md`
 
-**Commit note:** the working tree already contains an uncommitted `0.23.0`
-version bump in `Cargo.toml` and `Cargo.lock`. It is not part of this plan.
-Stage only the files named in each task's commit step; never `git add -A` and
-never `git commit -a`.
+**Commit note:** the `0.23.0` version bump in `Cargo.toml` and `Cargo.lock` is
+committed as `07bd75c`, on top of the placement commit, and is not part of this
+plan. Stage only the files named in each task's commit step; never `git add -A`
+and never `git commit -a`.
 
 ---
 
@@ -54,7 +54,7 @@ without leaving the feature half-working.
 | `README.md` | User documentation | Document placement, the pattern's role, and the artist-only limit |
 
 No new files. `src/mode.rs` is untouched. `src/config.rs` gains the
-`storage.organize_pattern` containment check (see Task 8 Step 6 below) plus its
+`storage.organize_pattern` containment check (see Task 6 Step 3 below) plus its
 tests, and `src/main.rs` changes only in a comment that named the removed
 parameter.
 
@@ -582,6 +582,14 @@ Add to `src/discover.rs`'s `#[cfg(test)] mod tests`, and extend the existing
             .collect()
     }
 
+    /// The destination pair as owned strings, so an assertion reads the same way
+    /// regardless of the `PathBuf` the index keeps internally.
+    fn destination(index: &LibraryIndex, artist_key: &str) -> Option<(String, String)> {
+        index.artist_destination(artist_key).map(|(root, directory)| {
+            (root.to_string_lossy().into_owned(), directory.to_string())
+        })
+    }
+
     #[test]
     fn destination_is_recorded_per_artist_from_the_scan() {
         let index = build_index(&[
@@ -589,8 +597,8 @@ Add to `src/discover.rs`'s `#[cfg(test)] mod tests`, and extend the existing
             scanned_at("Metallica", "Reload", "/library/Metal", "Metallica"),
         ]);
         assert_eq!(
-            index.artist_destination("metallica"),
-            Some(("/library/Metal", "Metallica"))
+            destination(&index, "metallica"),
+            Some(("/library/Metal".to_string(), "Metallica".to_string()))
         );
     }
 
@@ -603,8 +611,8 @@ Add to `src/discover.rs`'s `#[cfg(test)] mod tests`, and extend the existing
             scanned_at("Artist", "Four", "/library/Zoo", "Artist"),
         ]);
         assert_eq!(
-            index.artist_destination("artist"),
-            Some(("/library/Metal", "Artist")),
+            destination(&index, "artist"),
+            Some(("/library/Metal".to_string(), "Artist".to_string())),
             "two albums beat one, and the single-album tie breaks alphabetically"
         );
     }
@@ -618,8 +626,8 @@ Add to `src/discover.rs`'s `#[cfg(test)] mod tests`, and extend the existing
             "Guns N Roses",
         )]);
         assert_eq!(
-            index.artist_destination("guns 'n' roses"),
-            Some(("/library/Rock", "Guns N Roses")),
+            destination(&index, "guns 'n' roses"),
+            Some(("/library/Rock".to_string(), "Guns N Roses".to_string())),
             "the folder that exists on disk wins over the tag spelling"
         );
     }
@@ -653,7 +661,7 @@ struct IndexedArtist {
     /// Library root and on-disk artist folder to number of albums found there.
     /// A library whose artist sits under one genre root has a single entry; an
     /// artist split across roots has several and the majority wins.
-    destinations: BTreeMap<(String, String), usize>,
+    destinations: BTreeMap<(PathBuf, String), usize>,
 }
 ```
 
@@ -663,15 +671,19 @@ Add the accessor to `impl LibraryIndex`, after `artist_name`:
     /// The library root and on-disk artist folder to place this artist's
     /// downloads under: the pair covering the most albums, with ties broken
     /// alphabetically so the destination never depends on walk order.
-    pub fn artist_destination(&self, artist_key: &str) -> Option<(&str, &str)> {
+    pub fn artist_destination(&self, artist_key: &str) -> Option<(&Path, &str)> {
         let entry = self.artists.get(artist_key)?;
         entry
             .destinations
             .iter()
             .min_by_key(|((root, directory), albums)| {
-                (std::cmp::Reverse(**albums), root.as_str(), directory.as_str())
+                (
+                    std::cmp::Reverse(**albums),
+                    root.as_os_str(),
+                    directory.as_str(),
+                )
             })
-            .map(|((root, directory), _)| (root.as_str(), directory.as_str()))
+            .map(|((root, directory), _)| (root.as_path(), directory.as_str()))
     }
 ```
 
@@ -681,10 +693,7 @@ In `build_index`, inside the per-album loop after
 ```rust
         *entry
             .destinations
-            .entry((
-                album.path.to_string_lossy().into_owned(),
-                album.artist_dir.clone(),
-            ))
+            .entry((album.path.clone(), album.artist_dir.clone()))
             .or_insert(0) += 1;
 ```
 
@@ -729,7 +738,7 @@ and in the `select_artists` loop, replace
         };
         selection.artists.push(SelectedArtist {
             name: name.to_string(),
-            library_root: PathBuf::from(library_root),
+            library_root: library_root.to_path_buf(),
             artist_dir: artist_dir.to_string(),
         });
 ```
@@ -1057,7 +1066,25 @@ arm followed by its closing braces, with:
                 artist_dir,
                 album.unwrap_or("Unknown"),
             ) {
-                Ok(_) => {
+                Ok(dests) => {
+                    // `place_into_library` reports only the files it wrote, so an
+                    // empty list means every destination already held a file that
+                    // parses as audio. The album still counts as placed: the
+                    // library holds audio at every path placement would have
+                    // written, and failing here would not converge because the
+                    // album folder presence looks for is never created. Warn,
+                    // because the incoming copies are not written.
+                    // Widened during review: any shortfall warns, not just the
+                    // all-kept case, because a partial keep also discards the
+                    // incoming copies for the tracks it kept.
+                    if dests.len() < downloaded.len() {
+                        tracing::warn!(
+                            "{artist} - {}: only {} of {} downloaded file(s) were written; the rest were kept because the destination already holds audio for them, from an earlier run or because another track or album of this artist maps onto the same path",
+                            album.unwrap_or("?"),
+                            dests.len(),
+                            downloaded.len()
+                        );
+                    }
                     let track_count = downloaded.len();
                     return finish_library_write(
                         config,
@@ -1330,7 +1357,7 @@ that parses as audio, which is deliberately not the upgrade path's
 never-downgrade guard, so add
 `test_place_into_library_uses_the_artist_folder_name_verbatim`,
 `test_place_into_library_never_replaces_a_readable_existing_file`,
-`test_place_into_library_replaces_an_unreadable_existing_file`,
+`test_place_into_library_replaces_a_file_that_does_not_parse_as_audio`,
 `test_place_into_library_does_not_cascade_placeholders_from_the_folder_name` and
 `test_place_into_library_rejects_an_artist_value_that_is_not_one_component`. The
 tag/folder spelling mismatch is covered at the unit level by
@@ -1443,6 +1470,13 @@ formatting with `&artist.name`:
 `counters.provider_failed.push((artist.name.clone(), reason));` keep the same
 shape.
 
+Placement also joins `storage.organize_pattern` onto the artist's library root,
+so add the containment check to `validate_non_credential_constraints` in
+`src/config.rs`: reject a pattern whose components are not all ordinary names or
+`.`, which covers an absolute pattern, a `..` component and an empty pattern,
+with tests for each. `Path::join` discards part or all of the root for those
+forms, so without the check the placement path could write outside the library.
+
 - [ ] **Step 4: Run the new tests to verify they pass**
 
 ```bash
@@ -1524,7 +1558,8 @@ destination from the same scan that produces its artist list, so a nested librar
 `Music/<user>/Albums/<genre>/<style>/<artist>/` keeps its layout instead of writing a second artist
 tree under `library.paths[0]`. The staging copy is deleted once the album is placed. Placement never
 replaces a file that already parses as audio, because the album folder may belong to a different
-edition of the album — only a truncated leftover from an interrupted run is replaced. A placement
+edition of the album — only a file that cannot be opened at all (junk bytes, an empty file, an
+unrelated format) is replaced. A placement
 failure (a read-only or otherwise blocked destination) keeps the staging copy, records the album as
 failed, and counts against `discover.max_cycle_downloads`. The album is retried when no audio file
 reached the folder; once any file landed the album counts as present when its tags match the folder
@@ -1621,7 +1656,7 @@ MusicBrainz run was performed.
 | Staging removed after a successful copy | 6 (first test), 5 (`finish_library_write`) |
 | Placement failure = charged `Failed`, staging kept | 6 (third test) |
 | Auto mode unchanged in both flag states | 5 (Steps 1–2, 8) |
-| No new config keys, no schema change | `src/config.rs` gains the `organize_pattern` containment check (Task 8 Step 6) |
+| No new config keys, no schema change | `src/config.rs` gains the `organize_pattern` containment check (Task 6 Step 3) |
 | README documentation | 7 |
 | Deliberate limits (artist-only manual still stages) | 6 (Step 5 asserts unchanged artist-only tests), 7 (documented) |
 
@@ -1637,6 +1672,6 @@ library_root, artist_dir }` is declared in Task 4 and read in Task 6 via
 `artist.artist_dir.as_str()`. `discs::album_index(&[&str]) -> Option<usize>` is
 declared in Task 1, consumed in Task 2 through `components[album_index -
 1..album_index]` and in Task 3 through the `artist_dir`/`album` derivation.
-`LibraryIndex::artist_destination(&str) -> Option<(&str, &str)>` from Task 4 is
+`LibraryIndex::artist_destination(&str) -> Option<(&Path, &str)>` from Task 4 is
 the only destination accessor used by `select_artists`. `finish_library_write`
 from Task 5 is called with the same six arguments in both arms.

@@ -98,6 +98,15 @@ pub fn organize_name_from_stem(stem: &str) -> (String, String) {
         .map(|n| format!("{n:02}"))
         .unwrap_or_else(|| "01".to_string());
     let title = strip_leading_track_token(stem).to_string();
+    // A DISC-TRACK stem ("1-11 - Steel Bars") keeps the track number once the
+    // disc number is stripped, which would duplicate it in `%track% - %title%`.
+    // Only the hyphenated form is treated this way: a title that merely starts
+    // with its own track number ("01 - 1 Thing") keeps that word.
+    let title = if crate::tracks::has_hyphenated_disc_prefix(stem) {
+        strip_leading_track_token(&title).to_string()
+    } else {
+        title
+    };
     (track, title)
 }
 
@@ -263,9 +272,17 @@ enum ExistingFile {
     ReplaceUnlessBetter,
     /// Placement semantics: keep any existing file that parses as audio,
     /// because the destination folder may hold a different edition of the
-    /// album. Only a file that does not parse (a truncated copy from an
-    /// interrupted run) is replaced, so a retry can still finish a partial
-    /// copy.
+    /// album. Only a file lofty cannot open at all (junk bytes, an empty file,
+    /// an unrelated format) is replaced.
+    ///
+    /// The probe reads the header and metadata block, so a copy interrupted
+    /// after that block still parses and is kept. That is deliberate: reading
+    /// every audio frame to prove completeness is not affordable per file, and
+    /// replacing a complete track that merely looks smaller would destroy a
+    /// different edition of the album. A kept destination is therefore not
+    /// written from the fresh download — the caller completes the album as
+    /// placed and warns when every destination was kept (see the placement arm
+    /// in `runner`).
     KeepWhenValid,
 }
 
@@ -286,15 +303,15 @@ pub fn copy_to_library(
     artist: &str,
     album: &str,
 ) -> Result<Vec<PathBuf>> {
-    copy_into_library(
+    copy_into_library(LibraryWrite {
         downloaded,
         library_root,
         pattern,
         artist,
         album,
-        ArtistComponent::Sanitized,
-        ExistingFile::ReplaceUnlessBetter,
-    )
+        artist_component: ArtistComponent::Sanitized,
+        existing_file: ExistingFile::ReplaceUnlessBetter,
+    })
 }
 
 /// Place newly downloaded files beside an artist's existing albums.
@@ -306,7 +323,13 @@ pub fn copy_to_library(
 ///   inside the folder that already exists instead of beside a rewritten copy
 ///   of its name;
 /// - a destination file that parses as audio is never replaced, because the
-///   destination folder may hold a different edition of the album.
+///   destination folder may hold a different edition of the album. The test is
+///   header/metadata parseability, so a partially written file that still
+///   parses counts as audio the library already holds, and a track whose
+///   destination is kept is not written from the fresh download. The album as a
+///   whole still counts as placed in that state, which is what the design
+///   requires: a failure there would not converge, because the album folder
+///   presence looks for is still absent.
 ///
 /// `artist_dir` must be a single ordinary path component. It is substituted
 /// into the pattern without sanitisation, so a value carrying a separator or
@@ -332,27 +355,41 @@ pub fn place_into_library(
             "artist folder {artist_dir:?} must be a single path component"
         )));
     }
-    copy_into_library(
+    copy_into_library(LibraryWrite {
         downloaded,
         library_root,
         pattern,
-        artist_dir,
+        artist: artist_dir,
         album,
-        ArtistComponent::Verbatim,
-        ExistingFile::KeepWhenValid,
-    )
+        artist_component: ArtistComponent::Verbatim,
+        existing_file: ExistingFile::KeepWhenValid,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_into_library(
-    downloaded: &[PathBuf],
-    library_root: &Path,
-    pattern: &str,
-    artist: &str,
-    album: &str,
+/// Everything one library write needs: the files to copy, where they go, and
+/// which keep/replace policy applies. Grouped so the shared implementation takes
+/// one argument instead of seven, and so the two entry points read as a list of
+/// named choices rather than a positional run of strings.
+struct LibraryWrite<'a> {
+    downloaded: &'a [PathBuf],
+    library_root: &'a Path,
+    pattern: &'a str,
+    artist: &'a str,
+    album: &'a str,
     artist_component: ArtistComponent,
     existing_file: ExistingFile,
-) -> Result<Vec<PathBuf>> {
+}
+
+fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
+    let LibraryWrite {
+        downloaded,
+        library_root,
+        pattern,
+        artist,
+        album,
+        artist_component,
+        existing_file,
+    } = write;
     let mut dests = Vec::with_capacity(downloaded.len());
     for src in downloaded {
         let stem = src.file_stem().unwrap_or_default().to_string_lossy();
@@ -753,6 +790,7 @@ pub fn recover_interrupted_upgrades(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::test_support::{write_minimal_flac, write_minimal_flac24};
     use std::fs;
     use tempfile::TempDir;
 
@@ -929,17 +967,26 @@ mod tests {
         // The destination folder may hold a different edition of the album, so
         // placement keeps any file it finds that parses as audio. The upgrade
         // path replaces an equal-quality file; placement must not.
+        //
+        // The fixture is a 42-byte FLAC header with no audio frames, i.e. an
+        // interrupted copy. It still parses, so it is kept: the guard is "lofty
+        // can open it", never "the file is complete".
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
         let album_dir = library.path().join("Test Artist").join("Test Album");
         fs::create_dir_all(&album_dir).unwrap();
 
         let existing = album_dir.join("01 - Track One.flac");
-        write_real_flac(&existing);
+        write_minimal_flac(&existing);
         let existing_bytes = fs::read(&existing).unwrap();
+        assert_eq!(
+            existing_bytes.len(),
+            42,
+            "fixture must be header-only so the test proves completeness is not checked"
+        );
 
         let src = staging.path().join("01 - Track One.flac");
-        write_real_flac(&src);
+        write_minimal_flac(&src);
 
         let dests = place_into_library(
             std::slice::from_ref(&src),
@@ -963,9 +1010,10 @@ mod tests {
     }
 
     #[test]
-    fn test_place_into_library_replaces_an_unreadable_existing_file() {
-        // A truncated copy left by an interrupted run must stay replaceable,
-        // otherwise a retry could never finish the album.
+    fn test_place_into_library_replaces_a_file_that_does_not_parse_as_audio() {
+        // Only a file lofty cannot open is replaceable. Junk bytes are used
+        // rather than a truncated audio file: a truncated copy whose header
+        // survived still parses and is deliberately kept.
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
         let album_dir = library.path().join("Test Artist").join("Test Album");
@@ -975,7 +1023,7 @@ mod tests {
         fs::write(&existing, b"truncated").unwrap();
 
         let src = staging.path().join("01 - Track One.flac");
-        write_real_flac(&src);
+        write_minimal_flac(&src);
         let src_bytes = fs::read(&src).unwrap();
 
         let dests = place_into_library(
@@ -987,7 +1035,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(dests.len(), 1, "an unreadable file is replaced");
+        assert_eq!(dests.len(), 1, "an unparseable file is replaced");
         assert_eq!(fs::read(&existing).unwrap(), src_bytes);
     }
 
@@ -1047,52 +1095,6 @@ mod tests {
             !library.path().join("..").join("outside").exists(),
             "nothing may be created outside the library"
         );
-    }
-
-    /// Write a minimal but valid FLAC file ("fLaC" marker + STREAMINFO block:
-    /// 44100 Hz, stereo, 16-bit) that lofty can actually parse, so quality
-    /// scoring sees real metadata instead of degrading to 0 for junk bytes.
-    fn write_real_flac(path: &Path) {
-        let mut bytes = Vec::with_capacity(42);
-        bytes.extend_from_slice(b"fLaC");
-        // STREAMINFO metadata block header: last-block flag (0x80) + type 0,
-        // content length 34 (0x22).
-        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
-        // min/max block size (4096).
-        bytes.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
-        // min/max frame size (unknown = 0).
-        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        // 20-bit sample rate (44100) | channels-1 (1) | bits-per-sample-1 (15)
-        // | top 4 bits of total samples (0).
-        bytes.extend_from_slice(&0x0AC4_42F0u32.to_be_bytes());
-        // Remaining 32 bits of the 36-bit total sample count (44100).
-        bytes.extend_from_slice(&0x0000_AC44u32.to_be_bytes());
-        // MD5 signature of unencoded audio (unknown = zeros).
-        bytes.extend_from_slice(&[0u8; 16]);
-        assert_eq!(bytes.len(), 42);
-        fs::write(path, bytes).unwrap();
-    }
-
-    /// Same minimal FLAC as [`write_real_flac`] but with bits-per-sample-1 =
-    /// 23 (24-bit audio), so quality scoring ranks it strictly above a 16-bit
-    /// copy (used by the overwrite-guard tests). lofty reads the audio
-    /// properties as: sample rate in bits 63-44, bits-per-sample-1 in bits
-    /// 40-36, total samples in bits 35-0 — the 16-bit fixture encodes 15
-    /// there, this fixture encodes 23.
-    fn write_real_flac24(path: &Path) {
-        let mut bytes = Vec::with_capacity(42);
-        bytes.extend_from_slice(b"fLaC");
-        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
-        bytes.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]);
-        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        // 44100 Hz, same as write_real_flac, but bits-per-sample-1 = 23.
-        bytes.extend_from_slice(&0x0AC4_4370_0000_AC44u64.to_be_bytes());
-        bytes.extend_from_slice(&[0u8; 16]);
-        assert_eq!(bytes.len(), 42);
-        fs::write(path, bytes).unwrap();
-        // Self-check: lofty must read this as 24-bit for the guard tests to
-        // be meaningful.
-        assert_eq!(extract_bitdepth(path), Some(24));
     }
 
     #[test]
@@ -1159,7 +1161,7 @@ mod tests {
     fn test_extract_bitdepth_from_lossless_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.flac");
-        write_real_flac(&path);
+        write_minimal_flac(&path);
         assert_eq!(extract_bitdepth(&path), Some(16));
     }
 
@@ -1167,7 +1169,7 @@ mod tests {
     fn test_extract_bitrate_from_lossless_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.flac");
-        write_real_flac(&path);
+        write_minimal_flac(&path);
         assert_eq!(extract_bitrate(&path), None);
     }
 
@@ -1321,11 +1323,11 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
 
         let existing = album_dir.join("01 - Track One.flac");
-        write_real_flac24(&existing);
+        write_minimal_flac24(&existing);
         let existing_bytes = fs::read(&existing).unwrap();
 
         let src = staging.path().join("01 - Track One.flac");
-        write_real_flac(&src); // 16-bit — strictly worse
+        write_minimal_flac(&src); // 16-bit — strictly worse
 
         let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let dests = copy_to_library(
@@ -1362,7 +1364,7 @@ mod tests {
         fs::write(&existing, b"corrupt junk bytes").unwrap();
 
         let src = staging.path().join("01 - Track One.flac");
-        write_real_flac(&src);
+        write_minimal_flac(&src);
 
         let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let dests = copy_to_library(
@@ -1400,7 +1402,7 @@ mod tests {
         // The newly downloaded file must be a real, parseable FLAC so its
         // quality score is meaningful (junk bytes score 0 and nothing deletes).
         let new_flac = album_dir.join("01 - New Track.flac");
-        write_real_flac(&new_flac);
+        write_minimal_flac(&new_flac);
 
         let new_files = vec![new_flac];
         let deleted =
@@ -1413,6 +1415,47 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_lesser_quality_uses_the_album_location_as_its_root() {
+        // The walk is rooted at the directory the album was found in, which for a
+        // nested library is the genre directory rather than a library.paths entry.
+        let dir = TempDir::new().unwrap();
+        let library_root = dir.path().join("Metal");
+        let album_dir = library_root.join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let old_mp3 = album_dir.join("01 - Old Track.mp3");
+        fs::write(&old_mp3, b"mp3 content").unwrap();
+        let new_flac = album_dir.join("01 - New Track.flac");
+        write_minimal_flac(&new_flac);
+
+        let deleted =
+            delete_lesser_quality_files(&library_root, "Artist", "Album", &[new_flac]).unwrap();
+
+        assert_eq!(deleted, 1, "the nested album location must be walked");
+        assert!(!old_mp3.exists());
+    }
+
+    #[test]
+    fn test_delete_lesser_quality_reports_a_pattern_that_misses_the_album_folder() {
+        // A pattern that does not keep <artist>/<album> copies elsewhere, so the
+        // walk finds no album directory: the caller logs the error and the old
+        // files stay where they are.
+        let dir = TempDir::new().unwrap();
+        let library_root = dir.path();
+        let misplaced = library_root.join("Artist - Album");
+        fs::create_dir_all(&misplaced).unwrap();
+        let new_flac = misplaced.join("01 - New Track.flac");
+        write_minimal_flac(&new_flac);
+
+        let result = delete_lesser_quality_files(library_root, "Artist", "Album", &[new_flac]);
+
+        assert!(
+            result.is_err(),
+            "a missing album directory must be reported rather than silently ignored"
+        );
+    }
+
+    #[test]
     fn test_delete_lesser_quality_preserves_better_files() {
         let dir = TempDir::new().unwrap();
         let library_root = dir.path();
@@ -1421,7 +1464,7 @@ mod tests {
 
         // Existing high-quality FLAC (real, parseable metadata).
         let old_flac = album_dir.join("01 - Track.flac");
-        write_real_flac(&old_flac);
+        write_minimal_flac(&old_flac);
         // New download is a lower-quality MP3.
         let new_mp3 = album_dir.join("01 - New Track.mp3");
         fs::write(&new_mp3, b"mp3 content").unwrap();

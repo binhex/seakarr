@@ -10,10 +10,10 @@ use crate::client::FileInfo;
 /// numbering ("Linkin Park - Hybrid Theory - 11 - Cure for the Itch.flac").
 /// Returns `None` when no such token exists.
 ///
-/// For DISC-TRACK filenames (e.g. "1-11 - Title.flac", "2-16 - Title.flac"),
-/// the first numeric token is the disc number and the second is the track
-/// number. When the first two alphanumeric tokens are both 1–3 digit numbers,
-/// the first is skipped and the second (track number) is returned.
+/// For the hyphenated DISC-TRACK form ("1-11 - Title.flac", "2-16 - Title.flac")
+/// the first number is the disc number and the second is the track number.
+/// Only that shape is treated as DISC-TRACK: a title that merely starts with a
+/// number ("02 - 4 Minutes.flac") is read as track 2, not 4.
 pub fn track_number_from_filename(name: &str) -> Option<u32> {
     let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
     let tokens: Vec<&str> = basename
@@ -21,19 +21,10 @@ pub fn track_number_from_filename(name: &str) -> Option<u32> {
         .filter(|tok| !tok.is_empty())
         .collect();
 
-    // For DISC-TRACK filenames (e.g. "1-11 - Title.flac"), the first
-    // numeric token is the disc number and the second is the track
-    // number. Skip the disc number and return the track number.
-    let start = if tokens.len() >= 2
-        && tokens[0].len() <= 3
-        && tokens[0].chars().all(|c| c.is_ascii_digit())
-        && tokens[1].len() <= 3
-        && tokens[1].chars().all(|c| c.is_ascii_digit())
-    {
-        1
-    } else {
-        0
-    };
+    // Skip the disc number, and only for the hyphenated form: "1-11 - Title"
+    // has no separator between the two numbers, whereas "02 - 4 Minutes" has a
+    // space-dash-space run, so its second token belongs to the title.
+    let start = usize::from(has_hyphenated_disc_prefix(basename) && tokens.len() >= 2);
 
     tokens[start..].iter().find_map(|tok| {
         if tok.len() > 3 || !tok.chars().all(|c| c.is_ascii_digit()) {
@@ -43,26 +34,34 @@ pub fn track_number_from_filename(name: &str) -> Option<u32> {
     })
 }
 
+/// True when the name starts with a hyphenated DISC-TRACK pair, e.g. "1-11" in
+/// "1-11 - Steel Bars": up to three digits, a hyphen with no spaces around it,
+/// then more digits.
+pub(crate) fn has_hyphenated_disc_prefix(name: &str) -> bool {
+    let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let bytes = basename.as_bytes();
+    let mut digits = 0;
+    while digits < bytes.len() && digits < 3 && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    digits > 0
+        && bytes.get(digits) == Some(&b'-')
+        && bytes.get(digits + 1).is_some_and(u8::is_ascii_digit)
+}
+
 /// Extract the disc number from a DISC-TRACK filename (e.g.
 /// "1-11 - Title.flac" → disc 1, "2-16 - Title.flac" → disc 2).
-/// Returns `None` when the filename does not use the DISC-TRACK
+/// Returns `None` when the filename does not use the hyphenated DISC-TRACK
 /// convention (e.g. "01 - Title.flac", "Title.flac").
 pub(crate) fn disc_number_from_filename(name: &str) -> Option<u32> {
-    let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
-    let tokens: Vec<&str> = basename
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|tok| !tok.is_empty())
-        .collect();
-    if tokens.len() >= 2
-        && tokens[0].len() <= 3
-        && tokens[0].chars().all(|c| c.is_ascii_digit())
-        && tokens[1].len() <= 3
-        && tokens[1].chars().all(|c| c.is_ascii_digit())
-    {
-        tokens[0].parse::<u32>().ok()
-    } else {
-        None
+    if !has_hyphenated_disc_prefix(name) {
+        return None;
     }
+    let basename = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let token = basename
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|tok| !tok.is_empty())?;
+    token.parse::<u32>().ok()
 }
 
 /// Check that a set of files carries contiguous track numbers.
@@ -142,9 +141,10 @@ mod tests {
 
     #[test]
     fn test_disc_track_skips_leading_disc_number() {
-        // DISC-TRACK names ("1-01 - Title.flac") yield the TRACK number —
-        // the leading disc number is skipped by the two-digit-token rule
-        // (see test_extract_track_from_disc_track_format for the pairs).
+        // DISC-TRACK names ("1-01 - Title.flac") yield the TRACK number — the
+        // leading disc number is skipped because the name has the hyphenated
+        // disc prefix (see `has_hyphenated_disc_prefix` and
+        // test_extract_track_from_disc_track_format for the pairs).
         assert_eq!(track_number_from_filename("1-01 - Title.flac"), Some(1));
     }
 
@@ -261,6 +261,23 @@ mod tests {
             Some(1)
         );
         assert_eq!(track_number_from_filename("11 - Steel Bars.flac"), Some(11));
+    }
+
+    #[test]
+    fn test_a_title_starting_with_a_number_is_not_read_as_disc_track() {
+        // "02 - 4 Minutes.flac" (track 2, title "4 Minutes") has two numeric
+        // tokens too, but they are separated by a space-dash-space run, so it is
+        // not the hyphenated DISC-TRACK shape: the track number is 2 and there is
+        // no disc number. Reading the title's number instead would both misfile
+        // the track and split the album's contiguity groups.
+        assert_eq!(
+            track_number_from_filename("02 - 4 Minutes.flac"),
+            Some(2),
+            "the title's leading number must not win"
+        );
+        assert_eq!(disc_number_from_filename("02 - 4 Minutes.flac"), None);
+        assert_eq!(track_number_from_filename("07 - 7 Seconds.flac"), Some(7));
+        assert_eq!(disc_number_from_filename("07 - 7 Seconds.flac"), None);
     }
 
     #[test]

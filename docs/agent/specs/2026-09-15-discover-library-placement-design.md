@@ -223,9 +223,10 @@ ways:
 - an existing destination file that parses as audio is never replaced, because
   the destination folder may hold a different edition of the album (an existing
   folder named after the MusicBrainz title whose files carry different tags).
-  Only a file that does not parse — a truncated copy from an interrupted run —
-  is replaced, so a retry can finish an album whose copy was interrupted before
-  any complete file landed. The gap: placement is not transactional, so a crash
+  Whether a file parses is decided by its metadata header, not by its audio
+  frames, so a copy interrupted after its header is kept as well: the incoming
+  file for that track is not written and the album still completes as placed.
+  The gap: placement is not transactional, so a crash
   after at least one file lands leaves an album the presence index already
   treats as present (see Deliberate limits). The upgrade path keeps its existing
   rule: replace unless the destination scores strictly higher.
@@ -283,14 +284,16 @@ No new keys and no schema change. Discover placement is governed by the
 existing `library.paths` (the index and the destination pair come from the scan
 of those paths) and `storage.organize_pattern`, which defines the destination
 shape: `%artist%` expands to the on-disk artist directory and `%album%` to the
-MusicBrainz title, relative to the scanned root.
+MusicBrainz title, relative to the directory above the artist's own folder (the
+scanned root only in a flat `<root>/Artist/Album` layout).
 
 One semantic is called out for documentation: discover honours
 `storage.organize_pattern` as a naming preference even when
 `storage.organize` is `false`. For every other mode the pattern only applies
 when that flag is on; for discover it also shapes placement. The pattern is
-honoured verbatim, so a pattern without `%artist%` places the album directly
-under the scanned root — the same as any other organize write.
+honoured verbatim, so a pattern without `%artist%` places the album beside the
+artist's folder — under that folder's parent — the same as any other organize
+write.
 
 The pattern is validated: it must be non-empty, relative, and free of `..`
 components, because `Path::join` discards the library root for an absolute
@@ -340,8 +343,9 @@ behaviour change — its current `album_index == 0` refusal becomes the helper's
 
   ```rust
   /// (root, on-disk artist directory) for this artist, majority first,
-  /// ties broken alphabetically.
-  pub fn artist_destination(&self, artist_key: &str) -> Option<(&str, &str)>;
+  /// ties broken alphabetically. The root stays a `PathBuf` so a non-UTF-8
+  /// library path never round-trips through a lossy `String`.
+  pub fn artist_destination(&self, artist_key: &str) -> Option<(&Path, &str)>;
   ```
 
 - `ArtistSelection::artists` becomes `Vec<SelectedArtist>`, carrying the query
@@ -404,7 +408,13 @@ argument.
   run, which is the outcome removal was meant to prevent; because the album is
   already recorded successful it is not re-downloaded.
 - **Destination file already present and parseable** — kept; the incoming file
-  is not copied, and the album still counts as placed.
+  is not copied, and the album still counts as placed. Whenever fewer files were
+  written than downloaded — the all-kept case and a partial keep alike — the run
+  logs a warning naming both counts before completing the album, because the
+  incoming copies that were not written are discarded with the staging copy.
+  A failure here would not converge: the album folder presence looks for is
+  never created, so every later run would download and keep the same files
+  again.
 - **Artist destination unavailable** — not representable for a selected artist;
   every indexed album contributes a destination pair, and selection is drawn
   from the index.
@@ -430,11 +440,17 @@ argument.
   job and a separate concern.
 - Artist-only manual, explicit manual, and batch modes are untouched; only the
   `process_album` signature they call changes.
-- Existing configuration files remain valid, with one exception: a
-  `storage.organize_pattern` that was empty, absolute, or carried `..` used to
-  run and is now rejected at startup, because `Path::join` discards part or all
-  of the library root for those forms. Every other key keeps its meaning and
-  default.
+- Existing configuration files remain valid, with two exceptions, both of which
+  could never have worked: a
+  `storage.organize_pattern` that was empty, absolute, carried `..`, contained
+  no ordinary path component (a bare `.`), or ended
+  with a path separator is now rejected at startup, because `Path::join`
+  discards part or all of the library root for the first three forms and a
+  trailing separator names a directory for the last; and a
+  `filters.allowed_extensions` entry that is empty, contains a dot, or carries
+  surrounding whitespace, or an empty list, is rejected because the matcher
+  compares the text after the last dot with no trimming. Every other key keeps
+  its meaning and default.
 - The database schema is unchanged. Discover still writes the same
   processed-album records.
 - The reporting contract is unchanged: no new notices, and placement failures
@@ -442,6 +458,21 @@ argument.
 
 ## Deliberate limits
 
+- **Folder-derived names assume UTF-8.** The scanner builds its positional
+  component list with `to_str()`, so a non-UTF-8 library component is skipped
+  rather than replaced, which shifts the derived artist and album for that
+  album. Tagged libraries are unaffected for the names themselves, but the
+  derived location still shifts, so the limit applies to placement as well as
+  to the upgrade path. Making the walk lossless needs `OsStr`-based components
+  throughout and is a separate change.
+- **Auto mode's upgrade destination stays tag-derived.** Discover places albums
+  under the artist folder found on disk, but `auto` mode still writes under the
+  tag-preferred artist name, sanitised. When an artist's tag spelling differs
+  from the folder spelling (`Guns 'n' Roses` versus `Guns N Roses`), an upgrade
+  therefore copies into a second artist folder and `delete_lesser_quality`
+  walks that new folder, leaving the old files in place. Retargeting auto mode
+  is a separate change: it would alter an unrelated write path that the design
+  keeps as-is.
 - **Artist-only manual runs do not place albums in the artist's folder.** Only
   discover mode places albums. An artist-only manual run organizes into
   `library.paths[0]` when `storage.organize` is on and leaves the download in

@@ -159,7 +159,6 @@ async fn run() -> Result<()> {
         artist: cli.artist.clone(),
         album: cli.album.clone(),
         schedule: cli.schedule || cli.daemon,
-        test: cli.test,
         ignore_processed: cli.ignore_processed,
     };
 
@@ -221,7 +220,7 @@ async fn run() -> Result<()> {
         "Connecting to Soulseek server {}...",
         config.soulseek.server
     );
-    let client = RealClient::new();
+    let client = RealClient::from_config(&config);
     if let Err(e) = client
         .login(
             &config.soulseek.username,
@@ -240,7 +239,13 @@ async fn run() -> Result<()> {
     }
     tracing::info!("Connected to Soulseek.");
 
-    client.set_max_peers(config.soulseek.max_peers).await?;
+    if let Err(e) = client.set_max_peers(config.soulseek.max_peers).await {
+        // The lock was acquired above; a failure here must not leave it behind.
+        if let Err(release_err) = release_pid_lock(&pid_file) {
+            tracing::warn!("Failed to release PID file after client setup error: {release_err}");
+        }
+        return Err(e);
+    }
 
     if config.schedule.enabled {
         let interval_mins = config.schedule.interval_mins;
@@ -286,6 +291,24 @@ enum PidLiveness {
     Indeterminate,
 }
 
+/// The error to report when a parsed PID file cannot be taken over.
+///
+/// `Stale` is not an error — the caller removes the file and retries — so this
+/// returns `None` for it. Split out from [`acquire_pid_lock`] so both messages
+/// (a live PID, and one whose liveness could not be determined) are asserted
+/// without needing a real process to exist.
+fn pid_lock_conflict(liveness: PidLiveness, pid: i32, pid_file: &Path) -> Option<SeakarrError> {
+    match liveness {
+        PidLiveness::Stale => None,
+        PidLiveness::Alive => Some(SeakarrError::PidLock(format!(
+            "Another instance is running with PID {pid}. If this is stale, delete {pid_file:?}"
+        ))),
+        PidLiveness::Indeterminate => Some(SeakarrError::PidLock(format!(
+            "Cannot tell whether PID {pid} is still running, so {pid_file:?} is treated as a live lock. If no seakarr process is running, delete {pid_file:?}"
+        ))),
+    }
+}
+
 /// Probe whether the process `pid` is alive using `kill -0` on Unix:
 /// exit 0 → alive; "no such process" (ESRCH) → stale; "operation not
 /// permitted" (EPERM, a process owned by another user) → alive; any other
@@ -298,19 +321,27 @@ fn pid_is_alive(pid: i32) -> PidLiveness {
         Ok(o) => o,
         Err(_) => return PidLiveness::Indeterminate, // spawn failure: do not overwrite
     };
-    match output.status.code() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_kill_failure(output.status.code(), &stderr)
+}
+
+/// Classify a `kill -0` failure from its exit code and stderr.
+///
+/// Split out from [`pid_is_alive`] so the locale-fragile text matching can be
+/// unit-tested without spawning a process. `kill -0` exits 1 for BOTH ESRCH (no
+/// such process → stale) and EPERM (owned by another user → alive), so the exit
+/// code alone cannot tell them apart; anything unrecognised is indeterminate, so
+/// a potentially live lock is never overwritten.
+#[cfg(unix)]
+fn classify_kill_failure(code: Option<i32>, stderr: &str) -> PidLiveness {
+    match code {
         Some(0) => PidLiveness::Alive,
         Some(1) => {
-            // kill -0 exits 1 for BOTH ESRCH (no such process → stale) and
-            // EPERM (process exists but owned by another user → alive). The
-            // exit code alone cannot tell them apart, so parse stderr instead
-            // of assuming code 1 always means "stale" (the old logic would
-            // clobber a live process owned by another user).
-            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-            if stderr.contains("no such process") || stderr.contains("process not found") {
+            let message = stderr.to_lowercase();
+            if message.contains("no such process") || message.contains("process not found") {
                 PidLiveness::Stale
-            } else if stderr.contains("operation not permitted")
-                || stderr.contains("permission denied")
+            } else if message.contains("operation not permitted")
+                || message.contains("permission denied")
             {
                 PidLiveness::Alive
             } else {
@@ -372,20 +403,15 @@ fn acquire_pid_lock(pid_file: &Path) -> Result<()> {
                         continue;
                     }
                 };
-                match pid_is_alive(pid) {
-                    PidLiveness::Stale => {
-                        tracing::warn!(
-                            "PID file {pid_file:?} references dead PID {pid} — removing and continuing"
-                        );
-                        std::fs::remove_file(pid_file)?;
-                        continue; // retry the atomic create
-                    }
-                    PidLiveness::Alive | PidLiveness::Indeterminate => {
-                        return Err(SeakarrError::PidLock(format!(
-                            "Another instance is running with PID {pid}. If this is stale, delete {pid_file:?}"
-                        )));
-                    }
+                if let Some(error) = pid_lock_conflict(pid_is_alive(pid), pid, pid_file) {
+                    return Err(error);
                 }
+                // No conflict, so the recorded process is provably gone.
+                tracing::warn!(
+                    "PID file {pid_file:?} references dead PID {pid} — removing and continuing"
+                );
+                std::fs::remove_file(pid_file)?;
+                continue; // retry the atomic create
             }
             Err(e) => return Err(e.into()),
         }
@@ -1143,6 +1169,80 @@ mod tests {
             std::fs::read_to_string(&pid_file).unwrap(),
             std::process::id().to_string(),
             "lock must contain our own PID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_failure_classification_covers_every_outcome() {
+        // The text of `kill -0`'s error is locale-dependent and the exit code
+        // alone cannot separate ESRCH from EPERM, so pin every branch: a change
+        // that collapsed the unrecognised case into Stale would clobber a live
+        // lock owned by another user.
+        assert_eq!(classify_kill_failure(Some(0), ""), PidLiveness::Alive);
+        assert_eq!(
+            classify_kill_failure(Some(1), "kill: no such process"),
+            PidLiveness::Stale
+        );
+        assert_eq!(
+            classify_kill_failure(Some(1), "kill: process not found"),
+            PidLiveness::Stale
+        );
+        assert_eq!(
+            classify_kill_failure(Some(1), "kill: Operation not permitted"),
+            PidLiveness::Alive,
+            "EPERM means the process exists but is owned by another user"
+        );
+        assert_eq!(
+            classify_kill_failure(Some(1), "kill: permission denied"),
+            PidLiveness::Alive
+        );
+        assert_eq!(
+            classify_kill_failure(Some(1), "kill: Kein solcher Prozess"),
+            PidLiveness::Indeterminate,
+            "an unrecognised (localised) message must not be read as stale"
+        );
+        assert_eq!(
+            classify_kill_failure(Some(3), ""),
+            PidLiveness::Indeterminate
+        );
+        assert_eq!(
+            classify_kill_failure(None, ""),
+            PidLiveness::Indeterminate,
+            "a signal-killed probe is not evidence of a stale lock"
+        );
+    }
+
+    #[test]
+    fn pid_lock_conflict_messages_name_the_pid_and_the_file() {
+        let file = Path::new("/var/lib/seakarr/seakarr.pid");
+        assert!(
+            pid_lock_conflict(PidLiveness::Stale, 42, file).is_none(),
+            "a stale lock is not a conflict: the caller removes it"
+        );
+
+        let alive = pid_lock_conflict(PidLiveness::Alive, 42, file)
+            .expect("a live PID is a conflict")
+            .to_string();
+        assert!(
+            alive.contains("Another instance is running with PID 42"),
+            "got: {alive}"
+        );
+        assert!(
+            alive.contains("seakarr.pid"),
+            "the message must name the file to delete, got: {alive}"
+        );
+
+        let unknown = pid_lock_conflict(PidLiveness::Indeterminate, 42, file)
+            .expect("an undecidable liveness is a conflict")
+            .to_string();
+        assert!(
+            unknown.contains("Cannot tell whether PID 42"),
+            "the indeterminate message must not claim a running instance, got: {unknown}"
+        );
+        assert!(
+            unknown.contains("seakarr.pid"),
+            "the message must name the file to delete, got: {unknown}"
         );
     }
 

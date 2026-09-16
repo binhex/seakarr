@@ -413,17 +413,8 @@ mod tests {
     use super::*;
     use crate::client::{FileInfo, SearchResult};
     use crate::config::FilterConfig;
+    use crate::test_support::make_file;
     use std::collections::HashMap;
-
-    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
-        let mut attribs = HashMap::new();
-        attribs.insert(0, bitrate);
-        FileInfo {
-            name: name.into(),
-            size,
-            attribs,
-        }
-    }
 
     fn make_result(username: &str, speed: u32, slots: u8, files: Vec<FileInfo>) -> SearchResult {
         SearchResult {
@@ -1422,6 +1413,10 @@ pub struct FilterRejectionSummary {
     pub non_contiguous: usize,
     /// Results rejected because below min_tracks
     pub below_min_tracks: usize,
+    /// Results rejected because none of their files passed the quality gate, so
+    /// the track-count floor never applied (reported separately so the log names
+    /// the gate that actually rejected them, e.g. `min_tracks: 0`)
+    pub no_usable_files: usize,
     /// Results rejected because fewer tracks than library (peer_track_count)
     pub peer_track_count_rejected: usize,
     /// Files rejected by bitrate check
@@ -1441,6 +1436,7 @@ impl FilterRejectionSummary {
             || self.no_free_slots > 0
             || self.non_contiguous > 0
             || self.below_min_tracks > 0
+            || self.no_usable_files > 0
             || self.peer_track_count_rejected > 0
             || self.bitrate_rejected > 0
             || self.bitdepth_rejected > 0
@@ -1489,6 +1485,9 @@ impl FilterRejectionSummary {
                 self.below_min_tracks,
                 if self.below_min_tracks == 1 { "" } else { "s" }
             ));
+        }
+        if self.no_usable_files > 0 {
+            parts.push(format!("{} with no usable files", self.no_usable_files));
         }
         if self.peer_track_count_rejected > 0 {
             parts.push(format!(
@@ -1624,8 +1623,14 @@ pub(crate) fn summarize_rejections_with_queue_limit(
             passing_files.push(f);
         }
 
+        // A result with no usable files is rejected by `filter_results` before
+        // its track count matters, so report that gate rather than the floor.
+        if passing_files.is_empty() {
+            summary.no_usable_files += 1;
+            continue;
+        }
         // Min tracks check (mirror filter_results: min_tracks=0 still
-        // enforces floor of1 for zero-passing-file rejection)
+        // enforces floor of 1 for zero-passing-file rejection)
         let min = config.min_tracks.max(1) as usize;
         if passing_files.len() < min {
             summary.below_min_tracks += 1;
@@ -1672,17 +1677,8 @@ mod rejection_summary_tests {
     use super::*;
     use crate::client::{FileInfo, SearchResult};
     use crate::config::FilterConfig;
+    use crate::test_support::make_file;
     use std::collections::HashMap;
-
-    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
-        let mut attribs = HashMap::new();
-        attribs.insert(0, bitrate);
-        FileInfo {
-            name: name.into(),
-            size,
-            attribs,
-        }
-    }
 
     fn make_result(username: &str, speed: u32, slots: u8, files: Vec<FileInfo>) -> SearchResult {
         SearchResult {
@@ -2163,6 +2159,38 @@ mod rejection_summary_tests {
         )];
         let filtered = filter_results(&results, &cfg, None, Some("Café"));
         assert_eq!(filtered.len(), 1, "accented album must match ASCII path");
+    }
+
+    #[test]
+    fn test_summarize_rejections_names_the_gate_that_rejected_a_result() {
+        // With `min_tracks: 0` a result whose files are all rejected has no usable
+        // files; the floor never applied, so the summary must say so instead of
+        // reporting "below min track".
+        let cfg = FilterConfig {
+            min_tracks: 0,
+            allowed_extensions: vec!["flac".into()],
+            ..FilterConfig::default()
+        };
+        let results = vec![make_result(
+            "peer",
+            500,
+            1,
+            vec![make_file(
+                r"Music\Artist\Album\01 - Track.mp3",
+                320,
+                10_000_000,
+            )],
+        )];
+
+        let summary = summarize_rejections(&results, &cfg, None, None);
+
+        assert_eq!(summary.no_usable_files, 1);
+        assert_eq!(summary.below_min_tracks, 0);
+        assert!(
+            summary.summary_line().contains("no usable files"),
+            "got: {}",
+            summary.summary_line()
+        );
     }
 
     #[test]

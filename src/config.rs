@@ -16,6 +16,7 @@ use crate::error::{Result, SeakarrError};
 //   LibraryConfig::scan_on_startup
 //   SearchConfig::response_limit, r#type, delay_secs,
 //                block_threshold, block_pause_secs
+//   FilterConfig::include_locked
 //   DownloadConfig::max_download_time_mins, min_filtered_users,
 //                skip_retry_hours
 //
@@ -319,7 +320,6 @@ pub struct CliOverrides {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub schedule: bool,
-    pub test: bool,
     /// Runtime-only: bypass the processed-album success check for this run.
     pub ignore_processed: bool,
 }
@@ -384,9 +384,10 @@ fn default_extensions() -> Vec<String> {
 fn default_concurrent() -> usize {
     // 1: auto mode searches albums concurrently, and each search makes the
     // Soulseek server push ConnectToPeer for every result peer (the crate
-    // spawns a peer-actor thread per connection). The vendored crate's
-    // peer-registry cap (16) bounds the thread count, but keeping seakarr's
-    // own concurrency at 1 further reduces search-driven peer churn.
+    // spawns a peer-actor thread per connection). The peer registry is sized
+    // from the configured `soulseek.max_peers` (default 64), which bounds the
+    // thread count, but keeping seakarr's own concurrency at 1 further reduces
+    // search-driven peer churn.
     1
 }
 fn default_max_start_time() -> u64 {
@@ -815,6 +816,25 @@ impl Config {
         Ok(())
     }
 
+    /// Bounds the login retry policy, which backs off exponentially and so
+    /// cannot be left unbounded: `login_retries` of 25 with a 5 s base delay
+    /// would sleep for weeks after the last attempts.
+    fn validate_login_bounds(&self) -> Result<()> {
+        if self.soulseek.login_retries > 10 {
+            return Err(SeakarrError::Config(format!(
+                "soulseek.login_retries must be at most 10, got {}",
+                self.soulseek.login_retries
+            )));
+        }
+        if self.soulseek.login_retry_delay_secs > 300 {
+            return Err(SeakarrError::Config(format!(
+                "soulseek.login_retry_delay_secs must be at most 300, got {}",
+                self.soulseek.login_retry_delay_secs
+            )));
+        }
+        Ok(())
+    }
+
     /// Shared download-bound checks used by both `validate()` (real startup)
     /// and `validate_for_test` (`--test` mode). Keeps the two paths in sync.
     pub fn validate_download_bounds(&self) -> Result<()> {
@@ -912,10 +932,49 @@ impl Config {
                     component,
                     std::path::Component::Normal(_) | std::path::Component::CurDir
                 )
-            });
+            })
+            // At least one ordinary component: a pattern made only of `.`
+            // components expands to the library root itself, and the
+            // duplicate-suffix branch of `organize_file` then resolves that
+            // existing path to a sibling of the library root.
+            && pattern_components
+                .iter()
+                .any(|component| matches!(component, std::path::Component::Normal(_)));
         if !pattern_is_contained {
             return Err(SeakarrError::Config(format!(
-                "storage.organize_pattern must be a non-empty relative path inside the library and must not contain \"..\" components, got {:?}",
+                "storage.organize_pattern must be a non-empty relative path inside the library, must contain at least one ordinary path component, and must not contain \"..\" components, got {:?}",
+                self.storage.organize_pattern
+            )));
+        }
+        // The login retry policy backs off exponentially, so its bounds matter as
+        // much as the download retry bounds.
+        self.validate_login_bounds()?;
+        // The matcher compares the lowercased text after the last dot with no
+        // trimming, so anything but a bare token can never match: a dot-prefixed
+        // or interior dot, and any surrounding whitespace, all silently reject
+        // every candidate. An empty list is worse still — every album is flagged
+        // for upgrade, because the wrong-format test is vacuously true with
+        // nothing to allow. Reject all of these here, where the message can name
+        // the offending value, instead of failing every album later with a
+        // self-contradicting filter reason.
+        if self.filters.allowed_extensions.is_empty() {
+            return Err(SeakarrError::Config(
+                "filters.allowed_extensions must list at least one extension; an empty list rejects every candidate"
+                    .into(),
+            ));
+        }
+        if let Some(invalid) = self.filters.allowed_extensions.iter().find(|extension| {
+            extension.is_empty() || !extension.chars().all(|c| c.is_ascii_alphanumeric())
+        }) {
+            return Err(SeakarrError::Config(format!(
+                "filters.allowed_extensions entries must be a bare extension of ASCII letters and digits, got {invalid:?}"
+            )));
+        }
+        // A trailing separator names a directory, so every copy would fail with
+        // "Is a directory" at the destination.
+        if self.storage.organize_pattern.ends_with(['/', '\\']) {
+            return Err(SeakarrError::Config(format!(
+                "storage.organize_pattern must name a file, not end with a path separator, got {:?}",
                 self.storage.organize_pattern
             )));
         }
@@ -1957,7 +2016,6 @@ library_upgrade:
         for pattern in [
             "%artist%/%album%/%track% - %title%.%ext%",
             "./%artist%/%album%/%ext%",
-            "%artist%/%album%/",
         ] {
             assert!(
                 pattern_error(pattern).is_none(),
@@ -2003,7 +2061,6 @@ library_upgrade:
             artist: Some("Michael Bolton".into()),
             album: Some("The Essential Michael Bolton".into()),
             schedule: true,
-            test: false,
             ignore_processed: false,
         });
 
@@ -2687,6 +2744,171 @@ search:
             .unwrap_err()
             .to_string()
             .contains("duplicate normalized artist"));
+    }
+
+    #[test]
+    fn login_retry_bounds_are_enforced() {
+        // The backoff doubles per attempt, so an unbounded retry count sleeps for
+        // weeks; mirror the download retry bounds.
+        let mut config = Config::default();
+        config.soulseek.login_retries = 11;
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("an unbounded retry count must be rejected");
+        assert!(error.to_string().contains("login_retries"), "got: {error}");
+
+        let mut config = Config::default();
+        config.soulseek.login_retry_delay_secs = 301;
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("an unbounded base delay must be rejected");
+        assert!(
+            error.to_string().contains("login_retry_delay_secs"),
+            "got: {error}"
+        );
+
+        let mut config = Config::default();
+        config.soulseek.login_retries = 10;
+        config.soulseek.login_retry_delay_secs = 300;
+        assert!(
+            config.validate_non_credential_constraints().is_ok(),
+            "the bounds themselves must be accepted"
+        );
+    }
+
+    #[test]
+    fn organize_pattern_must_have_an_ordinary_component() {
+        // `Path::components` reduces these to bare `.` components, which expand
+        // to the library root itself; the duplicate-suffix branch of
+        // `organize_file` then names a sibling of the library root, outside it.
+        for pattern in [".", "./.", "././"] {
+            let mut config = Config::default();
+            config.storage.organize_pattern = pattern.to_string();
+            let error = config
+                .validate_non_credential_constraints()
+                .expect_err("a pattern with no ordinary component must be rejected");
+            assert!(
+                error.to_string().contains("organize_pattern"),
+                "{pattern:?} produced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn organize_pattern_must_name_a_file_not_a_directory() {
+        // Path::components drops a trailing separator, so the containment check
+        // accepts it, but the expanded path then names a directory and every
+        // copy fails with "Is a directory".
+        for pattern in ["%artist%/%album%/", "%artist%/%album%/%track%.%ext%\\"] {
+            let mut config = Config::default();
+            config.storage.organize_pattern = pattern.to_string();
+            let error = config
+                .validate_non_credential_constraints()
+                .expect_err("a directory-shaped pattern must be rejected");
+            assert!(
+                error.to_string().contains("organize_pattern"),
+                "{pattern:?} produced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_extensions_rejects_entries_that_can_never_match() {
+        // The matcher compares against the text after the last dot with no
+        // trimming, so a dot anywhere, or any surrounding whitespace, matches
+        // nothing and would silently reject every candidate.
+        for invalid in [
+            ".flac",
+            "",
+            "audio.flac",
+            " flac",
+            "flac ",
+            "   ",
+            "flac, mp3",
+            "flac/mp3",
+        ] {
+            let mut config = Config::default();
+            config.filters.allowed_extensions = vec![invalid.to_string()];
+            let error = config
+                .validate_non_credential_constraints()
+                .expect_err("an unmatchable extension must be rejected");
+            assert!(
+                error.to_string().contains("allowed_extensions"),
+                "{invalid:?} produced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_extensions_rejects_an_empty_list() {
+        // Nothing to allow means every album is flagged for upgrade, because the
+        // wrong-format test is vacuously true.
+        let mut config = Config::default();
+        config.filters.allowed_extensions = Vec::new();
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("an empty allow-list must be rejected");
+        assert!(
+            error.to_string().contains("allowed_extensions"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn allowed_extensions_accepts_bare_extensions_in_any_case() {
+        // Case is normalised at match time, so an upper-case entry is usable and
+        // must not be rejected.
+        let mut config = Config::default();
+        config.filters.allowed_extensions = vec!["flac".to_string(), "MP3".to_string()];
+        assert!(config.validate_non_credential_constraints().is_ok());
+    }
+
+    #[test]
+    fn organize_pattern_is_rejected_when_it_escapes_the_library() {
+        // The pattern is joined onto the library root, so an absolute pattern or
+        // a parent component would write outside it — most damaging on the
+        // discover placement path, whose contract is to write inside the
+        // artist's own folder. `Path::join` discards part or all of the root for
+        // both forms, which is why the check inspects components.
+        for pattern in [
+            "/absolute/%artist%/%track%.%ext%",
+            "%artist%/../%album%/%track%.%ext%",
+        ] {
+            let mut config = Config::default();
+            config.storage.organize_pattern = pattern.to_string();
+            let error = config
+                .validate_non_credential_constraints()
+                .expect_err("an escaping pattern must be rejected");
+            assert!(
+                error.to_string().contains("organize_pattern"),
+                "{pattern:?} produced: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn organize_pattern_is_rejected_when_empty() {
+        let mut config = Config::default();
+        config.storage.organize_pattern = String::new();
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("an empty pattern must be rejected");
+        assert!(
+            error.to_string().contains("organize_pattern"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn organize_pattern_accepts_relative_paths_with_curdir_components() {
+        // Both harmless components are accepted: an ordinary name and a leading
+        // `.`, which `Path::components` normalises but does not reject.
+        let mut config = Config::default();
+        config.storage.organize_pattern = "./%artist%/%album%/%track% - %title%.%ext%".to_string();
+        assert!(
+            config.validate_non_credential_constraints().is_ok(),
+            "a leading ./ must not be treated as an escape"
+        );
     }
 
     #[test]

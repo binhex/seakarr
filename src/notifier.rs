@@ -3,9 +3,10 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-/// JSON payload posted to Apprise webhook URLs.
-/// (Built with `serde` instead of `serde_json::json!` — serde_json is not a
-/// direct dependency of this crate; the wire payload is identical.)
+/// JSON payload posted to each configured notification webhook URL.
+///
+/// Built with `serde` rather than `serde_json::json!`, so the payload shape
+/// lives in one derived struct instead of a macro invocation.
 #[derive(Serialize)]
 struct NotificationPayload {
     title: String,
@@ -13,7 +14,11 @@ struct NotificationPayload {
     r#type: String,
 }
 
-/// Send success notification to all configured Apprise URLs.
+/// POST the success payload to every configured webhook URL.
+///
+/// Only `http`/`https` URLs can be delivered; a URL with any other scheme is
+/// skipped by `reqwest` and logged as a warning, and a failed delivery never
+/// fails the run.
 pub async fn notify_success(
     urls: &[String],
     artist: &str,
@@ -43,10 +48,10 @@ pub async fn notify_success(
         match client.post(trimmed).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
-                tracing::warn!("Apprise notification to {url} returned {}", resp.status());
+                tracing::warn!("Notification to {url} returned {}", resp.status());
             }
             Err(e) => {
-                tracing::warn!("Failed to send Apprise notification to {url}: {e}");
+                tracing::warn!("Failed to send notification to {url}: {e}");
             }
         }
     }
@@ -57,7 +62,7 @@ pub async fn notify_success(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -74,6 +79,77 @@ mod tests {
         let urls = vec![format!("{}/notify", mock_server.uri())];
         let result = notify_success(&urls, "Test Artist", "Test Album", 3).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_notify_posts_the_documented_payload_shape() {
+        // The README documents the body as {title, message, type}; a rename or a
+        // switch to form encoding would break every configured webhook silently.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/notify"))
+            .and(body_json(serde_json::json!({
+                "title": "Seakarr — Download Complete",
+                "message": "Downloaded \"Test Artist — Test Album\" (2 tracks)",
+                "type": "success",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        notify_success(
+            &[format!("{}/notify", mock_server.uri())],
+            "Test Artist",
+            "Test Album",
+            2,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_notify_accepts_an_undeliverable_scheme_without_failing_the_run() {
+        // An Apprise-style scheme URL cannot be delivered because the payload is a
+        // plain HTTP POST. The README promises the run still succeeds and that
+        // each failure is logged, so assert both: the outcome alone would pass
+        // even if such a URL were skipped with no log line at all.
+        let capture = crate::test_support::LogCapture::start();
+        let result = notify_success(
+            &[
+                "ntfy://my-topic".to_string(),
+                "discord://id/token".to_string(),
+            ],
+            "Artist",
+            "Album",
+            1,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an undeliverable notification URL must not fail the run"
+        );
+
+        let logs = capture.text();
+        let ntfy = logs
+            .lines()
+            .find(|line| line.contains("ntfy://my-topic"))
+            .unwrap_or_else(|| panic!("the undeliverable URL was not logged, got:\n{logs}"));
+        assert!(
+            ntfy.contains(" WARN "),
+            "the failure must be a warning, got: {ntfy}"
+        );
+        // Every configured URL is reported, and at WARN: a change that logged the
+        // later ones at a lower level would otherwise keep this test green while
+        // the operator's log lost the warning the README promises.
+        let discord = logs
+            .lines()
+            .find(|line| line.contains("discord://id/token"))
+            .unwrap_or_else(|| panic!("the second URL was not logged, got:\n{logs}"));
+        assert!(
+            discord.contains(" WARN "),
+            "every URL must be reported at WARN, got: {discord}"
+        );
     }
 
     #[tokio::test]

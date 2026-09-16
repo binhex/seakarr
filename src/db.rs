@@ -85,6 +85,16 @@ impl Database {
         Ok(db)
     }
 
+    /// Create the schema. Idempotent, and the only migration entry point.
+    ///
+    /// Reserved (created-but-unwired) tables: `download_queue`,
+    /// `download_stats`, `batch_jobs` and `batch_job_lines` are created here and
+    /// have their own accessors (`enqueue_download`, `get_queued_downloads`),
+    /// but no production path writes or reads them yet. They are deliberately
+    /// kept so an existing database needs no migration when download queuing and
+    /// batch persistence are wired; nothing in the README claims they are live.
+    /// Removing them would be a schema change, so it belongs with the feature
+    /// work rather than a cleanup pass.
     pub fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS browse_cache;
@@ -481,7 +491,7 @@ mod tests {
         let db = test_db();
         db.migrate().unwrap();
 
-        // Verify all 7 tables exist by querying sqlite_master
+        // Verify every expected table exists by querying sqlite_master
         let tables: Vec<String> = db
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")

@@ -245,7 +245,7 @@ impl SoulseekClient for MockClient {
 
 // ── Real client (soulseek-rs-lib wrapper) ──
 //
-// Vendored soulseek-rs-lib v14.0.0 (workspace member at vendor/soulseek-rs-lib) with
+// Vendored soulseek-rs-lib v14.1.0 (workspace member at vendor/soulseek-rs-lib) with
 // a local peer-registry cap. The crate's API is synchronous: `Client::connect()`/`login()` block on the
 // server, `Client::search()` blocks for the whole timeout window, and
 // `Client::download()` returns `(Download, std::sync::mpsc::Receiver<DownloadStatus>)`.
@@ -302,6 +302,10 @@ pub struct RealClient {
 /// login sequence; once it elapses, a reconnect is attempted again.
 const RECONNECT_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 
+/// Ceiling for a single login-retry backoff sleep, so the doubling delay cannot
+/// hold startup for hours on a long retry chain.
+const LOGIN_RETRY_DELAY_CAP_SECS: u64 = 600;
+
 /// Login credentials captured at login time, used to reconnect transparently
 /// after the server session is lost.
 #[derive(Clone)]
@@ -317,6 +321,17 @@ impl RealClient {
     /// (`login_retries: 3`, `login_retry_delay_secs: 5`).
     pub fn new() -> Self {
         Self::with_login_retries(3, 5)
+    }
+
+    /// Build a client whose login retry/backoff policy comes from the loaded
+    /// configuration, so `soulseek.login_retries` and
+    /// `soulseek.login_retry_delay_secs` actually take effect.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::with_login_retries(
+            config.soulseek.login_retries,
+            config.soulseek.login_retry_delay_secs,
+        )
     }
 
     /// Configure the login retry/backoff policy. `retries` is the total number
@@ -553,7 +568,13 @@ fn ss_download_status_to_domain(status: SsDownloadStatus) -> DownloadStatus {
             total_bytes,
             speed_bytes_per_sec,
         } => DownloadStatus::InProgress {
-            speed_bytes_per_sec: speed_bytes_per_sec.max(0.0).round() as u64,
+            // `NaN` survives `max(0.0)` and casts to 0, which would be silently
+            // wrong; treat a non-finite speed as unknown (0) explicitly.
+            speed_bytes_per_sec: if speed_bytes_per_sec.is_finite() {
+                speed_bytes_per_sec.max(0.0).round() as u64
+            } else {
+                0
+            },
             bytes_downloaded,
             total_bytes,
         },
@@ -598,9 +619,11 @@ fn forward_transfer_status(
     // updates several times a second, which floods the console. Log
     // state transitions immediately, but progress at most once per
     // 5 seconds.
+    // A monotonic clock younger than the interval (a process started within
+    // seconds of boot) makes `checked_sub` return None; start from now then.
     let mut last_progress_log = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(6))
-        .unwrap();
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         match crate_rx.recv_timeout(StdDuration::from_millis(200)) {
             Ok(status) => {
@@ -806,9 +829,13 @@ impl SoulseekClient for RealClient {
             }
 
             if attempt + 1 < self.login_retries {
+                // The delay doubles per attempt but is capped, so a long retry
+                // chain cannot stall startup for days: with the largest
+                // accepted base delay this sleeps at most nine 10-minute waits.
                 let delay = self
                     .login_retry_delay_secs
-                    .saturating_mul(1u64 << attempt.min(20));
+                    .saturating_mul(1u64 << attempt.min(20))
+                    .min(LOGIN_RETRY_DELAY_CAP_SECS);
                 tokio::time::sleep(StdDuration::from_secs(delay)).await;
             }
         }
@@ -985,6 +1012,73 @@ mod real_client_tests {
         assert_eq!(
             err.to_string(),
             "server connection lost: the connection to the server dropped"
+        );
+    }
+
+    #[test]
+    fn login_retry_policy_comes_from_configuration() {
+        // Regression: `soulseek.login_retries` and
+        // `soulseek.login_retry_delay_secs` were documented keys that no code
+        // path read, so a configured policy was silently ignored.
+        let mut config = crate::config::Config::default();
+        config.soulseek.login_retries = 7;
+        config.soulseek.login_retry_delay_secs = 11;
+
+        let client = RealClient::from_config(&config);
+
+        assert_eq!(client.login_retries, 7);
+        assert_eq!(client.login_retry_delay_secs, 11);
+    }
+
+    #[test]
+    fn a_zero_retry_count_still_attempts_one_login() {
+        let mut config = crate::config::Config::default();
+        config.soulseek.login_retries = 0;
+
+        assert_eq!(
+            RealClient::from_config(&config).login_retries,
+            1,
+            "zero retries would mean never trying to log in"
+        );
+    }
+
+    #[test]
+    fn main_builds_the_client_from_configuration() {
+        // The tests above pin `from_config`; this pins the call site, so a revert
+        // to `RealClient::new()` (which hardcoded 3/5 and ignored the configured
+        // policy) cannot pass silently.
+        let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+
+        assert!(
+            main_rs.contains("RealClient::from_config(&config)"),
+            "main.rs must build the client from the loaded configuration"
+        );
+    }
+
+    #[test]
+    fn main_releases_the_pid_lock_when_client_setup_fails() {
+        // The lock is taken before login, so every early return after it has to
+        // release it. The unit tests cannot reach this path (it needs a live
+        // client), so guard the call site from the source, as the vendored-version
+        // test guards the manifest.
+        let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let after_set_max_peers = main_rs
+            .split("set_max_peers")
+            .nth(1)
+            .expect("main.rs must set max_peers after login");
+        // Bound the window to the statements up to the next part of `run()`, so
+        // the assertion cannot be satisfied by a later release or by the
+        // function definition itself.
+        let window = after_set_max_peers
+            .split("config.schedule.enabled")
+            .next()
+            .expect("the schedule block follows the client setup");
+
+        assert!(
+            window.contains("release_pid_lock"),
+            "a failed set_max_peers must release the PID lock before returning: {window}"
         );
     }
 
@@ -1448,6 +1542,24 @@ mod real_client_tests {
                 total_bytes: 1000,
             }
         ));
+        // A non-finite speed must map to 0: `NaN as u64` is 0 but `+inf as u64`
+        // saturates to u64::MAX, so the guard is what keeps the value sane.
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    ss_download_status_to_domain(SsDownloadStatus::InProgress {
+                        bytes_downloaded: 100,
+                        total_bytes: 1000,
+                        speed_bytes_per_sec: non_finite,
+                    }),
+                    DownloadStatus::InProgress {
+                        speed_bytes_per_sec: 0,
+                        ..
+                    }
+                ),
+                "{non_finite} must map to a zero speed"
+            );
+        }
         assert!(matches!(
             ss_download_status_to_domain(SsDownloadStatus::Paused {
                 bytes_downloaded: 100,

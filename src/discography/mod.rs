@@ -238,14 +238,18 @@ fn secondary_category(value: &str) -> Option<DiscographyReleaseType> {
     }
 }
 
-fn reject_release(release: &ReleaseGroup, reason: &str) -> bool {
+/// Log why a release group was excluded, so a debug run explains a gap.
+///
+/// Returns nothing on purpose: the caller decides the verdict, which keeps the
+/// rejection path readable instead of hiding a `false` in a boolean-returning
+/// helper.
+fn log_rejected_release(release: &ReleaseGroup, reason: &str) {
     tracing::debug!(
         release_group_id = %release.id,
         title = %release.title,
         reason,
         "excluding MusicBrainz release group"
     );
-    false
 }
 
 /// Classify a release group against the configured friendly categories.
@@ -253,16 +257,19 @@ fn reject_release(release: &ReleaseGroup, reason: &str) -> bool {
 /// be allowed; `Album` without secondaries requires `StudioAlbum`.
 pub fn release_allowed(release: &ReleaseGroup, allowed: &[DiscographyReleaseType]) -> bool {
     let Some(primary) = release.primary_type.as_deref() else {
-        return reject_release(release, "missing primary type");
+        log_rejected_release(release, "missing primary type");
+        return false;
     };
     let primary = primary.trim().to_ascii_lowercase();
     if primary != "album" && primary != "ep" && primary != "single" {
-        return reject_release(release, &format!("unknown primary type {primary}"));
+        log_rejected_release(release, &format!("unknown primary type {primary}"));
+        return false;
     }
     let mut secondaries = Vec::new();
     for value in &release.secondary_types {
         let Some(category) = secondary_category(value) else {
-            return reject_release(release, &format!("unknown secondary type {}", value.trim()));
+            log_rejected_release(release, &format!("unknown secondary type {}", value.trim()));
+            return false;
         };
         secondaries.push(category);
     }
@@ -291,7 +298,8 @@ pub fn release_allowed(release: &ReleaseGroup, allowed: &[DiscographyReleaseType
     if is_allowed {
         true
     } else {
-        reject_release(release, "release type is not enabled")
+        log_rejected_release(release, "release type is not enabled");
+        false
     }
 }
 
@@ -1039,35 +1047,27 @@ mod tests {
 
     #[test]
     fn excluded_release_groups_are_logged_with_reasons() {
-        let buffer = Arc::new(Mutex::new(String::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturingWriter(Arc::clone(&buffer)))
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let groups = [
-                group(
-                    "unknown-secondary",
-                    "Unknown Secondary",
-                    None,
-                    Some("Album"),
-                    &["Interview"],
-                ),
-                group("empty-title", "   ", None, Some("Album"), &[]),
-            ];
-            assert!(select_albums(
-                &groups,
-                &[
-                    DiscographyReleaseType::StudioAlbum,
-                    DiscographyReleaseType::LiveAlbum,
-                ],
-            )
-            .is_empty());
-        });
+        let capture = crate::test_support::LogCapture::start();
+        let groups = [
+            group(
+                "unknown-secondary",
+                "Unknown Secondary",
+                None,
+                Some("Album"),
+                &["Interview"],
+            ),
+            group("empty-title", "   ", None, Some("Album"), &[]),
+        ];
+        assert!(select_albums(
+            &groups,
+            &[
+                DiscographyReleaseType::StudioAlbum,
+                DiscographyReleaseType::LiveAlbum,
+            ],
+        )
+        .is_empty());
 
-        let logs = buffer.lock().unwrap().clone();
+        let logs = capture.text();
         assert!(logs.contains("unknown-secondary"), "got: {logs}");
         assert!(logs.contains("unknown secondary type"), "got: {logs}");
         assert!(logs.contains("empty-title"), "got: {logs}");
@@ -1167,32 +1167,7 @@ mod tests {
     use crate::db::{Database, DiscographyCacheEntry};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    struct CapturingWriter(Arc<Mutex<String>>);
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(bytes));
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct FakeProvider {
@@ -1683,8 +1658,24 @@ mod tests {
     #[test]
     fn dominant_selection_logs_its_evidence_at_info() {
         let db = Database::open_in_memory().unwrap();
+        // A distinctive artist spelling, deliberately unlike the Ils fixture the
+        // parallel dominance tests share: the capture window separates capture
+        // windows from each other, but a test that is not capturing still
+        // contributes records while a window is open, so every asserted value
+        // here has to be one only this test can produce.
         let provider = FakeProvider {
-            artist_responses: Mutex::new(VecDeque::from([Ok(ils_candidates())])),
+            artist_responses: Mutex::new(VecDeque::from([Ok(vec![
+                scored(
+                    "11111111-aaaa-4aaa-8aaa-000000000001",
+                    "Dominance Probe",
+                    Some(100),
+                ),
+                scored(
+                    "11111111-aaaa-4aaa-8aaa-000000000002",
+                    "DOMINANCE PROBE",
+                    Some(87),
+                ),
+            ])])),
             group_responses: Mutex::new(VecDeque::from([Ok(vec![group(
                 "1",
                 "Studio",
@@ -1694,27 +1685,19 @@ mod tests {
             )])])),
             ..FakeProvider::default()
         };
-        let buffer = Arc::new(Mutex::new(String::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturingWriter(Arc::clone(&buffer)))
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .finish();
+        let capture = crate::test_support::LogCapture::start();
 
-        let outcome = tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(discover_artist_albums_at(
-                    &provider,
-                    &db,
-                    "Ils",
-                    &DiscographyConfig::default(),
-                    1_000,
-                ))
-        });
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(discover_artist_albums_at(
+                &provider,
+                &db,
+                "dominance probe",
+                &DiscographyConfig::default(),
+                1_000,
+            ));
 
         assert!(matches!(
             outcome,
@@ -1724,22 +1707,30 @@ mod tests {
             }
         ));
 
-        let logs = buffer.lock().unwrap().clone();
-        assert!(logs.contains(" INFO "), "got: {logs}");
+        let logs = capture.text();
+        // Every assertion is made against the single record that carries the
+        // selected MBID. Asserting over the whole buffer would also accept
+        // another test's records, and asserting the level over the buffer would
+        // accept a DEBUG copy of this message.
+        let record = logs
+            .lines()
+            .find(|line| line.contains("selected_mbid=11111111-aaaa-4aaa-8aaa-000000000001"))
+            .unwrap_or_else(|| panic!("no dominance evidence record, got:\n{logs}"));
         assert!(
-            logs.contains("resolved duplicate canonical artist name by search-score dominance"),
-            "got: {logs}"
+            record.contains(" INFO "),
+            "the evidence must be logged at INFO, got: {record}"
         );
-        assert!(logs.contains("artist=Ils"), "got: {logs}");
-        assert!(logs.contains("selected_name=Ils"), "got: {logs}");
-        assert!(
-            logs.contains("selected_mbid=16b97aaa-d7c0-469f-8c97-47c705b2d02f"),
-            "log must name the selected MBID field, got: {logs}"
-        );
-        assert!(logs.contains("exact_matches=4"), "got: {logs}");
-        assert!(logs.contains("top_score=100"), "got: {logs}");
-        assert!(logs.contains("runner_up_score=86"), "got: {logs}");
-        assert!(logs.contains("margin=14"), "got: {logs}");
+        for field in [
+            "resolved duplicate canonical artist name by search-score dominance",
+            "artist=dominance probe",
+            "selected_name=Dominance Probe",
+            "exact_matches=2",
+            "top_score=100",
+            "runner_up_score=87",
+            "margin=13",
+        ] {
+            assert!(record.contains(field), "missing {field:?} in: {record}");
+        }
     }
 
     #[tokio::test]

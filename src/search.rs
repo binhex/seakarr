@@ -1042,11 +1042,6 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
     })
 }
 
-/// Audio file extensions collected by [`get_library_track_filenames`].
-const AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "wma", "ape",
-];
-
 /// The leading-track-number pattern (`01.`, `01 -`, `01-`, `12-`, ...).
 fn track_number_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -1251,7 +1246,9 @@ fn collect_audio_filenames(dir: &std::path::Path) -> Vec<String> {
         let is_audio = std::path::Path::new(&name)
             .extension()
             .and_then(|ext| ext.to_str())
-            .map(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+            .map(|ext| {
+                crate::scanner::KNOWN_AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+            })
             .unwrap_or(false);
         if is_audio {
             filenames.push(name);
@@ -1401,11 +1398,11 @@ pub fn record_search(
 /// not substrings, so "Prince" does not match "Princess". If an artist is
 /// made entirely of stop-words, every stop-word token must be present.
 ///
-/// This token-level helper is exercised by tests and kept for callers that
-/// match a bare filename; the production search tiers instead use
+/// This token-level helper is exercise-only: the production search tiers use
 /// [`retain_artist_files`] / [`path_matches_artist_directory`], which require an
 /// exact artist *directory* component. Empty or blank artist names never match.
-pub fn path_matches_artist(path: &str, artist: &str) -> bool {
+#[cfg(test)]
+fn path_matches_artist(path: &str, artist: &str) -> bool {
     if artist.trim().is_empty() {
         return false;
     }
@@ -1439,18 +1436,8 @@ pub fn path_matches_artist(path: &str, artist: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{FileInfo, MockClient, SearchResult};
-    use std::collections::HashMap;
-
-    fn make_file(name: &str, bitrate: u32, size: u64) -> FileInfo {
-        let mut attribs = HashMap::new();
-        attribs.insert(0, bitrate);
-        FileInfo {
-            name: name.into(),
-            size,
-            attribs,
-        }
-    }
+    use crate::client::{MockClient, SearchResult};
+    use crate::test_support::make_file;
 
     fn test_filters() -> FilterConfig {
         FilterConfig {
@@ -2274,7 +2261,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_album_only_fallback_never_matches_when_artist_empty() {
-        // An empty artist can never pass path_matches_artist. The primary
+        // An empty artist can never pass the artist-directory matcher
+        // (`path_matches_artist_directory`). The primary
         // album-only query is sufficient, so the redundant album-only fallback
         // tier must be skipped when the artist is empty.
         let client = MockClient::new();
@@ -2620,7 +2608,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let artist_album = dir.path().join("Artist").join("Album");
         std::fs::create_dir_all(&artist_album).unwrap();
-        for name in ["b.flac", "a.mp3", "c.ogg", "d.OPUS"] {
+        for name in ["b.flac", "a.mp3", "c.ogg", "d.OPUS", "e.oga", "f.alac"] {
             std::fs::write(artist_album.join(name), b"x").unwrap();
         }
         // Non-audio files and sub-directories are ignored.
@@ -2634,7 +2622,10 @@ mod tests {
             "Album",
         )
         .unwrap();
-        assert_eq!(filenames, vec!["a.mp3", "b.flac", "c.ogg", "d.OPUS"]);
+        assert_eq!(
+            filenames,
+            vec!["a.mp3", "b.flac", "c.ogg", "d.OPUS", "e.oga", "f.alac"]
+        );
     }
 
     #[test]
@@ -3484,7 +3475,7 @@ mod tests {
                 slots: 1,
                 files: vec![
                     make_file("Prince/Musicology/01.mp3", 320, 8_000_000),
-                    // Wrong-artist file that path_matches_artist prunes.
+                    // Wrong-artist file that path_matches_artist_directory prunes.
                     make_file("Other/Musicology/02.mp3", 320, 8_000_000),
                 ],
             }],
