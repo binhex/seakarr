@@ -54,6 +54,20 @@ pub struct DiscographyCacheEntry {
     pub release_groups_json: String,
 }
 
+/// A recorded artist-resolution failure, so a later run can skip the lookup
+/// instead of asking MusicBrainz the same unanswerable question again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscographyFailureEntry {
+    pub artist_key: String,
+    /// Why the lookup failed. Only `"unresolved"` is written today; the column
+    /// exists so the row is self-describing if a second kind is ever cached.
+    pub failure_kind: String,
+    /// The resolver's own message, replayed verbatim on a cache hit.
+    pub reason: String,
+    /// Unix seconds, the same clock as `DiscographyCacheEntry::fetched_at`.
+    pub recorded_at: i64,
+}
+
 /// Input data for enqueueing a download into the persistent queue.
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
@@ -188,6 +202,13 @@ impl Database {
                 canonical_artist   TEXT NOT NULL,
                 fetched_at         INTEGER NOT NULL,
                 release_groups_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS discography_failures (
+                artist_key   TEXT PRIMARY KEY COLLATE NOCASE,
+                failure_kind TEXT NOT NULL,
+                reason       TEXT NOT NULL,
+                recorded_at  INTEGER NOT NULL
             );",
         )?;
 
@@ -444,6 +465,57 @@ impl Database {
             params![artist_key],
         )? > 0)
     }
+
+    /// Read the recorded resolution failure for `artist_key`, if there is one.
+    pub fn get_discography_failure(
+        &self,
+        artist_key: &str,
+    ) -> Result<Option<DiscographyFailureEntry>> {
+        self.conn
+            .query_row(
+                "SELECT artist_key, failure_kind, reason, recorded_at
+                 FROM discography_failures WHERE artist_key = ?1 COLLATE NOCASE",
+                params![artist_key],
+                |row| {
+                    Ok(DiscographyFailureEntry {
+                        artist_key: row.get(0)?,
+                        failure_kind: row.get(1)?,
+                        reason: row.get(2)?,
+                        recorded_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Record a resolution failure for `artist_key`, replacing any earlier one.
+    pub fn upsert_discography_failure(&self, entry: &DiscographyFailureEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO discography_failures
+             (artist_key, failure_kind, reason, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(artist_key) DO UPDATE SET
+               failure_kind = excluded.failure_kind,
+               reason = excluded.reason,
+               recorded_at = excluded.recorded_at",
+            params![
+                entry.artist_key,
+                entry.failure_kind,
+                entry.reason,
+                entry.recorded_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete the recorded failure for `artist_key`; true when a row was removed.
+    pub fn delete_discography_failure(&self, artist_key: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM discography_failures WHERE artist_key = ?1 COLLATE NOCASE",
+            params![artist_key],
+        )? > 0)
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +559,52 @@ mod tests {
     }
 
     #[test]
+    fn discography_failures_table_is_added_to_an_existing_database() {
+        // An install created before this feature has a database without the new
+        // table, and it must gain it on open rather than needing a migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE processed_albums (
+                artist TEXT NOT NULL,
+                album  TEXT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='discography_failures'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "the fixture must start without the new table");
+
+        let db = Database { conn };
+        db.migrate().unwrap();
+
+        let after: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='discography_failures'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "an existing database must gain the table on open");
+
+        // It must be usable immediately, not merely present.
+        db.upsert_discography_failure(&DiscographyFailureEntry {
+            artist_key: "artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            recorded_at: 1_000,
+        })
+        .unwrap();
+        assert!(db.get_discography_failure("artist").unwrap().is_some());
+    }
+
+    #[test]
     fn test_create_tables() {
         let db = test_db();
         db.migrate().unwrap();
@@ -509,6 +627,7 @@ mod tests {
         assert!(tables.contains(&"batch_jobs".to_string()));
         assert!(tables.contains(&"batch_job_lines".to_string()));
         assert!(tables.contains(&"discography_cache".to_string()));
+        assert!(tables.contains(&"discography_failures".to_string()));
     }
 
     #[test]
@@ -703,5 +822,68 @@ mod tests {
         );
         assert!(db.delete_discography_cache("test artist").unwrap());
         assert!(db.get_discography_cache("test artist").unwrap().is_none());
+    }
+
+    #[test]
+    fn discography_failure_round_trips_replaces_and_deletes() {
+        let db = test_db();
+        db.migrate().unwrap();
+
+        assert!(db.get_discography_failure("artist").unwrap().is_none());
+
+        db.upsert_discography_failure(&DiscographyFailureEntry {
+            artist_key: "artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            recorded_at: 1_000,
+        })
+        .unwrap();
+
+        // The key matches case-insensitively, exactly as the success cache does.
+        let stored = db.get_discography_failure("ARTIST").unwrap().unwrap();
+        assert_eq!(stored.artist_key, "artist");
+        assert_eq!(stored.failure_kind, "unresolved");
+        assert_eq!(stored.reason, "no candidate matches");
+        assert_eq!(stored.recorded_at, 1_000);
+
+        // A second write replaces the row rather than duplicating it.
+        db.upsert_discography_failure(&DiscographyFailureEntry {
+            artist_key: "artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "second reason".to_string(),
+            recorded_at: 2_000,
+        })
+        .unwrap();
+        let stored = db.get_discography_failure("artist").unwrap().unwrap();
+        assert_eq!(stored.reason, "second reason");
+        assert_eq!(stored.recorded_at, 2_000);
+
+        // A conflicting write under a different case must replace the row rather
+        // than add a second one. The key and the delete are both COLLATE NOCASE,
+        // so the ON CONFLICT target has to resolve to the same row.
+        db.upsert_discography_failure(&DiscographyFailureEntry {
+            artist_key: "ARTIST".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "replaced under a different case".to_string(),
+            recorded_at: 3_000,
+        })
+        .unwrap();
+        let stored = db.get_discography_failure("artist").unwrap().unwrap();
+        assert_eq!(stored.reason, "replaced under a different case");
+        assert_eq!(stored.recorded_at, 3_000);
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM discography_failures", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "a case-differing upsert must not add a second row");
+
+        assert!(db.delete_discography_failure("artist").unwrap());
+        assert!(db.get_discography_failure("artist").unwrap().is_none());
+        assert!(
+            !db.delete_discography_failure("artist").unwrap(),
+            "deleting an absent row reports false"
+        );
     }
 }

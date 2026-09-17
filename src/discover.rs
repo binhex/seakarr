@@ -280,6 +280,10 @@ pub struct DiscoverCounters {
     pub excluded: usize,
     /// Artists MusicBrainz could not resolve, in encounter order.
     pub unresolved: Vec<String>,
+    /// Artists skipped because a previous run recorded a resolution failure,
+    /// in encounter order. Kept apart from `unresolved` so the summary shows
+    /// what was avoided rather than what was attempted.
+    pub cached_failures: Vec<String>,
     /// Artists that resolved but had no eligible release groups.
     pub no_eligible_albums: usize,
     /// Artists whose provider request failed, with the reason.
@@ -318,6 +322,12 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
         notices.push(format!(
             "discover: excluded {} artist(s) by discover.exclude_artists",
             counters.excluded
+        ));
+    }
+    if !counters.cached_failures.is_empty() {
+        notices.push(format!(
+            "discover: {} artist(s) skipped from cached resolution failures",
+            counters.cached_failures.len()
         ));
     }
     if !counters.unresolved.is_empty() {
@@ -860,11 +870,36 @@ mod tests {
     }
 
     #[test]
+    fn cached_failures_get_their_own_notice() {
+        let counters = DiscoverCounters {
+            cached_failures: vec!["40 Licks".to_string(), "30Hz".to_string()],
+            unresolved: vec!["Fresh Failure".to_string()],
+            ..DiscoverCounters::default()
+        };
+
+        let notices = discover_notices(&counters);
+
+        assert!(
+            notices.contains(
+                &"discover: 2 artist(s) skipped from cached resolution failures".to_string()
+            ),
+            "got {notices:?}"
+        );
+        assert!(
+            notices.contains(
+                &"discover: 1 artist(s) unresolved on MusicBrainz: Fresh Failure".to_string()
+            ),
+            "the cached and fresh notices must stay distinguishable: {notices:?}"
+        );
+    }
+
+    #[test]
     fn notices_summarise_every_aggregate_in_order() {
         let counters = DiscoverCounters {
             present: 12,
             excluded: 2,
             unresolved: vec!["Mystery Artist".to_string()],
+            cached_failures: Vec::new(),
             no_eligible_albums: 1,
             provider_failed: vec![("Offline Artist".to_string(), "connection reset".to_string())],
             budget_reached_at: Some("Beta Band".to_string()),

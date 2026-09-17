@@ -245,6 +245,10 @@ pub struct DiscographyConfig {
     pub enabled: bool,
     #[serde(default = "default_discography_cache_days")]
     pub cache_days: u64,
+    /// How long a recorded artist-resolution failure is honoured. `0` disables
+    /// the failure cache entirely: nothing is written and nothing is replayed.
+    #[serde(default = "default_discography_failure_cache_days")]
+    pub failure_cache_days: u64,
     #[serde(default = "default_discography_release_types")]
     pub allowed_types: Vec<DiscographyReleaseType>,
     #[serde(default)]
@@ -253,6 +257,10 @@ pub struct DiscographyConfig {
 
 fn default_discography_cache_days() -> u64 {
     30
+}
+
+fn default_discography_failure_cache_days() -> u64 {
+    7
 }
 
 fn default_discography_release_types() -> Vec<DiscographyReleaseType> {
@@ -264,6 +272,7 @@ impl Default for DiscographyConfig {
         Self {
             enabled: true,
             cache_days: default_discography_cache_days(),
+            failure_cache_days: default_discography_failure_cache_days(),
             allowed_types: default_discography_release_types(),
             artist_mbids: BTreeMap::new(),
         }
@@ -866,6 +875,11 @@ impl Config {
                 "discography.cache_days is too large".into(),
             ));
         }
+        if self.discography.failure_cache_days > i64::MAX as u64 / 86_400 {
+            return Err(SeakarrError::Config(
+                "discography.failure_cache_days is too large".into(),
+            ));
+        }
         let mut normalized = HashSet::new();
         for (artist, mbid) in &self.discography.artist_mbids {
             let key = crate::discography::normalize_catalog_key(artist);
@@ -1295,6 +1309,7 @@ search:
 discography:
   enabled: true
   cache_days: 30
+  failure_cache_days: 7
   allowed_types: ["studio_album"]
   artist_mbids:
     "Test Artist": "11111111-1111-1111-1111-111111111111"
@@ -2702,11 +2717,37 @@ search:
         let config = Config::default();
         assert!(config.discography.enabled);
         assert_eq!(config.discography.cache_days, 30);
+        assert_eq!(config.discography.failure_cache_days, 7);
         assert_eq!(
             config.discography.allowed_types,
             vec![DiscographyReleaseType::StudioAlbum]
         );
         assert!(config.discography.artist_mbids.is_empty());
+    }
+
+    #[test]
+    fn discography_failure_cache_days_round_trips_through_yaml() {
+        let mut config = Config::default();
+        config.discography.failure_cache_days = 3;
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("failure_cache_days: 3"), "got {yaml}");
+
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.discography.failure_cache_days, 3);
+    }
+
+    #[test]
+    fn discography_failure_cache_days_too_large_is_rejected() {
+        let mut config = Config::default();
+        config.discography.failure_cache_days = u64::MAX;
+        let error = config.validate_non_credential_constraints().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discography.failure_cache_days is too large"),
+            "got {error}"
+        );
     }
 
     #[test]

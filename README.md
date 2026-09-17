@@ -263,6 +263,7 @@ key.
 | --- | ----------- | ------- |
 | `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
 | `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
+| `failure_cache_days` | How long an artist that MusicBrainz could not resolve is remembered, so a later run skips the lookup instead of asking again. `0` disables the failure cache: nothing is recorded and nothing is skipped. Only resolution failures are remembered — a MusicBrainz outage is always retried. | `7` |
 | `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. Must not be empty while `enabled` is true. | `[studio_album]` |
 | `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. Keys must be unique after normalization, so `Nirvana` and ` nirvana ` cannot both appear. | `{}` |
 
@@ -292,6 +293,18 @@ name, or a format label (`2006 - Days to Come`, `Days to Come - Bonobo`,
 `Days to Come [FLAC]`) is a different key from the plain title MusicBrainz
 reports, and discover can place one extra copy beside it; keeping folder names
 close to the MusicBrainz title avoids that.
+
+An artist that MusicBrainz cannot resolve to exactly one candidate is recorded
+for `discography.failure_cache_days`, and a later run skips the lookup for it
+instead of asking again; the run summary reports those skips separately from
+failures encountered in that run. An artist whose discography is already cached
+is not recorded, because that cache is the better answer even once it has
+expired. Running an artist explicitly with `--artist`, or pinning it in
+`discography.artist_mbids`, always bypasses the recorded failure and queries
+MusicBrainz; the row is cleared as soon as the artist name resolves, and pinning
+an MBID clears it immediately. Only a failure to match the artist name is remembered —
+an outage, and a search whose reported result count disagrees with the page it
+returned, are retried every run rather than cached.
 
 ### `filters`
 
@@ -669,7 +682,8 @@ arbitrary Soulseek folders:
 
 **Q: What happens when MusicBrainz cannot be reached or returns nothing?**
 
-Fallback precedence is fresh cache, successful refresh, stale cache, then the legacy heuristic. The last
+Fallback precedence is fresh cache, a freshly recorded resolution failure (unless `--artist` or a pinned MBID
+bypasses it), successful refresh, stale cache, then the legacy heuristic. The last
 step applies to artist-only manual mode; discover mode instead reports the artist as skipped and aborts the
 run after repeated provider failures (see the discover answer below), and `discography.enabled: false` is a
 configuration error for discover.

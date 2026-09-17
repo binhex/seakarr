@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::discography::{
     discover_artist_albums, DiscographyProvider, DiscoveryFailure, DiscoveryOutcome,
-    DiscoveryProvenance, MusicBrainzProvider,
+    DiscoveryProvenance, FailureCacheUse, MusicBrainzProvider,
 };
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
@@ -1277,7 +1277,15 @@ async fn run_artist_only_mode_with_provider(
     cancel: &Arc<AtomicBool>,
     provider: &dyn DiscographyProvider,
 ) -> Result<ArtistOnlyRun> {
-    match discover_artist_albums(provider, db, artist, &config.discography).await {
+    match discover_artist_albums(
+        provider,
+        db,
+        artist,
+        &config.discography,
+        FailureCacheUse::Bypass,
+    )
+    .await
+    {
         DiscoveryOutcome::Authoritative { albums, provenance } => {
             if let DiscoveryProvenance::StaleCache {
                 age_days,
@@ -1589,6 +1597,15 @@ async fn run_discover_mode_with_provider(
     let selection =
         discover::select_artists(&index, &config.discover.exclude_artists, artist_filter)?;
 
+    // An explicit --artist is a deliberate one-off request, so it bypasses a
+    // recorded failure; the scheduled sweep honours it. This matches the
+    // existing rule that --artist overrides discover.exclude_artists.
+    let failure_cache = if artist_filter.is_some() {
+        FailureCacheUse::Bypass
+    } else {
+        FailureCacheUse::Honour
+    };
+
     let mut counters = discover::DiscoverCounters {
         excluded: selection.excluded.len(),
         budget_limit: config.discover.max_cycle_downloads,
@@ -1631,7 +1648,15 @@ async fn run_discover_mode_with_provider(
             artist_dir: artist.artist_dir.as_str(),
         };
         counters.artists_examined += 1;
-        match discover_artist_albums(provider, db, &artist.name, &config.discography).await {
+        match discover_artist_albums(
+            provider,
+            db,
+            &artist.name,
+            &config.discography,
+            failure_cache,
+        )
+        .await
+        {
             DiscoveryOutcome::Authoritative { albums, provenance } => {
                 if let DiscoveryProvenance::StaleCache {
                     age_days,
@@ -1759,17 +1784,32 @@ async fn run_discover_mode_with_provider(
                 }
                 counters.no_eligible_albums += 1;
             }
-            DiscoveryOutcome::LegacyFallback { reason, kind } => match kind {
+            DiscoveryOutcome::LegacyFallback {
+                reason,
+                kind,
+                from_cache,
+            } => match kind {
                 DiscoveryFailure::Unresolved => {
-                    // MusicBrainz answered for this artist, so the provider is
-                    // reachable. Reset the consecutive-failure count and keep
-                    // the circuit breaker for genuine outages only.
-                    consecutive_provider_failures = 0;
-                    tracing::warn!(
-                        "{}: artist could not be resolved on MusicBrainz: {reason}",
-                        artist.name
-                    );
-                    counters.unresolved.push(artist.name.clone());
+                    if from_cache {
+                        // No request was made, so this is no evidence about
+                        // provider health: neither increment nor reset the
+                        // consecutive-failure counter.
+                        tracing::debug!(
+                            "{}: skipped, resolution failure recorded earlier ({reason})",
+                            artist.name
+                        );
+                        counters.cached_failures.push(artist.name.clone());
+                    } else {
+                        // MusicBrainz answered for this artist, so the provider
+                        // is reachable. Reset the consecutive-failure count and
+                        // keep the circuit breaker for genuine outages only.
+                        consecutive_provider_failures = 0;
+                        tracing::warn!(
+                            "{}: artist could not be resolved on MusicBrainz: {reason}",
+                            artist.name
+                        );
+                        counters.unresolved.push(artist.name.clone());
+                    }
                 }
                 DiscoveryFailure::Provider => {
                     consecutive_provider_failures += 1;
@@ -2804,6 +2844,7 @@ mod tests {
         failure: Option<String>,
         /// `None` echoes the requested artist back as the only candidate.
         candidate_names: Option<Vec<String>>,
+        artist_calls: Arc<AtomicUsize>,
     }
 
     impl FakeDiscographyProvider {
@@ -2812,6 +2853,7 @@ mod tests {
                 groups,
                 failure: None,
                 candidate_names: None,
+                artist_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -2820,6 +2862,7 @@ mod tests {
                 groups: Vec::new(),
                 failure: Some(reason.to_string()),
                 candidate_names: None,
+                artist_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -2830,7 +2873,12 @@ mod tests {
                 groups: Vec::new(),
                 failure: None,
                 candidate_names: Some(vec!["Somebody Else".to_string()]),
+                artist_calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn calls(&self) -> usize {
+            self.artist_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -2840,6 +2888,7 @@ mod tests {
             &self,
             artist: &str,
         ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            self.artist_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -4466,6 +4515,177 @@ mod tests {
             soulseek.search_queries.lock().unwrap().is_empty(),
             "an unresolved artist must never trigger a broad artist search"
         );
+    }
+
+    #[tokio::test]
+    async fn discover_skips_a_recorded_failure_without_calling_the_provider() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "test artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            recorded_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            0,
+            "a recorded failure must spare the MusicBrainz lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_artist_bypasses_a_recorded_failure() {
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "test artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            recorded_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Test Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            provider.calls() > 0,
+            "asking for an artist by name must reach MusicBrainz"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_skip_neither_increments_nor_resets_the_provider_failure_breaker() {
+        // A cached skip makes no request, so it is no evidence about provider
+        // health. Interleaving it between failures distinguishes the two halves:
+        // if it reset the count the run would stop short of the limit and not
+        // abort. Artists are examined alphabetically, so the recorded failure sits
+        // between two failures.
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[
+            ("Alpha Artist", "Present"),
+            ("Beta Artist", "Present"),
+            ("Delta Artist", "Present"),
+            ("Gamma Artist", "Present"),
+        ]);
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "beta artist".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            recorded_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        let provider = FakeDiscographyProvider::failing("connection reset");
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::MusicBrainz(_)),
+            "a cached skip must not reset the breaker, got {error:?}"
+        );
+        assert_eq!(
+            provider.calls(),
+            3,
+            "three artists must be asked about; the recorded one must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_skip_is_reported_in_the_summary() {
+        // The counter and its notice are the only way to tell a cached skip apart
+        // from a failure this run observed, so nothing else would catch a missing
+        // push in the discover loop.
+        //
+        // `LogCapture` is process-wide and records every event emitted by any
+        // concurrently running test, so both the positive and the negative
+        // assertion have to key on values only this test can produce. Two
+        // distinctively named artists give the notice a count of 2 that no other
+        // test produces, and the names make the loop's own log lines and the
+        // fresh-failure notice attributable to this run.
+        let capture = crate::test_support::LogCapture::start();
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[
+            ("Cached Skip Alpha", "Present"),
+            ("Cached Skip Beta", "Present"),
+        ]);
+        for artist_key in ["cached skip alpha", "cached skip beta"] {
+            db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+                artist_key: artist_key.to_string(),
+                failure_kind: "unresolved".to_string(),
+                reason: "no candidate matches".to_string(),
+                recorded_at: chrono::Utc::now().timestamp(),
+            })
+            .unwrap();
+        }
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let logs = capture.text();
+        for name in ["Cached Skip Alpha", "Cached Skip Beta"] {
+            assert!(
+                logs.contains(&format!(
+                    "{name}: skipped, resolution failure recorded earlier"
+                )),
+                "the loop must take the cached-skip branch for {name}, got:\n{logs}"
+            );
+        }
+        assert!(
+            logs.contains("discover: 2 artist(s) skipped from cached resolution failures"),
+            "the summary must report both cached skips, got:\n{logs}"
+        );
+        for name in ["Cached Skip Alpha", "Cached Skip Beta"] {
+            assert!(
+                !logs.contains(&format!("unresolved on MusicBrainz: {name}")),
+                "a cached skip must not be counted as a failure observed this run, got:\n{logs}"
+            );
+        }
     }
 
     #[tokio::test]

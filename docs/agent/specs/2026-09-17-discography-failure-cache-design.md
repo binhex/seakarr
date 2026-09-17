@@ -189,7 +189,7 @@ artist_key, configured_mbid
                 |          delete failure row
                 |          select_outcome(Refreshed)                       (unchanged)
                 |
-                +-- Err -> if from_error(err) == Unresolved
+                +-- Err -> if ArtistUnresolved (a stable name failure)
                 |            and no success row exists
                 |              upsert failure row
                 |          stale_or_legacy(...)                           (unchanged)
@@ -251,6 +251,10 @@ success row by warning and continuing.
   negatively cached, because a success row exists and the rows are mutually
   exclusive. It therefore keeps its per-run cost. This case does not appear in
   the live data.
+- Not every recorded decision is purely a property of the name. Three of the
+  `ArtistUnresolved` producers decide from MusicBrainz's per-response search
+  scores, so a later re-ranking can make a name resolvable while the cached row
+  still suppresses the lookup until the expiry elapses.
 - Each artist still costs one database read per run.
 - There is no bulk-clear command. The exits from the cache are the TTL, a
   successful resolution, and the pinned-MBID bypass.

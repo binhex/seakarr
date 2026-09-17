@@ -5,7 +5,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::config::DiscographyConfig;
 use crate::config::DiscographyReleaseType;
-use crate::db::{Database, DiscographyCacheEntry};
+use crate::db::{Database, DiscographyCacheEntry, DiscographyFailureEntry};
 
 mod musicbrainz;
 pub use musicbrainz::MusicBrainzProvider;
@@ -86,6 +86,16 @@ pub enum DiscographyError {
     IncompletePagination(String),
     #[error("artist could not be resolved safely: {0}")]
     ArtistUnresolved(String),
+    /// The artist search answered with a page whose reported total disagrees
+    /// with the candidates it carried, so the exact-name match cannot be proven
+    /// from the candidates in hand. This is a property of one HTTP response
+    /// rather than a fact about the artist name, which is why it stays out of
+    /// the resolution-failure cache: a single inconsistent response must not
+    /// suppress the artist for days. It is still classified as an artist
+    /// problem for the circuit breaker and the legacy fallback, so the run
+    /// behaves exactly as it did before the failure cache existed.
+    #[error("artist search was inconsistent: {0}")]
+    ArtistSearchInconsistent(String),
     /// The provider answered, but its candidate data was unusable: a search
     /// score outside the documented range, or a missing score where one is
     /// required. This is a provider defect, not an artist that genuinely cannot
@@ -476,6 +486,10 @@ pub fn select_albums(
 pub const SECONDS_PER_DAY: u64 = 86_400;
 pub const MAX_CACHE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+/// The only failure kind written to the failure cache. Anything else is treated
+/// as a miss, so a future kind cannot suppress a lookup it was not written for.
+const FAILURE_KIND_UNRESOLVED: &str = "unresolved";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryProvenance {
     FreshCache,
@@ -504,16 +518,58 @@ pub enum DiscoveryFailure {
     Provider,
 }
 
+impl DiscographyError {
+    /// True when this failure means the artist name could not be matched or
+    /// disambiguated, as opposed to a transport, HTTP, decode, pagination or
+    /// unusable-data failure, and is therefore worth remembering across runs.
+    ///
+    /// Only [`DiscographyError::ArtistUnresolved`] qualifies. Its sibling
+    /// [`DiscographyError::ArtistSearchInconsistent`] is deliberately classified
+    /// as an artist problem for the circuit breaker and the legacy fallback, but
+    /// a page whose reported total disagrees with its payload describes one
+    /// inconsistent response, so caching it would suppress a healthy artist
+    /// until the expiry elapsed.
+    ///
+    /// The match is not entirely response-independent: three of the
+    /// `ArtistUnresolved` producers decide from MusicBrainz's per-response search
+    /// scores — a tied top score, a top score below the required threshold, and a
+    /// leading margin below the required margin — so a later re-ranking could make
+    /// a cached name resolvable while the row still suppresses the lookup until it
+    /// expires. That is accepted deliberately: the alternative is to remember
+    /// nothing and pay the per-run cost this cache exists to remove.
+    pub(crate) fn is_stable_artist_resolution_failure(&self) -> bool {
+        matches!(self, Self::ArtistUnresolved(_))
+    }
+}
+
 impl DiscoveryFailure {
     /// Only an artist-resolution failure is an artist problem; every other
     /// provider error (transport, HTTP status, decode, pagination, or unusable
     /// candidate data) is an outage problem.
+    ///
+    /// An inconsistent search page counts as an artist problem even though it is
+    /// not cacheable, because falling back for this run is the pre-existing
+    /// behaviour and changing it here would turn a response defect into a run
+    /// abort.
     fn from_error(error: &DiscographyError) -> Self {
         match error {
-            DiscographyError::ArtistUnresolved(_) => Self::Unresolved,
+            DiscographyError::ArtistUnresolved(_)
+            | DiscographyError::ArtistSearchInconsistent(_) => Self::Unresolved,
             _ => Self::Provider,
         }
     }
+}
+
+/// Whether a caller will accept a recorded resolution failure in place of a
+/// provider call. Named rather than a bare `bool` so the two call sites read as
+/// a decision, following `ArtistComponent` in `organizer.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCacheUse {
+    /// Replay a fresh recorded failure for this artist.
+    Honour,
+    /// Ignore any recorded failure: the user asked for this artist by name, or
+    /// pinned its MBID, so the lookup runs.
+    Bypass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,19 +584,36 @@ pub enum DiscoveryOutcome {
     LegacyFallback {
         reason: String,
         kind: DiscoveryFailure,
+        /// True when this failure was replayed from the failure cache rather
+        /// than observed live, so the caller can report the two separately.
+        from_cache: bool,
     },
 }
 
 /// Resolve an artist's conceptual albums, preferring a fresh discography
-/// cache, then authoritative MusicBrainz data, then a compatible stale cache,
-/// and finally a visible legacy fallback.
+/// cache, then a freshly recorded resolution failure unless the caller bypassed
+/// it or the artist already has a usable cache entry, then authoritative
+/// MusicBrainz data, then a compatible stale cache, and finally a visible legacy
+/// fallback.
+///
+/// `failure_cache` decides whether a recorded resolution failure may stand in
+/// for the provider call; see [`FailureCacheUse`].
 pub async fn discover_artist_albums(
     provider: &dyn DiscographyProvider,
     db: &Database,
     artist: &str,
     config: &DiscographyConfig,
+    failure_cache: FailureCacheUse,
 ) -> DiscoveryOutcome {
-    discover_artist_albums_at(provider, db, artist, config, chrono::Utc::now().timestamp()).await
+    discover_artist_albums_at(
+        provider,
+        db,
+        artist,
+        config,
+        chrono::Utc::now().timestamp(),
+        failure_cache,
+    )
+    .await
 }
 
 /// Time-injectable variant of [`discover_artist_albums`].
@@ -550,6 +623,7 @@ pub(crate) async fn discover_artist_albums_at(
     artist: &str,
     config: &DiscographyConfig,
     now: i64,
+    failure_cache: FailureCacheUse,
 ) -> DiscoveryOutcome {
     let artist_key = normalize_catalog_key(artist);
     let configured_mbid = config
@@ -567,6 +641,18 @@ pub(crate) async fn discover_artist_albums_at(
                 DiscoveryProvenance::FreshCache,
             );
         }
+    }
+
+    if let Some(replayed) = replay_recorded_failure(
+        db,
+        &artist_key,
+        config,
+        now,
+        failure_cache,
+        configured_mbid,
+        cached.is_some(),
+    ) {
+        return replayed;
     }
 
     let refresh = async {
@@ -590,6 +676,14 @@ pub(crate) async fn discover_artist_albums_at(
                 resolved.candidate
             }
         };
+        // The row records a failure to RESOLVE this name, so a successful
+        // resolution makes it obsolete whatever happens to the release-group
+        // fetch that follows. Clearing it here rather than on the fully
+        // successful path is what stops an earlier run's row from keeping the
+        // artist skipped for the rest of its expiry once the name resolves.
+        if let Err(error) = db.delete_discography_failure(&artist_key) {
+            tracing::warn!("failed to clear discography failure cache: {error}");
+        }
         let groups = provider.release_groups(&resolved.id).await?;
         Ok::<_, DiscographyError>((resolved, groups))
     }
@@ -618,7 +712,11 @@ pub(crate) async fn discover_artist_albums_at(
             // fall back to the stale cache or legacy discovery.
             Err(error) => stale_or_legacy(cached, &config.allowed_types, now, error),
         },
-        Err(error) => stale_or_legacy(cached, &config.allowed_types, now, error),
+        Err(error) => {
+            let has_success_row = cached.is_some();
+            record_resolution_failure(db, &artist_key, config, now, &error, has_success_row);
+            stale_or_legacy(cached, &config.allowed_types, now, error)
+        }
     }
 }
 
@@ -681,6 +779,116 @@ fn stale_age_days(now: i64, fetched_at: i64) -> u64 {
     }
 }
 
+/// Replay a recorded resolution failure instead of calling the provider.
+///
+/// Returns `None` when there is nothing to replay. In order of the checks below:
+/// a pinned MBID makes resolution deterministic, so the recorded row is deleted
+/// and the lookup runs; the caller bypassed the cache; the configured expiry is
+/// `0`; a compatible success row exists, which is the better answer even when it
+/// is stale; no row exists; the row is stale; or its kind is unknown.
+///
+/// Every one of those is a miss rather than an error, because a cache must never
+/// be able to block a lookup it was not written for.
+fn replay_recorded_failure(
+    db: &Database,
+    artist_key: &str,
+    config: &DiscographyConfig,
+    now: i64,
+    use_cache: FailureCacheUse,
+    configured_mbid: Option<&str>,
+    has_success_row: bool,
+) -> Option<DiscoveryOutcome> {
+    if configured_mbid.is_some() {
+        // A pinned MBID makes resolution deterministic, so any recorded failure
+        // is obsolete. Drop it and let the lookup run.
+        if let Err(error) = db.delete_discography_failure(artist_key) {
+            tracing::warn!("failed to clear discography failure row: {error}");
+        }
+        return None;
+    }
+    if use_cache == FailureCacheUse::Bypass || config.failure_cache_days == 0 {
+        return None;
+    }
+    // The two kinds of row are mutually exclusive by construction, but a failed
+    // delete or a crash between the success write and the failure delete can
+    // leave both. A compatible success row is the better answer even when it is
+    // stale - it is a usable fallback - so a failure row must never shadow it,
+    // or the artist would be skipped instead of falling back to those albums.
+    if has_success_row {
+        return None;
+    }
+    let entry = match db.get_discography_failure(artist_key) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!("failed to read discography failure cache: {error}");
+            return None;
+        }
+    };
+    if !cache_is_fresh(entry.recorded_at, config.failure_cache_days, now) {
+        return None;
+    }
+    if entry.failure_kind != FAILURE_KIND_UNRESOLVED {
+        return None;
+    }
+    let reason = if entry.reason.trim().is_empty() {
+        "artist could not be resolved safely".to_string()
+    } else {
+        entry.reason
+    };
+    tracing::debug!(
+        artist_key,
+        recorded_at = entry.recorded_at,
+        "skipping a recorded resolution failure"
+    );
+    Some(DiscoveryOutcome::LegacyFallback {
+        reason,
+        kind: DiscoveryFailure::Unresolved,
+        from_cache: true,
+    })
+}
+
+/// Record an artist-resolution failure so a later run can skip the lookup.
+///
+/// Only a failure to match the artist name is recorded, which
+/// [`DiscographyError::is_stable_artist_resolution_failure`] decides. That
+/// excludes a `Provider` failure, because an outage would otherwise keep
+/// suppressing a healthy MusicBrainz for the whole expiry, and it excludes
+/// [`DiscographyError::ArtistSearchInconsistent`], which is classified as an
+/// artist problem for this run's fallback but describes one response. Nothing is
+/// recorded when the feature is off, when there is no usable artist key, or when
+/// a success row already exists for this key — the two kinds of row are mutually
+/// exclusive by construction, so a stale-but-usable success row is never
+/// shadowed by a fresh failure.
+fn record_resolution_failure(
+    db: &Database,
+    artist_key: &str,
+    config: &DiscographyConfig,
+    now: i64,
+    error: &DiscographyError,
+    has_success_row: bool,
+) {
+    if config.failure_cache_days == 0 || has_success_row || artist_key.is_empty() {
+        return;
+    }
+    // Cacheability is decided by the error itself, not by the discovery-failure
+    // classification: an inconsistent search page is classified as unresolved so
+    // this run falls back, but it describes one response and must not be
+    // remembered.
+    if !error.is_stable_artist_resolution_failure() {
+        return;
+    }
+    let entry = DiscographyFailureEntry {
+        artist_key: artist_key.to_string(),
+        failure_kind: FAILURE_KIND_UNRESOLVED.to_string(),
+        reason: error.to_string(),
+        recorded_at: now,
+    };
+    if let Err(error) = db.upsert_discography_failure(&entry) {
+        tracing::warn!("failed to write discography failure cache for {artist_key:?}: {error}");
+    }
+}
+
 /// Reject cache payloads over the 16 MiB limit (a refresh error that falls
 /// back to a stale cache or legacy discovery when no cache exists).
 fn serialize_cache_payload(
@@ -723,6 +931,7 @@ fn stale_or_legacy(
         return DiscoveryOutcome::LegacyFallback {
             kind: DiscoveryFailure::from_error(&refresh_error),
             reason: refresh_error.to_string(),
+            from_cache: false,
         };
     };
     let provenance = DiscoveryProvenance::StaleCache {
@@ -1204,6 +1413,9 @@ mod tests {
         lookup_calls: AtomicUsize,
         group_calls: AtomicUsize,
         failure: Option<String>,
+        /// Answer the artist search with a page whose reported total disagrees
+        /// with the candidates it carried.
+        inconsistent: bool,
     }
 
     impl FakeProvider {
@@ -1233,6 +1445,29 @@ mod tests {
             }
         }
 
+        /// An artist search that returns only non-matching names, so resolution
+        /// fails as `DiscoveryFailure::Unresolved` rather than as an outage.
+        fn unresolvable_recording() -> Self {
+            Self {
+                artist_responses: Mutex::new(VecDeque::from([Ok(vec![ArtistCandidate {
+                    id: "22222222-2222-2222-2222-222222222222".to_string(),
+                    name: "Somebody Else".to_string(),
+                    score: None,
+                }])])),
+                ..Self::default()
+            }
+        }
+
+        /// A search that answers with a page whose reported total disagrees with
+        /// its payload. Classified as an artist problem for this run, but it is a
+        /// property of one response, so it must never be cached.
+        fn inconsistent_search() -> Self {
+            Self {
+                inconsistent: true,
+                ..Self::default()
+            }
+        }
+
         fn total_calls(&self) -> usize {
             self.artist_calls.load(Ordering::SeqCst)
                 + self.lookup_calls.load(Ordering::SeqCst)
@@ -1249,6 +1484,11 @@ mod tests {
             self.artist_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
+            }
+            if self.inconsistent {
+                return Err(DiscographyError::ArtistSearchInconsistent(
+                    "artist search returned 0 candidates but reported 1".to_string(),
+                ));
             }
             self.artist_responses
                 .lock()
@@ -1309,6 +1549,478 @@ mod tests {
         .unwrap();
     }
 
+    fn record_failure(db: &Database, artist_key: &str, reason: &str, recorded_at: i64) {
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: artist_key.to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: reason.to_string(),
+            recorded_at,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_artist_is_recorded() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider::unresolvable_recording();
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &DiscographyConfig::default(),
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        let stored = db.get_discography_failure("unknown").unwrap().unwrap();
+        assert_eq!(stored.failure_kind, "unresolved");
+        assert_eq!(stored.recorded_at, 1_000);
+        assert!(!stored.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_outage_is_not_recorded() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider::failing("service unavailable");
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            db.get_discography_failure("artist").unwrap().is_none(),
+            "a transient outage must never be remembered"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_failure_cache_days_records_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig {
+            failure_cache_days: 0,
+            ..DiscographyConfig::default()
+        };
+        let provider = FakeProvider::unresolvable_recording();
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &config,
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(db.get_discography_failure("unknown").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_failure_row_is_written_when_a_success_row_exists() {
+        let db = Database::open_in_memory().unwrap();
+        let groups = vec![group("1", "Studio", Some("2000"), Some("Album"), &[])];
+        // Stale, so the refresh still runs, but present, so the rows stay
+        // mutually exclusive.
+        cache_groups(
+            &db,
+            "artist",
+            "11111111-1111-1111-1111-111111111111",
+            0,
+            &groups,
+        );
+        let provider = FakeProvider::default();
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            31 * 86_400,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(db.get_discography_failure("artist").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_successful_refresh_clears_a_recorded_failure() {
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        // Recorded exactly at the expiry, so the row is stale (equality is
+        // stale, as it is for the success cache) and the refresh runs instead
+        // of being replayed.
+        record_failure(&db, "artist", "no candidate matches", 1_000);
+        let provider =
+            FakeProvider::with_groups(vec![group("1", "Studio", Some("2000"), Some("Album"), &[])]);
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            1_000 + (config.failure_cache_days * 86_400) as i64,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            db.get_discography_failure("artist").unwrap().is_none(),
+            "a successful resolution makes the recorded failure obsolete"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_recorded_failure_is_replayed_without_a_provider_call() {
+        let db = Database::open_in_memory().unwrap();
+        record_failure(&db, "unknown", "no candidate matches \"unknown\"", 1_000);
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &DiscographyConfig::default(),
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                ref reason,
+                kind: DiscoveryFailure::Unresolved,
+                from_cache: true,
+            } if reason == "no candidate matches \"unknown\""
+        ));
+        assert_eq!(
+            provider.total_calls(),
+            0,
+            "a replay must not call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_failure_at_the_ttl_boundary_is_retried() {
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        let ttl = config.failure_cache_days * 86_400;
+        record_failure(&db, "unknown", "no candidate matches", 1_000);
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &config,
+            1_000 + ttl as i64,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(provider.total_calls() > 0, "an expired row must retry");
+    }
+
+    #[tokio::test]
+    async fn recorded_failure_beyond_the_ttl_is_retried() {
+        // The contract requires both boundaries to retry, not just equality: a row
+        // one second past the expiry must be treated exactly like one at it.
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        let ttl = config.failure_cache_days * 86_400;
+        record_failure(&db, "unknown", "no candidate matches", 1_000);
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &config,
+            1_000 + ttl as i64 + 1,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(
+            provider.total_calls() > 0,
+            "a row past the expiry must retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_failure_cache_days_retries_and_records_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig {
+            failure_cache_days: 0,
+            ..DiscographyConfig::default()
+        };
+        record_failure(&db, "unknown", "no candidate matches", 1_000);
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &config,
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(provider.total_calls() > 0);
+        // The seeded row is what proves nothing was honoured. It must also be
+        // left exactly as it was, because a disabled cache must not rewrite what
+        // is already there - the sibling test covers the case where no row exists.
+        let stored = db.get_discography_failure("unknown").unwrap().unwrap();
+        assert_eq!(
+            stored.recorded_at, 1_000,
+            "a disabled cache must not rewrite an existing row"
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_ignores_a_fresh_recorded_failure() {
+        let db = Database::open_in_memory().unwrap();
+        record_failure(&db, "unknown", "no candidate matches", 1_000);
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &DiscographyConfig::default(),
+            1_100,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(provider.total_calls() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_mbid_bypasses_and_clears_a_recorded_failure() {
+        let db = Database::open_in_memory().unwrap();
+        record_failure(&db, "artist", "no candidate matches", 1_000);
+        // A failing provider, so the pinned refresh produces no success row: the
+        // only thing that can clear the recorded failure is the bypass itself.
+        let provider = FakeProvider::failing("service unavailable");
+        let config = DiscographyConfig {
+            artist_mbids: std::collections::BTreeMap::from([(
+                "Artist".to_string(),
+                "11111111-1111-1111-1111-111111111111".to_string(),
+            )]),
+            ..DiscographyConfig::default()
+        };
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            provider.total_calls() > 0,
+            "a pinned MBID must reach MusicBrainz"
+        );
+        assert!(
+            db.get_discography_failure("artist").unwrap().is_none(),
+            "the recorded failure is obsolete once the MBID is pinned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_resolution_clears_the_row_even_if_the_release_fetch_fails() {
+        // The row records a failure to RESOLVE the name. Once the name resolves
+        // the row is obsolete, whatever happens to the release-group fetch that
+        // follows; otherwise an earlier run's row would keep the artist skipped
+        // for the rest of its expiry even though it now resolves.
+        let db = Database::open_in_memory().unwrap();
+        record_failure(&db, "artist", "no candidate matches", 1_000);
+        let provider = FakeProvider {
+            artist_responses: Mutex::new(VecDeque::from([Ok(vec![ArtistCandidate {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                name: "Artist".to_string(),
+                score: None,
+            }])])),
+            group_responses: Mutex::new(VecDeque::from([Err(DiscographyError::Transport(
+                "service unavailable".to_string(),
+            ))])),
+            ..FakeProvider::default()
+        };
+
+        // Bypass so the fresh row cannot be replayed, forcing the resolution to
+        // actually run.
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            1_100,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(
+            db.get_discography_failure("artist").unwrap().is_none(),
+            "the name resolved, so the recorded failure is obsolete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inconsistent_search_page_is_not_recorded() {
+        // A page whose reported total disagrees with its payload is a property of
+        // one response, not a fact about the artist, so it must not suppress the
+        // artist for the whole expiry. It is still treated as an artist problem
+        // for this run, so the caller falls back exactly as it did before the
+        // failure cache existed.
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeProvider::inconsistent_search();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                kind: DiscoveryFailure::Unresolved,
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(
+            db.get_discography_failure("artist").unwrap().is_none(),
+            "a single inconsistent response must never be remembered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_row_never_shadows_a_usable_success_row() {
+        // The two kinds of row are mutually exclusive by construction, but a
+        // failed delete or a crash can leave both. A stale success row is still a
+        // usable fallback, so it must win over a fresh failure row rather than
+        // the artist being skipped.
+        let db = Database::open_in_memory().unwrap();
+        let groups = vec![group("1", "Studio", Some("2000"), Some("Album"), &[])];
+        cache_groups(
+            &db,
+            "artist",
+            "11111111-1111-1111-1111-111111111111",
+            0,
+            &groups,
+        );
+        record_failure(&db, "artist", "no candidate matches", 1_000_000);
+
+        let provider = FakeProvider::default();
+        // A longer failure expiry than success expiry is what lets a fresh failure
+        // row coexist with a stale success row; the shipped defaults cannot.
+        let config = DiscographyConfig {
+            cache_days: 1,
+            failure_cache_days: 30,
+            ..DiscographyConfig::default()
+        };
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            1_000_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                DiscoveryOutcome::Authoritative {
+                    provenance: DiscoveryProvenance::StaleCache { .. },
+                    ..
+                }
+            ),
+            "the stale success row must be used instead of being shadowed, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_failure_kind_is_treated_as_a_miss() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "unknown".to_string(),
+            failure_kind: "something-new".to_string(),
+            reason: "from a future version".to_string(),
+            recorded_at: 1_000,
+        })
+        .unwrap();
+        let provider = FakeProvider::unresolvable_recording();
+
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Unknown",
+            &DiscographyConfig::default(),
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DiscoveryOutcome::LegacyFallback {
+                from_cache: false,
+                ..
+            }
+        ));
+        assert!(provider.total_calls() > 0);
+    }
+
     #[tokio::test]
     async fn fresh_cache_avoids_provider_and_refilters_current_types() {
         let db = Database::open_in_memory().unwrap();
@@ -1329,7 +2041,15 @@ mod tests {
             ..DiscographyConfig::default()
         };
 
-        let outcome = discover_artist_albums_at(&provider, &db, "Artist", &config, 1_100).await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(outcome, DiscoveryOutcome::Authoritative {
             provenance: DiscoveryProvenance::FreshCache,
@@ -1352,8 +2072,15 @@ mod tests {
         let provider = FakeProvider::failing("service unavailable");
         let config = DiscographyConfig::default();
 
-        let outcome =
-            discover_artist_albums_at(&provider, &db, "Artist", &config, 31 * 86_400).await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            31 * 86_400,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -1374,13 +2101,17 @@ mod tests {
             "Unknown",
             &DiscographyConfig::default(),
             1_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
         assert!(matches!(
             outcome,
-            DiscoveryOutcome::LegacyFallback { reason, kind }
-                if kind == DiscoveryFailure::Unresolved
+            DiscoveryOutcome::LegacyFallback {
+                reason,
+                kind,
+                from_cache: false,
+            } if kind == DiscoveryFailure::Unresolved
                     && reason.contains("artist could not be resolved safely")
         ));
     }
@@ -1402,7 +2133,15 @@ mod tests {
             ..DiscographyConfig::default()
         };
 
-        let outcome = discover_artist_albums_at(&provider, &db, "Artist", &config, 5_000).await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            5_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -1428,9 +2167,15 @@ mod tests {
         );
         let provider = FakeProvider::with_groups(groups);
 
-        let outcome =
-            discover_artist_albums_at(&provider, &db, "Artist", &DiscographyConfig::default(), now)
-                .await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &DiscographyConfig::default(),
+            now,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(
             matches!(
@@ -1464,6 +2209,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             10_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1503,7 +2249,15 @@ mod tests {
             .artist_mbids
             .insert("Artist".to_string(), configured.to_string());
 
-        let outcome = discover_artist_albums_at(&failing, &db, "Artist", &config, 6_000).await;
+        let outcome = discover_artist_albums_at(
+            &failing,
+            &db,
+            "Artist",
+            &config,
+            6_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(
             matches!(outcome, DiscoveryOutcome::LegacyFallback { .. }),
@@ -1522,7 +2276,15 @@ mod tests {
 
         let groups = vec![group("1", "Studio", Some("2000"), Some("Album"), &[])];
         let provider = FakeProvider::with_groups(groups);
-        let outcome = discover_artist_albums_at(&provider, &db, "Artist", &config, 6_000).await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Artist",
+            &config,
+            6_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
         assert!(matches!(
             outcome,
             DiscoveryOutcome::Authoritative {
@@ -1557,6 +2319,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             5_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1585,6 +2348,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             1_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1614,6 +2378,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             1_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1653,6 +2418,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             31 * 86_400,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1672,6 +2438,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             31 * 86_400,
+            FailureCacheUse::Honour,
         )
         .await;
         assert!(
@@ -1722,6 +2489,7 @@ mod tests {
                 "dominance probe",
                 &DiscographyConfig::default(),
                 1_000,
+                FailureCacheUse::Honour,
             ));
 
         assert!(matches!(
@@ -1773,9 +2541,15 @@ mod tests {
             ..FakeProvider::default()
         };
 
-        let outcome =
-            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_000)
-                .await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Ils",
+            &DiscographyConfig::default(),
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
         assert!(matches!(
             outcome,
             DiscoveryOutcome::Authoritative {
@@ -1819,6 +2593,7 @@ mod tests {
             "Ils",
             &DiscographyConfig::default(),
             31 * 86_400,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1842,14 +2617,23 @@ mod tests {
             ..FakeProvider::default()
         };
 
-        let outcome =
-            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_000)
-                .await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Ils",
+            &DiscographyConfig::default(),
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
-            DiscoveryOutcome::LegacyFallback { reason, kind }
-                if kind == DiscoveryFailure::Unresolved
+            DiscoveryOutcome::LegacyFallback {
+                reason,
+                kind,
+                from_cache: false,
+            } if kind == DiscoveryFailure::Unresolved
                     && reason.contains("artist could not be resolved safely")
                     && reason.contains("below 100")
         ));
@@ -1874,7 +2658,15 @@ mod tests {
             "16b97aaa-d7c0-469f-8c97-47c705b2d02f".to_string(),
         );
 
-        let outcome = discover_artist_albums_at(&provider, &db, "Ils", &config, 1_000).await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Ils",
+            &config,
+            1_000,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -1903,9 +2695,15 @@ mod tests {
             ..FakeProvider::default()
         };
 
-        let outcome =
-            discover_artist_albums_at(&provider, &db, "Ils", &DiscographyConfig::default(), 1_100)
-                .await;
+        let outcome = discover_artist_albums_at(
+            &provider,
+            &db,
+            "Ils",
+            &DiscographyConfig::default(),
+            1_100,
+            FailureCacheUse::Honour,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -1950,6 +2748,7 @@ mod tests {
             "Unknown",
             &DiscographyConfig::default(),
             1_000,
+            FailureCacheUse::Honour,
         )
         .await;
 
@@ -1972,6 +2771,7 @@ mod tests {
             "Artist",
             &DiscographyConfig::default(),
             1_000,
+            FailureCacheUse::Honour,
         )
         .await;
 

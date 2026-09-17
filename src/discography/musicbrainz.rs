@@ -269,10 +269,11 @@ impl MusicBrainzProvider {
             )));
         }
         if page.count != page.artists.len() {
-            // Deliberately unresolved rather than a provider defect: the
-            // reported total exceeds the page we read, so the exact-name match
-            // cannot be proven from the candidates in hand.
-            return Err(DiscographyError::ArtistUnresolved(format!(
+            // Still classified as an artist problem so this run falls back
+            // instead of aborting, but this describes one inconsistent response
+            // rather than a fact about the artist, so the failure cache must not
+            // remember it.
+            return Err(DiscographyError::ArtistSearchInconsistent(format!(
                 "artist search returned {} candidates but reported {}",
                 page.artists.len(),
                 page.count
@@ -919,10 +920,20 @@ mod tests {
             .await;
 
         let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        // An artist whose search matches exceed one page is answered with a page
+        // whose reported total is larger than the candidates it carries. That has
+        // to stay an artist problem rather than an outage, because falling back is
+        // the pre-existing behaviour, but it describes one response and must never
+        // be remembered by the resolution-failure cache.
+        let error = provider.search_artists("Artist").await.unwrap_err();
         assert!(matches!(
-            provider.search_artists("Artist").await,
-            Err(DiscographyError::ArtistUnresolved(_))
+            error,
+            DiscographyError::ArtistSearchInconsistent(_)
         ));
+        assert!(
+            !error.is_stable_artist_resolution_failure(),
+            "a page-length mismatch must not be cacheable"
+        );
     }
 
     #[tokio::test]
@@ -1237,7 +1248,10 @@ mod tests {
         let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
         let result = provider.search_artists("Unexpected Artist").await;
 
-        assert!(matches!(result, Err(DiscographyError::ArtistUnresolved(_))));
+        assert!(matches!(
+            result,
+            Err(DiscographyError::ArtistSearchInconsistent(_))
+        ));
     }
 
     #[tokio::test]
