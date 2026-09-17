@@ -259,6 +259,16 @@ from your library. Explicit artist-plus-album, album-only, batch, auto, and
 library-upgrade flows are unchanged. The MusicBrainz API needs no account or API
 key.
 
+A release group whose title names several other release groups joined by a spaced slash, such as
+Archive's `Controlling Crowds / You All Look the Same to Me`, is not used as an album name. Each part
+is already a release group of its own, so it is searched under its own title instead of the
+concatenation, which returned no results. A part is only searched when it is also selected by
+`allowed_types`; a part whose own release group the release-type filter excludes is not searched at
+all. A title keeps being searched as MusicBrainz spells it unless every part of it matches one of
+that artist's release-group titles exactly, after case, width and whitespace folding, so `Either/Or`
+is unaffected, and so is a venue-and-date title such as
+`Live at Wembley Stadium, London, England / April 20th, 1992`.
+
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
@@ -693,6 +703,14 @@ configuration error for discover.
   stale, and a clock rollback or future timestamp is stale too.
 - A successful refresh replaces the cached copy atomically. The raw release groups are re-filtered against the
   current `allowed_types` on every run, so changing categories applies immediately without re-downloading.
+- A release group whose title names several other release groups joined by a spaced slash is not
+  selected when every part matches one of that artist's release-group titles exactly, after case,
+  width and whitespace folding. Those parts are searched under their own titles instead of the
+  concatenation, which returned no results, and a part is only searched when `allowed_types` also
+  selects its own release group. A title whose parts are not spelled exactly like the artist's
+  release-group titles is searched as MusicBrainz spells it, so a disc-prefixed box set such as
+  `2cd: Highway 61 Revisited / Blonde on Blonde` is unchanged: the prefix means the first part
+  matches nothing, even though the artist does have `Highway 61 Revisited`.
 - If a refresh fails, seakarr warns with the cache age and the failure reason and processes the compatible
   stale cache instead.
 - If no compatible cache exists, seakarr logs a prominent WARN, records a run-summary notice naming the exact

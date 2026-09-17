@@ -7,6 +7,7 @@ use crate::config::DiscographyConfig;
 use crate::config::DiscographyReleaseType;
 use crate::db::{Database, DiscographyCacheEntry, DiscographyFailureEntry};
 
+mod bundle;
 mod musicbrainz;
 pub use musicbrainz::MusicBrainzProvider;
 
@@ -390,7 +391,8 @@ fn parse_partial_date(value: &str) -> Option<PartialDate> {
     }
 }
 
-/// Filter allowed release groups with non-empty titles, deduplicate by the
+/// Filter allowed release groups with non-empty titles, drop any whose title
+/// bundles other release groups of the same artist, deduplicate by the
 /// normalized title key (prefer dated over undated, then earlier date, then
 /// lexicographically smaller MBID), and order dated targets by partial date
 /// before undated targets.
@@ -404,6 +406,15 @@ pub fn select_albums(
         target: AlbumTarget,
     }
 
+    // Every release-group title the artist has, before the release-type filter
+    // runs, so a bundle part counts as known even when its own release group is
+    // not selectable under the configured categories.
+    let artist_titles: std::collections::BTreeSet<String> = groups
+        .iter()
+        .map(|group| normalize_catalog_key(&group.title))
+        .filter(|key| !key.is_empty())
+        .collect();
+
     let mut best: std::collections::BTreeMap<String, Candidate> = std::collections::BTreeMap::new();
     for release in groups {
         if !release_allowed(release, allowed) {
@@ -415,6 +426,10 @@ pub fn select_albums(
                 release_group_id = %release.id,
                 "excluding MusicBrainz release group: empty title"
             );
+            continue;
+        }
+        if bundle::is_bundle(title, &artist_titles) {
+            log_rejected_release(release, "title bundles other release groups");
             continue;
         }
         let key = normalize_catalog_key(title);
@@ -1306,6 +1321,131 @@ mod tests {
         assert!(logs.contains("unknown secondary type"), "got: {logs}");
         assert!(logs.contains("empty-title"), "got: {logs}");
         assert!(logs.contains("empty title"), "got: {logs}");
+    }
+
+    /// The live MusicBrainz release groups for Archive on 2026-09-17, reduced
+    /// to the three that matter: the two-album bundle and the albums it names.
+    /// The last MBID is a test fixture, not a real MusicBrainz ID.
+    fn archive_bundle_groups() -> Vec<ReleaseGroup> {
+        vec![
+            group(
+                "3eecc2ca-8d9e-4159-8bee-cd84173a5fba",
+                "Controlling Crowds / You All Look the Same to Me",
+                Some("2014"),
+                Some("Album"),
+                &[],
+            ),
+            group(
+                "532ed7d7-ad97-3771-b9e8-333f1c25adc2",
+                "Controlling Crowds",
+                Some("2009-03-27"),
+                Some("Album"),
+                &[],
+            ),
+            group(
+                "aa11bb22-cc33-44dd-55ee-66ff77008899",
+                "You All Look the Same to Me",
+                Some("2002-03-12"),
+                Some("Album"),
+                &[],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_bundled_release_group_is_not_selected_and_its_albums_are() {
+        let albums = select_albums(
+            &archive_bundle_groups(),
+            &[DiscographyReleaseType::StudioAlbum],
+        );
+        let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["You All Look the Same to Me", "Controlling Crowds"]
+        );
+        let bundle_id = "3eecc2ca-8d9e-4159-8bee-cd84173a5fba";
+        assert!(albums
+            .iter()
+            .all(|album| album.release_group_id != bundle_id));
+        assert_eq!(
+            albums[1].release_group_id,
+            "532ed7d7-ad97-3771-b9e8-333f1c25adc2"
+        );
+    }
+
+    #[test]
+    fn a_venue_and_date_title_stays_a_single_target() {
+        let groups = vec![
+            group(
+                "m1",
+                concat!(
+                    "Live at Wembley Stadium, London, England",
+                    " / April 20th, 1992"
+                ),
+                Some("1992-04-20"),
+                Some("Album"),
+                &[],
+            ),
+            group("m2", "Metallica", Some("1991-08-12"), Some("Album"), &[]),
+        ];
+        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum]);
+        let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Metallica",
+                "Live at Wembley Stadium, London, England / April 20th, 1992"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bundle_is_dropped_when_one_part_is_filtered_out() {
+        let groups = vec![
+            group(
+                "b1",
+                "First Album / Second Album",
+                Some("2020"),
+                Some("Album"),
+                &[],
+            ),
+            group("b2", "First Album", Some("2001"), Some("EP"), &[]),
+            group("b3", "Second Album", Some("2002"), Some("Album"), &[]),
+        ];
+        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum]);
+        let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
+        assert_eq!(titles, vec!["Second Album"]);
+    }
+
+    /// The same shape as `archive_bundle_groups`, with a bundle MBID that no
+    /// other test emits, so a captured log record can only have come from the
+    /// test that uses this fixture.
+    fn bundle_log_fixture() -> Vec<ReleaseGroup> {
+        let mut groups = archive_bundle_groups();
+        groups[0].id = "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a".to_owned();
+        groups
+    }
+
+    #[test]
+    fn a_bundled_release_group_is_logged_with_its_reason() {
+        let capture = crate::test_support::LogCapture::start();
+        let albums = select_albums(
+            &bundle_log_fixture(),
+            &[DiscographyReleaseType::StudioAlbum],
+        );
+        assert_eq!(albums.len(), 2);
+        let logs = capture.text();
+        // Both halves of the assertion read the same record, so only this
+        // test's own fixture can satisfy it - the unique MBID and the reason
+        // must appear on one line.
+        let record = logs
+            .lines()
+            .find(|line| line.contains("9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a"))
+            .unwrap_or_default();
+        assert!(
+            record.contains("title bundles other release groups"),
+            "got: {logs}"
+        );
     }
 
     #[test]
