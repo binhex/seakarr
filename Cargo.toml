@@ -2,6 +2,12 @@
 name = "seakarr"
 version = "0.23.1"
 edition = "2021"
+# Not published to crates.io — verified against the registry API and the sparse
+# index, neither of which has this crate. Declared here so `cargo publish`
+# cannot push it by accident, and so `cargo deny` treats it as a private crate
+# instead of reporting the absent `license` field. Choosing that licence is the
+# author's decision, which is why no `license` value is asserted here.
+publish = false
 
 # The vendored soulseek-rs-lib is a workspace member so `cargo test` at the
 # root runs its behavioral regression tests (peer cap, FIFO eviction, zombie

@@ -126,13 +126,19 @@ pub fn scan_library(
                 },
             };
             let artist_dir = components[album_index - 1].to_string();
-            // The on-disk album folder name, kept verbatim. It is the identity
-            // the upgrade path copies into and the root the quality-deletion
-            // pass walks, so stripping an embedded disc marker here would move
-            // the write into a new folder and leave the replaced files behind
-            // in the old one — the album would then be re-upgraded on every
-            // run. Merging marker-variant folders into one album is a presence
-            // and identity concern, not a path concern.
+            // The on-disk album folder name, kept verbatim. Stripping an
+            // embedded disc marker here would move the write into a new folder
+            // and leave the replaced files behind in the old one — the album
+            // would then be re-upgraded on every run. Merging marker-variant
+            // folders into one album is a presence and identity concern, not a
+            // path concern.
+            //
+            // Note that the auto-mode upgrade destination comes from the album
+            // TAG (`final_album` below), not from this name, so a tag that
+            // differs from the folder already sent that write to a sibling
+            // folder before the portable-name sanitiser existed. The current
+            // sanitiser is a second cause of the same divergence; the
+            // `library_upgrade` section of the README documents the consequence.
             let album = components[album_index].to_string();
 
             // Read audio tags if available

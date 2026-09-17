@@ -47,8 +47,14 @@ Automated Soulseek music downloader with library quality upgrading.
   with cancel, per-file retries with configurable count and delay, and
   candidate fallback (try the next ranked peer once retries are exhausted).
 - **Post-download organisation** — move completed files from a staging directory into your library using a
-  configurable naming pattern (`%artist%/%album%/...`), with traversal-safe sanitisation and automatic
-  duplicate handling.
+  configurable naming pattern (`%artist%/%album%/...`), with automatic duplicate handling. Every path
+  component is sanitised before the folder is created: characters Windows reserves (`< > : " | ? *`),
+  control characters, a trailing dot or space, and reserved device names are all removed or neutralised, so
+  a library served to Windows clients over SMB renders every folder name instead of a mangled one. Path
+  separators are replaced and directory-traversal sequences are rewritten, so remote metadata cannot escape
+  the library. The mapping is deliberately lossy: two names that differ only in a removed character collapse
+  to one component, so a peer offering both `Gold: Disc 1` and `Gold Disc 1` writes them into the same
+  folder.
 - **SQLite persistence** — tracks processed albums, peer reputation, and search history
   across restarts and schedule cycles.
 - **Scheduled mode** — run the selected auto, manual, batch, or discover operation immediately, then repeat
@@ -271,15 +277,21 @@ already have.
 | `exclude_artists` | Artist names skipped before any MusicBrainz lookup, matched as whole names ignoring case and spacing, which prevents aggregator folders from expanding into hundreds of releases when `compilation` or `live_album` is enabled. An explicit `--artist` overrides this list for that one artist. | `[Various Artists, VA, Unknown Artist]` |
 
 An album counts as present when a matching `artist/album` folder holds at least
-one audio file. Matching is exact after case, spacing, and Unicode folding, so
-punctuation is significant and an album you hold only as a deluxe or remastered
-edition does not satisfy the plain album. Quality is not considered: replacing
-lossy files remains `auto` mode's job. The match is a whole title, so a folder
-that also carries a release year, the artist name, or a format label
-(`2006 - Days to Come`, `Days to Come - Bonobo`, `Days to Come [FLAC]`) is a
-different key from the plain title MusicBrainz reports, and discover can place
-one extra copy beside it; keeping folder names close to the MusicBrainz title
-avoids that.
+one audio file. Matching is exact after case, spacing, and Unicode folding, and
+after the name sanitiser has run on both sides: the folder seakarr writes has
+been through it, so a title such as `Tronic Jazz: The Berlin Sessions` is stored
+as `Tronic Jazz The Berlin Sessions` and still satisfies the MusicBrainz title it
+came from. Punctuation the sanitiser leaves alone stays significant, so an album
+you hold only as a deluxe or remastered edition does not satisfy the plain album.
+The sanitised key is lossy, so the reverse can also happen: two release titles
+that differ only by a character it removes share one key, and holding one of them
+makes the other look present, so discover skips it.
+Quality is not considered: replacing lossy files remains `auto` mode's job. The
+match is a whole title, so a folder that also carries a release year, the artist
+name, or a format label (`2006 - Days to Come`, `Days to Come - Bonobo`,
+`Days to Come [FLAC]`) is a different key from the plain title MusicBrainz
+reports, and discover can place one extra copy beside it; keeping folder names
+close to the MusicBrainz title avoids that.
 
 ### `filters`
 
@@ -320,8 +332,13 @@ better source, replacing the existing files.
 
 The destination is derived from the album's tags, not from the folder the album was found in, so a tag
 spelling that differs from the folder name (`Guns 'n' Roses` versus `Guns N Roses`) writes into a second
-artist folder and leaves the original files where they are. Discover mode is not affected: it places
-under the on-disk artist folder.
+artist folder and leaves the original files where they are. A name rewritten by the portable-name
+sanitiser behaves the same way: an album stored by an earlier release as `Tronic Jazz: The Berlin
+Sessions` is upgraded into a sibling `Tronic Jazz The Berlin Sessions` folder, because that is the name the
+current sanitiser writes. `delete_lesser_quality` then walks only the folder the upgrade wrote to, so the
+original lower-quality files stay behind and the album keeps its stale copy. Seakarr never renames an
+existing folder for you: rename it to the sanitised name to converge. Discover mode is not affected: it
+places under the on-disk artist folder.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |

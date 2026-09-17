@@ -1162,6 +1162,14 @@ pub fn fallback_track_query(filename: &str, artist: &str) -> String {
 /// List the audio filenames (not full paths) inside
 /// `<path>/<artist>/<album>/` for each configured library path.
 ///
+/// The artist and album arguments may be raw tag or MusicBrainz titles. Both are
+/// run through [`crate::organizer::sanitize_component`] before use, on both sides
+/// of every comparison, so a raw title finds the folder the write path stored
+/// under its sanitised name: `AC/DC` finds `AC-DC`, and
+/// `Tronic Jazz: The Berlin Sessions` finds `Tronic Jazz The Berlin Sessions`.
+/// The sanitised components must then each be a single ordinary path component,
+/// so the lookup cannot read outside a library root.
+///
 /// Non-audio files, sub-directories, and unreadable/missing album
 /// directories are skipped; a missing album directory yields an empty list,
 /// never an error. The result is sorted alphabetically and deduplicated
@@ -1171,20 +1179,26 @@ pub fn get_library_track_filenames(
     artist: &str,
     album: &str,
 ) -> Result<Vec<String>> {
-    // Reject path traversal and separator injection from tag-derived names.
-    if artist.contains("..")
-        || album.contains("..")
-        || artist.contains('/')
-        || artist.contains('\\')
-        || album.contains('/')
-        || album.contains('\\')
-    {
+    // The library write path stores sanitised components, but the names reaching
+    // this lookup are raw tag or MusicBrainz titles, so both are sanitised first.
+    // Doing it before the safety check matters: a raw title containing a
+    // separator (`AC/DC`) is a legitimate album whose stored folder name has no
+    // separator, and rejecting it up front would silently disable the
+    // title-search tier and `filters.peer_track_count` for every such album.
+    let artist_component = crate::organizer::sanitize_component(artist);
+    let album_component = crate::organizer::sanitize_component(album);
+    // The sanitiser removes separators and collapses traversal, so both values
+    // are single ordinary components by construction. The check is defence in
+    // depth, matching `organizer::place_into_library`.
+    if !is_single_path_component(&artist_component) || !is_single_path_component(&album_component) {
         return Ok(Vec::new());
     }
     let mut filenames = Vec::new();
     for library_path in library_paths {
         // Try the exact tag-derived path first.
-        let album_dir = std::path::Path::new(library_path).join(artist).join(album);
+        let album_dir = std::path::Path::new(library_path)
+            .join(&artist_component)
+            .join(&album_component);
         let found = collect_audio_filenames(&album_dir);
         if !found.is_empty() {
             filenames.extend(found);
@@ -1202,7 +1216,9 @@ pub fn get_library_track_filenames(
                 continue;
             }
             let artist_name = artist_entry.file_name().to_string_lossy().into_owned();
-            if !artist_name.eq_ignore_ascii_case(artist) {
+            if !crate::organizer::sanitize_component(&artist_name)
+                .eq_ignore_ascii_case(&artist_component)
+            {
                 continue;
             }
             let artist_dir = artist_entry.path();
@@ -1214,7 +1230,9 @@ pub fn get_library_track_filenames(
                     continue;
                 }
                 let album_name = album_entry.file_name().to_string_lossy().into_owned();
-                if album_name.eq_ignore_ascii_case(album) {
+                if crate::organizer::sanitize_component(&album_name)
+                    .eq_ignore_ascii_case(&album_component)
+                {
                     let found = collect_audio_filenames(&album_entry.path());
                     if !found.is_empty() {
                         filenames.extend(found);
@@ -1226,6 +1244,14 @@ pub fn get_library_track_filenames(
     filenames.sort();
     filenames.dedup();
     Ok(filenames)
+}
+
+/// True when `value` names exactly one ordinary path component, so joining it
+/// onto a directory cannot address anything outside that directory.
+fn is_single_path_component(value: &str) -> bool {
+    let mut components = std::path::Path::new(value).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Collect audio filenames from a directory, returning an empty Vec if
@@ -2638,6 +2664,58 @@ mod tests {
         )
         .unwrap();
         assert!(filenames.is_empty());
+    }
+
+    #[test]
+    fn test_get_library_track_filenames_matches_a_sanitised_folder_from_a_raw_title() {
+        // The write path stores the sanitised album name, but this lookup is
+        // given the tag or MusicBrainz title. Both sides must be sanitised or the
+        // title-search tier never fires for an album whose title carries a
+        // character the filesystem cannot hold.
+        let dir = tempfile::TempDir::new().unwrap();
+        let artist = "A Guy Called Gerald";
+        let stored = dir
+            .path()
+            .join(artist)
+            .join("Tronic Jazz The Berlin Sessions");
+        std::fs::create_dir_all(&stored).unwrap();
+        std::fs::write(stored.join("01 - Track.flac"), b"x").unwrap();
+
+        let filenames = get_library_track_filenames(
+            &[dir.path().to_string_lossy().into_owned()],
+            artist,
+            "Tronic Jazz: The Berlin Sessions",
+        )
+        .unwrap();
+        assert_eq!(filenames, vec!["01 - Track.flac"]);
+
+        // A folder written before the sanitiser existed keeps working, because
+        // its raw spelling sanitises to the same component.
+        let legacy = dir.path().join(artist).join("Legacy: Name");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("02 - Track.flac"), b"x").unwrap();
+        let filenames = get_library_track_filenames(
+            &[dir.path().to_string_lossy().into_owned()],
+            artist,
+            "Legacy: Name",
+        )
+        .unwrap();
+        assert_eq!(filenames, vec!["02 - Track.flac"]);
+
+        // A separator in a raw title is replaced by `-` on the write path, so the
+        // lookup must sanitise before deciding a name is unsafe: `AC/DC` has to
+        // find the folder stored as `AC-DC`, otherwise the title-search tier and
+        // `filters.peer_track_count` silently switch off for every such album.
+        let separator = dir.path().join("AC-DC").join("FutureSex-LoveSounds");
+        std::fs::create_dir_all(&separator).unwrap();
+        std::fs::write(separator.join("03 - Track.flac"), b"x").unwrap();
+        let filenames = get_library_track_filenames(
+            &[dir.path().to_string_lossy().into_owned()],
+            "AC/DC",
+            "FutureSex/LoveSounds",
+        )
+        .unwrap();
+        assert_eq!(filenames, vec!["03 - Track.flac"]);
     }
 
     #[test]

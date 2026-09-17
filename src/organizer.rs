@@ -160,20 +160,119 @@ fn expand_pattern_inner(
         .replace("%artist%", artist)
 }
 
+/// Characters Windows cannot store in a file or directory name, whatever the
+/// filesystem serving them. Windows reserves these outright, and a Linux write
+/// that keeps one leaves the folder unrenderable over SMB: Explorer falls back
+/// to a mangled 8.3 short name. `/` and `\` are absent because they are
+/// replaced rather than removed, so a value cannot inject a path segment.
+const WINDOWS_RESERVED_CHARACTERS: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
+
+/// Device names Windows reserves in every directory, so they can never name a
+/// folder. The superscript digits are listed by Microsoft alongside the plain
+/// ones.
+const WINDOWS_RESERVED_NAMES: [&str; 28] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// Inserted where a component would otherwise be unsafe. It makes a reserved
+/// device name an ordinary one (`CON` becomes `_CON`), and replaces a value
+/// that sanitises away to nothing so a path level is never empty — without it a
+/// title such as `???` would collapse a level and write an album beside its
+/// artist folder instead of inside it.
+const SAFE_COMPONENT_PLACEHOLDER: &str = "_";
+
+/// Remove the characters Windows cannot store and trim the trailing dot or
+/// space it silently discards. Keeping either would mean the name Linux stores
+/// and the name Explorer shows are different strings — the defect this guards.
+///
+/// The trailing trim is a single pass over the predicate, not a dot-then-space
+/// sequence: removing a dot run exposes the whitespace in front of it, and
+/// removing that whitespace can expose another dot, so `"Album. ."` would
+/// otherwise come back still ending in the dot Windows drops.
+fn strip_unsafe_name_characters(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !WINDOWS_RESERVED_CHARACTERS.contains(character) && !character.is_control()
+        })
+        .collect::<String>()
+        .trim()
+        .trim_end_matches(|character: char| character == '.' || character.is_whitespace())
+        .to_string()
+}
+
+/// Prefix a reserved device name so it can be used as an ordinary component.
+/// Windows matches the stem before the first dot, so `NUL.txt` is as reserved
+/// as `NUL`. Ordinary names that merely contain a device name are untouched.
+fn neutralise_device_name(value: &str) -> String {
+    let stem = value.split('.').next().unwrap_or_default().trim();
+    if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(stem))
+    {
+        format!("{SAFE_COMPONENT_PLACEHOLDER}{value}")
+    } else {
+        value.to_string()
+    }
+}
+
 /// Remove path separators, null bytes, percent signs (to prevent cascading
 /// placeholder re-substitution), and directory-traversal patterns from a
 /// metadata value so it cannot inject extra path segments into the
 /// destination path.
+///
+/// The same pass also makes the value portable between Linux and Windows,
+/// because the library may be served to Windows clients over SMB: characters
+/// Windows reserves are removed, control characters are removed, a trailing dot
+/// or space is trimmed, and a reserved device name is prefixed. A value that
+/// sanitises away to nothing becomes [`SAFE_COMPONENT_PLACEHOLDER`]. The result
+/// is idempotent, so re-sanitising an already-sanitised on-disk name is a no-op
+/// — which is what lets the album-presence key compare a stored name with the
+/// MusicBrainz title it was written from.
 pub fn sanitize_component(value: &str) -> String {
-    let mut s = value
+    let value = value
         .replace(['/', '\\'], "-")
         .replace('\0', "")
         .replace('%', "％"); // U+FF05 FULLWIDTH PERCENT SIGN — prevents cascading replace
-                             // Collapse directory-traversal sequences.
+    let mut s = strip_unsafe_name_characters(&value);
+    // Collapse directory-traversal sequences. Runs after the trailing-dot trim
+    // so "Album.." becomes "Album" rather than a fullwidth stop.
     while s.contains("..") {
         s = s.replace("..", "．"); // U+FF0E FULLWIDTH FULL STOP
     }
-    s
+    let s = neutralise_device_name(&s);
+    if s.is_empty() {
+        SAFE_COMPONENT_PLACEHOLDER.to_string()
+    } else {
+        s
+    }
 }
 
 /// Metadata used to expand the organize pattern.
@@ -411,10 +510,8 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
         // from different discs do not collide.
         if let Some(disc) = disc_subdir(src) {
             dest = match dest.parent() {
-                Some(parent) => parent
-                    .join(&disc)
-                    .join(dest.file_name().unwrap_or_default()),
-                None => PathBuf::from(&disc).join(dest.file_name().unwrap_or_default()),
+                Some(parent) => parent.join(disc).join(dest.file_name().unwrap_or_default()),
+                None => PathBuf::from(disc).join(dest.file_name().unwrap_or_default()),
             };
         }
         if let Some(parent) = dest.parent() {
@@ -488,6 +585,11 @@ fn parses_as_audio(path: &Path) -> bool {
 /// deepest disc folder component. Files flattened directly into the album
 /// staging root return `None` so their destination is unchanged.
 ///
+/// The returned label is the peer's own folder name, so it is run through
+/// [`sanitize_component`] before it is handed back: it becomes a real path
+/// component in the library, and a peer-supplied name must not reach the
+/// filesystem raw.
+///
 /// Uses [`crate::discs`] so the destination grouping matches the download
 /// stager exactly.
 fn disc_subdir(src: &Path) -> Option<String> {
@@ -501,10 +603,11 @@ fn disc_subdir(src: &Path) -> Option<String> {
                 break;
             }
             if crate::discs::is_disc_designator(name) {
-                // Preserve the peer's original disc label for traceability;
-                // only its classification is normalized across marker styles.
-                // Return the innermost folder, closest to the file.
-                return Some(name.to_string());
+                // Return the innermost folder, closest to the file. Only the
+                // classification is normalized across marker styles; the label
+                // itself is the peer's own, so it goes through the sanitiser
+                // before it becomes a library path component.
+                return Some(sanitize_component(name));
             }
         }
         current = dir.parent();
@@ -690,13 +793,18 @@ pub fn resume_library_upgrade(
             // unbounded recursion (stack overflow).
             if entry.file_type()?.is_dir() {
                 // Recurse into the subdirectory, mapping it 1:1 onto the
-                // destination so CD 01/ stays CD 01/. Create the matching
-                // destination directory so the copy has a parent to land in.
-                let dest_dir = dest_root.join(entry.file_name());
+                // destination so CD 01/ stays CD 01/. Sanitising the leaf keeps
+                // a disc designator in the same directory the forward copy would
+                // have used. Create the matching destination directory so the
+                // copy has a parent to land in. The lossy conversion cannot
+                // normally fire because the stager derives these names from UTF-8
+                // peer metadata.
+                let leaf = sanitize_component(&entry.file_name().to_string_lossy());
+                let dest_dir = dest_root.join(leaf);
                 fs::create_dir_all(&dest_dir)?;
                 walk(&src, &dest_dir, copied)?;
             } else {
-                let dest = dest_root.join(entry.file_name());
+                let dest = dest_root.join(sanitize_component(&entry.file_name().to_string_lossy()));
                 if dest.exists() {
                     if file_hash(&src)? == file_hash(&dest)? {
                         copied.push(dest);
@@ -1153,6 +1261,230 @@ mod tests {
     #[test]
     fn test_sanitize_component_is_public() {
         assert_eq!(sanitize_component("A/B"), "A-B");
+    }
+
+    // ── Portable component sanitisation (Linux write, Windows read) ──
+
+    #[test]
+    fn test_sanitize_component_strips_windows_reserved_characters() {
+        // A name carrying any of < > : " | ? * cannot be written on NTFS, and a
+        // Linux-written folder holding one is shown by Windows Explorer as a
+        // mangled 8.3 short name. The processor removes them outright so the
+        // Linux name and the Windows-visible name are the same string.
+        assert_eq!(sanitize_component("A<B>C:D\"E|F?G*H"), "ABCDEFGH");
+    }
+
+    #[test]
+    fn test_sanitize_component_strips_control_characters() {
+        // Characters 0x01-0x1F are reserved on Windows and render as garbage.
+        assert_eq!(
+            sanitize_component("Line\tOne\nTwo\u{1}Three\u{1f}Four"),
+            "LineOneTwoThreeFour"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_component_strips_trailing_dots_and_spaces() {
+        // Windows silently drops a trailing dot or space, so a Linux folder
+        // named "Album." and the "Album" Explorer shows would be two names for
+        // one folder. Trimming at write time keeps both sides identical.
+        assert_eq!(sanitize_component("Album. "), "Album");
+        assert_eq!(sanitize_component("Album.."), "Album");
+        assert_eq!(sanitize_component("  Album  "), "Album");
+        // Removing a dot run can expose the whitespace before it, and removing
+        // that whitespace can in turn expose another dot. Trimming must run to a
+        // fixpoint, or the component still ends in the dot Windows drops.
+        assert_eq!(sanitize_component("Album. ."), "Album");
+        assert_eq!(sanitize_component("Album. . ."), "Album");
+        // Interior dots carry meaning and must survive.
+        assert_eq!(sanitize_component("Album.Vol.2"), "Album.Vol.2");
+    }
+
+    #[test]
+    fn test_sanitize_component_neutralises_reserved_device_names() {
+        // CON, PRN, AUX, NUL, COM1-9 and LPT1-9 name devices on Windows
+        // wherever they appear, so they can never be folders. Only an exact
+        // match is affected: "CONCERT" and "Comedy" are ordinary names.
+        for name in [
+            "CON", "con", "PRN", "AUX", "NUL", "Nul.txt", "COM1", "com9", "LPT1", "lpt9.mp3",
+        ] {
+            let sanitized = sanitize_component(name);
+            assert_ne!(sanitized, name, "{name:?} is a reserved device name");
+            assert!(!sanitized.is_empty());
+        }
+        assert_eq!(sanitize_component("CONCERT"), "CONCERT");
+        assert_eq!(sanitize_component("Con Todo"), "Con Todo");
+        assert_eq!(sanitize_component("Comedy"), "Comedy");
+    }
+
+    #[test]
+    fn test_sanitize_component_never_yields_an_empty_component() {
+        // An all-illegal title would otherwise collapse a path level and write
+        // the album beside the artist folder instead of inside it.
+        assert_eq!(sanitize_component("???"), "_");
+        assert_eq!(sanitize_component("   "), "_");
+        assert!(!sanitize_component("..").is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_component_is_idempotent() {
+        // The album-presence check runs the sanitiser over a name that was
+        // itself sanitised on write, so a second pass must be a no-op.
+        for value in [
+            "Tronic Jazz: The Berlin Sessions",
+            "NUL.txt",
+            "???",
+            "Album..",
+            "Album. .",
+            "a..b",
+            "100% Pure",
+        ] {
+            let once = sanitize_component(value);
+            assert_eq!(
+                sanitize_component(&once),
+                once,
+                "not idempotent for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_place_into_library_strips_unsafe_characters_from_the_album_folder() {
+        // The discover path: a MusicBrainz title carrying a colon must not reach
+        // the filesystem, or Windows cannot render the album folder.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let src = staging.path().join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        let dests = place_into_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "A Guy Called Gerald",
+            "Tronic Jazz: The Berlin Sessions",
+        )
+        .unwrap();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(
+            dests[0],
+            library
+                .path()
+                .join("A Guy Called Gerald/Tronic Jazz The Berlin Sessions/01 - Track One.flac")
+        );
+    }
+
+    #[test]
+    fn test_organize_file_strips_unsafe_characters_from_album_and_title() {
+        // The auto path: album and title both come from remote metadata, and
+        // the default pattern puts both into the destination path.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let src = staging.path().join("01 - Song.flac");
+        fs::write(&src, b"fake flac content").unwrap();
+
+        let destination = organize_file(OrganizeInput {
+            src: &src,
+            library_root: library.path(),
+            pattern: "%artist%/%album%/%track% - %title%.%ext%",
+            artist: "Aerosmith",
+            album: "Tough Love: Best of the Ballads",
+            track: "01",
+            title: "Pink: The Song?",
+            ext: "flac",
+        })
+        .unwrap();
+
+        assert_eq!(
+            destination,
+            library
+                .path()
+                .join("Aerosmith/Tough Love Best of the Ballads/01 - Pink The Song.flac")
+        );
+    }
+
+    #[test]
+    fn test_copy_to_library_sanitises_a_peer_supplied_disc_folder_name() {
+        // A peer supplies the disc folder leaf, and an embedded marker such as
+        // "Gold: Disc 1" is used as a real path component. It must be sanitised
+        // like every other component, or the peer controls the folder name.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("Gold: Disc 1");
+        fs::create_dir_all(&disc).unwrap();
+        let src = disc.join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        let dests = copy_to_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(dests.len(), 1);
+        assert_eq!(
+            dests[0],
+            library
+                .path()
+                .join("Test Artist/Test Album/Gold Disc 1/01 - Track One.flac")
+        );
+    }
+
+    #[test]
+    fn test_resume_library_upgrade_sanitises_staging_file_names() {
+        // Staging file names are the peer's own basenames, and the forward copy
+        // runs them through the pattern's sanitiser. The resume walk must apply
+        // the same sanitiser, or recovery creates a name the library's own write
+        // path refuses to create — the SMB short-name defect itself. Only the
+        // character divergence is closed here: the forward name is also
+        // pattern-derived (zero-padded track numbers, a stripped leading track
+        // token), so a peer name such as `1 - Track.flac` still differs from the
+        // forward `01 - Track.flac` and is copied again under its own name.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        fs::write(
+            staging.path().join("01 - Cryin': The Blues.flac"),
+            b"content",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        resume_library_upgrade(&config, staging.path(), library.path(), "Artist", "Album").unwrap();
+
+        assert!(library
+            .path()
+            .join("Artist/Album/01 - Cryin' The Blues.flac")
+            .exists());
+        assert!(
+            !library
+                .path()
+                .join("Artist/Album/01 - Cryin': The Blues.flac")
+                .exists(),
+            "the peer's raw file name must not reach the library"
+        );
+    }
+
+    #[test]
+    fn test_resume_library_upgrade_sanitises_staging_subdirectory_names() {
+        // Resume re-copies staging 1:1 into the library, so it must apply the
+        // same sanitiser as the forward copy or the two disagree on the path.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("Gold: Disc 1");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("01 - Track.flac"), b"content").unwrap();
+
+        let config = Config::default();
+        resume_library_upgrade(&config, staging.path(), library.path(), "Artist", "Album").unwrap();
+
+        assert!(library
+            .path()
+            .join("Artist/Album/Gold Disc 1/01 - Track.flac")
+            .exists());
     }
 
     // ── Post-download verification helpers ──

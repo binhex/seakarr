@@ -20,6 +20,31 @@ pub(crate) fn normalize_catalog_key(value: &str) -> String {
         .join(" ")
 }
 
+/// Comparison key for library album presence, built from the name the library
+/// write path would store rather than from the raw title.
+///
+/// The album folder on disk has been through
+/// [`crate::organizer::sanitize_component`], but the album tag the scanner
+/// prefers, and the MusicBrainz title the presence check is made against, have
+/// not. Sanitising both sides keeps a stored album equal to the title it was
+/// written from; comparing raw titles would make an album whose title carried a
+/// character the filesystem cannot hold permanently "missing", and discover
+/// would download it again on every cycle.
+///
+/// Artist identity deliberately does not use this: it keeps
+/// [`normalize_catalog_key`] and its significant-punctuation contract.
+///
+/// The compatibility fold runs BEFORE the sanitiser so that a width variant of a
+/// reserved character reaches it as the reserved character itself. Folding
+/// afterwards would leave a library tagged `Tronic Jazz：` (U+FF1A) keyed on
+/// `tronic jazz:` while the MusicBrainz spelling keys on
+/// `tronic jazz the berlin sessions`, and the album would be re-downloaded every
+/// cycle.
+pub(crate) fn normalize_album_key(value: &str) -> String {
+    let folded: String = value.nfkc().collect();
+    normalize_catalog_key(&crate::organizer::sanitize_component(&folded))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistCandidate {
     pub id: String,

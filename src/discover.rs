@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::discography::{normalize_catalog_key, AlbumTarget};
+use crate::discography::{normalize_album_key, normalize_catalog_key, AlbumTarget};
 use crate::error::{Result, SeakarrError};
 use crate::scanner::ScannedAlbum;
 
@@ -61,7 +61,7 @@ impl LibraryIndex {
     pub fn contains_album(&self, artist: &str, album: &str) -> bool {
         self.artists
             .get(&normalize_catalog_key(artist))
-            .is_some_and(|entry| entry.albums.contains(&normalize_catalog_key(album)))
+            .is_some_and(|entry| entry.albums.contains(&normalize_album_key(album)))
     }
 
     /// Normalised album titles for one artist key, in order.
@@ -107,10 +107,14 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
     let mut index = LibraryIndex::default();
     for album in albums {
         let artist_key = normalize_catalog_key(&album.artist);
-        let album_key = normalize_catalog_key(&album.album);
-        if artist_key.is_empty() || album_key.is_empty() {
+        // A blank title carries no album identity, so it is skipped. The check
+        // is made on the title itself rather than on the album key: the
+        // sanitiser's non-empty placeholder exists so a path component is never
+        // empty, and must not invent an album here.
+        if artist_key.is_empty() || normalize_catalog_key(&album.album).is_empty() {
             continue;
         }
+        let album_key = normalize_album_key(&album.album);
         let entry = index.artists.entry(artist_key).or_default();
         *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
         entry.albums.insert(album_key);
@@ -408,6 +412,88 @@ mod tests {
             release_group_id: format!("rg-{title}"),
             title: title.to_string(),
         }
+    }
+
+    // ── Presence keys survive the portable-name sanitiser ──
+
+    #[test]
+    fn an_album_written_through_the_sanitiser_still_matches_its_musicbrainz_title() {
+        // The folder seakarr wrote to disk went through the path sanitiser, so
+        // the library holds "Tronic Jazz The Berlin Sessions" while MusicBrainz
+        // still reports "Tronic Jazz: The Berlin Sessions". The presence check
+        // must compare the sanitised form on both sides, or the album is
+        // downloaded again on every discover cycle.
+        let index = build_index(&[scanned(
+            "A Guy Called Gerald",
+            "Tronic Jazz The Berlin Sessions",
+        )]);
+        assert!(
+            index.contains_album("A Guy Called Gerald", "Tronic Jazz: The Berlin Sessions"),
+            "the sanitised on-disk title must satisfy the MusicBrainz title"
+        );
+    }
+
+    #[test]
+    fn the_presence_key_is_symmetric_for_the_stored_and_musicbrainz_spellings() {
+        // Coupling guard: whichever function the presence check uses, both the
+        // on-disk (sanitised) spelling and the MusicBrainz spelling must resolve
+        // to one key, from either direction of the lookup.
+        let stored = build_index(&[scanned(
+            "A Guy Called Gerald",
+            "Tronic Jazz The Berlin Sessions",
+        )]);
+        let tagged = build_index(&[scanned(
+            "A Guy Called Gerald",
+            "Tronic Jazz: The Berlin Sessions",
+        )]);
+        for spelling in [
+            "Tronic Jazz The Berlin Sessions",
+            "Tronic Jazz: The Berlin Sessions",
+        ] {
+            assert!(
+                stored.contains_album("A Guy Called Gerald", spelling),
+                "stored album must match {spelling:?}"
+            );
+            assert!(
+                tagged.contains_album("A Guy Called Gerald", spelling),
+                "tagged album must match {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fullwidth_spelling_of_a_stripped_character_still_matches() {
+        // NFKC folds a compatibility variant (U+FF1A) to the character the
+        // sanitiser removes. Both sides must be folded BEFORE the sanitiser runs,
+        // or a library tagged with the fullwidth form never matches the
+        // MusicBrainz spelling and discover re-downloads the album every cycle.
+        let index = build_index(&[scanned(
+            "A Guy Called Gerald",
+            "Tronic Jazz\u{ff1a} The Berlin Sessions",
+        )]);
+        assert!(
+            index.contains_album("A Guy Called Gerald", "Tronic Jazz: The Berlin Sessions"),
+            "a fullwidth spelling must resolve to the same presence key"
+        );
+    }
+
+    #[test]
+    fn missing_albums_does_not_reselect_an_album_that_was_sanitised_on_write() {
+        // The user-visible consequence: a stored album must not be selected for
+        // download again just because its title carried a stripped character.
+        let index = build_index(&[scanned(
+            "A Guy Called Gerald",
+            "Tronic Jazz The Berlin Sessions",
+        )]);
+        let missing = missing_albums(
+            &index,
+            "A Guy Called Gerald",
+            &[target("Tronic Jazz: The Berlin Sessions")],
+        );
+        assert!(
+            missing.is_empty(),
+            "a stored album must not be downloaded again: {missing:?}"
+        );
     }
 
     #[test]
