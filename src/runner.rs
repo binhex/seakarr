@@ -164,6 +164,73 @@ pub enum LibraryTarget<'a> {
     },
 }
 
+/// Reason a downloaded set must not be written into the library, or `None` when
+/// it may be.
+///
+/// The pre-download `min_tracks` gate counts every quality-passing file in a
+/// peer's result, but only the largest single album directory is ever downloaded,
+/// so a result can pass that gate and still yield a handful of files. An album
+/// whose title is also one of its track titles makes that routine: the peer's
+/// copies of the *track* match the query by filename, and the largest group is
+/// then that one track. Neither shape is an album, so the downloaded set is
+/// checked here, at the last point before the library write, on the discover
+/// `Place` and generic-organize paths. The library-upgrade path does not call
+/// this: its own gate compares the download against `needs_upgrade`, the number of
+/// files that failed the quality gate for that album — a different reference, not
+/// a stronger one, so the two gates do not subsume each other.
+///
+/// `min_tracks == 0` disables the gate, exactly as it disables the pre-download
+/// gate, so EPs and singles stay reachable for operators who ask for them.
+fn library_write_refusal(downloaded: &[PathBuf], min_tracks: u32) -> Option<String> {
+    if min_tracks == 0 {
+        return None;
+    }
+    if downloaded.len() < min_tracks as usize {
+        return Some(format!(
+            "only {} of at least {min_tracks} tracks were downloaded",
+            downloaded.len()
+        ));
+    }
+    // Track numbering is judged only when the read is credible, and it often is
+    // not. `track_number_from_filename` takes the *first* numeric token in the
+    // name, so every file of "Blink 182 - Enema of the State - 01 - Dumpweed.flac"
+    // reports track 182, and a peer that numbers only some of its files (an
+    // "Intro.flac" beside "02 - Two.flac") leaves files with no number at all.
+    // Two guards follow from that:
+    //
+    // - every downloaded file must have parsed a number, or the set is mixed and
+    //   nothing can be concluded from it; and
+    // - at least two distinct values must have been seen, because a run of one
+    //   repeated value is either a phantom read or a genuinely repeated track
+    //   number (the project supports duplicate track numbers, so the two are
+    //   indistinguishable here).
+    //
+    // Both guards mean this half deliberately misses some real fragments — a
+    // single numbered file, or a set that repeats one number — which the count
+    // half still catches whenever the set is shorter than `min_tracks`.
+    let numbers: Vec<u32> = downloaded
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .filter_map(crate::tracks::track_number_from_filename)
+        .collect();
+    let mut distinct = numbers.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if numbers.len() == downloaded.len() {
+        if let Some(&start) = distinct.first() {
+            // A disc and track fused into one value ("101" for disc 1 track 1, "205"
+            // for disc 2 track 5) carries the same signal as the hyphenated "1-01"
+            // form, which `track_number_from_filename` already unwraps, so the same
+            // modulo test applies to the fused spelling.
+            let starts_at_track_one = distinct.iter().any(|number| number % 100 == 1);
+            if distinct.len() >= 2 && !starts_at_track_one {
+                return Some(format!("the tracks start at track {start} instead of 1"));
+            }
+        }
+    }
+    None
+}
+
 /// Shared tail for both library writes: drop the staging copy, record the
 /// album as processed, notify, and report the completed album.
 async fn finish_library_write(
@@ -641,11 +708,12 @@ async fn process_album_internal(
             root,
             expected_tracks,
         }) => {
-            // Completeness gate: the library album's own track count is the
-            // reference — NOT the best peer's folder size. Peers share
-            // different editions (box sets, anniversary editions) whose folder
-            // can contain far more files than the album being upgraded has
-            // (e.g. a 121-file peer folder for a 19-track library album).
+            // Completeness gate: the album's own count of files that failed the
+            // quality gate (`needs_upgrade`) is the reference — NOT the best
+            // peer's folder size. Peers share different editions (box sets,
+            // anniversary editions) whose folder can contain far more files than
+            // the album being upgraded needs replacing (e.g. a 121-file peer
+            // folder for an album with 2 non-conforming tracks).
             if downloaded.len() < expected_tracks {
                 // The serving peer delivered an incomplete album — record an
                 // album-level failure for it (per-track outcomes were already
@@ -721,14 +789,35 @@ async fn process_album_internal(
             }
         }
         Some(LibraryTarget::Place { root, artist_dir }) => {
-            // No completeness gate: a new album has no library track count to
-            // compare against, and presence already treats any audio file under
-            // the album folder as present. No quality deletion either — nothing
-            // is being replaced. `place_into_library` uses the folder name that
+            // A new album has no library track count to compare against, so the
+            // completeness test here is the configured `min_tracks` plus the
+            // numbering check instead (see `library_write_refusal`). Presence
+            // already treats any audio file under the album folder as present,
+            // and there is no quality deletion either — nothing is being
+            // replaced. `place_into_library` uses the folder name that
             // already exists on disk verbatim, so the album lands inside it
             // instead of beside a rewritten copy of it, and it never replaces a
             // readable existing file because the destination folder may belong
             // to a different edition of the album.
+            if let Some(reason) = library_write_refusal(&downloaded, config.filters.min_tracks) {
+                // The serving peer also takes an album-level failure, as it does for
+                // an incomplete library-upgrade download. The demotion is light: the
+                // tracks it did deliver are already credited as successes, so it will
+                // not necessarily fall below a peer with no history at all.
+                if config.search.peer_reputation {
+                    if let Some(peer) = furthest_peer(&stats).map(str::to_string) {
+                        record_album_failure(db, &peer);
+                    }
+                }
+                tracing::warn!(
+                    "{artist} - {}: incomplete download ({reason}), skipping library placement",
+                    album.unwrap_or("?")
+                );
+                mark_album_processed_if_identifiable(db, artist, album, "failed")?;
+                return Ok(AlbumOutcome::Failed {
+                    reason: format!("incomplete download, library placement skipped: {reason}"),
+                });
+            }
             match organizer::place_into_library(
                 &downloaded,
                 root,
@@ -792,6 +881,22 @@ async fn process_album_internal(
     let mut library_album_dir: Option<PathBuf> = None;
     let mut organize_ok = true;
     if config.storage.organize && !config.library.paths.is_empty() {
+        if let Some(reason) = library_write_refusal(&downloaded, config.filters.min_tracks) {
+            // Same light peer demotion as the placement refusal above.
+            if config.search.peer_reputation {
+                if let Some(peer) = furthest_peer(&stats).map(str::to_string) {
+                    record_album_failure(db, &peer);
+                }
+            }
+            tracing::warn!(
+                "{artist} - {}: incomplete download ({reason}), skipping organize",
+                album.unwrap_or("?")
+            );
+            mark_album_processed_if_identifiable(db, artist, album, "failed")?;
+            return Ok(AlbumOutcome::Failed {
+                reason: format!("incomplete download, organize skipped: {reason}"),
+            });
+        }
         let lib_root = Path::new(&config.library.paths[0]);
         for path in &downloaded {
             // Metadata is derived exactly as in the auto-upgrade copy path
@@ -2231,6 +2336,621 @@ mod tests {
         assert!(
             message.ends_with(&expected),
             "the notification must name the destination, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_download_is_not_written_to_the_library() {
+        // The pre-download min_tracks gate counts every quality-passing file in a
+        // peer's result, but only the largest single album directory is ever
+        // downloaded. A result can therefore pass that gate and still yield one
+        // file — a one-track "album" must not reach the library.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\09 - Nine.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Other Album\10 - Ten.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Third Album\11 - Eleven.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        // Three passing files clear the pre-download gate; only one is downloaded.
+        config.filters.min_tracks = 3;
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "a one-track set is not an album and must not be placed, got {result:?}"
+        );
+        assert!(
+            !library.path().join("Test Artist/Test Album").exists(),
+            "nothing may be written into the library for an incomplete set"
+        );
+        // The refused set survives this run. A later auto run with
+        // `library_upgrade.enabled: true` removes it, because its album status is
+        // not "success"; nothing else does.
+        let staged = std::fs::read_dir(staging.path().join("Test Artist--Test Album"))
+            .expect("the album staging directory must survive a refusal")
+            .count();
+        assert_eq!(staged, 1, "the downloaded file must be left in staging");
+    }
+
+    #[tokio::test]
+    async fn download_without_track_one_is_not_written_to_the_library() {
+        // The reported shape: two contiguous tracks from the middle of an album
+        // (nine and ten). Contiguous numbering alone does not make a complete
+        // album, so the set must not be placed.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\09 - Nine.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\10 - Ten.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 2; // the count gate alone would let this through
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "tracks nine and ten are not a complete album, got {result:?}"
+        );
+        // The refusal must be recorded, and the serving peer demoted, or the same
+        // fragment is re-picked from the same peer on every cycle.
+        assert_eq!(
+            db.get_album_status("Test Artist", "Test Album").unwrap(),
+            Some("failed".to_string()),
+            "the refused album must be recorded as failed"
+        );
+        // The two delivered tracks are credited as successes, and the album-level
+        // failure adds one more, unsuccessful, entry — so the demotion is real but
+        // light: this peer now reads 2 successes of 3, which the reliability factor
+        // only just separates from an unmeasured peer.
+        let reputation = db.get_reputation_map().unwrap();
+        let peer = reputation
+            .get("peer")
+            .expect("the serving peer must be recorded");
+        assert_eq!(
+            peer.total_downloads, 3,
+            "two tracks plus the album-level failure"
+        );
+        assert_eq!(
+            peer.successful, 2,
+            "both delivered tracks were usable audio"
+        );
+        assert!(
+            !library.path().join("Test Artist/Test Album").exists(),
+            "nothing may be written into the library for a set that starts at track 9"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_download_is_still_written_to_the_library() {
+        // The gate must not refuse a complete album: numbered from one, and at
+        // least min_tracks long.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\01 - One.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\02 - Two.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\03 - Three.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 3,
+                destination: DownloadDestination::Library(
+                    library.path().join("Test Artist/Test Album")
+                ),
+            },
+            "a complete album must still be placed"
+        );
+        assert!(library.path().join("Test Artist/Test Album").exists());
+    }
+
+    #[tokio::test]
+    async fn short_download_is_not_organized_into_the_library() {
+        // The generic organize path (manual and batch runs, target: None) writes
+        // straight into library.paths[0] and had no completeness check at all.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\09 - Nine.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Other Album\10 - Ten.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Third Album\11 - Eleven.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+        config.storage.organize = true;
+        config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+        config.library.paths = vec![library.path().to_string_lossy().to_string()];
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None, // no library target: the generic organize path
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "the organize path must refuse a one-track set, got {result:?}"
+        );
+        assert_eq!(
+            db.get_album_status("Test Artist", "Test Album").unwrap(),
+            Some("failed".to_string()),
+            "the organize refusal must also record the album as failed"
+        );
+        // One delivered track is credited as a success and the album-level failure
+        // adds a second, unsuccessful entry. Asserting only that the peer exists
+        // would pass on the track success alone, with the demotion removed.
+        let reputation = db.get_reputation_map().unwrap();
+        let peer = reputation
+            .get("peer")
+            .expect("the serving peer must be recorded");
+        assert_eq!(
+            peer.total_downloads, 2,
+            "the organize refusal must also demote the serving peer"
+        );
+        assert_eq!(
+            peer.successful, 1,
+            "only the delivered track was usable audio"
+        );
+        assert!(
+            !library.path().join("Test Artist/Test Album").exists(),
+            "nothing may be organized into the library for an incomplete set"
+        );
+    }
+
+    #[test]
+    fn library_write_refusal_is_disabled_by_min_tracks_zero() {
+        // The escape hatch for EPs and singles, matching the pre-download gate.
+        // The set is one the numbering half *would* refuse, so removing the early
+        // return fails this test: a single unnumbered file could not, because the
+        // numbering guard skips it regardless.
+        let files = vec![
+            PathBuf::from("staging/09 - Nine.flac"),
+            PathBuf::from("staging/10 - Ten.flac"),
+        ];
+        assert_eq!(library_write_refusal(&files, 0), None);
+    }
+
+    #[test]
+    fn library_write_refusal_keeps_the_numbering_half_at_min_tracks_one() {
+        // `min_tracks: 1` opens the count half for EPs, but the numbering half still
+        // refuses a fragment that starts past track 1.
+        let files = vec![
+            PathBuf::from("staging/09 - Nine.flac"),
+            PathBuf::from("staging/10 - Ten.flac"),
+        ];
+        assert!(
+            library_write_refusal(&files, 1).is_some(),
+            "a fragment starting at track 9 must still be refused at min_tracks: 1"
+        );
+    }
+
+    #[test]
+    fn library_write_refusal_accepts_unnumbered_files_it_cannot_judge() {
+        // An album whose names carry no parseable number cannot be judged by
+        // numbering, and demanding a number would refuse valid albums.
+        let files = vec![
+            PathBuf::from("staging/Intro.flac"),
+            PathBuf::from("staging/Outro.flac"),
+        ];
+        assert_eq!(library_write_refusal(&files, 2), None);
+    }
+
+    #[test]
+    fn library_write_refusal_reports_the_shortfall_before_the_numbering() {
+        let short = vec![PathBuf::from("staging/01 - One.flac")];
+        let reason = library_write_refusal(&short, 5).expect("a short set must be refused");
+        assert!(
+            reason.contains("only 1 of at least 5 tracks"),
+            "got {reason}"
+        );
+
+        let mid = vec![
+            PathBuf::from("staging/09 - Nine.flac"),
+            PathBuf::from("staging/10 - Ten.flac"),
+        ];
+        let reason = library_write_refusal(&mid, 2).expect("a set starting at 9 must be refused");
+        assert!(reason.contains("start at track 9"), "got {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_number_earlier_in_the_filename_does_not_refuse_a_complete_album() {
+        // `track_number_from_filename` takes the first numeric token, so every file
+        // of "Blink 182 - Enema of the State - NN - Title.flac" parses as track 182.
+        // A complete album must still be written: a run of identical values is a
+        // phantom parse, not a mid-album fragment.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Blink 182\Enema of the State\Blink 182 - Enema of the State - 01 - Dumpweed.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Blink 182\Enema of the State\Blink 182 - Enema of the State - 02 - One Step Closer.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Blink 182\Enema of the State\Blink 182 - Enema of the State - 03 - Aliens Exist.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Blink 182",
+            Some("Enema of the State"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Blink 182",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 3,
+                destination: DownloadDestination::Library(
+                    library.path().join("Blink 182/Enema of the State")
+                ),
+            },
+            "a complete album must not be refused because a number precedes the track number"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_unnumbered_set_is_not_refused_by_the_numbering_half() {
+        // A complete album can lead with an unnumbered track ("Intro.flac") and
+        // number the rest. The numbering half must not judge a mixed set.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(r"Music\Test Artist\Test Album\Intro.flac", 900, 1_000_000),
+                make_file(
+                    r"Music\Test Artist\Test Album\02 - Two.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\03 - Three.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 3,
+                destination: DownloadDestination::Library(
+                    library.path().join("Test Artist/Test Album")
+                ),
+            },
+            "a mixed numbered/unnumbered set must not be refused by the numbering half"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fused_disc_and_track_number_is_not_a_fragment() {
+        // Rips that fuse disc and track ("101" for disc 1 track 1) name every file
+        // that way. The album is complete and must be placed: reading 101 literally
+        // would refuse it and demote the peer that served it.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\101 - One.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\102 - Two.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\103 - Three.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 3,
+                destination: DownloadDestination::Library(
+                    library.path().join("Test Artist/Test Album")
+                ),
+            },
+            "a fused disc+track album is complete and must not be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_organize_path_also_refuses_a_set_without_track_one() {
+        // The numbering half of the gate applies on the organize path too, not only
+        // on the placement path.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Music\Test Artist\Test Album\09 - Nine.flac",
+                    900,
+                    1_000_000,
+                ),
+                make_file(
+                    r"Music\Test Artist\Test Album\10 - Ten.flac",
+                    900,
+                    1_000_000,
+                ),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 2;
+        config.storage.organize = true;
+        config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+        config.library.paths = vec![library.path().to_string_lossy().to_string()];
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "the organize path must refuse a set starting at track 9, got {result:?}"
         );
     }
 

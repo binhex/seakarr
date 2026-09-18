@@ -328,7 +328,7 @@ Controls which Soulseek search results pass the quality gate.
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. | `true` |
-| `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. | `3` |
+| `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. Also enforced **after** download on the discover-placement and organize paths: a downloaded set shorter than `min_tracks`, or one whose numbered files (if any) do not include track 1, is left in staging and the album is recorded failed rather than written into the library. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
 | `peer_track_count` | In auto mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that auto mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
@@ -448,6 +448,62 @@ actually served (`... after 12s queued`), so `immediately` is never printed for 
 demonstrably waited.
 
 Queue timeouts and rejections keep reporting the position in their existing warnings.
+
+#### Incomplete downloads are not written to the library
+
+The pre-download `min_tracks` gate counts every quality-passing file in a peer's search result,
+but only the largest single album directory is ever downloaded — so a result can clear that gate
+and still produce a handful of files. An album whose title is also one of its track titles makes
+that routine: peers' copies of the *track* match the query by filename, and the largest group is
+then that one track. Contiguous numbering alone does not make an album either, so a set of tracks
+nine and ten passes the contiguity check while being a fragment of something longer.
+
+Those sets are therefore refused at the last point before the library write, on the discover
+placement path and the generic organize path. The library-upgrade path is unchanged: it compares
+the download against `needs_upgrade`, the number of files that failed the quality gate for that
+album, which is a different reference rather than a stronger one. A refused set logs
+
+```text
+WARN seakarr::runner: Aquasky - Shadow Era Pt. 1: incomplete download (only 1 of at least 5 tracks were downloaded), skipping library placement
+```
+
+and the album is recorded failed rather than written, with its files left in `storage.staging_dir`.
+Nothing removes them on their own: a later `auto` run cleans up leftover staging for any album that
+is not recorded as successful only when `library_upgrade.enabled` is `true`, and `discover` never
+runs that pass — so a discover-only operator keeps the refused files until they clean staging
+themselves. The serving peer is recorded as an album failure too. The demotion is real but light:
+the tracks that peer did deliver are already credited as successes for the same download, so the
+album-level failure only tips the balance against a peer that has a positive history.
+
+Two conditions make up the check, and only `min_tracks: 0` disables both halves — the pre-download
+gate's own "set it to 0 or 1 for EPs" advice does not reach the numbering half:
+
+- **the set is shorter than `min_tracks`**; and
+- **its numbered files, if any, do not include track 1** — a set of tracks nine and ten is a
+  fragment however contiguous it looks.
+
+The numbering half is deliberately cautious, and misses several real fragments as a result. It
+judges a set only when **every** downloaded file parsed a number, so a mixed set — an `Intro.flac`
+beside `02 - Two.flac` — is left alone. It also requires at least **two distinct** parsed values,
+because `track_number_from_filename` reads the *first* numeric token: every file of
+`Blink 182 - Enema of the State - 01 - Dumpweed.flac` reports track 182, and a single repeated
+value is indistinguishable from a set that genuinely repeats one track number, which the project
+supports. A lone numbered file is not judged either, since one value can never be distinct.
+
+So a fragment that includes track 1, or that repeats one number, or that mixes numbered and
+unnumbered names, can still be written when it is at least `min_tracks` long — the gate has no
+notion of the album's true length. Raise `min_tracks` to narrow that; the count half is the one
+that catches every short set regardless of its names.
+
+Track numbers are read as tracks, not as fragments, when they are `1` or when their last two
+digits are `01`: a rip that fuses the disc and track number (`101` for disc 1 track 1) counts as
+starting at track 1, just as the hyphenated `1-01` form does.
+
+Note that this refusal also applies to genuine EPs and singles on the organize path: an album
+shorter than `min_tracks` is downloaded and then refused, so auto mode with
+`library_upgrade.enabled: false` (the shipped default) needs `min_tracks: 0` or `1` to replace a
+short album rather than refusing it every cycle. With `library_upgrade.enabled: true` the
+library-upgrade path's `needs_upgrade` reference decides instead.
 
 ### `pid`
 
