@@ -386,7 +386,11 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
   and per missing album the existing `process_album` path with
   `target_library_path: None` (no upgrade copy) and `library_track_count: None`
   (no library baseline exists for an album that is not present).
-  Cancellation, staging, progress display, organisation, notifications, and
+  Cancellation is no longer entirely the existing machinery, and it no longer
+  leaves the scan untouched: the walk takes the run's cancellation flag and
+  aborts with `Cancelled`, so Ctrl+C during the scan ends the run before any
+  work item (previously it could only be killed, stranding the PID lock).
+  Staging, progress display, organisation, notifications, and
   per-album recording are the existing machinery, unchanged.
 - `run_artist_only_mode_with_provider` additionally filters its authoritative
   target list through `missing_albums` before `process_artist_album_work`, and
@@ -411,7 +415,10 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
 
 ## Data flow
 
-1. `scan_library(library.paths, filters)` walks the library once.
+1. `scan_library(library.paths, filters, cancel)` walks the library once,
+   returning `Cancelled` if the cancellation flag is set, and reporting its
+   progress (start, per-minute heartbeat, per-500-file debug line, unreadable
+   count, completion).
 2. `build_index` turns the scanned albums into the presence index.
 3. `select_artists` applies exclusions, the folder-ownership gate and the
    optional filter, and orders the result.
@@ -449,6 +456,8 @@ Artist-only manual runs additionally emit:
 
 - `Artist-only run: <N> album(s) already present; skipped`
 - `Artist-only run: all <N> eligible album(s) already present`
+- `<artist>: library scan cancelled by user` — added 2026-09-18, when a Ctrl+C
+  during the presence scan stopped being treated as a scan failure
 
 When the provider circuit breaker aborts a run, the notices collected so far
 are printed before the error propagates to the CLI, so the artists already
@@ -476,14 +485,16 @@ Per-album outcome sections and per-album downloads are unchanged.
 - **`--album` or `--batch-file` with discover** - configuration error with a
   discover-specific message.
 - **Cancellation (SIGINT)** - existing behaviour: stop before the next album and
-  clean staging.
+  clean staging, extended to the library scan: a press during the scan aborts it
+  and ends the run before any work item, and a second press forces exit.
 
 ## Backward compatibility
 
 - Auto mode is unchanged: same targets, same ordering, same tests.
-- Artist-only manual mode changes only by skipping albums already present in the
-  library. Explaining that to a user needs one README line; the benefit is that
-  `--artist X` stops re-downloading albums that are already on disk.
+- Artist-only manual mode changes by skipping albums already present in the
+  library, and by treating a cancelled library scan as a stop rather than as a
+  scan failure. Explaining that to a user needs one README line; the benefit is
+  that `--artist X` stops re-downloading albums that are already on disk.
 - Explicit `--artist X --album Y` manual runs and batch runs are unchanged: an
   explicit request is an instruction to fetch, not a discovery decision.
 - Existing configuration files remain valid; the new block is optional and

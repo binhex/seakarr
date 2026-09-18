@@ -69,13 +69,115 @@ pub(crate) const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
     "aif", "alac", "dsf", "dff", "spx",
 ];
 
+/// How often the walk reports progress at debug level. Counted in audio files,
+/// not seconds: a progress line per file would flood the log on a large library,
+/// and a time-based cadence is untestable without waiting.
+const SCAN_PROGRESS_EVERY_FILES: usize = 500;
+
+/// How long the walk may run before it reports progress at info level.
+///
+/// The shipped `logging.level` is INFO, so a debug-only heartbeat would still
+/// leave "is it working or hung?" unanswered for the minutes a real library
+/// takes: one bounded line a minute shows the walk is advancing. It is checked
+/// between entries, so a silence longer than this means the walk has not returned
+/// from the entry it is on - which a single stalled file read can also cause, so
+/// the line shows progress rather than proving health.
+const SCAN_HEARTBEAT_SECS: u64 = 60;
+
+/// Report the walk's progress at info level when the heartbeat is due, advancing
+/// the clock it is given. Returns whether it reported.
+///
+/// Decision and emission are one function so a test can drive the schedule with
+/// an injected `now`: testing the predicate alone would let a deleted or
+/// downgraded emission leave the suite green. The walk's own call to this is
+/// covered by inspection, because exercising it needs a scan lasting a minute.
+fn maybe_report_heartbeat(
+    last: &mut std::time::Instant,
+    now: std::time::Instant,
+    files_seen: usize,
+    albums: usize,
+    started: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    if !heartbeat_due(*last, now, interval) {
+        return false;
+    }
+    *last = now;
+    tracing::info!(
+        "Library scan still running: {files_seen} audio file(s), {albums} album(s) ({:.0}s elapsed)",
+        now.duration_since(started).as_secs_f64()
+    );
+    true
+}
+
+/// True when enough time has passed for another info-level progress line.
+fn heartbeat_due(
+    last: std::time::Instant,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    now.duration_since(last) >= interval
+}
+
+/// Tags read from one audio file, plus whether the file could be opened at all.
+///
+/// A readable file may legitimately carry no artist or album tag; an unreadable
+/// one is a different condition and is reported separately, because grouping it
+/// by folder name silently is how a corrupt file goes unnoticed.
+struct AudioTags {
+    artist: Option<String>,
+    album: Option<String>,
+    bitrate_kbps: Option<u32>,
+    readable: bool,
+    /// Why the file could not be read, when it could not. Carried so the debug
+    /// line can distinguish a corrupt file from a permission or I/O failure.
+    error: Option<String>,
+}
+
 /// Walk library directories, group audio files by artist/album, collect
 /// format+bitrate info, and per-file gate status. `filters` provides the
-/// allowed-extension and minimum-bitrate gate used to compute.
+/// allowed-extension and minimum-bitrate gate used to compute
 /// [`ScannedAlbum::needs_upgrade`] for every file.
+///
+/// `cancel` is an optional cooperative cancellation flag, checked once per walk
+/// entry; when it is set the walk stops and returns [`SeakarrError::Cancelled`],
+/// so a caller can tell a user cancellation from a scan that failed. It is the
+/// shared [`std::sync::atomic::AtomicBool`] rather than an `Arc` because the
+/// caller owns the `Arc` and this only reads it.
+///
+/// The walk reports what it is doing: an info line naming the roots when it
+/// starts, an info line every [`SCAN_HEARTBEAT_SECS`] while it runs, a debug line
+/// every [`SCAN_PROGRESS_EVERY_FILES`] audio files, a debug line for each file
+/// whose tags cannot be read, and an info line with the final counts when it
+/// ends. Before this, a stalled scan was indistinguishable from a hang.
+///
+/// # Errors
+///
+/// [`SeakarrError::Cancelled`] when `cancel` is set, and
+/// [`SeakarrError::Scanner`] when a configured root does not exist.
 pub fn scan_library(
     library_paths: &[String],
     filters: &crate::config::FilterConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<ScannedAlbum>> {
+    scan_library_with_heartbeat(
+        library_paths,
+        filters,
+        cancel,
+        std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS),
+    )
+}
+
+/// [`scan_library`] with the heartbeat interval injected.
+///
+/// The interval is a parameter only so the walk's own heartbeat call can be
+/// tested: exercising it through `scan_library` would need a scan lasting a
+/// minute, which leaves the operator-visible line unpinned.
+fn scan_library_with_heartbeat(
+    library_paths: &[String],
+    filters: &crate::config::FilterConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    heartbeat_every: std::time::Duration,
 ) -> Result<Vec<ScannedAlbum>> {
     let mut albums: std::collections::BTreeMap<(String, String), ScannedAlbum> =
         std::collections::BTreeMap::new();
@@ -92,6 +194,24 @@ pub fn scan_library(
     let mut location_root: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
 
+    // The scan reads every audio file's tags, which is minutes of I/O on a real
+    // library. Without these lines a slow scan is indistinguishable from a
+    // hang: nothing else in this phase logs anything.
+    tracing::info!(
+        "Library scan starting: {} root(s): {}",
+        library_paths.len(),
+        library_paths.join(", ")
+    );
+    let scan_started = std::time::Instant::now();
+    let mut last_heartbeat = scan_started;
+    let mut files_seen: usize = 0;
+    let mut unreadable: usize = 0;
+    // Acquire, which is sufficient alongside every other reader of this flag
+    // (the listener stores with SeqCst and downloads load with SeqCst). Relaxed
+    // would also do for a cooperative check, but a lone weaker ordering invites
+    // the question of whether it was a mistake.
+    let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+
     for (root_index, lib_path_str) in library_paths.iter().enumerate() {
         let lib_path = Path::new(lib_path_str);
         if !lib_path.exists() {
@@ -104,6 +224,26 @@ pub fn scan_library(
             .into_iter()
             .filter_map(|e| e.ok())
         {
+            // Checked before the entry is classified, so a tree dominated by
+            // non-audio files is still interruptible, and so the count in the
+            // cancellation message is what has actually been handled rather
+            // than one file more.
+            if cancelled() {
+                tracing::info!("Library scan cancelled by user after {files_seen} audio file(s)");
+                return Err(SeakarrError::Cancelled);
+            }
+            // Time-based and therefore bounded, and evaluated per walk entry
+            // rather than per audio file: a tree dominated by non-audio entries
+            // walks for minutes without touching a single tag, and must still
+            // show movement at the level operators actually run with.
+            maybe_report_heartbeat(
+                &mut last_heartbeat,
+                std::time::Instant::now(),
+                files_seen,
+                albums.len(),
+                scan_started,
+                heartbeat_every,
+            );
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -116,6 +256,15 @@ pub fn scan_library(
 
             if !ext_set.contains(ext.as_str()) {
                 continue;
+            }
+
+            files_seen += 1;
+            if files_seen.is_multiple_of(SCAN_PROGRESS_EVERY_FILES) {
+                tracing::debug!(
+                    "Library scan: {files_seen} audio file(s), {} album(s) so far ({:.0}s)",
+                    albums.len(),
+                    scan_started.elapsed().as_secs_f64()
+                );
             }
 
             // Infer the artist folder, album folder, and library location from
@@ -164,7 +313,16 @@ pub fn scan_library(
             let album_dir = components[album_index].to_string();
 
             // Read audio tags if available
-            let (tag_artist, tag_album, bitrate) = read_audio_tags(path);
+            let tags = read_audio_tags(path);
+            if !tags.readable {
+                unreadable += 1;
+                tracing::debug!(
+                    "Library scan: cannot read tags from {} ({}); grouping it by folder name",
+                    path.display(),
+                    tags.error.as_deref().unwrap_or("unknown reason")
+                );
+            }
+            let (tag_artist, tag_album, bitrate) = (tags.artist, tags.album, tags.bitrate_kbps);
 
             // Whether THIS file fails the quality gate: a non-allowed format,
             // or a bitrate below the configured minimum (unknown bitrate is
@@ -251,18 +409,25 @@ pub fn scan_library(
         }
     }
 
+    let album_count = albums.len();
+    tracing::info!(
+        "Library scan complete: {files_seen} audio file(s), {album_count} album(s), {unreadable} unreadable file(s) in {:.1}s",
+        scan_started.elapsed().as_secs_f64()
+    );
     Ok(albums.into_values().collect())
 }
 
-/// Read artist, album, and bitrate from an audio file using lofty.
-/// Returns (artist, album, bitrate_kbps). Falls back gracefully if tag reading fails.
-fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>) {
+/// Read artist, album and bitrate from an audio file using lofty, and report
+/// whether the file could be opened at all. A readable file may carry no tags;
+/// that is not the same as a file that cannot be read, which the scan counts and
+/// names at debug level instead of silently grouping it by folder name.
+fn read_audio_tags(path: &Path) -> AudioTags {
     let tagged_file = match lofty::probe::Probe::open(path) {
         Ok(probe) => match probe.read() {
             Ok(file) => file,
-            Err(_) => return (None, None, None),
+            Err(error) => return unreadable(error),
         },
-        Err(_) => return (None, None, None),
+        Err(error) => return unreadable(error),
     };
 
     let tag = tagged_file
@@ -275,7 +440,25 @@ fn read_audio_tags(path: &Path) -> (Option<String>, Option<String>, Option<u32>)
     // lofty 0.21 reports the audio bitrate in kbps
     let bitrate = tagged_file.properties().audio_bitrate();
 
-    (artist, album, bitrate)
+    AudioTags {
+        artist,
+        album,
+        bitrate_kbps: bitrate,
+        readable: true,
+        error: None,
+    }
+}
+
+/// The values a caller gets for a file whose tags could not be read, with the
+/// reason kept for the debug line.
+fn unreadable(error: impl std::fmt::Display) -> AudioTags {
+    AudioTags {
+        artist: None,
+        album: None,
+        bitrate_kbps: None,
+        readable: false,
+        error: Some(error.to_string()),
+    }
 }
 
 /// Determine which albums need upgrading based on filter config.
@@ -336,7 +519,7 @@ pub fn find_albums_to_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{write_minimal_flac, write_minimal_flac_with_tags};
+    use crate::test_support::{write_minimal_flac, write_minimal_flac_with_tags, LogCapture};
     use std::fs;
     use tempfile::TempDir;
 
@@ -346,10 +529,274 @@ mod tests {
         vec![dir.to_string_lossy().into_owned()]
     }
 
+    /// A library with `albums` albums of two files each, all named so the walk
+    /// sees them as `<root>/Artist/Album/0N - track.flac`.
+    fn library_with_albums(albums: usize) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for index in 0..albums {
+            let album_dir = dir.path().join("Artist").join(format!("Album {index}"));
+            fs::create_dir_all(&album_dir).unwrap();
+            write_minimal_flac_with_tags(
+                &album_dir.join("01 - track.flac"),
+                "Artist",
+                &format!("Album {index}"),
+            );
+            write_minimal_flac_with_tags(
+                &album_dir.join("02 - track.flac"),
+                "Artist",
+                &format!("Album {index}"),
+            );
+        }
+        dir
+    }
+
+    // ── The scan must say what it is doing ──
+    //
+    // A library scan reads every audio file's tags on an Unraid user share and
+    // can take minutes; when it stalled, nothing at all was logged at any level
+    // so a slow scan was indistinguishable from a hang. These tests pin the
+    // output that makes the phase observable.
+
+    #[test]
+    fn scan_reports_a_start_line_naming_its_roots() {
+        let dir = library_with_albums(1);
+        let capture = LogCapture::start();
+
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+
+        assert_eq!(albums.len(), 1);
+        let logs = capture.text();
+        let root = dir.path().to_string_lossy();
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("Library scan starting") && line.contains(root.as_ref())),
+            "the scan must name the roots it is about to walk, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn scan_reports_a_finish_line_with_file_and_album_counts() {
+        let dir = library_with_albums(7);
+        let capture = LogCapture::start();
+
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+
+        assert_eq!(albums.len(), 7);
+        let logs = capture.text();
+        // The whole line, and this fixture's own counts: a bare `14 audio file(s)`
+        // substring would also be satisfied by `114 audio file(s)`, and finding
+        // the first matching line in the shared process-wide capture window could
+        // return a neighbouring test's scan.
+        assert!(
+            logs.lines().any(|line| line
+                .contains("Library scan complete: 14 audio file(s), 7 album(s), 0 unreadable")),
+            "the completion line must carry this scan's own counts, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn scan_counts_and_names_files_whose_tags_cannot_be_read() {
+        let dir = library_with_albums(1);
+        let broken = dir
+            .path()
+            .join("Artist")
+            .join("Broken Album")
+            .join("01 - track.flac");
+        fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        fs::write(&broken, b"this is not a flac stream").unwrap();
+        let capture = LogCapture::start();
+
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+
+        assert_eq!(
+            albums.len(),
+            2,
+            "an unreadable file is still grouped by folder"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.lines().any(|line| line
+                .contains("Library scan complete: 3 audio file(s), 2 album(s), 1 unreadable")),
+            "an unreadable file must be counted in this scan's own completion line, got:\n{logs}"
+        );
+        // Keyed to this fixture's own path: "01 - track.flac" is shared by a
+        // dozen other fixtures in this module.
+        assert!(
+            logs.contains(&broken.display().to_string()) && logs.contains("cannot read tags from"),
+            "the unreadable file must be named individually at debug level, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn scan_reports_progress_every_five_hundred_files() {
+        // 501 single-file albums trip the first debug progress line at the
+        // documented cadence, and the line must carry that exact count.
+        let dir = TempDir::new().unwrap();
+        for index in 0..=500 {
+            let album_dir = dir.path().join("Artist").join(format!("Album {index}"));
+            fs::create_dir_all(&album_dir).unwrap();
+            fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
+        }
+        let capture = LogCapture::start();
+
+        scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+
+        let logs = capture.text();
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("Library scan: 500 audio file(s),")),
+            "the progress line must report the first cadence point exactly, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn the_walk_itself_emits_the_heartbeat() {
+        // Pins the walk's own call, not just the helper: with a zero interval the
+        // first entry that reaches the check reports, so a deleted or relocated
+        // call fails here. This is the line the incident needed to see.
+        let dir = library_with_albums(1);
+        let capture = LogCapture::start();
+
+        scan_library_with_heartbeat(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+
+        let logs = capture.text();
+        // With a zero interval every walk entry reports, and the check runs
+        // before the entry is counted, so the highest count reached by a two-file
+        // library is one file and its one album. No other test can emit a
+        // heartbeat line at all: they run with the real 60-second interval.
+        assert!(
+            logs.lines().any(|line| line.contains("INFO")
+                && line.contains("Library scan still running: 1 audio file(s), 1 album(s)")),
+            "the walk must emit the heartbeat itself, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_reports_once_a_minute_and_only_when_due() {
+        // Drives the schedule with an injected clock, so both halves are pinned:
+        // a heartbeat emitted too early, and an emission deleted or downgraded
+        // below info, both fail here.
+        let capture = LogCapture::start();
+        // `elapsed` is measured from `started`, so the fixture backdates it: the
+        // scan began 59 s before the first probe and 61 s before the second.
+        let now = std::time::Instant::now();
+        let started = now - std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS - 1);
+        let mut last = started;
+        let due = now + std::time::Duration::from_secs(2);
+
+        assert!(
+            !maybe_report_heartbeat(
+                &mut last,
+                now,
+                2,
+                1,
+                started,
+                std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS)
+            ),
+            "a heartbeat before the interval must not report"
+        );
+        assert!(
+            maybe_report_heartbeat(
+                &mut last,
+                due,
+                3,
+                2,
+                started,
+                std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS)
+            ),
+            "a heartbeat once the interval has passed must report"
+        );
+        assert_eq!(last, due, "the clock must advance to the reporting instant");
+        assert!(
+            !maybe_report_heartbeat(
+                &mut last,
+                due,
+                4,
+                2,
+                started,
+                std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS)
+            ),
+            "an already-reported clock must not report again"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Library scan still running").count(),
+            1,
+            "exactly one heartbeat line must be emitted, got:\n{logs}"
+        );
+        assert!(
+            logs.lines().any(|line| line.contains("INFO")
+                && line.contains(
+                    "Library scan still running: 3 audio file(s), 2 album(s) (61s elapsed)"
+                )),
+            "the heartbeat must be emitted at INFO with its counts, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn a_scan_heartbeats_once_a_minute_at_info_level() {
+        // The predicate is exercised through the schedule test above; this keeps
+        // the interval itself pinned to the documented constant.
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS);
+        assert!(!heartbeat_due(start, start, interval));
+        assert!(!heartbeat_due(
+            start,
+            start + std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS - 1),
+            interval
+        ));
+        assert!(heartbeat_due(
+            start,
+            start + std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS),
+            interval
+        ));
+    }
+
+    #[test]
+    fn scan_stops_when_the_run_is_cancelled() {
+        // Ctrl+C during a slow scan must stop it. Before this change the flag was
+        // never consulted and the walk ran to completion, because the scan ran
+        // before any signal listener existed.
+        let dir = library_with_albums(3);
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let capture = LogCapture::start();
+
+        let outcome = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            Some(&cancel),
+        );
+
+        assert!(
+            matches!(outcome, Err(SeakarrError::Cancelled)),
+            "a cancelled scan must stop and say so, got: {outcome:?}"
+        );
+        // Exact count: the flag is checked before the first entry is classified,
+        // so nothing has been handled yet.
+        assert!(
+            capture
+                .text()
+                .contains("Library scan cancelled by user after 0 audio file(s)"),
+            "the cancellation must name the progress it reached, got:\n{}",
+            capture.text()
+        );
+    }
+
     #[test]
     fn test_scan_empty_directory() {
         let dir = TempDir::new().unwrap();
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert!(albums.is_empty());
     }
 
@@ -368,7 +815,8 @@ mod tests {
         fs::create_dir_all(&mp3_dir).unwrap();
         fs::write(mp3_dir.join("track.mp3"), b"fake mp3 data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 2);
         // Both albums should be present
         let artists: Vec<&str> = albums.iter().map(|a| a.artist.as_str()).collect();
@@ -437,7 +885,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -474,7 +923,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -513,7 +963,8 @@ mod tests {
             write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Tagged", "Album");
         }
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
 
         assert_eq!(albums.len(), 1, "the tagged copies are one album");
         assert_eq!(
@@ -539,7 +990,8 @@ mod tests {
             write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
         }
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
 
         assert_eq!(albums.len(), 1, "the tagged copies are one album");
         assert_eq!(albums[0].track_count, 2);
@@ -573,6 +1025,7 @@ mod tests {
                 smaller.to_string_lossy().into_owned(),
             ],
             &FilterConfig::default(),
+            None,
         )
         .unwrap();
 
@@ -597,7 +1050,7 @@ mod tests {
             min_bit_depth: 24,
             ..FilterConfig::default()
         };
-        let albums = scan_library(&library_paths(dir.path()), &filters).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &filters, None).unwrap();
         assert!(
             find_albums_to_upgrade(&albums, &filters).is_empty(),
             "bit depth must not flag an album for upgrade"
@@ -661,7 +1114,8 @@ mod tests {
             .unwrap();
         }
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         let album = &albums[0];
         assert_eq!(album.track_count, 24);
@@ -694,7 +1148,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -711,7 +1166,8 @@ mod tests {
             fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
         }
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1, "both discs are one album");
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -732,7 +1188,8 @@ mod tests {
         fs::create_dir_all(&disc_dir).unwrap();
         fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -757,7 +1214,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -777,7 +1235,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Album");
         assert_eq!(albums[0].album, "FLAC");
@@ -792,7 +1251,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert!(albums.is_empty());
     }
 
@@ -803,7 +1263,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(
             albums.len(),
             1,
@@ -826,7 +1287,8 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+        let albums =
+            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Gold (Disc 1)");

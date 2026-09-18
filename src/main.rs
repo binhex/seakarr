@@ -1,7 +1,6 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use seakarr::client::{RealClient, SoulseekClient};
@@ -581,10 +580,11 @@ async fn run_batch_mode(
         None
     };
 
-    // Shared cancellation flag: SIGINT aborts the in-flight album download;
-    // its staging dir is cleaned by download_album.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let _listener = seakarr::runner::spawn_cancel_listener(Arc::clone(&cancel));
+    // Shared cancellation flag: SIGINT aborts the in-flight album download (its
+    // staging dir is cleaned by download_album). Batch mode performs no library
+    // scan of its own; the flag is armed through the same guard as the other
+    // modes so the listener cannot outlive the cycle.
+    let (cancel, _guard) = seakarr::runner::arm_cancellation();
 
     for line in &lines {
         // Check cancellation between batch lines — stop processing
@@ -637,7 +637,7 @@ async fn run_batch_mode(
     }
 
     report.print_summary();
-    _listener.abort();
+    // `_guard` aborts the listener as it drops.
     Ok(())
 }
 

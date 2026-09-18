@@ -19,8 +19,9 @@ use crate::{discover, download, filter, notifier, organizer, scanner, search};
 
 /// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
 ///
-/// The first press sets the shared cancellation flag, aborting in-flight
-/// downloads (their staging dirs are cleaned by `download_album`). A second
+/// The first press sets the shared cancellation flag, cancelling the run in
+/// flight — an album download (its staging dir is cleaned by `download_album`) or
+/// the library scan. A second
 /// press force-exits the process — the run may be wedged on a network call
 /// that ignores the flag, and Ctrl+C must always be able to terminate
 /// seakarr.
@@ -37,7 +38,7 @@ pub fn spawn_cancel_listener(cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle
                         tracing::info!("Received second SIGINT — forcing exit");
                         std::process::exit(130);
                     }
-                    tracing::info!("Received SIGINT — aborting in-flight downloads...");
+                    tracing::info!("Received SIGINT — cancelling the run...");
                 }
                 Err(e) => {
                     // Signal driver unavailable — cancellation via Ctrl+C
@@ -49,6 +50,62 @@ pub fn spawn_cancel_listener(cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle
             }
         }
     })
+}
+
+/// Owns one run's SIGINT listener and aborts it when the run ends.
+///
+/// A scheduled loop calls a mode once per cycle, so the listener must not
+/// outlive its run: dropping a [`tokio::task::JoinHandle`] only detaches the
+/// task, which would leave one task, one signal receiver and one flag per cycle,
+/// and every one of them would log on the next Ctrl+C. Aborting from `Drop`
+/// makes that structural, so an early return — a cancelled scan, an empty work
+/// list, a propagated error — cannot leak one.
+pub struct CancellationGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Arm the SIGINT listener and hand back the flag it flips.
+///
+/// Armed *before* the library scan: the scan reads every audio file's tags and
+/// is the longest silent phase of a run, so a listener installed only afterwards
+/// left Ctrl+C to the default signal action, which killed the process, left the
+/// PID file behind, and made the next run warn about a dead PID.
+///
+/// Residual window: `tokio::signal::ctrl_c` registers the OS handler when the
+/// spawned listener task is first polled and the runtime has an idle worker, so
+/// a SIGINT delivered between this returning and that first poll still takes the
+/// default disposition. It is microseconds against a scan of minutes, and
+/// closing it needs either an await on a registration handshake (making this
+/// async at every call site) or a platform-specific `signal::unix` stream; the
+/// window is documented instead of papered over.
+pub fn arm_cancellation() -> (Arc<AtomicBool>, CancellationGuard) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let listener = spawn_cancel_listener(Arc::clone(&cancel));
+    (cancel, CancellationGuard { handle: listener })
+}
+
+/// Scan the library for a mode that has already armed cancellation.
+///
+/// `Ok(None)` means the user cancelled: the caller returns without doing any
+/// work, and `main` releases the PID lock as it unwinds.
+fn scan_library_cancellable(
+    config: &Config,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<scanner::ScannedAlbum>>> {
+    match scanner::scan_library(&config.library.paths, &config.filters, Some(cancel)) {
+        Ok(albums) => Ok(Some(albums)),
+        Err(SeakarrError::Cancelled) => {
+            tracing::info!("Library scan cancelled — aborting before any work item");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Record every track's measured speed + success/failure into the peer
@@ -977,9 +1034,16 @@ pub async fn run_auto_mode(
         ));
     }
 
+    // Arm cancellation before the scan: Ctrl+C must stop a slow scan, and a
+    // first press during downloads still aborts them. The guard aborts the
+    // listener on every return path, so a no-op cycle cannot leak one.
+    let (cancel, _guard) = arm_cancellation();
+
     // Scan library
     tracing::info!("Scanning library...");
-    let albums = scanner::scan_library(&config.library.paths, &config.filters)?;
+    let Some(albums) = scan_library_cancellable(config, &cancel)? else {
+        return Ok(());
+    };
     let targets_with_counts = scanner::find_albums_to_upgrade(&albums, &config.filters);
     for album in &albums {
         let fmt_str: Vec<&str> = album.formats.iter().map(|f| f.as_str()).collect();
@@ -1025,11 +1089,7 @@ pub async fn run_auto_mode(
         None
     };
 
-    // Shared cancellation flag: SIGINT (Ctrl+C) sets it, aborting in-flight
-    // downloads. Each album's staging dir is cleaned by download_album.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
-
+    // Shared cancellation flag, created by `arm_cancellation` before the scan.
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
     let targets_vec: Vec<(String, String, usize, PathBuf)> = targets_with_counts;
@@ -1109,12 +1169,8 @@ pub async fn run_auto_mode(
     }
     report.print_summary();
 
-    // Abort the cancel listener so the tokio task does not accumulate across
-    // scheduled scan cycles (each cycle calls run_auto_mode again). Without
-    // abort(), the JoinHandle drop only detaches the task - it keeps running
-    // and waiting for SIGINT, leaking one task per scan.
-    _listener.abort();
-
+    // `_guard` aborts the listener as it drops. Each cycle of a scheduled run
+    // calls this mode again, so the task must not outlive its run.
     Ok(())
 }
 
@@ -1303,15 +1359,27 @@ async fn run_legacy_artist_only_mode(
     // does. The documented promise is that --artist X fetches only what is
     // missing, and this heuristic path is both the explicit opt-out and the
     // automatic fallback during a MusicBrainz outage.
-    let index = match discover::index_from_paths(&config.library.paths, &config.filters) {
-        Ok(index) => index,
-        Err(error) => {
-            tracing::warn!(
-                "{artist}: library scan failed ({error}); skipping the already-present check"
-            );
-            discover::LibraryIndex::default()
-        }
-    };
+    let index =
+        match discover::index_from_paths(&config.library.paths, &config.filters, Some(cancel)) {
+            Ok(index) => index,
+            // A user cancellation is not a scan failure: stop the run rather than
+            // warn about a broken library and drop the presence check.
+            Err(SeakarrError::Cancelled) => {
+                tracing::info!(
+                    "{artist}: library scan cancelled by user — stopping before any album"
+                );
+                return Ok(ArtistOnlyRun {
+                    outcomes: Vec::new(),
+                    notice: Some(format!("{artist}: library scan cancelled by user")),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "{artist}: library scan failed ({error}); skipping the already-present check"
+                );
+                discover::LibraryIndex::default()
+            }
+        };
 
     let albums = search::group_artist_results(&outcome.results, artist);
     if albums.is_empty() {
@@ -1410,8 +1478,24 @@ async fn run_artist_only_mode_with_provider(
             }
             // A failing scan must not break artist-only manual mode, which
             // worked without a library before: warn and filter nothing.
-            let index = match discover::index_from_paths(&config.library.paths, &config.filters) {
+            let index = match discover::index_from_paths(
+                &config.library.paths,
+                &config.filters,
+                Some(cancel),
+            ) {
                 Ok(index) => index,
+                // As on the legacy path: a cancelled scan stops the run instead
+                // of warning about a failure and continuing without a presence
+                // check (which would treat every album as missing).
+                Err(SeakarrError::Cancelled) => {
+                    tracing::info!(
+                        "{artist}: library scan cancelled by user — stopping before any album"
+                    );
+                    return Ok(ArtistOnlyRun {
+                        outcomes: Vec::new(),
+                        notice: Some(format!("{artist}: library scan cancelled by user")),
+                    });
+                }
                 Err(error) => {
                     tracing::warn!(
                         "{artist}: library scan failed ({error}); skipping the already-present check"
@@ -1626,7 +1710,6 @@ fn abort_discover_run(
     report: &mut RunReport,
     counters: &discover::DiscoverCounters,
     progress: Option<&ProgressDisplay>,
-    listener: &tokio::task::JoinHandle<()>,
 ) -> SeakarrError {
     for notice in discover::discover_notices(counters) {
         report.add_notice(notice);
@@ -1635,7 +1718,6 @@ fn abort_discover_run(
         display.clear();
     }
     report.print_summary();
-    listener.abort();
     SeakarrError::MusicBrainz(format!(
         "{DISCOVER_PROVIDER_FAILURE_LIMIT} consecutive MusicBrainz failures; aborting discover run"
     ))
@@ -1703,7 +1785,15 @@ async fn run_discover_mode_with_provider(
         ));
     }
 
-    let scanned = scanner::scan_library(&config.library.paths, &config.filters)?;
+    // Discover reads the whole library before it can pick a single work item, so
+    // cancellation is armed first: interrupting a slow scan must be possible
+    // without killing the process and stranding the PID lock. The guard aborts
+    // the listener on every return path.
+    let (cancel, _guard) = arm_cancellation();
+
+    let Some(scanned) = scan_library_cancellable(config, &cancel)? else {
+        return Ok(());
+    };
     let index = discover::build_index(&scanned);
     let selection =
         discover::select_artists(&index, &config.discover.exclude_artists, artist_filter)?;
@@ -1733,8 +1823,6 @@ async fn run_discover_mode_with_provider(
     } else {
         None
     };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
 
     for artist in &selection.artists {
         if budget.exhausted() {
@@ -1791,7 +1879,6 @@ async fn run_discover_mode_with_provider(
                                 &mut report,
                                 &counters,
                                 progress.as_ref(),
-                                &_listener,
                             ));
                         }
                     } else {
@@ -1885,7 +1972,6 @@ async fn run_discover_mode_with_provider(
                                 &mut report,
                                 &counters,
                                 progress.as_ref(),
-                                &_listener,
                             ));
                         }
                     } else {
@@ -1935,7 +2021,6 @@ async fn run_discover_mode_with_provider(
                             &mut report,
                             &counters,
                             progress.as_ref(),
-                            &_listener,
                         ));
                     }
                 }
@@ -1950,7 +2035,7 @@ async fn run_discover_mode_with_provider(
         display.clear();
     }
     report.print_summary();
-    _listener.abort();
+    // `_guard` aborts the listener as it drops; a scheduled cycle must not leak.
     Ok(())
 }
 
@@ -1981,10 +2066,10 @@ pub async fn run_manual_mode(
         None
     };
     let progress_ref = progress.as_ref();
-    // Cancellation flag: SIGINT aborts the in-flight download; download_album
-    // cleans the album's staging dir.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let _listener = spawn_cancel_listener(Arc::clone(&cancel));
+    // Cancellation flag: SIGINT aborts the in-flight download (download_album
+    // cleans the album's staging dir) or the library scan a sub-mode runs. The
+    // guard aborts the listener on every return path.
+    let (cancel, _guard) = arm_cancellation();
 
     // Derive library track count from the configured library paths when an
     // explicit album is selected, so peer_track_count can reject peers with
@@ -2068,7 +2153,7 @@ pub async fn run_manual_mode(
     }
 
     report.print_summary();
-    _listener.abort();
+    // `_guard` aborts the listener as it drops.
     result
 }
 
@@ -2081,6 +2166,190 @@ mod tests {
     use crate::test_support::{make_file, write_minimal_flac, write_minimal_flac_with_tags};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_cancelled_scan_reports_nothing_to_do() {
+        // The seam both runners use. A cancelled scan must come back as "no work"
+        // rather than as a completed scan: an empty scan would look like a library
+        // with nothing in it, and discover would then treat every album as a gap.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        let (mut config, _db, _staging) = artist_only_fixture();
+        config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let capture = crate::test_support::LogCapture::start();
+
+        let outcome = scan_library_cancellable(&config, &cancel).unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "a cancelled scan must report no albums, got {outcome:?}"
+        );
+        // The distinctive tail of the runner's own mapping message: the scanner
+        // logs "Library scan cancelled by user ..." too, so asserting on the
+        // shared prefix would leave the mapping arm untested.
+        assert!(
+            capture.text().contains("aborting before any work item"),
+            "the runner must report the abort it performs, got:\n{}",
+            capture.text()
+        );
+    }
+
+    #[test]
+    fn an_uncancelled_scan_still_returns_the_library() {
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        let (mut config, _db, _staging) = artist_only_fixture();
+        config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = scan_library_cancellable(&config, &cancel).unwrap();
+
+        let albums = outcome.expect("an uncancelled scan must return the library");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist, "Artist");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_cancellation_guard_aborts_its_listener() {
+        // A scheduled loop calls a mode once per cycle. Dropping a JoinHandle
+        // only detaches the task, so a guard that forgot to abort would leave one
+        // live signal listener per cycle; the marker proves the task was dropped.
+        struct AbortMarker(Arc<AtomicBool>);
+        impl Drop for AbortMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let aborted = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let marker = AbortMarker(Arc::clone(&aborted));
+            async move {
+                let _marker = marker;
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !aborted.load(Ordering::SeqCst),
+            "the task must be running first"
+        );
+
+        let guard = CancellationGuard { handle };
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "dropping the guard must abort the listener, not detach it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_scan_stops_a_legacy_artist_only_run() {
+        // The legacy path (discography disabled, or the provider outage
+        // fallback) scans the library for the same presence check, so its
+        // Cancelled arm needs the same coverage: without it a cancellation is
+        // logged as a scan *failure* and every album is treated as missing.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Old", "Old"), ("Test Artist New", "New")],
+        );
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let present = library.path().join("Test Artist").join("Old");
+        std::fs::create_dir_all(&present).unwrap();
+        write_minimal_flac_with_tags(&present.join("01 - track.flac"), "Test Artist", "Old");
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let _capture = crate::test_support::LogCapture::start();
+
+        let run = run_legacy_artist_only_mode(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            run.outcomes.is_empty(),
+            "a cancelled scan must not process albums on the legacy path: {:?}",
+            run.outcomes
+        );
+        assert!(
+            run.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("cancelled")),
+            "the cancellation must be reported, got {:?}",
+            run.notice
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_scan_stops_an_artist_only_run_without_processing_an_album() {
+        // Ctrl+C during the artist-only presence scan used to be reported as a
+        // scan *failure* and then silently dropped the presence check, so every
+        // album looked missing. A cancellation must stop the run instead.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Old", "Old"), ("Test Artist New", "New")],
+        );
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("old", "Old", "1999"),
+            release_group("new", "New", "2005"),
+        ]);
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let present = library.path().join("Test Artist").join("Old");
+        std::fs::create_dir_all(&present).unwrap();
+        write_minimal_flac_with_tags(&present.join("01 - track.flac"), "Test Artist", "Old");
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(true));
+        // Hold the capture window so this test's own cancelled-walk line cannot
+        // land in another test's window and satisfy its assertion.
+        let _capture = crate::test_support::LogCapture::start();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &cancel,
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            run.outcomes.is_empty(),
+            "a cancelled scan must not process albums: {:?}",
+            run.outcomes
+        );
+        assert!(
+            run.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("cancelled")),
+            "the cancellation must be reported, got {:?}",
+            run.notice
+        );
+    }
 
     // Regression guard: the organize step must derive names exactly like the
     // auto-upgrade copy path — zero-padded track number and the title

@@ -505,16 +505,32 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
     notices
 }
 
-/// Build the presence index from configured library paths.
+/// Build a presence index from the configured library roots.
 ///
 /// An empty `paths` list yields an empty index rather than an error, so callers
 /// that only use the index to filter (artist-only manual mode) keep working
 /// without a configured library.
-pub fn index_from_paths(paths: &[String], filters: &FilterConfig) -> Result<LibraryIndex> {
+///
+/// `cancel` is forwarded to the walk, so a caller that has armed cancellation
+/// can hand it over: a user cancellation then surfaces as
+/// [`SeakarrError::Cancelled`] rather than as an empty index, which would make
+/// every album look missing.
+///
+/// # Errors
+///
+/// [`SeakarrError::Cancelled`] when the walk is cancelled, and
+/// [`SeakarrError::Scanner`] when a configured root does not exist.
+pub fn index_from_paths(
+    paths: &[String],
+    filters: &FilterConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<LibraryIndex> {
     if paths.is_empty() {
         return Ok(LibraryIndex::default());
     }
-    Ok(build_index(&crate::scanner::scan_library(paths, filters)?))
+    Ok(build_index(&crate::scanner::scan_library(
+        paths, filters, cancel,
+    )?))
 }
 
 #[cfg(test)]
@@ -686,6 +702,7 @@ mod tests {
         let scanned = scan_library(
             &[library.path().to_string_lossy().into_owned()],
             &FilterConfig::default(),
+            None,
         )
         .unwrap();
         let index = build_index(&scanned);

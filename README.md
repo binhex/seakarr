@@ -63,7 +63,11 @@ Automated Soulseek music downloader with library quality upgrading.
   across restarts and schedule cycles.
 - **Scheduled mode** — run the selected auto, manual, batch, or discover operation immediately, then repeat
   it after a configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle
-  cancellation or stops the scheduler while it is waiting between cycles.
+  cancellation or stops the scheduler while it is waiting between cycles. A Ctrl+C received during the
+  library scan aborts the scan and the run before any work item. While a run is active, a second Ctrl+C
+  forces immediate exit with code 130 and leaves the PID file behind, which the next run treats as a
+  stale lock and removes; a press while the scheduler waits between cycles is a graceful shutdown that
+  removes the PID file and exits 0.
 - **PID lock** — prevents concurrent instances from running against the same database and staging
   directory.
 - **Notifications** — sends alerts for each successful album download by POSTing a small JSON body
@@ -406,6 +410,18 @@ places under the on-disk artist folder.
 | `path` | Directory for the log file (`seakarr.log` is created inside). Overridden by `--log-path`. | `logs` |
 | `file` | Log filename. | `seakarr.log` |
 
+#### Library scan log lines
+
+The library scan is the longest silent phase of a run, so it reports what it is doing. One info line
+names the roots when the walk starts, an info line every minute while it runs carries the file and album
+counts so far (a longer silence means the walk has not returned from the entry it is on, which a single
+stalled read can also cause, so the line shows progress rather than proving health), an info line with the
+final counts and elapsed
+time ends it, and the count of files whose tags could not be read is included there too — those files are
+also named individually at debug level, because grouping them by folder name silently is how a corrupt
+file goes unnoticed. Two debug lines add detail without filling an info-level log: one every 500 audio
+files, and one per unreadable file.
+
 #### Download log lines
 
 Every completed album produces one completion line naming its final destination:
@@ -573,7 +589,8 @@ Seakarr has four operating modes:
 1. **Scan** — walks every path in `library.paths`, reads audio tags via `lofty`, and groups tracks by
    artist and album. Prefers tag metadata over directory names. Folder-derived artist and album names
    assume UTF-8 path components: a non-UTF-8 component is skipped, which shifts the derived names for
-   that album, so keep library folder names in UTF-8.
+   that album, so keep library folder names in UTF-8. The scan reports its progress (see the library scan
+   log lines above) and can be stopped with Ctrl+C, which aborts the run before any album is processed.
 2. **Detect upgrades** — for each album, checks whether any track is in a non-allowed format or below
    `min_bit_rate`. When `min_bit_rate` is set, an album whose files all report no bitrate is flagged too,
    because its quality cannot be verified.
@@ -677,8 +694,12 @@ When `--schedule` or `schedule.enabled` is set, the same validated auto, manual,
 plan runs immediately in a foreground loop. After each cycle completes, seakarr waits for
 `schedule.interval_mins` before dispatching that unchanged plan again. SIGTERM received at
 any time stops the scheduler after the active cycle and removes the PID file. Ctrl+C during
+the library scan aborts the scan and the run before any work item; Ctrl+C during
 an active cycle requests cancellation; Ctrl+C while waiting between cycles stops the
-scheduler and removes the PID file.
+scheduler and removes the PID file. A second Ctrl+C during an active run forces immediate exit with
+code 130 and leaves the PID file behind, which the next run treats as a stale lock and removes; while
+the scheduler is waiting between cycles a press is that graceful shutdown, removes the PID file and
+exits 0.
 
 ## Development
 
@@ -760,7 +781,9 @@ Seakarr expects an `Artist/Album/Track` directory structure by default. For exam
 ```
 
 If your files have embedded tags (artist, album, bitrate), seakarr prefers tag metadata over directory
-names. Files without readable tags fall back to the directory naming convention.
+names. Files without readable tags fall back to the directory naming convention; a file that cannot be
+read at all is counted in the scan's completion line and named at debug level, so it does not disappear
+from the report while still being grouped by folder name.
 
 **Q: What formats can seakarr scan?**
 

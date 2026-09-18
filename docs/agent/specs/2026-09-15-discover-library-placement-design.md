@@ -23,8 +23,13 @@ library folder — the directory the artist's existing albums were found in —
 using the configured organize pattern, and the staging copy is removed once the
 copy succeeds. Nothing else changes: auto, artist-only manual, explicit manual,
 and batch behaviour, the presence index, the download budget, and the reporting
-contract all stay as they are. (Superseded on 2026-09-18: discovery's artist
-selection later gained the folder-ownership gate, which adds one summary line;
+contract all stay as they are, apart from cancellation: the library scan that
+artist-only manual mode runs is now cancellable, and a cancelled scan stops that
+run instead of warning about a scan failure (see the note below). Batch and
+explicit-manual runs arm the same cancellation guard for their downloads, so no
+listener outlives a run. (Superseded on 2026-09-18:
+discovery's artist selection later gained the folder-ownership gate, which adds
+one summary line;
 see the gap-filling design's reporting contract.)
 
 ## Scope
@@ -279,8 +284,11 @@ reason. (Superseded on 2026-09-18: discovery's artist selection later gained the
 folder-ownership gate and its `discover: <N> artist(s) skipped: no folder of
 their own` summary line, so the run summary is no longer byte-identical to this
 design's contract.) The
-budget rule is untouched. Cancellation is untouched: Ctrl+C stops before the
-next album and a cancelled download cleans its own staging. Discover does not
+budget rule is untouched. Cancellation was untouched by this design, but is no
+longer untouched in the code: discovery now arms the SIGINT listener before the
+library scan, so Ctrl+C aborts a slow scan and the run ends before any work item
+(see the gap-filling design's cancellation note). A cancelled download still
+cleans its own staging. Discover does not
 participate in upgrade recovery, and after this change it leaves no staging
 directory behind on success.
 
@@ -380,9 +388,10 @@ argument.
 
 ## Data flow
 
-1. `scan_library(library.paths, filters)` walks the library once and resolves
+1. `scan_library(library.paths, filters, cancel)` walks the library once and resolves
    each album's artist folder, album folder, and library location positionally,
-   peeling one disc folder.
+   peeling one disc folder. The third argument is the optional cooperative
+   cancellation flag; the walk returns `Cancelled` when it is set.
 2. `build_index` records, per artist, the query spellings, the normalised album
    titles (tag-derived titles and the album folder names each album was found
    under), the artist folder names its albums live in, and the destination pairs
@@ -432,7 +441,8 @@ argument.
 - **`library.paths` empty or `--artist` naming an unknown artist** — unchanged
   configuration errors raised before this code runs.
 - **Album already present, unresolved artist, provider failure, budget
-  exhaustion, cancellation** — unchanged behaviour.
+  exhaustion** — unchanged behaviour. Cancellation is no longer unchanged: the
+  run can now end during the library scan, before any work item.
 
 ## Backward compatibility
 
@@ -449,7 +459,11 @@ argument.
   the name is the destination the upgrade copy and the quality-deletion root
   use; folding marker variants into one album identity is the peer-side parser's
   job and a separate concern.
-- Artist-only manual, explicit manual, and batch modes are untouched; only the
+- Artist-only manual mode is untouched apart from cancellation: the library scan
+it runs is now cancellable and a cancelled scan stops the run instead of warning
+about a scan failure and dropping the presence check. Explicit manual and batch
+modes run no library scan and are unchanged apart from arming the same
+cancellation guard for their downloads, so no listener outlives a run. Only the
   `process_album` signature they call changes.
 - Existing configuration files remain valid, with two exceptions, both of which
   could never have worked: a
@@ -676,11 +690,16 @@ Unchanged: discover resolution, `--artist` narrowing, and the `--album` and
    correctly, and library-side and peer-side path parsing share one disc rule.
 8. Auto mode's behaviour is unchanged except for the corrected disc-nested
    upgrade destination, and its existing tests pass.
-9. Artist-only manual, explicit manual, and batch modes are unchanged.
+9. Artist-only manual mode is unchanged apart from cancellation: its library scan
+   is cancellable and a cancelled scan stops the run rather than warning about a
+   scan failure. Explicit manual and batch modes are unchanged apart from sharing
+   the cancellation guard, which they arm for their downloads (neither runs a
+   library scan).
 10. No new configuration keys, no schema change, and no new report notices.
-    (Superseded on 2026-09-18: discovery's artist selection later gained the
-    folder-ownership gate, which adds one summary line; see the gap-filling
-    design's reporting contract.)
+    (Superseded on 2026-09-18, twice: discovery's artist selection later gained
+    the folder-ownership gate, which adds one summary line, and the library scan
+    gained its own log lines plus, for artist-only manual runs, a cancelled-scan
+    notice; see the gap-filling design's reporting contract.)
 
 ## External contracts
 

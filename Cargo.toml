@@ -2,6 +2,12 @@
 name = "seakarr"
 version = "0.26.3"
 edition = "2021"
+# The real floor, and it was already implicit before this change: the vendored
+# workspace member is edition 2024 and uses `slice::as_chunks_mut`, this crate
+# uses `ErrorKind::CrossesDevices` (1.85) and `Option::is_none_or` (1.82), and
+# `tracing-appender` pulls `time 0.3.55`, whose manifest requires 1.88.
+# Declaring it turns a cryptic dependency error into cargo's own message.
+rust-version = "1.88"
 # Not published to crates.io — verified against the registry API and the sparse
 # index, neither of which has this crate. Declared here so `cargo publish`
 # cannot push it by accident, and so `cargo deny` treats it as a private crate
