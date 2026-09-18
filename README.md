@@ -382,6 +382,73 @@ places under the on-disk artist folder.
 | `path` | Directory for the log file (`seakarr.log` is created inside). Overridden by `--log-path`. | `logs` |
 | `file` | Log filename. | `seakarr.log` |
 
+#### Download log lines
+
+Every completed album produces one completion line naming its final destination:
+
+```text
+INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 1 (8 tracks) -> /media/Music/Paul/Albums/Aquasky/Shadow Era Pt. 1
+```
+
+The path is the album folder the write actually produced, after name sanitisation and disc
+subdirectory handling — not the raw `storage.organize_pattern`. When `storage.organize` is
+`false`, or `library.paths` is empty, the album stays where it was downloaded and the line
+says so:
+
+```text
+INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 2 (6 tracks) -> /downloads/Aquasky--Shadow Era Pt. 2 (kept in staging)
+```
+
+The per-file line that appears as each track finishes reports the **staging** location, and is
+labelled accordingly so it cannot be mistaken for the final destination:
+
+```text
+INFO seakarr::download: Download staged: 08 Moondance.flac -> /downloads/Aquasky--Shadow Era Pt. 1/08 Moondance.flac
+```
+
+The same destination appears in the end-of-run summary and in the `message` of each success
+notification. Per-file library destinations are available at `DEBUG`:
+
+```text
+DEBUG seakarr::organizer: Organized: /downloads/Aquasky--Shadow Era Pt. 1/08 Moondance.flac -> /media/Music/Paul/Albums/Aquasky/Shadow Era Pt. 1/08 - Moondance.flac
+```
+
+A download that waits in a peer's upload queue reports its position in the same line that
+announces it, and reports how long it waited when it finally starts:
+
+```text
+INFO seakarr::download: Download queued: 08 Moondance.flac from nottucks - position 42
+INFO seakarr::download: Download started: 08 Moondance.flac from nottucks after 21m 40s queued (last position 3)
+```
+
+The queue line is emitted once the peer reports a position — normally within a fraction of a
+second — or at the latest five seconds after the request, or when a queue limit ends the wait.
+A peer that never answers still produces the line, without a position, even when
+`max_queue_time_secs` is shorter than five seconds and the queue limit expires first — unless the
+attempt ends first, in which case its own warning (cancellation, a closed status channel, or a
+peer-reported failure) is what the log shows. A candidate admitted on an advertised free slot that
+starts transferring at once — within one poll window — reads:
+
+```text
+INFO seakarr::download: Download queued: 08 Moondance.flac from nottucks
+INFO seakarr::download: Download started: 08 Moondance.flac from nottucks immediately (free slot)
+```
+
+Positions are deliberately **not** logged as a live counter: a queue 100 deep would produce
+100 lines. Every position change is instead available at `DEBUG`, and in an interactive
+terminal a queue bar shows the current position in place, so a long wait costs one terminal
+line:
+
+```text
+DEBUG seakarr::download: Queue position for 08 Moondance.flac from nottucks: 9
+```
+
+A peer that never reports a position and does not start promptly is reported with the wait it
+actually served (`... after 12s queued`), so `immediately` is never printed for a transfer that
+demonstrably waited.
+
+Queue timeouts and rejections keep reporting the position in their existing warnings.
+
 ### `pid`
 
 | Key | Description | Default |

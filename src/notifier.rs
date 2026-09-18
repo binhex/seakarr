@@ -19,11 +19,16 @@ struct NotificationPayload {
 /// Only `http`/`https` URLs can be delivered; a URL with any other scheme is
 /// skipped by `reqwest` and logged as a warning, and a failed delivery never
 /// fails the run.
+///
+/// `destination` is the album's already-rendered final path, including the
+/// `(kept in staging)` marker when the album deliberately stayed in staging, so
+/// an alert says where the album actually landed.
 pub async fn notify_success(
     urls: &[String],
     artist: &str,
     album: &str,
     track_count: usize,
+    destination: &str,
 ) -> Result<()> {
     if urls.is_empty() {
         return Ok(());
@@ -35,7 +40,9 @@ pub async fn notify_success(
         .unwrap_or_else(|_| Client::new());
     let body = NotificationPayload {
         title: "Seakarr — Download Complete".into(),
-        message: format!("Downloaded \"{artist} — {album}\" ({track_count} tracks)"),
+        message: format!(
+            "Downloaded \"{artist} — {album}\" ({track_count} tracks) to {destination}"
+        ),
         r#type: "success".into(),
     };
 
@@ -77,7 +84,14 @@ mod tests {
             .await;
 
         let urls = vec![format!("{}/notify", mock_server.uri())];
-        let result = notify_success(&urls, "Test Artist", "Test Album", 3).await;
+        let result = notify_success(
+            &urls,
+            "Test Artist",
+            "Test Album",
+            3,
+            "/media/Music/Test Artist/Test Album",
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -85,12 +99,14 @@ mod tests {
     async fn test_notify_posts_the_documented_payload_shape() {
         // The README documents the body as {title, message, type}; a rename or a
         // switch to form encoding would break every configured webhook silently.
+        // The destination the operator asked for rides in `message`, so this also
+        // pins that the album folder reaches the payload.
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/notify"))
             .and(body_json(serde_json::json!({
                 "title": "Seakarr — Download Complete",
-                "message": "Downloaded \"Test Artist — Test Album\" (2 tracks)",
+                "message": "Downloaded \"Test Artist — Test Album\" (2 tracks) to /media/Music/Test Artist/Test Album",
                 "type": "success",
             })))
             .respond_with(ResponseTemplate::new(200))
@@ -103,6 +119,7 @@ mod tests {
             "Test Artist",
             "Test Album",
             2,
+            "/media/Music/Test Artist/Test Album",
         )
         .await
         .unwrap();
@@ -123,6 +140,7 @@ mod tests {
             "Artist",
             "Album",
             1,
+            "/media/Music/Test Artist/Test Album",
         )
         .await;
         assert!(
@@ -154,7 +172,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_empty_urls_is_noop() {
-        let result = notify_success(&[], "Artist", "Album", 1).await;
+        let result = notify_success(
+            &[],
+            "Artist",
+            "Album",
+            1,
+            "/media/Music/Test Artist/Test Album",
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -172,7 +197,14 @@ mod tests {
             format!("{}/webhook1", mock_server.uri()),
             format!("{}/webhook2", mock_server.uri()),
         ];
-        let result = notify_success(&urls, "Artist", "Album", 5).await;
+        let result = notify_success(
+            &urls,
+            "Artist",
+            "Album",
+            5,
+            "/media/Music/Test Artist/Test Album",
+        )
+        .await;
         assert!(result.is_ok());
     }
 }

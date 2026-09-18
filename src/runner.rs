@@ -14,7 +14,7 @@ use crate::discography::{
 };
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
-use crate::report::{AlbumOutcome, RunReport};
+use crate::report::{AlbumOutcome, DownloadDestination, RunReport};
 use crate::{discover, download, filter, notifier, organizer, scanner, search};
 
 /// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
@@ -173,9 +173,15 @@ async fn finish_library_write(
     artist: &str,
     album: Option<&str>,
     track_count: usize,
+    destination: DownloadDestination,
 ) -> Result<AlbumOutcome> {
-    if let Err(e) = std::fs::remove_dir_all(album_staging) {
-        tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
+    // A library write has moved the album out of staging, so the staging copy is
+    // dropped. A staging destination means staging *is* the album's final
+    // location — removing it would delete the album.
+    if matches!(destination, DownloadDestination::Library(_)) {
+        if let Err(e) = std::fs::remove_dir_all(album_staging) {
+            tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
+        }
     }
     mark_album_processed_if_identifiable(db, artist, album, "success")?;
     if let Err(e) = notifier::notify_success(
@@ -183,6 +189,7 @@ async fn finish_library_write(
         artist,
         album.unwrap_or("Unknown"),
         track_count,
+        destination.render().as_str(),
     )
     .await
     {
@@ -192,10 +199,14 @@ async fn finish_library_write(
         );
     }
     tracing::info!(
-        "Completed: {artist} - {} ({track_count} tracks)",
-        album.unwrap_or("(all)")
+        "Completed: {artist} - {} ({track_count} tracks) -> {}",
+        album.unwrap_or("(all)"),
+        destination.render()
     );
-    Ok(AlbumOutcome::Downloaded { track_count })
+    Ok(AlbumOutcome::Downloaded {
+        track_count,
+        destination,
+    })
 }
 
 /// Process a single album: search → filter rank → download → organize → notify.
@@ -662,13 +673,13 @@ async fn process_album_internal(
                 artist,
                 album.unwrap_or("Unknown"),
             ) {
-                Ok(dests) => {
+                Ok(outcome) => {
                     if config.library_upgrade.delete_lesser_quality {
                         match organizer::delete_lesser_quality_files(
                             root,
                             artist,
                             album.unwrap_or("Unknown"),
-                            &dests,
+                            &outcome.written,
                         ) {
                             Ok(count) if count > 0 => {
                                 tracing::info!(
@@ -693,6 +704,7 @@ async fn process_album_internal(
                         artist,
                         album,
                         track_count,
+                        DownloadDestination::Library(outcome.album_dir),
                     )
                     .await;
                 }
@@ -724,7 +736,7 @@ async fn process_album_internal(
                 artist_dir,
                 album.unwrap_or("Unknown"),
             ) {
-                Ok(dests) => {
+                Ok(outcome) => {
                     // `place_into_library` reports only the files it wrote, so an
                     // empty list means every destination already held a file that
                     // parses as audio. The design contract for that state is that
@@ -738,11 +750,11 @@ async fn process_album_internal(
                     // Warn rather than stay silent, because any track whose
                     // incoming copy was not written is only reported per file at
                     // INFO while the staging copy is removed below.
-                    if dests.len() < downloaded.len() {
+                    if outcome.written.len() < downloaded.len() {
                         tracing::warn!(
                             "{artist} - {}: only {} of {} downloaded file(s) were written; the rest were kept because the destination already holds audio for them, from an earlier run or because another track or album of this artist maps onto the same path - check storage.organize_pattern distinguishes the tracks. The staging copy is removed",
                             album.unwrap_or("?"),
-                            dests.len(),
+                            outcome.written.len(),
                             downloaded.len()
                         );
                     }
@@ -754,6 +766,7 @@ async fn process_album_internal(
                         artist,
                         album,
                         track_count,
+                        DownloadDestination::Library(outcome.album_dir),
                     )
                     .await;
                 }
@@ -773,6 +786,10 @@ async fn process_album_internal(
     }
 
     // Organize (if enabled)
+    // Album folder the generic organize step wrote into. `None` means the step
+    // did not run (organisation disabled, or no configured library path), so the
+    // album is staying in staging.
+    let mut library_album_dir: Option<PathBuf> = None;
     let mut organize_ok = true;
     if config.storage.organize && !config.library.paths.is_empty() {
         let lib_root = Path::new(&config.library.paths[0]);
@@ -796,7 +813,11 @@ async fn process_album_internal(
                 title: &title,
                 ext: &ext,
             }) {
-                Ok(_) => {}
+                Ok(outcome) => {
+                    if library_album_dir.is_none() {
+                        library_album_dir = Some(outcome.album_dir);
+                    }
+                }
                 Err(e) => {
                     tracing::error!(
                         "Failed to organize {path:?} for {artist}/{}: {e}",
@@ -810,47 +831,32 @@ async fn process_album_internal(
 
     // Mark processed — only success if organize also succeeded. Albums without
     // an artist are not recorded because ("", album) is not an unambiguous key.
-    if organize_ok {
-        mark_album_processed_if_identifiable(db, artist, album, "success")?;
-        // Remove the staging directory — files have been organized into the
-        // library. Absence of the staging dir signals a completed download.
-        if config.storage.organize && !config.library.paths.is_empty() {
-            if let Err(e) = std::fs::remove_dir_all(&album_staging) {
-                tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
-            }
-        }
-    } else {
-        mark_album_processed_if_identifiable(db, artist, album, "failed")?;
-    }
+    // Staging removal and the completion line now live in
+    // `finish_library_write`, which removes staging only for a library
+    // destination: when organisation did not run, staging *is* the album and
+    // deleting it would destroy the download.
     if !organize_ok {
+        mark_album_processed_if_identifiable(db, artist, album, "failed")?;
         return Ok(AlbumOutcome::Failed {
             reason: "download succeeded but file organization failed".into(),
         });
     }
 
-    // Notify — log failure but don't propagate; the download succeeded
-    // and is already marked success in the DB. Pre-change behaviour:
-    // notify errors were also non-fatal to the album outcome.
+    let destination = match library_album_dir {
+        Some(album_dir) => DownloadDestination::Library(album_dir),
+        None => DownloadDestination::Staging(album_staging.clone()),
+    };
     let track_count = downloaded.len();
-    if let Err(e) = notifier::notify_success(
-        &config.notifications.urls,
+    finish_library_write(
+        config,
+        db,
+        &album_staging,
         artist,
-        album.unwrap_or("Unknown"),
+        album,
         track_count,
+        destination,
     )
     .await
-    {
-        tracing::warn!(
-            "{artist} — {}: notification failed: {e}",
-            album.unwrap_or("(all)")
-        );
-    }
-
-    tracing::info!(
-        "Completed: {artist} — {} ({track_count} tracks)",
-        album.unwrap_or("(all)")
-    );
-    Ok(AlbumOutcome::Downloaded { track_count })
 }
 
 /// Run in automatic mode: scan library, find upgrades, process each album concurrently.
@@ -2071,7 +2077,300 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 1, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_line_names_the_library_album_folder() {
+        // Distinctive artist and album names: `LogCapture` keeps one process-wide
+        // window, so a neighbouring test's completion line can land in this
+        // buffer. Naming this fixture uniquely lets the assertion select its own
+        // line instead of whichever line happens to come first.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![make_file(
+                r"Completion Fixture Artist\Completion Fixture Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+        // Real bytes so the organizer has something to move.
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.storage.organize = true;
+        config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+        config.library.paths = vec![library.path().to_string_lossy().to_string()];
+
+        let capture = crate::test_support::LogCapture::start();
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Completion Fixture Artist",
+            Some("Completion Fixture Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let expected = library
+            .path()
+            .join("Completion Fixture Artist/Completion Fixture Album")
+            .display()
+            .to_string();
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 1,
+                destination: DownloadDestination::Library(PathBuf::from(expected.clone())),
+            }
+        );
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Completed: Completion Fixture Artist"))
+            .unwrap_or_else(|| panic!("no completion line for this fixture, got:\n{logs}"));
+        assert!(
+            line.contains(&expected),
+            "the completion line must name the album folder, got: {line}"
+        );
+        assert!(
+            !line.contains("(kept in staging)"),
+            "a library write must not be reported as staging, got: {line}"
+        );
+        // Key on this fixture's own destination: the organizer unit tests emit the
+        // same bare `Organized:` prefix concurrently under `LogCapture`'s single
+        // process-wide window, so a bare-prefix assertion could pass without the
+        // generic organize path emitting anything at all.
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("Organized:") && line.contains(&expected)),
+            "the organize path must report this album's per-file destination at DEBUG, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_success_notification_names_the_destination() {
+        // `notify_success` is reached only from `finish_library_write`, with
+        // `destination.render()`. Every other runner test leaves
+        // `notifications.urls` empty, so a wrong argument at that one call site
+        // would leave the whole suite green.
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![make_file(
+                r"Notify Fixture Artist\Notify Fixture Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.storage.organize = true;
+        config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+        config.library.paths = vec![library.path().to_string_lossy().to_string()];
+        config.notifications.urls = vec![format!("{}/notify", mock_server.uri())];
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Notify Fixture Artist",
+            Some("Notify Fixture Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "exactly one success notification");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("the payload is JSON");
+        let message = body["message"].as_str().expect("a message string");
+        let expected = library
+            .path()
+            .join("Notify Fixture Artist/Notify Fixture Album")
+            .display()
+            .to_string();
+        assert!(
+            message.ends_with(&expected),
+            "the notification must name the destination, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_line_marks_a_staging_only_album() {
+        // Staging-only state: organisation is off and no library path is
+        // configured, so staging is where the album stays. The completion line
+        // must say so rather than staying silent, which is the defect this
+        // behaviour exists to fix.
+        //
+        // Distinctive artist and album names for the same reason as the library
+        // fixture above: `LogCapture` keeps one process-wide window, so a
+        // neighbouring test's completion line can land in this buffer.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![make_file(
+                r"Staging Fixture Artist\Staging Fixture Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+        // Real bytes so the staged album exists on disk, as it does in a real
+        // staging-only run.
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.storage.organize = false;
+        config.library.paths.clear();
+
+        let capture = crate::test_support::LogCapture::start();
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Staging Fixture Artist",
+            Some("Staging Fixture Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                AlbumOutcome::Downloaded {
+                    destination: DownloadDestination::Staging(_),
+                    ..
+                }
+            ),
+            "an album with no library write must be reported as staging, got {result:?}"
+        );
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Completed: Staging Fixture Artist"))
+            .unwrap_or_else(|| panic!("no completion line for this fixture, got:\n{logs}"));
+        assert!(
+            line.contains("(kept in staging)"),
+            "a staging destination must be marked, got: {line}"
+        );
+        // The album is still in staging - reporting it must not have deleted it.
+        // `staging.path()` is the TempDir root and always exists, so the assertion
+        // must name the album's own staging directory: that is the object a
+        // regressed `remove_dir_all` would delete.
+        assert!(
+            staging
+                .path()
+                .join("Staging Fixture Artist--Staging Fixture Album")
+                .exists(),
+            "a staging destination must not remove the album's staging directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_reports_the_album_folder_as_the_destination() {
+        // The place path passes `Library(outcome.album_dir)` from
+        // `place_into_library`. The organizer unit tests cover `album_dir` itself
+        // and the generic-organize test covers the other wiring, so this closes
+        // the seam between them for placement, where the artist folder is used
+        // verbatim from disk.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 1,
+            files: vec![make_file(
+                r"Place Fixture Artist\Place Fixture Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let mut config = make_test_config();
+        config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Place Fixture Artist",
+            Some("Place Fixture Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Place Fixture Artist",
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            AlbumOutcome::Downloaded {
+                track_count: 1,
+                destination: DownloadDestination::Library(
+                    library
+                        .path()
+                        .join("Place Fixture Artist/Place Fixture Album")
+                ),
+            }
+        );
     }
 
     #[tokio::test]
@@ -2134,7 +2433,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 1, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
         assert!(
             db.is_album_processed("Test Artist", "Test Album").unwrap(),
             "successful reprocess must recreate the success record"
@@ -5005,7 +5310,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 2, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
 
         // Only the primary search fired.
         let queries = client.search_queries.lock().unwrap().clone();
@@ -5085,7 +5396,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 2, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
 
         // Four queries ran: primary, lowercase fallback, album-only
         // fallback, title search.
@@ -5221,7 +5538,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 1, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
 
         // Three searches were attempted: primary, lowercase fallback, then
         // album-only.
@@ -5276,7 +5599,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 1, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
 
         // Two searches were attempted: primary then lowercase fallback — the
         // album-only tier never fired because lowercase found results.
@@ -5357,7 +5686,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 2, .. }
+            ),
+            "the album must complete with its downloaded track count"
+        );
 
         // Assert on the record itself, not on the buffer: another test's record
         // could hold either half of this, while a record naming this artist and
@@ -5467,9 +5802,17 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+        // The upgrade path passes `Library(outcome.album_dir)`. Asserting only the
+        // track count would leave this arm free to report `(kept in staging)` and
+        // skip staging removal for an album that was in fact copied in.
         assert_eq!(
             result.unwrap(),
-            AlbumOutcome::Downloaded { track_count: 2 },
+            AlbumOutcome::Downloaded {
+                track_count: 2,
+                destination: DownloadDestination::Library(
+                    target.path().join("Test Artist/Test Album")
+                ),
+            },
             "album must complete: 2 matching tracks downloaded, peer folder size (5) is irrelevant"
         );
     }
@@ -5586,7 +5929,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, AlbumOutcome::Downloaded { track_count: 1 });
+        assert!(
+            matches!(result, AlbumOutcome::Downloaded { track_count: 1, .. }),
+            "the album must complete with its downloaded track count"
+        );
         assert!(
             library
                 .path()

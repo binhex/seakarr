@@ -67,7 +67,13 @@ async fn test_full_pipeline_manual_mode() {
     .await;
 
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+    assert!(
+        matches!(
+            result.unwrap(),
+            AlbumOutcome::Downloaded { track_count: 2, .. }
+        ),
+        "the album must complete with its downloaded track count"
+    );
 
     // Album should be marked as processed
     assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
@@ -134,7 +140,13 @@ async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
     .await;
 
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), AlbumOutcome::Downloaded { track_count: 2 });
+    assert!(
+        matches!(
+            result.unwrap(),
+            AlbumOutcome::Downloaded { track_count: 2, .. }
+        ),
+        "the album must complete with its downloaded track count"
+    );
 
     // Organised files carry clean, zero-padded names with the leading track
     // token stripped from the title — never "1 - 01 - Track One.flac".

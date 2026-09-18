@@ -273,6 +273,23 @@ fn effective_throughput_kib_s(bytes: u64, elapsed: std::time::Duration) -> f64 {
 /// during a long queue wait.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long the queued notice waits for a queue position before it is emitted
+/// without one.
+///
+/// The vendored client requests position telemetry immediately on enqueue and
+/// the poll window is `STATUS_POLL_INTERVAL`, so a position normally arrives
+/// within a few hundred milliseconds. The grace exists only so a peer that never
+/// answers cannot leave the run silent — the defect this notice fixes.
+const QUEUE_NOTICE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a transfer may take to start before it stops counting as immediate.
+///
+/// Deliberately the poll window rather than `QUEUE_NOTICE_GRACE`: a peer that
+/// holds the transfer for seconds and never reports a position has not started
+/// "immediately", and the grace is far too wide to claim otherwise — it exists
+/// to bound how long the queued line waits, not to define immediacy.
+const IMMEDIATE_START_WINDOW: Duration = STATUS_POLL_INTERVAL;
+
 /// Which queue limit expired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueDeadlineKind {
@@ -343,6 +360,24 @@ async fn stop_with_error(
     error
 }
 
+/// Release a queue bar if one exists, counting the release through the display so
+/// the "every attempt releases its bar" contract stays observable.
+///
+/// Every path that leaves the queue before the transfer starts calls this:
+/// transfer start, position rejection, both fail-closed rejections, queue
+/// deadline expiry, channel close, cancellation, a peer-side failure, and a
+/// completion that never sent `InProgress`.
+///
+/// The two fail-closed rejections are defensive no-ops today: a queue bar exists
+/// only once a positive in-bound position was observed, and that same block stores
+/// the position, so their `observed_queue_position.is_none()` guard implies no bar.
+/// They are kept so a future change that creates a bar earlier cannot leak one.
+fn clear_queue_bar(progress: Option<&ProgressDisplay>, queue_bar: &mut Option<ProgressBar>) {
+    if let (Some(display), Some(bar)) = (progress, queue_bar.take()) {
+        display.clear_queue_bar(bar);
+    }
+}
+
 /// End a queued attempt whose queue deadline expired, naming the limit that
 /// was exceeded. A cancellation that arrived in the meantime wins over the
 /// expiry — Ctrl+C must always surface as a cancellation.
@@ -398,6 +433,51 @@ async fn reject_queued_attempt(
     stop_with_error(handle, bar, error).await
 }
 
+/// Announce that a file has been queued.
+///
+/// Deferred rather than logged at enqueue time: the position is not known until
+/// the peer answers, and one line carrying it is what the operator asked for. A
+/// `None` position means the notice fired on the transfer-start or grace path.
+fn emit_queue_notice(basename: &str, username: &str, position: Option<u32>) {
+    match position {
+        Some(position) => {
+            tracing::info!("Download queued: {basename} from {username} - position {position}");
+        }
+        None => tracing::info!("Download queued: {basename} from {username}"),
+    }
+}
+
+/// Announce that a queued file has started transferring, with the wait it
+/// served. The free-slot form is used when no position was ever reported and the
+/// transfer began inside the immediacy window (`IMMEDIATE_START_WINDOW`), so it
+/// never queued in any meaningful sense — the notice grace is a bound on how long
+/// the queued line waits, not a definition of immediacy.
+fn emit_download_started(
+    basename: &str,
+    username: &str,
+    wait: Duration,
+    last_position: Option<u32>,
+) {
+    if last_position.is_none() && wait <= IMMEDIATE_START_WINDOW {
+        tracing::info!("Download started: {basename} from {username} immediately (free slot)");
+        return;
+    }
+    // Reaching this form means either the wait exceeded the immediacy window, or a
+    // position was observed — in which case the file genuinely queued and a
+    // sub-second wait is still a wait. Reporting it as `0s` would read as "waited
+    // nothing", so floor it at one second: `format_duration` works in whole
+    // seconds.
+    let reported = crate::formatting::format_duration(wait.max(Duration::from_secs(1)));
+    match last_position {
+        Some(position) => tracing::info!(
+            "Download started: {basename} from {username} after {reported} queued (last position {position})"
+        ),
+        None => tracing::info!(
+            "Download started: {basename} from {username} after {reported} queued"
+        ),
+    }
+}
+
 /// Single download attempt for `download_file_for_candidate` (no retry loop).
 /// Queues the transfer and polls status until success, failure, timeout, or
 /// cancel. Returns the destination path plus the transfer duration (first
@@ -428,12 +508,16 @@ async fn download_once(
         Ok(h) => h,
         Err(e) => return Err(e),
     };
-    tracing::info!("Download queued: {basename} from {username}");
     // Queue state. `total_queue_deadline` bounds the whole wait from enqueue;
     // `queue_head_at` records the first position-1 observation, which starts
     // the `max_start_time_secs` clock only at that point. Either is `None`
     // when its limit is zero (disabled).
     let enqueued_at = tokio::time::Instant::now();
+    // The queued notice is deferred until one of three things happens: the peer
+    // reports a position, the transfer starts, or the grace expires.
+    // `notice_emitted` guards all three so the line can never be duplicated.
+    let notice_grace_deadline = enqueued_at + QUEUE_NOTICE_GRACE;
+    let mut notice_emitted = false;
     let total_queue_deadline = enabled_deadline(enqueued_at, config.max_queue_time_secs);
     let mut queue_head_at: Option<tokio::time::Instant> = None;
     let mut observed_queue_position: Option<u32> = None;
@@ -450,6 +534,10 @@ async fn download_once(
     // previously created eagerly in download_album from search metadata,
     // so a 0 B/[total] [0%] bar appeared before the bridge even started).
     let mut bar: Option<ProgressBar> = None;
+    // Queue bar for this attempt. Created on the first position observation and
+    // released on every path out of the queue, so no attempt can leave a bar
+    // behind.
+    let mut queue_bar: Option<ProgressBar> = None;
     // Track the peer's reported total so the bar can be snapped to 100%
     // on completion (the final InProgress may lag the actual end).
     let mut last_total_bytes: u64 = 0;
@@ -463,6 +551,7 @@ async fn download_once(
         // queue and transfer deadline. The caller (download_album) removes
         // the staging dir.
         if cancellation_requested(cancel) {
+            clear_queue_bar(progress, &mut queue_bar);
             return Err(stop_with_error(
                 &mut handle,
                 &bar,
@@ -471,6 +560,16 @@ async fn download_once(
             .await);
         }
         let now = tokio::time::Instant::now();
+        // The notice grace is evaluated here, at the top of the loop, and not
+        // only when the status poll times out. A peer that answers position-0
+        // more often than the poll window (each reply maps to
+        // `Queued { queue_position: None }`) keeps the poll alive, so a check
+        // inside the timeout arm can be starved and the queued line never
+        // emitted — the silence this notice exists to remove.
+        if !notice_emitted && now >= notice_grace_deadline {
+            emit_queue_notice(basename, username, None);
+            notice_emitted = true;
+        }
         // While queued, the earliest of the total queue limit and the
         // queue-head limit bounds the wait. Once the transfer has started,
         // only transfer inactivity matters.
@@ -485,6 +584,22 @@ async fn download_once(
         if transfer_start.is_none() {
             if let Some((deadline, kind)) = active_queue_deadline {
                 if now >= deadline {
+                    // Reachable when a status already in the channel beats the
+                    // poll timer: `timeout` polls the channel before its timer, so
+                    // a message can be handled and the loop top then observe the
+                    // deadline. Without this the expiry swallows the queued line.
+                    // Idempotent through `notice_emitted`, and the arm returns.
+                    //
+                    // Coverage limitation: which arm observes an expiry that lands
+                    // exactly on a status arrival is scheduler-dependent, so this
+                    // arm is not deterministically testable. It is kept as
+                    // defence for the deadline that the poll-timeout arm would
+                    // otherwise swallow, and both lines are deliberately cheap and
+                    // idempotent.
+                    if !notice_emitted {
+                        emit_queue_notice(basename, username, None);
+                    }
+                    clear_queue_bar(progress, &mut queue_bar);
                     return Err(expire_queue_wait(
                         &mut handle,
                         &bar,
@@ -526,9 +641,21 @@ async fn download_once(
                         "{basename} from {username} started with an unknown queue position while max_queue_length={}",
                         config.max_queue_length
                     );
+                    clear_queue_bar(progress, &mut queue_bar);
                     return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
                 }
                 if transfer_start.is_none() {
+                    clear_queue_bar(progress, &mut queue_bar);
+                    if !notice_emitted {
+                        emit_queue_notice(basename, username, None);
+                        notice_emitted = true;
+                    }
+                    emit_download_started(
+                        basename,
+                        username,
+                        now.duration_since(enqueued_at),
+                        observed_queue_position,
+                    );
                     transfer_start = Some(now);
                     // Create the progress bar only once the transfer has
                     // actually started (first InProgress). Skip for
@@ -591,8 +718,34 @@ async fn download_once(
                         "{basename} from {username} completed without a queue position while max_queue_length={}",
                         config.max_queue_length
                     );
+                    clear_queue_bar(progress, &mut queue_bar);
                     return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
                 }
+                // A transfer can reach Completed without ever sending
+                // InProgress. It never entered the transfer-start block, so the
+                // started line is emitted here to keep the "one started line per
+                // downloaded file" contract.
+                //
+                // `notice_emitted` is deliberately not set here: the arm returns
+                // immediately below, so the write would be dead and clippy rejects
+                // it (`unused_assignments`). One queued line is still guaranteed,
+                // because this arm runs at most once per attempt.
+                if transfer_start.is_none() {
+                    if !notice_emitted {
+                        emit_queue_notice(basename, username, None);
+                    }
+                    emit_download_started(
+                        basename,
+                        username,
+                        now.duration_since(enqueued_at),
+                        observed_queue_position,
+                    );
+                }
+                // The same short-circuit applies to the queue bar: the
+                // transfer-start release is never reached, and the bar holds a
+                // steady tick, so leaving it would keep a spinner on the terminal
+                // for the rest of the run.
+                clear_queue_bar(progress, &mut queue_bar);
                 if let Some(bar) = &bar {
                     // Snap to 100% before clearing — the final InProgress
                     // may have left the bar below the total.
@@ -603,7 +756,7 @@ async fn download_once(
                     bar.finish_and_clear();
                 }
                 let dest = dir.join(basename);
-                tracing::info!("Download completed: {basename} -> {}", dest.display());
+                tracing::info!("Download staged: {basename} -> {}", dest.display());
 
                 // Post-download quality verification: when min_bit_rate or
                 // min_bit_depth is set and the peer did not provide the
@@ -627,6 +780,7 @@ async fn download_once(
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 tracing::warn!("Download of {basename} failed: {reason}");
+                clear_queue_bar(progress, &mut queue_bar);
                 if let Some(bar) = &bar {
                     bar.finish_and_clear();
                 }
@@ -642,9 +796,26 @@ async fn download_once(
                             queue_position_rejection(position, config.max_queue_length)
                         {
                             let reason = format!("{basename} from {username} {detail}");
+                            clear_queue_bar(progress, &mut queue_bar);
                             return Err(
                                 reject_queued_attempt(&mut handle, &bar, cancel, reason).await
                             );
+                        }
+                        if !notice_emitted {
+                            emit_queue_notice(basename, username, Some(position));
+                            notice_emitted = true;
+                        } else if observed_queue_position != Some(position) {
+                            tracing::debug!(
+                                "Queue position for {basename} from {username}: {position}"
+                            );
+                        }
+                        if let Some(display) = progress {
+                            let label =
+                                crate::progress::queue_label(basename, username, Some(position));
+                            match &queue_bar {
+                                Some(existing) => display.update_queue_bar(existing, &label),
+                                None => queue_bar = Some(display.create_queue_bar(&label)),
+                            }
                         }
                         observed_queue_position = Some(position);
                         if position == 1 && queue_head_at.is_none() {
@@ -662,6 +833,7 @@ async fn download_once(
                     bar.finish_and_clear();
                 }
                 tracing::warn!("Download channel closed for {basename}");
+                clear_queue_bar(progress, &mut queue_bar);
                 return Err(SeakarrError::Download(
                     "download channel closed unexpectedly".into(),
                 ));
@@ -686,6 +858,20 @@ async fn download_once(
                     }
                 } else if let Some((deadline, kind)) = active_queue_deadline {
                     if now >= deadline {
+                        // A queue limit shorter than the notice grace expires
+                        // first. Emitting the notice here keeps the wait visible
+                        // instead of letting the expiry swallow it, so the queued
+                        // line is never skipped whatever the limits are.
+                        //
+                        // `None` rather than `observed_queue_position`: that field
+                        // is assigned only where the notice is emitted, so a stored
+                        // position implies `notice_emitted` and this call can never
+                        // carry one. A position that did arrive reaches the
+                        // `QueueTimeout` warning instead.
+                        if !notice_emitted {
+                            emit_queue_notice(basename, username, None);
+                        }
+                        clear_queue_bar(progress, &mut queue_bar);
                         return Err(expire_queue_wait(
                             &mut handle,
                             &bar,
@@ -1469,6 +1655,51 @@ mod tests {
         // The mock client emits InProgress immediately, so a bar must have
         // been created once the transfer started.
         assert_eq!(display.created_bars(), 1);
+    }
+
+    #[tokio::test]
+    async fn staging_line_says_staged_not_completed() {
+        // "Download completed: ... -> <staging path>" read as the album's final
+        // location. The line must say where the file was staged.
+        //
+        // A unique filename: `LogCapture` keeps one process-wide window, so under
+        // a parallel suite this assertion must select its own staging line rather
+        // than another test's.
+        let client = MockClient::new();
+        let dir = TempDir::new().unwrap();
+        let file = make_file("staging-label-fixture.flac", 900, 10_000_000);
+        let capture = crate::test_support::LogCapture::start();
+
+        download_file(
+            &client,
+            &file,
+            "peer",
+            dir.path(),
+            &default_dl_config(),
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let logs = capture.text();
+        // Key both checks on this fixture's own staging line. Selecting on the
+        // generic prefix would match a neighbouring test's line, and a crate-wide
+        // negative on "Download completed:" would pass without proving anything,
+        // since that string no longer exists in the crate.
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Download staged: staging-label-fixture.flac"))
+            .unwrap_or_else(|| panic!("no staging line for this fixture, got:\n{logs}"));
+        assert!(
+            line.contains(" -> "),
+            "the staging line must name the staging path, got: {line}"
+        );
+        assert!(
+            !line.contains("completed"),
+            "no line may call a staging path completed, got: {line}"
+        );
     }
 
     // Regression guard: the progress bar must not be created until a
@@ -2816,11 +3047,26 @@ mod tests {
     #[derive(Clone)]
     struct StatusStep {
         after: Duration,
-        status: DownloadStatus,
+        /// `None` ends the script by dropping the sender, so the application
+        /// observes the status channel closing mid-attempt.
+        status: Option<DownloadStatus>,
     }
 
     fn status_step(after: Duration, status: DownloadStatus) -> StatusStep {
-        StatusStep { after, status }
+        StatusStep {
+            after,
+            status: Some(status),
+        }
+    }
+
+    /// A script step that closes the status channel instead of reporting a
+    /// status. The script otherwise holds its sender open for the whole attempt,
+    /// which makes the channel-close path unreachable from a script.
+    fn close_step(after: Duration) -> StatusStep {
+        StatusStep {
+            after,
+            status: None,
+        }
     }
 
     struct ScriptedClient {
@@ -2872,8 +3118,15 @@ mod tests {
                 for step in script {
                     tokio::select! {
                         _ = tokio::time::sleep(step.after) => {
-                            if status_tx.send(step.status).await.is_err() {
-                                return;
+                            match step.status {
+                                Some(status) => {
+                                    if status_tx.send(status).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                // Drop the sender: the application sees the
+                                // channel close rather than another status.
+                                None => return,
                             }
                         }
                         cancelled = cancel_rx.recv() => {
@@ -2929,6 +3182,547 @@ mod tests {
         (dir, result)
     }
 
+    /// Run one scripted attempt whose log lines cannot be confused with another
+    /// test's.
+    ///
+    /// `LogCapture` keeps recording while other tests run, and almost every test
+    /// in this module downloads `Music\Artist\Album\01.flac` from `peer`. A
+    /// count assertion on those strings can therefore be satisfied by a
+    /// concurrent test's identical line, so a capturing test has to key on a
+    /// file and peer name only its own fixture produces.
+    async fn download_with_named_script(
+        client: &ScriptedClient,
+        peer_slots: u8,
+        share_path: &str,
+        username: &str,
+        config: &DownloadConfig,
+    ) -> (TempDir, Result<(PathBuf, f64)>) {
+        let dir = TempDir::new().unwrap();
+        let file = make_file(share_path, 900, 10_000_000);
+        let result = download_file_for_candidate(
+            client,
+            &file,
+            username,
+            peer_slots,
+            dir.path(),
+            config,
+            &default_filter_config_test(),
+            None,
+            None,
+        )
+        .await;
+        (dir, result)
+    }
+
+    /// Run one scripted attempt with a progress display, so queue-bar lifecycle
+    /// can be observed. Mirrors `download_with_script`.
+    async fn download_with_script_and_progress(
+        client: &ScriptedClient,
+        peer_slots: u8,
+        display: &ProgressDisplay,
+        config: &DownloadConfig,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> (TempDir, Result<(PathBuf, f64)>) {
+        let dir = TempDir::new().unwrap();
+        let file = make_file("Music\\Artist\\Album\\01.flac", 900, 10_000_000);
+        let result = download_file_for_candidate(
+            client,
+            &file,
+            "peer",
+            peer_slots,
+            dir.path(),
+            config,
+            &default_filter_config_test(),
+            Some(display),
+            cancel,
+        )
+        .await;
+        (dir, result)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_replaced_by_the_transfer_bar_and_released() {
+        // Two in-bound positions: the second must update the existing bar in place.
+        // Without a second observation the update arm is never exercised, and
+        // creating another bar instead of updating would pass unnoticed.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(7)),
+            status_step(Duration::from_secs(1), queue_position(3)),
+            status_step(Duration::from_secs(60), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let display = ProgressDisplay::new();
+        // A positive cap is what admits a zero-slot candidate to the queue at all.
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        assert_eq!(
+            display.queue_bars_created(),
+            1,
+            "the second position must update the existing bar, not create another"
+        );
+        assert_eq!(
+            display.queue_bars_updated(),
+            1,
+            "the second position must go through the in-place update"
+        );
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "the queue bar must be released when the transfer takes over"
+        );
+        assert_eq!(
+            display.created_bars(),
+            1,
+            "the transfer bar must still be created at transfer start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_a_position_is_rejected() {
+        // An out-of-bound position abandons the attempt. The bar must not be
+        // left on the terminal by a path that never starts transferring.
+        //
+        // The first position is in bound, so a bar exists by the time the
+        // out-of-bound one arrives — a rejection only has something to release
+        // once an accepted position has put a bar on the terminal.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(3)),
+            status_step(Duration::from_secs(1), queue_position(500)),
+        ]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_queue_length = 5;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+        assert!(
+            result.is_err(),
+            "an out-of-bound position must reject the attempt"
+        );
+
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "rejection must release the queue bar"
+        );
+        assert_eq!(
+            display.created_bars(),
+            0,
+            "a rejected attempt must never create a transfer bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_the_queue_deadline_expires() {
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(9),
+        )]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 60;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+        assert!(result.is_err(), "expected a queue timeout, got {result:?}");
+
+        assert_eq!(
+            display.queue_bars_created(),
+            1,
+            "the queue bar must exist before the expiry path can release it"
+        );
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "every queue bar must be released on the timeout path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_an_attempt_completes_without_progress() {
+        // A position is reported and the transfer then completes without ever
+        // sending InProgress. `SoulseekClient` is public API, so a client is free
+        // to do that; the transfer-start release is never reached, and only the
+        // Completed arm can release the bar.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(7)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let display = ProgressDisplay::new();
+        let config = default_dl_config();
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 1, &display, &config, None).await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "a completion that never sent InProgress must still release the bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_the_attempt_is_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_millis(100),
+            queue_position(4),
+        )]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 60;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, Some(&cancel)).await;
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("download cancelled by user"),
+            "expected a cancellation, got {error:?}"
+        );
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "cancellation must release the queue bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_the_channel_closes() {
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(7)),
+            close_step(Duration::from_secs(1)),
+        ]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 1, &display, &config, None).await;
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("channel closed"),
+            "expected a channel-close failure, got {error:?}"
+        );
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "a closed channel must release the queue bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_after_the_grace_reaches_the_started_line() {
+        // The grace expires first, so the queued line carries no position; the
+        // peer's late answer must then reach the started line's last-position
+        // field rather than a second INFO line.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(10), queue_position(3)),
+            status_step(Duration::from_secs(60), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\Artist\\Album\\late-position.flac",
+            "late-position-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: late-position.flac").count(),
+            1,
+            "the grace emits the line once and a late position adds no INFO line, got:\n{logs}"
+        );
+        let queued = logs
+            .lines()
+            .find(|line| line.contains("Download queued: late-position.flac"))
+            .unwrap_or_else(|| panic!("no queued line for this fixture, got:\n{logs}"));
+        assert!(
+            queued.ends_with("Download queued: late-position.flac from late-position-peer"),
+            "the grace form carries no position, got: {queued}"
+        );
+        assert!(
+            logs.contains(
+                "Download started: late-position.flac from late-position-peer after 1m 10s queued (last position 3)"
+            ),
+            "the started line must carry the late position, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_fires_while_a_peer_floods_position_zero() {
+        // A peer that answers position-0 more often than the poll window keeps the
+        // status poll alive: each reply maps to `Queued { queue_position: None }`,
+        // which the position filter drops and which resets the poll timeout. If the
+        // grace were only evaluated in the poll-timeout arm it could be starved for
+        // the whole queue wait, so no queued line would ever be emitted.
+        let mut steps: Vec<StatusStep> = (0..200)
+            .map(|_| {
+                status_step(
+                    Duration::from_millis(100),
+                    DownloadStatus::Queued {
+                        queue_position: None,
+                    },
+                )
+            })
+            .collect();
+        steps.push(status_step(
+            Duration::from_secs(30),
+            in_progress(10_000_000),
+        ));
+        let client = ScriptedClient::new(vec![steps]);
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        // Longer than the 5s notice grace, shorter than the 20s of flooding.
+        config.max_queue_time_secs = 8;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            3,
+            "Music\\Artist\\Album\\flooded.flac",
+            "flooded-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the queue limit must end the wait, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: flooded.flac").count(),
+            1,
+            "the grace must fire during the flood, got:\n{logs}"
+        );
+        let queued = logs
+            .lines()
+            .find(|line| line.contains("Download queued: flooded.flac"))
+            .unwrap_or_else(|| panic!("no queued line for this fixture, got:\n{logs}"));
+        assert!(
+            queued.ends_with("Download queued: flooded.flac from flooded-peer"),
+            "no position was ever reported, so none may be printed, got: {queued}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_bar_is_released_when_a_queued_peer_fails() {
+        // A realistic path: the peer reports a position and then refuses the
+        // upload. Deleting the release in the Failed arm would otherwise leave the
+        // whole suite green.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(4)),
+            status_step(
+                Duration::from_secs(1),
+                DownloadStatus::Failed {
+                    reason: "peer refused".into(),
+                },
+            ),
+        ]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+        assert!(
+            result.is_err(),
+            "a refused upload must fail the attempt, got {result:?}"
+        );
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "a failed queued attempt must release the queue bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_without_progress_still_reports_a_started_line() {
+        // A client may report a position and then complete without ever sending
+        // InProgress. That attempt never enters the transfer-start block, so the
+        // started line must be emitted from the Completed arm: the design promises
+        // one started line per downloaded file.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(7)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let config = default_dl_config();
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\no-progress.flac",
+            "no-progress-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert!(
+            logs.contains(
+                "Download started: no-progress.flac from no-progress-peer after 2s queued (last position 7)"
+            ),
+            "the started line must be emitted for a completion that skipped InProgress, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_wait_without_a_position_is_not_called_immediate() {
+        // The peer never reports a position and holds the transfer for longer than
+        // one poll window. The log must report the wait instead of claiming the
+        // transfer started immediately: an advertised free slot is a stale
+        // snapshot, so "no position reported" does not mean "started at once".
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(2), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let config = default_dl_config();
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\slow-start.flac",
+            "slow-start-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert!(
+            logs.contains("Download started: slow-start.flac from slow-start-peer after 2s queued"),
+            "a 2s wait must be reported as a wait, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("slow-start.flac from slow-start-peer immediately"),
+            "a 2s wait must not be called immediate, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_queue_timeout_still_reports_the_queued_line() {
+        // The notice grace is 5s but the queue limit is 3s, so the limit fires
+        // first while the peer has reported nothing. The queued line must still be
+        // emitted: otherwise a short limit silently hides the wait.
+        let client = ScriptedClient::new(vec![vec![]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 3;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            3,
+            "Music\\Artist\\Album\\short-timeout.flac",
+            "short-timeout-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the queue limit must end the wait, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: short-timeout.flac").count(),
+            1,
+            "the queue limit must not swallow the queued line, got:\n{logs}"
+        );
+        let queued = logs
+            .lines()
+            .find(|line| line.contains("Download queued: short-timeout.flac"))
+            .unwrap_or_else(|| panic!("no queued line for this fixture, got:\n{logs}"));
+        assert!(
+            queued.ends_with("Download queued: short-timeout.flac from short-timeout-peer"),
+            "no position was reported, so none may be printed, got: {queued}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sub_second_wait_is_not_reported_as_zero() {
+        // 900ms is past the immediacy window but under a whole second, so the
+        // seconds-based formatter would otherwise print `after 0s queued`.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_millis(900), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let config = default_dl_config();
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\fast-start.flac",
+            "fast-start-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert!(
+            logs.contains("Download started: fast-start.flac from fast-start-peer after 1s queued"),
+            "a sub-second wait must not be reported as 0s, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("fast-start.flac from fast-start-peer after 0s"),
+            "the wait must never read as zero, got:\n{logs}"
+        );
+    }
+
     fn queue_timeout_reason(result: &Result<(PathBuf, f64)>) -> String {
         match result {
             Err(SeakarrError::QueueTimeout(reason)) => reason.clone(),
@@ -2948,6 +3742,206 @@ mod tests {
         DownloadStatus::Queued {
             queue_position: Some(position),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_line_carries_the_first_observed_position() {
+        // The position is not known when the download is enqueued, so the notice
+        // is deferred to the first observation and the operator gets one line
+        // with the position rather than one line with and one line without.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(42)),
+            status_step(Duration::from_secs(60), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        // A positive cap is what admits a zero-slot candidate: with the shipped
+        // `max_queue_length: 0` the admission gate rejects `peer_slots == 0`
+        // before any queue state exists.
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\Artist\\Album\\queue-notice.flac",
+            "queue-notice-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: queue-notice.flac").count(),
+            1,
+            "exactly one queued line, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(
+                "Download queued: queue-notice.flac from queue-notice-peer - position 42"
+            ),
+            "the queued line must carry the position, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(
+                "Download started: queue-notice.flac from queue-notice-peer after 1m 1s queued (last position 42)"
+            ),
+            "the started line must carry the wait and last position, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn free_slot_attempt_reports_an_immediate_start() {
+        // A candidate admitted on an advertised free slot starts without a queue
+        // position. It must still produce both lines, and the started line must
+        // be distinguishable from a queued wait.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::ZERO, in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let config = default_dl_config();
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\free-slot.flac",
+            "free-slot-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        // A unique share path and peer name: `LogCapture` keeps one process-wide
+        // window, and a sibling test emits the same `immediately (free slot)`
+        // line for the shared `Music\Artist\Album\01.flac` fixture. `ends_with`
+        // also proves nothing follows the peer name, so a position suffix cannot
+        // slip past the assertion.
+        let queued = logs
+            .lines()
+            .find(|line| line.contains("Download queued: free-slot.flac"))
+            .unwrap_or_else(|| panic!("no queued line for this fixture, got:\n{logs}"));
+        assert!(
+            queued.ends_with("Download queued: free-slot.flac from free-slot-peer"),
+            "the queued line must carry no position suffix, got: {queued}"
+        );
+        assert!(
+            logs.contains(
+                "Download started: free-slot.flac from free-slot-peer immediately (free slot)"
+            ),
+            "a free-slot start must say so, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_still_gets_a_queued_line_at_the_grace_deadline() {
+        // The whole point of the report: a peer that never answers must not
+        // leave the run silent while the file waits.
+        //
+        // The silence is 30s: well past the 5s notice grace, and well inside
+        // the 1800s `max_queue_time_secs` that `default_dl_config` sets — the
+        // plan's sketch used 3600s, which the queue timeout ends long before
+        // the scripted transfer starts.
+        //
+        // `peer_slots` is 1 because a zero-slot candidate with the shipped cap
+        // of zero never reaches the queue at all; the free slot is what admits
+        // this peer, and it simply never reports a position.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(30), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let config = default_dl_config();
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\queue-notice.flac",
+            "queue-notice-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: queue-notice.flac from queue-notice-peer")
+                .count(),
+            1,
+            "the queued line must be emitted once, at the grace deadline, got:\n{logs}"
+        );
+        // Scoped to this fixture's own lines: another test's queued line may
+        // legitimately carry a position while this window is open.
+        assert!(
+            !logs
+                .lines()
+                .filter(|line| line.contains("queue-notice.flac"))
+                .any(|line| line.contains(" - position ")),
+            "no position was reported, so none may be printed, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_changes_after_the_notice_are_debug_only() {
+        // A queue hundreds deep must not produce one INFO line per step: the
+        // depth problem is a volume problem, so mid-queue updates are demoted.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(42)),
+            status_step(Duration::from_secs(60), queue_position(9)),
+            status_step(Duration::from_secs(60), queue_position(1)),
+            status_step(Duration::from_secs(60), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        // Same admission gate as the position test above: the cap has to admit
+        // the zero-slot candidate before any of these positions can arrive.
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\Artist\\Album\\queue-notice.flac",
+            "queue-notice-peer",
+            &config,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expected a completed transfer, got {result:?}"
+        );
+
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download queued: queue-notice.flac").count(),
+            1,
+            "only the first observation may reach INFO, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(
+                "Download started: queue-notice.flac from queue-notice-peer after 3m 1s queued (last position 1)"
+            ),
+            "the started line must report the last position seen, got:\n{logs}"
+        );
+        let debug_lines = logs
+            .lines()
+            .filter(|line| line.contains("Queue position for queue-notice.flac"))
+            .count();
+        assert!(
+            debug_lines >= 2,
+            "every position change must be visible at DEBUG, got:\n{logs}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

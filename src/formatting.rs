@@ -46,9 +46,51 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
     }
 }
 
+/// Format an elapsed duration for queue-wait reporting.
+///
+/// | Range     | Format      | Example   |
+/// |-----------|-------------|-----------|
+/// | < 1 min   | `{s}s`      | `45s`     |
+/// | < 1 hour  | `{m}m {s}s` | `21m 40s` |
+/// | >= 1 hour | `{h}h {m}m` | `1h 3m`   |
+pub fn format_duration(elapsed: std::time::Duration) -> String {
+    let total = elapsed.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        // Matches the reported example: a 21m 40s queue wait.
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(Duration::from_secs(1_300)), "21m 40s");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3_600)), "1h 0m");
+        assert_eq!(format_duration(Duration::from_secs(3_780)), "1h 3m");
+    }
 
     #[test]
     fn test_format_bytes_zero() {

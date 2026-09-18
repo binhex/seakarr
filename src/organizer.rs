@@ -288,9 +288,25 @@ pub struct OrganizeInput<'a> {
     pub ext: &'a str,
 }
 
+/// Result of a library write: the album folder targeted and the files written.
+///
+/// `album_dir` is reported to the operator as the album's final destination, so
+/// it must be the album folder a human recognises — never a disc subdirectory,
+/// and never a path recomputed from the organize pattern (which the
+/// sanitisation pass and the verbatim artist component both rewrite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryWriteOutcome {
+    /// The album folder the write targeted, with any disc subdirectory removed.
+    /// Present even when `written` is empty.
+    pub album_dir: PathBuf,
+    /// Destinations actually written. Excludes a file whose destination was
+    /// kept because the library already held a better or parseable copy.
+    pub written: Vec<PathBuf>,
+}
+
 /// Move a file from staging to the library using the naming pattern.
 /// Handles directory creation and duplicate filenames (adds (1), (2) suffix).
-pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
+pub fn organize_file(input: OrganizeInput<'_>) -> Result<LibraryWriteOutcome> {
     let relative = expand_pattern(
         input.pattern,
         input.artist,
@@ -301,6 +317,13 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
         "unknown",
     );
     let mut dest = input.library_root.join(&relative);
+    // The album folder is the destination's parent *before* the disc
+    // subdirectory is inserted below, so a multi-disc album reports the album
+    // folder rather than the disc folder.
+    let album_dir = dest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| input.library_root.to_path_buf());
     if let Some(disc) = disc_subdir(input.src) {
         dest = match dest.parent() {
             Some(parent) => parent.join(disc).join(dest.file_name().unwrap_or_default()),
@@ -345,7 +368,18 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<PathBuf> {
         }
         Err(e) => return Err(e.into()),
     }
-    Ok(final_dest)
+    // The generic organize path is the manual and batch route into the library
+    // and writes one file at a time. Without this the README's promise of
+    // per-file destinations at DEBUG holds only for the copy-based paths.
+    tracing::debug!(
+        "Organized: {} -> {}",
+        input.src.display(),
+        final_dest.display()
+    );
+    Ok(LibraryWriteOutcome {
+        album_dir,
+        written: vec![final_dest],
+    })
 }
 
 // ── Library upgrade: copy, quality-aware deletion, and recovery ──
@@ -401,7 +435,7 @@ pub fn copy_to_library(
     pattern: &str,
     artist: &str,
     album: &str,
-) -> Result<Vec<PathBuf>> {
+) -> Result<LibraryWriteOutcome> {
     copy_into_library(LibraryWrite {
         downloaded,
         library_root,
@@ -445,7 +479,7 @@ pub fn place_into_library(
     pattern: &str,
     artist_dir: &str,
     album: &str,
-) -> Result<Vec<PathBuf>> {
+) -> Result<LibraryWriteOutcome> {
     let mut components = Path::new(artist_dir).components();
     let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
@@ -479,7 +513,7 @@ struct LibraryWrite<'a> {
     existing_file: ExistingFile,
 }
 
-fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
+fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
     let LibraryWrite {
         downloaded,
         library_root,
@@ -489,7 +523,8 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
         artist_component,
         existing_file,
     } = write;
-    let mut dests = Vec::with_capacity(downloaded.len());
+    let mut written = Vec::with_capacity(downloaded.len());
+    let mut album_dir: Option<PathBuf> = None;
     for src in downloaded {
         let stem = src.file_stem().unwrap_or_default().to_string_lossy();
         let ext = src.extension().unwrap_or_default().to_string_lossy();
@@ -503,6 +538,12 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
             }
         };
         let mut dest = library_root.join(&relative);
+        // Recorded before the disc subdirectory is inserted below, and before
+        // the keep/ replace decision, so the album folder is known even when
+        // every destination is kept.
+        if album_dir.is_none() {
+            album_dir = dest.parent().map(Path::to_path_buf);
+        }
         // Preserve the per-disc structure for multi-disc albums: when a
         // source file lives in a disc subdirectory under staging (a dedicated
         // "CD 01" folder or an embedded-marker "Gold (Disc 1)" folder),
@@ -563,9 +604,15 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<Vec<PathBuf>> {
             }
         }
         fs::copy(src, &dest)?;
-        dests.push(dest);
+        tracing::debug!("Organized: {} -> {}", src.display(), dest.display());
+        written.push(dest);
     }
-    Ok(dests)
+    Ok(LibraryWriteOutcome {
+        // `downloaded` is never empty for a completed album, so the fallback is
+        // defensive only.
+        album_dir: album_dir.unwrap_or_else(|| library_root.to_path_buf()),
+        written,
+    })
 }
 
 /// True when lofty can open and parse the file, i.e. the library already holds
@@ -1025,7 +1072,9 @@ mod tests {
             title: "Song",
             ext: "flac",
         })
-        .unwrap();
+        .unwrap()
+        .written[0]
+            .clone();
 
         assert_eq!(
             destination,
@@ -1059,7 +1108,8 @@ mod tests {
             "100% Hits..",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(dests.len(), 1);
         assert_eq!(
@@ -1103,7 +1153,8 @@ mod tests {
             "Test Artist",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert!(
             dests.is_empty(),
@@ -1141,7 +1192,8 @@ mod tests {
             "Test Artist",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(dests.len(), 1, "an unparseable file is replaced");
         assert_eq!(fs::read(&existing).unwrap(), src_bytes);
@@ -1167,7 +1219,8 @@ mod tests {
             "%album%",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(
             dests[0],
@@ -1364,7 +1417,8 @@ mod tests {
             "A Guy Called Gerald",
             "Tronic Jazz: The Berlin Sessions",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(dests.len(), 1);
         assert_eq!(
@@ -1394,7 +1448,9 @@ mod tests {
             title: "Pink: The Song?",
             ext: "flac",
         })
-        .unwrap();
+        .unwrap()
+        .written[0]
+            .clone();
 
         assert_eq!(
             destination,
@@ -1423,7 +1479,8 @@ mod tests {
             "Test Artist",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(dests.len(), 1);
         assert_eq!(
@@ -1605,6 +1662,80 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_library_reports_the_album_folder_not_the_disc_folder() {
+        // The completion log names the album folder. For a multi-disc album the
+        // destination of the first written file is the *disc* folder, so a
+        // caller deriving the album folder from `written[0].parent()` would
+        // report ".../Test Album/CD 01" instead of ".../Test Album".
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let cd1_dir = staging.path().join("CD 01");
+        let cd2_dir = staging.path().join("CD 02");
+        fs::create_dir_all(&cd1_dir).unwrap();
+        fs::create_dir_all(&cd2_dir).unwrap();
+        let cd1_t1 = cd1_dir.join("01 - Track.flac");
+        let cd2_t1 = cd2_dir.join("01 - Track.flac");
+        fs::write(&cd1_t1, b"cd1 track1").unwrap();
+        fs::write(&cd2_t1, b"cd2 track1").unwrap();
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        let outcome = copy_to_library(
+            &[cd1_t1, cd2_t1],
+            library.path(),
+            pattern,
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.album_dir,
+            library.path().join("Test Artist/Test Album"),
+            "the album folder must exclude the disc subdirectory"
+        );
+        assert_eq!(outcome.written.len(), 2);
+    }
+
+    #[test]
+    fn place_into_library_reports_the_album_folder_when_nothing_is_written() {
+        // `written` is empty when every destination already holds audio (a
+        // deliberate keep policy), yet the album is still placed. The album
+        // folder must therefore be derivable without inspecting `written`.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let staged = staging.path().join("01 - Track.flac");
+        write_minimal_flac(&staged);
+
+        // Pre-seed the destination with a file that parses as audio, so the
+        // placement keeps it instead of copying.
+        let existing_dir = library.path().join("On Disk Artist/Test Album");
+        fs::create_dir_all(&existing_dir).unwrap();
+        write_minimal_flac(&existing_dir.join("01 - Track.flac"));
+
+        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
+        let outcome = place_into_library(
+            &[staged],
+            library.path(),
+            pattern,
+            "On Disk Artist",
+            "Test Album",
+        )
+        .unwrap();
+
+        assert!(
+            outcome.written.is_empty(),
+            "the readable destination must be kept, not overwritten"
+        );
+        assert_eq!(
+            outcome.album_dir,
+            library.path().join("On Disk Artist/Test Album"),
+            "the album folder must be reported even when nothing was written"
+        );
+    }
+
+    #[test]
     fn test_copy_to_library_preserves_embedded_marker_disc_subdirectories() {
         // Regression (release-review Finding 2, library side): staging files
         // under an embedded-marker disc folder ("Gold (Disc 1)") must keep
@@ -1669,7 +1800,8 @@ mod tests {
             "Test Artist",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert!(
             dests.is_empty(),
@@ -1706,7 +1838,8 @@ mod tests {
             "Test Artist",
             "Test Album",
         )
-        .unwrap();
+        .unwrap()
+        .written;
 
         assert_eq!(dests.len(), 1);
         assert_eq!(

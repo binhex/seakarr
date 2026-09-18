@@ -1,10 +1,39 @@
 // src/report.rs
 
+use std::path::PathBuf;
+
+/// Where a completed album ended up.
+///
+/// The two variants are deliberately distinct rather than a path plus a boolean:
+/// the completion log, the run summary, and the notification all phrase the
+/// destination differently, and a staging path that read as a library location is
+/// the confusion this type exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadDestination {
+    /// Written into the library at this album folder.
+    Library(PathBuf),
+    /// Deliberately left in staging; this is the album's final location.
+    Staging(PathBuf),
+}
+
+impl DownloadDestination {
+    /// The path to report, with the staging form marked so it cannot be read as
+    /// a library location.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Library(path) => path.display().to_string(),
+            Self::Staging(path) => format!("{} (kept in staging)", path.display()),
+        }
+    }
+}
+
 /// Outcome of processing a single album.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlbumOutcome {
     Downloaded {
         track_count: usize,
+        destination: DownloadDestination,
     },
     Skipped,
     Failed {
@@ -22,12 +51,21 @@ pub enum AlbumOutcome {
     },
 }
 
+/// One successfully downloaded album and where it landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadedAlbum {
+    artist: String,
+    album: String,
+    track_count: usize,
+    destination: DownloadDestination,
+}
+
 /// Collects album outcomes during a run and prints a summary.
 #[derive(Debug, Default)]
 pub struct RunReport {
-    downloaded: Vec<(String, String, usize)>, // (artist, album, track_count)
-    skipped: Vec<(String, String)>,           // (artist, album)
-    failed: Vec<(String, String, String)>,    // (artist, album, reason)
+    downloaded: Vec<DownloadedAlbum>,      // completion order
+    skipped: Vec<(String, String)>,        // (artist, album)
+    failed: Vec<(String, String, String)>, // (artist, album, reason)
     notices: Vec<String>,
 }
 
@@ -39,9 +77,16 @@ impl RunReport {
     /// Record an album outcome.
     pub fn record(&mut self, artist: &str, album: &str, outcome: AlbumOutcome) {
         match outcome {
-            AlbumOutcome::Downloaded { track_count } => {
-                self.downloaded
-                    .push((artist.to_string(), album.to_string(), track_count));
+            AlbumOutcome::Downloaded {
+                track_count,
+                destination,
+            } => {
+                self.downloaded.push(DownloadedAlbum {
+                    artist: artist.to_string(),
+                    album: album.to_string(),
+                    track_count,
+                    destination,
+                });
             }
             AlbumOutcome::Skipped => {
                 self.skipped.push((artist.to_string(), album.to_string()));
@@ -81,11 +126,15 @@ impl RunReport {
         }
         if !self.downloaded.is_empty() {
             lines.push(format!("Downloaded ({}):", self.downloaded.len()));
-            lines.extend(
-                self.downloaded
-                    .iter()
-                    .map(|(artist, album, count)| format!("  {artist} — {album} ({count} tracks)")),
-            );
+            lines.extend(self.downloaded.iter().map(|entry| {
+                format!(
+                    "  {} — {} ({} tracks) -> {}",
+                    entry.artist,
+                    entry.album,
+                    entry.track_count,
+                    entry.destination.render()
+                )
+            }));
         }
         if !self.skipped.is_empty() {
             lines.push(format!("Skipped ({}):", self.skipped.len()));
@@ -146,11 +195,66 @@ mod tests {
         report.record(
             "Artist A",
             "Album 1",
-            AlbumOutcome::Downloaded { track_count: 10 },
+            AlbumOutcome::Downloaded {
+                track_count: 10,
+                destination: DownloadDestination::Staging(PathBuf::from("/downloads/album")),
+            },
         );
         assert_eq!(report.downloaded_count(), 1);
         assert_eq!(report.skipped_count(), 0);
         assert_eq!(report.failed_count(), 0);
+    }
+
+    #[test]
+    fn summary_renders_the_library_destination() {
+        let mut report = RunReport::new();
+        report.record(
+            "Aquasky",
+            "Shadow Era Pt. 1",
+            AlbumOutcome::Downloaded {
+                track_count: 8,
+                destination: DownloadDestination::Library(PathBuf::from(
+                    "/media/Music/Paul/Albums/Aquasky/Shadow Era Pt. 1",
+                )),
+            },
+        );
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "=== Run summary ===".to_string(),
+                "Downloaded (1):".to_string(),
+                "  Aquasky — Shadow Era Pt. 1 (8 tracks) -> \
+                 /media/Music/Paul/Albums/Aquasky/Shadow Era Pt. 1"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_marks_a_staging_destination_as_kept_in_staging() {
+        // A staging path is a real final destination, but it must not read as a
+        // library location — that confusion is the defect this work fixes.
+        let mut report = RunReport::new();
+        report.record(
+            "Aquasky",
+            "Shadow Era Pt. 2",
+            AlbumOutcome::Downloaded {
+                track_count: 6,
+                destination: DownloadDestination::Staging(PathBuf::from(
+                    "/downloads/Aquasky--Shadow Era Pt. 2",
+                )),
+            },
+        );
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "=== Run summary ===".to_string(),
+                "Downloaded (1):".to_string(),
+                "  Aquasky — Shadow Era Pt. 2 (6 tracks) -> \
+                 /downloads/Aquasky--Shadow Era Pt. 2 (kept in staging)"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -202,7 +306,14 @@ mod tests {
     #[test]
     fn test_mixed_outcomes() {
         let mut report = RunReport::new();
-        report.record("A", "1", AlbumOutcome::Downloaded { track_count: 5 });
+        report.record(
+            "A",
+            "1",
+            AlbumOutcome::Downloaded {
+                track_count: 5,
+                destination: DownloadDestination::Staging(PathBuf::from("/downloads/album")),
+            },
+        );
         report.record("B", "2", AlbumOutcome::Skipped);
         report.record(
             "C",
@@ -211,7 +322,14 @@ mod tests {
                 reason: "timeout".into(),
             },
         );
-        report.record("D", "4", AlbumOutcome::Downloaded { track_count: 8 });
+        report.record(
+            "D",
+            "4",
+            AlbumOutcome::Downloaded {
+                track_count: 8,
+                destination: DownloadDestination::Staging(PathBuf::from("/downloads/album")),
+            },
+        );
         assert_eq!(report.downloaded_count(), 2);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.failed_count(), 1);
@@ -245,13 +363,19 @@ mod tests {
     #[test]
     fn test_ordering_preserved() {
         let mut report = RunReport::new();
-        report.record("Z", "first", AlbumOutcome::Downloaded { track_count: 1 });
+        report.record(
+            "Z",
+            "first",
+            AlbumOutcome::Downloaded {
+                track_count: 1,
+                destination: DownloadDestination::Staging(PathBuf::from("/downloads/album")),
+            },
+        );
         report.record("A", "second", AlbumOutcome::Skipped);
         // Entries should be in the order they were recorded.
-        assert_eq!(
-            report.downloaded[0],
-            ("Z".to_string(), "first".to_string(), 1)
-        );
+        assert_eq!(report.downloaded[0].artist, "Z");
+        assert_eq!(report.downloaded[0].album, "first");
+        assert_eq!(report.downloaded[0].track_count, 1);
         assert_eq!(report.skipped[0], ("A".to_string(), "second".to_string()));
     }
 }
