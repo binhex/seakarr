@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 # Not published to crates.io — verified against the registry API and the sparse
 # index, neither of which has this crate. Declared here so `cargo publish`
