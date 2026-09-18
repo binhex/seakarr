@@ -378,7 +378,11 @@ argument.
    each album's artist folder, album folder, and library location positionally,
    peeling one disc folder.
 2. `build_index` records, per artist, the query spellings, the normalised album
-   titles, and the destination pairs with their album counts.
+   titles (tag-derived titles and the album folder names each album was found
+   under), the artist folder names its albums live in, and the destination pairs
+   with their album counts. It also records, per artist folder name, which album
+   presence keys that folder holds, which is what scopes the artist-folder
+   follow in `contains_album`.
 3. `select_artists` applies exclusions and the optional filter, orders the
    result, and attaches each selected artist's destination.
 4. For each artist, while the budget is not exhausted:
@@ -489,8 +493,37 @@ argument.
   runs report as already present rather than completing it.
 - **No quality deletion on the placement path.** `delete_lesser_quality`
   remains an upgrade-only action.
-- **Presence semantics are untouched.** A partially placed album counts as
-  present, so it is never completed by a later run.
+- **Presence semantics were untouched by this design.** A partially placed album
+  counts as present, so it is never completed by a later run. (Widened later; see
+  the note below.)
+- **Superseded on 2026-09-18: the presence key now covers both spellings.**
+  Presence used to match the album on its embedded tag only, and the artist on
+  the tag only, so a folder this design placed under the MusicBrainz title was
+  invisible whenever the peer's tag spelled the title differently: the next run
+  downloaded the album again, kept every file at the destination placement
+  recomputed, and removed the staging copy. The key now accepts the on-disk
+  album folder name as well as the tag, and the on-disk artist folder name as
+  well as the tag spelling, so the re-download loops recorded here as accepted
+  consequences no longer occur. `contains_album` gained an index-level artist
+  folder alias, and the scanner records every album folder a merged album was
+  found in, so the alias does not depend on walk order; everything else in this
+  design, including the keep-when-valid
+  placement rule and the "all destinations kept still counts as placed"
+  contract, is unchanged. Note that the non-convergence argument above assumes
+  the album folder is absent in that state; a kept destination can only exist
+  inside an album folder that is present, and with the widened key presence now
+  sees it.
+- **The widened key does not cover a pattern that omits `%album%`.** A pattern
+  like `%artist%/%track% - %title%.%ext%` writes every album straight into the
+  artist folder, where the scanner's depth rule finds no album component, so
+  nothing records an album folder name: an artist whose albums are all written
+  flat has no index entry and disappears from the work list, while an artist
+  that also has albums in folders keeps its entry, with its flat albums
+  searched and kept again on every run whatever their tags say. `--artist`
+  narrowing and the artist work list also still key on the tag spelling:
+  `has_artist` and `artist_keys` deliberately do not consult the folder alias,
+  so an artist whose on-disk folder is spelled differently from its tags cannot
+  be named with `--artist` even though presence would find its albums.
 - **A marker-shaped subfolder under an album folder reads as the artist folder.**
   For `<root>/Artist/Gold/Gold (Disc 1)/track.flac` the album component is the
   marker folder, so the artist folder resolves to `Gold` and the destination

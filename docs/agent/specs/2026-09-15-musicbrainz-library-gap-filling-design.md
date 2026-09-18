@@ -110,6 +110,16 @@ This is deliberately simple and predictable. It also means:
 - a deluxe-only or remaster-only copy of an album does not satisfy the plain
   album, so the plain edition may be downloaded even though an edition exists.
 
+> **Superseded on 2026-09-18.** Presence now matches an album on its embedded
+> album tag **or** on any album folder the scan found it in, and the artist on
+> its tag spelling **or** on the artist folders its albums live in (see
+> `2026-09-15-discover-library-placement-design.md`). The consequences above
+> narrow accordingly: `Discovery (Deluxe)` still reads as missing while neither
+> its tag nor its folder names the plain title, but a folder named `Discovery`
+> holding edition-tagged files now counts as present, and a differently spelled
+> album or artist tag no longer makes an album look missing. The table below and
+> the "No edition tolerance" limit describe the pre-2026-09-18 reading.
+
 Both are accepted consequences of this design, and both are listed under
 Deliberate limits.
 
@@ -463,6 +473,8 @@ Per-album outcome sections and per-album downloads are unchanged.
   discover cannot run as concurrent schedules on one installation.
 - **No edition tolerance.** A deluxe-only or remaster-only copy reads as
   missing, and the plain edition may be fetched. Revisitable if it proves noisy.
+  Narrowed by the superseded note above: tolerance is still zero unless a folder
+  names the plain title.
 - **No completeness threshold.** A 2-of-12 album counts as present.
 - **No automatic MBID discovery.** `discography.artist_mbids` is the fix for an
   artist MusicBrainz cannot resolve automatically.
@@ -491,6 +503,11 @@ Per-album outcome sections and per-album downloads are unchanged.
   album downloaded into a folder whose tag says something else is therefore
   reported as missing on later runs, but its success record makes the album a
   no-op `Skipped` that consumes no budget, so it is not re-downloaded.
+  **Superseded on 2026-09-18.** Presence now accepts the album folder name the
+  scan found the album in as well as its tag, and the artist folder spelling as
+  well as its tag, so a tag/folder name mismatch is no longer reported as
+  missing at all. Only the processed-record half of this note still applies (see
+  `2026-09-15-discover-library-placement-design.md`).
 - **No quality judgement.** Discover never replaces a lossy or low-bitrate
   album it considers present.
 - **No second provider.** Discogs and others remain future work.

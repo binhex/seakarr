@@ -11,8 +11,23 @@ use crate::error::{Result, SeakarrError};
 #[derive(Debug, Clone)]
 pub struct ScannedAlbum {
     pub path: PathBuf,
+    /// Artist name as the album is keyed: the embedded tag when one is present,
+    /// otherwise the on-disk artist folder name.
     pub artist: String,
+    /// Album title as the album is keyed: the embedded tag when one is
+    /// present, otherwise the on-disk folder name.
     pub album: String,
+    /// On-disk names of every album folder this album was found in. Kept for
+    /// the library-presence key: the write path names a placed folder from the
+    /// MusicBrainz title, while the audio inside carries whatever the peer
+    /// tagged it with, so a presence check that saw only `album` would treat
+    /// the album seakarr had just placed as missing and download it again.
+    ///
+    /// A set, not one name: the same tagged album can sit in several folders,
+    /// and presence must accept whichever of them a target title matches. A
+    /// single value would be whichever file the unsorted walk happened to see
+    /// first, which the walk-order-independence contract excludes.
+    pub album_dirs: std::collections::BTreeSet<String>,
     /// On-disk name of the artist folder this album was found in. Path-derived
     /// (unlike `artist`, which prefers the embedded tag), so a caller that
     /// writes back into the library reuses the folder that already exists
@@ -139,7 +154,7 @@ pub fn scan_library(
             // folder before the portable-name sanitiser existed. The current
             // sanitiser is a second cause of the same divergence; the
             // `library_upgrade` section of the README documents the consequence.
-            let album = components[album_index].to_string();
+            let album_dir = components[album_index].to_string();
 
             // Read audio tags if available
             let (tag_artist, tag_album, bitrate) = read_audio_tags(path);
@@ -156,7 +171,7 @@ pub fn scan_library(
 
             // Prefer tag metadata over directory name
             let final_artist = tag_artist.unwrap_or_else(|| artist_dir.clone());
-            let final_album = tag_album.unwrap_or(album);
+            let final_album = tag_album.unwrap_or_else(|| album_dir.clone());
 
             let key = (final_artist.clone(), final_album.clone());
             // The album's real location inside the library: the directory ABOVE
@@ -196,6 +211,10 @@ pub fn scan_library(
                         a.path = album_location.clone();
                         a.artist_dir = artist_dir.clone();
                     }
+                    // Every folder holding this album is recorded, not just the
+                    // recorded location's: presence accepts any of them, and a
+                    // set does not depend on the order the walk visited them.
+                    a.album_dirs.insert(album_dir.clone());
                     a.track_count += 1;
                     if file_needs_upgrade {
                         a.needs_upgrade += 1;
@@ -212,6 +231,7 @@ pub fn scan_library(
                     path: album_location,
                     artist: final_artist,
                     album: final_album,
+                    album_dirs: std::collections::BTreeSet::from([album_dir.clone()]),
                     artist_dir: artist_dir.clone(),
                     track_count: 1,
                     needs_upgrade: usize::from(file_needs_upgrade),
@@ -354,6 +374,7 @@ mod tests {
                 path: PathBuf::new(),
                 artist: "Artist1".into(),
                 album: "Album1".into(),
+                album_dirs: ["Album1".to_string()].into_iter().collect(),
                 artist_dir: "Artist1".into(),
                 track_count: 3,
                 needs_upgrade: 3,
@@ -365,6 +386,7 @@ mod tests {
                 path: PathBuf::new(),
                 artist: "Artist2".into(),
                 album: "Album2".into(),
+                album_dirs: ["Album2".to_string()].into_iter().collect(),
                 artist_dir: "Artist2".into(),
                 track_count: 5,
                 needs_upgrade: 0,
@@ -493,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn test_a_merged_album_records_every_folder_holding_it() {
+        // The same tagged album in two differently named folders is one album
+        // with one recorded location, but presence has to accept either folder
+        // name: a single recorded name would be whichever the unsorted walk saw
+        // first, so a target titled after the other folder would look missing and
+        // the album would be downloaded again.
+        let dir = TempDir::new().unwrap();
+        for folder in ["Second Folder", "First Folder"] {
+            let album_dir = dir.path().join("Artist").join(folder);
+            fs::create_dir_all(&album_dir).unwrap();
+            write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        }
+
+        let albums = scan_library(&library_paths(dir.path()), &FilterConfig::default()).unwrap();
+
+        assert_eq!(albums.len(), 1, "the tagged copies are one album");
+        assert_eq!(albums[0].track_count, 2);
+        assert_eq!(
+            albums[0].album_dirs.iter().cloned().collect::<Vec<_>>(),
+            ["First Folder", "Second Folder"],
+            "both folder names are recorded, independent of walk order"
+        );
+    }
+
+    #[test]
     fn test_the_first_listed_root_wins_over_a_lower_sorting_one() {
         // `library.paths` order is the primary rule, so a backup directory listed
         // second must not take over just because its path sorts first.
@@ -552,6 +599,7 @@ mod tests {
             path: PathBuf::new(),
             artist: "Artist".into(),
             album: "Album".into(),
+            album_dirs: ["Album".to_string()].into_iter().collect(),
             artist_dir: "Artist".into(),
             track_count: 2,
             needs_upgrade: 2,
@@ -677,6 +725,11 @@ mod tests {
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
         assert_eq!(albums[0].artist_dir, "Artist");
+        assert_eq!(
+            albums[0].album_dirs.iter().collect::<Vec<_>>(),
+            ["Album"],
+            "the album folder, never the stepped-over disc folder, is the presence key"
+        );
         assert_eq!(albums[0].path, dir.path().join("Genre"));
     }
 

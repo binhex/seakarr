@@ -16,8 +16,18 @@ use crate::scanner::ScannedAlbum;
 struct IndexedArtist {
     /// Original spelling to number of albums seen under it.
     spellings: BTreeMap<String, usize>,
-    /// Normalised album titles.
+    /// Normalised album titles, from the embedded tag when one is present.
     albums: BTreeSet<String>,
+    /// Normalised **on-disk album folder names**, the tag spelling included. A
+    /// folder this program placed is named from the MusicBrainz title while the
+    /// audio inside carries the peer's own tag, so presence has to accept
+    /// either spelling or it keeps treating its own placement as missing.
+    album_folders: BTreeSet<String>,
+    /// Normalised on-disk artist folder names this artist's albums were found
+    /// under. Presence follows them, scoped to what each folder holds, so an
+    /// album indexed under another artist spelling still counts for this artist
+    /// when it lives in one of these folders.
+    artist_folders: BTreeSet<String>,
     /// Library root and on-disk artist folder to number of albums found there.
     /// A library whose artist sits under one genre root has a single entry; an
     /// artist split across roots has several and the majority wins.
@@ -36,6 +46,17 @@ struct IndexedArtist {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LibraryIndex {
     artists: BTreeMap<String, IndexedArtist>,
+    /// The presence keys recorded **inside** each on-disk artist folder, keyed
+    /// by the folder's own spelling. Scoping the follow by folder is what keeps
+    /// an album that another artist keeps in a different folder from satisfying
+    /// this artist's lookup.
+    folders: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// True when the album is one of the titles this artist entry holds, under
+/// either the embedded tag or a folder the album was found in.
+fn holds_album(entry: &IndexedArtist, album_key: &str) -> bool {
+    entry.albums.contains(album_key) || entry.album_folders.contains(album_key)
 }
 
 impl LibraryIndex {
@@ -58,13 +79,60 @@ impl LibraryIndex {
     /// README), and the search-side `album_identity_key` heuristic is not
     /// applied here. The README documents the consequence: such a release can be
     /// downloaded again and placed beside the folder that already holds it.
+    ///
+    /// Two spellings of each half are accepted, because the two sides of the
+    /// comparison are written by different owners:
+    ///
+    /// - the album matches on its embedded tag **or** on any album folder name
+    ///   it was found under, which the write path takes from the MusicBrainz
+    ///   title;
+    /// - the artist matches on its tag spelling **or**, when neither side of
+    ///   that comparison is found, on the artist folders its albums live in: an
+    ///   album the artist's folders hold counts, whatever artist it is indexed
+    ///   under. Any name may be passed, not only an indexed artist, because an
+    ///   on-disk folder spelling is itself a valid lookup key.
     pub fn contains_album(&self, artist: &str, album: &str) -> bool {
-        self.artists
-            .get(&normalize_catalog_key(artist))
-            .is_some_and(|entry| entry.albums.contains(&normalize_album_key(album)))
+        let artist_key = normalize_catalog_key(artist);
+        let album_key = normalize_album_key(album);
+        if self
+            .artists
+            .get(&artist_key)
+            .is_some_and(|entry| holds_album(entry, &album_key))
+        {
+            return true;
+        }
+        // Follow the artist folders. An album whose files carry another artist
+        // spelling — a third spelling, or none at all, in which case the folder
+        // name becomes the key — is indexed under that spelling while still
+        // living in a folder this artist's albums were found in. Only the albums
+        // recorded **in those folders** count, so an album of another artist
+        // that merely shares a folder name, or that lives in a folder this
+        // artist does not use, cannot satisfy the lookup.
+        //
+        // The queried spelling is itself checked as a folder name, which covers
+        // both a folder-only artist (no entry under that spelling) and an artist
+        // whose albums live in a folder named after the spelling being queried.
+        let in_own_folders = self.artists.get(&artist_key).is_some_and(|entry| {
+            entry
+                .artist_folders
+                .iter()
+                .any(|folder| self.folder_holds(folder, &album_key))
+        });
+        in_own_folders || self.folder_holds(&artist_key, &album_key)
     }
 
-    /// Normalised album titles for one artist key, in order.
+    /// True when the folder recorded this album title inside it.
+    fn folder_holds(&self, folder: &str, album_key: &str) -> bool {
+        self.folders
+            .get(folder)
+            .is_some_and(|albums| albums.contains(album_key))
+    }
+
+    /// Normalised tag-derived album titles for one artist key, in order.
+    ///
+    /// Only the tags are listed: the titles an album is also reachable under
+    /// because of the folder it sits in are presence keys, not catalog titles,
+    /// and presence accepts them through [`Self::contains_album`].
     pub fn albums_for(&self, artist: &str) -> Option<impl Iterator<Item = &str>> {
         self.artists
             .get(&normalize_catalog_key(artist))
@@ -115,13 +183,32 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
             continue;
         }
         let album_key = normalize_album_key(&album.album);
-        let entry = index.artists.entry(artist_key).or_default();
-        *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
-        entry.albums.insert(album_key);
-        *entry
-            .destinations
-            .entry((album.path.clone(), album.artist_dir.clone()))
-            .or_insert(0) += 1;
+        let artist_dir_key = normalize_catalog_key(&album.artist_dir);
+        let album_dir_keys: Vec<String> = album
+            .album_dirs
+            .iter()
+            .map(|dir| normalize_album_key(dir))
+            .collect();
+        {
+            let entry = index.artists.entry(artist_key.clone()).or_default();
+            *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
+            entry.albums.insert(album_key.clone());
+            entry.album_folders.extend(album_dir_keys.iter().cloned());
+            if !artist_dir_key.is_empty() {
+                entry.artist_folders.insert(artist_dir_key.clone());
+            }
+            *entry
+                .destinations
+                .entry((album.path.clone(), album.artist_dir.clone()))
+                .or_insert(0) += 1;
+        }
+        // What this folder holds, so presence can be scoped to it: the tag
+        // spelling and every folder spelling the album is reachable under.
+        if !artist_dir_key.is_empty() {
+            let folder = index.folders.entry(artist_dir_key).or_default();
+            folder.extend(album_dir_keys);
+            folder.insert(album_key);
+        }
     }
     index
 }
@@ -387,19 +474,36 @@ pub fn index_from_paths(paths: &[String], filters: &FilterConfig) -> Result<Libr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FilterConfig;
     use crate::discography::AlbumTarget;
     use crate::error::SeakarrError;
+    use crate::scanner::scan_library;
+    use crate::test_support::write_minimal_flac_with_tags;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn scanned(artist: &str, album: &str) -> ScannedAlbum {
         scanned_at(artist, album, "/library", artist)
     }
 
     fn scanned_at(artist: &str, album: &str, root: &str, artist_dir: &str) -> ScannedAlbum {
+        scanned_in(artist, album, album, root, artist_dir)
+    }
+
+    /// As [`scanned_at`], but with the on-disk album folder named separately
+    /// from the album tag — the seam a discovery placement creates.
+    fn scanned_in(
+        artist: &str,
+        album: &str,
+        album_dir: &str,
+        root: &str,
+        artist_dir: &str,
+    ) -> ScannedAlbum {
         ScannedAlbum {
             path: PathBuf::from(root),
             artist: artist.to_string(),
             album: album.to_string(),
+            album_dirs: [album_dir.to_string()].into_iter().collect(),
             artist_dir: artist_dir.to_string(),
             track_count: 1,
             needs_upgrade: 0,
@@ -503,6 +607,261 @@ mod tests {
         assert!(
             missing.is_empty(),
             "a stored album must not be downloaded again: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn an_album_placed_under_its_musicbrainz_title_counts_as_present_when_its_tag_differs() {
+        // The reported bug. Discover names the folder it writes from the
+        // MusicBrainz title, but the audio inside carries whatever the peer
+        // tagged it with, and the scanner keys an album on that tag. When the
+        // two spellings differ the album seakarr had just placed was invisible
+        // to the presence check, so the next run searched the network and
+        // downloaded the whole album again.
+        //
+        // The pair here differs by a curly (U+2019) versus ASCII apostrophe,
+        // which the sanitiser leaves alone (it removes only `< > : " | ? *` and
+        // control characters), so the two really are different keys; the
+        // It-Is/It's test below pins the same seam with a difference no
+        // normalisation can unify.
+        let library = TempDir::new().unwrap();
+        let album_dir = library
+            .path()
+            .join("Aesop Rock")
+            .join("I Heard It\u{2019}s a Mess There Too");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(
+            &album_dir.join("01 - track.flac"),
+            "Aesop Rock",
+            "I Heard It's A Mess There Too",
+        );
+
+        let scanned = scan_library(
+            &[library.path().to_string_lossy().into_owned()],
+            &FilterConfig::default(),
+        )
+        .unwrap();
+        let index = build_index(&scanned);
+
+        assert!(
+            index.contains_album("Aesop Rock", "I Heard It\u{2019}s a Mess There Too"),
+            "the folder the write path created must satisfy the MusicBrainz title"
+        );
+        let missing = missing_albums(
+            &index,
+            "Aesop Rock",
+            &[target("I Heard It\u{2019}s a Mess There Too")],
+        );
+        assert!(
+            missing.is_empty(),
+            "an album already placed must not be selected again: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_on_disk_album_folder_name_satisfies_the_title_its_tag_misspells() {
+        // The seam a placement creates: the folder takes the MusicBrainz title,
+        // the tag keeps the peer's spelling. A fast pin for the same behaviour
+        // the end-to-end discover run covers, including the boundary that the
+        // folder name must not make punctuation insignificant.
+        let index = build_index(&[scanned_in(
+            "Aesop Rock",
+            "I Heard It's A Mess There Too",
+            "I Heard It\u{2019}s a Mess There Too",
+            "/library",
+            "Aesop Rock",
+        )]);
+
+        assert!(
+            index.contains_album("Aesop Rock", "I Heard It\u{2019}s a Mess There Too"),
+            "the folder name must satisfy the title it was written from"
+        );
+        assert!(
+            index.contains_album("Aesop Rock", "I Heard It's A Mess There Too"),
+            "the tag spelling must keep working"
+        );
+        assert!(
+            !index.contains_album("Aesop Rock", "I Heard Its a Mess There Too"),
+            "a third spelling must stay absent: punctuation remains significant"
+        );
+    }
+
+    #[test]
+    fn a_folder_named_after_the_plain_title_satisfies_it_even_when_its_files_are_tagged_as_an_edition(
+    ) {
+        // Accepted consequence of accepting either spelling. The folder name is
+        // what the write path took from the MusicBrainz title, while the tag
+        // inside can still name the edition the peer served, so the plain album
+        // counts as present once its folder carries the plain name. Pinned so
+        // the trade-off is explicit and cannot change silently.
+        let index = build_index(&[scanned_in(
+            "Artist",
+            "Greatest Hits (Deluxe Edition)",
+            "Greatest Hits",
+            "/library",
+            "Artist",
+        )]);
+
+        assert!(
+            index.contains_album("Artist", "Greatest Hits"),
+            "the folder naming the plain title satisfies it"
+        );
+        assert!(
+            index.contains_album("Artist", "Greatest Hits (Deluxe Edition)"),
+            "the tag spelling keeps working"
+        );
+        assert!(
+            !index.contains_album("Artist", "Greatest Hits (Remastered)"),
+            "an unrelated edition stays absent"
+        );
+    }
+
+    #[test]
+    fn a_folder_and_tag_that_no_normalisation_can_unify_still_resolve_by_folder() {
+        // The reported case in a form Unicode normalisation cannot fold: "It Is"
+        // and "It's" are different strings under NFKC and every other form, so
+        // the folder alias is load-bearing here by construction rather than by
+        // how a curly apostrophe happens to normalise.
+        let index = build_index(&[scanned_in(
+            "Aesop Rock",
+            "I Heard It Is a Mess There Too",
+            "I Heard It's a Mess There Too",
+            "/library",
+            "Aesop Rock",
+        )]);
+
+        assert!(
+            index.contains_album("Aesop Rock", "I Heard It's a Mess There Too"),
+            "the folder name must satisfy the title it was written from"
+        );
+        assert!(
+            !index.contains_album("Aesop Rock", "I Heard It Was a Mess There Too"),
+            "a title no folder or tag carries stays absent"
+        );
+    }
+
+    #[test]
+    fn a_folder_keyed_album_counts_for_the_artist_spelled_in_its_tags() {
+        // The direction discover actually uses. The work item for a tag-keyed
+        // artist carries the tag spelling, while an album whose files are
+        // untagged or carry a third artist spelling is keyed on that spelling
+        // instead. Both albums live in the same artist folder, so presence is
+        // scoped to the folder and neither album is downloaded again.
+        let index = build_index(&[
+            scanned_at("Aesop Rock", "Appetite", "/library", "Blockhead"),
+            scanned_at(
+                "Aesop Rock x Blockhead",
+                "Garbology",
+                "/library",
+                "Blockhead",
+            ),
+        ]);
+
+        assert!(index.contains_album("Aesop Rock", "Appetite"));
+        assert!(
+            index.contains_album("Aesop Rock", "Garbology"),
+            "an album keyed on another artist spelling still counts for the artist whose folder holds it"
+        );
+        assert!(
+            !index.contains_album("Aesop Rock", "Unreleased"),
+            "an album no folder or tag carries stays missing"
+        );
+    }
+
+    #[test]
+    fn an_album_of_another_artist_in_a_different_folder_does_not_count() {
+        // The folder follow is scoped to what the artist's own folders hold. A
+        // second artist sharing a folder name must not leak the albums it keeps
+        // elsewhere, or a genuinely missing album looks present and discover
+        // silently never fetches it.
+        let index = build_index(&[
+            scanned_at("Alpha", "Anthology", "/library", "Shared"),
+            scanned_in("Beta", "Beta Song", "Beta Song", "/library", "Shared"),
+            scanned_in("Beta", "Far Away", "Weird Folder", "/library", "Elsewhere"),
+        ]);
+
+        assert!(index.contains_album("Alpha", "Anthology"));
+        assert!(
+            index.contains_album("Alpha", "Beta Song"),
+            "an album in the folder Alpha's own albums live in counts"
+        );
+        assert!(
+            !index.contains_album("Alpha", "Far Away"),
+            "an album filed in a folder Alpha does not use must not count"
+        );
+    }
+
+    #[test]
+    fn an_album_in_a_folder_named_after_the_queried_spelling_counts() {
+        // The queried spelling is itself a folder name, so it is followed even
+        // when the artist also has an entry under that key. Without it, an
+        // album kept in a folder named after the spelling being queried is
+        // downloaded again.
+        let index = build_index(&[
+            scanned_in("Aesop Rock", "Skelethon", "Skelethon", "/lib", "Blockhead"),
+            scanned_in(
+                "Aesop Rock x Blockhead",
+                "Garbology",
+                "Garbology",
+                "/lib",
+                "Aesop Rock",
+            ),
+        ]);
+
+        assert!(index.contains_album("Aesop Rock", "Skelethon"));
+        assert!(
+            index.contains_album("Aesop Rock", "Garbology"),
+            "the folder named after the queried spelling holds this album"
+        );
+    }
+
+    #[test]
+    fn a_folder_only_spelling_cannot_be_selected_with_a_filter() {
+        // `--artist` narrows the work list, which is keyed on the artist tag
+        // spelling; a name that exists only as an on-disk folder spelling must
+        // still be rejected rather than silently selecting nothing or the wrong
+        // artist.
+        let index = build_index(&[scanned_at(
+            "Aesop Rock",
+            "Appetite",
+            "/library",
+            "Blockhead",
+        )]);
+
+        let error = select_artists(&index, &[], Some("Blockhead"))
+            .expect_err("a folder-only spelling is not an artist the library holds");
+        assert!(
+            error.to_string().contains("Blockhead"),
+            "the error must name the rejected spelling: {error}"
+        );
+        assert_eq!(
+            selected_names(&select_artists(&index, &[], Some("Aesop Rock")).unwrap()),
+            ["Aesop Rock"],
+            "the tag spelling still selects the artist"
+        );
+    }
+
+    #[test]
+    fn an_artist_folder_spelling_finds_albums_indexed_under_a_different_tag_spelling() {
+        // The other documented loop: an artist's albums can be indexed under a
+        // tag spelling while the folder holding them is spelled differently
+        // (with the tag absent, the folder name becomes the artist key). A
+        // lookup for the folder spelling must still find those albums.
+        let index = build_index(&[scanned_at(
+            "Aesop Rock",
+            "Garbology",
+            "/library",
+            "Blockhead",
+        )]);
+
+        assert!(
+            index.contains_album("Blockhead", "Garbology"),
+            "the artist folder spelling must find albums stored in that folder"
+        );
+        assert_eq!(
+            index.artist_keys().collect::<Vec<_>>(),
+            ["aesop rock"],
+            "the folder spelling must not add an artist to the work list"
         );
     }
 

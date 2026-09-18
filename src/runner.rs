@@ -4976,6 +4976,12 @@ mod tests {
         // database is used for the second run, so only the library scan can
         // suppress the search — the processed-album record must not be what
         // makes this pass.
+        //
+        // The placed file is then rewritten with an album tag that differs from
+        // the title placement used for the folder, which is the shape the real
+        // path produces (the peer's tag is copied verbatim into a folder named
+        // from the MusicBrainz title). Presence must survive that, or discover
+        // re-downloads the album it just placed — the reported bug.
         let soulseek = MockClient::new();
         search_index(
             &soulseek,
@@ -4998,15 +5004,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            library
-                .path()
-                .join("Test Artist")
-                .join("Missing")
-                .join("01 - track.flac")
-                .exists(),
-            "the first run must place the album"
-        );
+        let placed = library
+            .path()
+            .join("Test Artist")
+            .join("Missing")
+            .join("01 - track.flac");
+        assert!(placed.exists(), "the first run must place the album");
+        let searches_after_placing = soulseek.search_queries.lock().unwrap().len();
+
+        // Same bytes, peer's own tag spelling inside the MusicBrainz-named folder.
+        write_minimal_flac_with_tags(&placed, "Test Artist", "Missing (Remastered)");
 
         let fresh = Database::open_in_memory().unwrap();
         run_discover_mode_with_provider(
@@ -5022,9 +5029,101 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            soulseek.search_queries.lock().unwrap().as_slice(),
-            ["Test Artist Missing"],
-            "the placed album must count as present, so the second run searches nothing"
+            soulseek.search_queries.lock().unwrap().len(),
+            searches_after_placing,
+            "the placed album must count as present however its tag is spelled, so the second run searches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignore_processed_does_not_bypass_presence_for_a_differently_spelled_tag() {
+        // `--ignore-processed` is documented as unable to re-download an album
+        // the library already holds. It deletes the processed record, so the
+        // library scan is the only gate left: with a differently spelled tag it
+        // has to answer present, or the override re-downloads the album.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Missing", "Missing")],
+        );
+        let (config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let album_dir = library.path().join("Test Artist").join("Missing");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(
+            &album_dir.join("01 - track.flac"),
+            "Test Artist",
+            "Missing (Remastered)",
+        );
+        let mut config = config;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        db.mark_album_processed("Test Artist", "Missing", "success")
+            .unwrap();
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            true,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "the library scan must still suppress an album the library holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_does_not_search_an_album_placed_under_a_third_artist_spelling() {
+        // The library's artist folder is spelled differently from its tags, and
+        // one of its albums carries a third artist spelling in the files. That
+        // album is keyed on the third spelling while the work item for the tag
+        // spelling looks for it, so presence has to follow the artist folder.
+        // Otherwise the album is searched and downloaded again whenever the
+        // processed record is gone.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let first = library.path().join("Blockhead").join("First");
+        let second = library.path().join("Blockhead").join("Second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        write_minimal_flac_with_tags(&first.join("01 - track.flac"), "Aesop Rock", "First");
+        write_minimal_flac_with_tags(
+            &second.join("01 - track.flac"),
+            "Aesop Rock x Blockhead",
+            "Second",
+        );
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider = FakeDiscographyProvider::with_groups(vec![
+            release_group("first", "First", "1999"),
+            release_group("second", "Second", "2005"),
+        ]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "both albums sit in the artist's folder and must not be searched: {:?}",
+            soulseek.search_queries.lock().unwrap()
         );
     }
 
@@ -5314,6 +5413,51 @@ mod tests {
             soulseek.search_queries.lock().unwrap().as_slice(),
             ["Test Artist Newer"],
             "an album already in the library must never be searched"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_does_not_search_an_album_placed_under_a_differently_spelled_tag() {
+        // The reported bug, end to end. The album already sits in the artist's
+        // library folder, which the write path named from the MusicBrainz
+        // title, while the files inside carry the peer's own album tag. The
+        // presence check must still see it: no search is issued, so no
+        // bandwidth is spent on an album the library already holds.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let album_dir = library
+            .path()
+            .join("Test Artist")
+            .join("I Heard It\u{2019}s a Mess There Too");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(
+            &album_dir.join("01 - track.flac"),
+            "Test Artist",
+            "I Heard It's A Mess There Too",
+        );
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider = FakeDiscographyProvider::with_groups(vec![release_group(
+            "mess",
+            "I Heard It\u{2019}s a Mess There Too",
+            "2025",
+        )]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "an album the library already holds must never be searched"
         );
     }
 

@@ -288,12 +288,22 @@ already have.
 | `exclude_artists` | Artist names skipped before any MusicBrainz lookup, matched as whole names ignoring case and spacing, which prevents aggregator folders from expanding into hundreds of releases when `compilation` or `live_album` is enabled. An explicit `--artist` overrides this list for that one artist. | `[Various Artists, VA, Unknown Artist]` |
 
 An album counts as present when a matching `artist/album` folder holds at least
-one audio file. Matching is exact after case, spacing, and Unicode folding, and
+one audio file. Both halves are matched under two spellings, because the two
+sides are written by different owners: the album matches on its embedded album
+tag **or** on any album folder the scan found it in, and the artist matches on
+its tag spelling **or** on the artist folder the albums were found in. That is
+what lets a placed album stay present when a peer's tag spells the title
+differently from the MusicBrainz title the folder was named from. Matching is
+exact after case, spacing, and Unicode folding, and
 after the name sanitiser has run on both sides: the folder seakarr writes has
 been through it, so a title such as `Tronic Jazz: The Berlin Sessions` is stored
 as `Tronic Jazz The Berlin Sessions` and still satisfies the MusicBrainz title it
 came from. Punctuation the sanitiser leaves alone stays significant, so an album
-you hold only as a deluxe or remastered edition does not satisfy the plain album.
+held only under a spelling that differs in both the tag and the folder name — a
+deluxe or remastered edition, for example — does not satisfy the plain album;
+the one exception is a folder that itself carries the plain title, which counts
+even when the files inside are tagged as an edition, because that folder name is
+what the write path took from the MusicBrainz title.
 The sanitised key is lossy, so the reverse can also happen: two release titles
 that differ only by a character it removes share one key, and holding one of them
 makes the other look present, so discover skips it.
@@ -954,12 +964,19 @@ the album as placed, so a later run does not download it again.
 A placement failure (a read-only or otherwise blocked
 destination) keeps the staging copy, records the album as failed, and counts against
 `discover.max_cycle_downloads`. The album is retried when no audio file reached the folder; once any file landed the
-album counts as present when its tags match the folder the placement wrote to, so a mismatch between an embedded album
-tag and the MusicBrainz title can still cause one more download. Presence is also keyed by the artist spelling the scan
-indexed, so a new album whose files are untagged (or tagged with a third spelling) is indexed under a different artist
-key when the library's own artist folder is spelled differently from its tags: later runs then see it as missing and
-re-download it. The processed-album record still suppresses that for the run that placed it, and `--ignore-processed`
-can bring it back. Note that a later auto run with `library_upgrade.enabled` removes every leftover staging
+album counts as present, because the presence check accepts the album folder name the placement wrote as well as the
+embedded album tag, and accepts the artist folder name as well as the tag spelling. A peer whose album tag or artist
+tag is spelled differently from the MusicBrainz title therefore cannot make a later run re-download an album seakarr
+placed itself, and the `--ignore-processed` override cannot reach it either: both sides of the lookup cover both
+spellings. This holds for a pattern that keeps `%album%`; a pattern that omits it writes every album straight into the
+artist folder (see the pattern note above), where no album folder exists for the scan to match. Those albums are
+invisible to the scan instead of merely re-downloaded: an artist whose albums are all written flat has no index entry
+and drops out of the work list altogether, while an artist that also has albums in folders keeps its entry and its flat
+albums are searched and kept again on every run, whatever their tags say. The processed-album record still suppresses
+the album on later runs. Note that
+`--artist` narrowing and the artist work list are unchanged: they still key on the tag spelling, so a name spelled
+differently on disk than in its tags cannot be selected by `--artist`. Note that a later auto run with
+`library_upgrade.enabled` removes every leftover staging
 directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a
 permanent one.
 
