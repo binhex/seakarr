@@ -92,9 +92,26 @@ The artist list comes from the same derivation the library scanner already uses
 for the upgrade pass: the embedded tag artist when readable, otherwise the
 folder name. This keeps one definition of "an artist in my library" across
 modes, tolerates messy folders, and introduces no new inference logic. The
-scanner's known limitation is inherited unchanged: for a nested layout such as
-`<root>/Genre/Artist/Album`, the folder-derived value is the genre, which only
-matters when tags are missing or unreadable.
+folder fallback names the artist folder directly above the album folder, so a
+nested layout such as `<root>/Genre/Artist/Album` resolves the artist as
+`Artist`, not `Genre` (the positional rule the placement design introduced);
+the fallback value only matters when tags are missing or unreadable.
+
+**Amended on 2026-09-18: the derived list is then gated on folder ownership.**
+The tag-first derivation turns every track artist into an artist: albums tagged
+`ARTIST=Apashe` filed inside the `Bassnectar` folder, box sets tagged
+`ARTIST=1962 - 1966`, and collaboration spellings such as
+`afterlife; cathy battistessa` all become "artists in my library" and each one
+triggers a MusicBrainz lookup and a discography gap-fill. On the library this was
+diagnosed against, 509 tag-derived artists resolved to only 49 album artists.
+`select_artists` therefore keeps an artist only when it owns a folder, i.e. one
+of its albums was found in a folder whose name matches the artist key
+(`LibraryIndex::owns_folder`). Gated artists are counted and reported (below)
+and can still be processed by naming them with `--artist`, which overrides the
+gate exactly as it already overrode `exclude_artists`. The accepted cost: an
+artist whose albums live in a differently named folder (Aesop Rock in a
+`Blockhead` folder) or in a folder the write path sanitised (`AC/DC` stored as
+`AC-DC`) is no longer swept automatically.
 
 ### Presence: a matching folder with any audio file
 
@@ -270,7 +287,10 @@ error naming the artist; a typo can never silently do nothing.
 
 The selector can only narrow the library-derived list, never add to it; fetching
 a discography for an artist who is not in the library remains artist-only manual
-mode's job. `search.manual.artist` is not consulted by discover, consistent with
+mode's job. It can, however, reach an artist the automatic sweep skips, because
+naming an artist explicitly overrides the folder-ownership gate (and
+`exclude_artists`). `search.manual.artist` is not consulted by discover,
+consistent with
 mode resolution already ignoring inactive configuration values.
 
 `--album` and `--batch-file` remain incompatible with discover and are rejected
@@ -346,9 +366,15 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
 - `missing_albums(&index, artist, targets: &[AlbumTarget]) -> Vec<AlbumTarget>`
   - the presence decision, order-preserving.
 - `select_artists(&index, excludes: &[String], filter: Option<&str>)` -
-  normalised-order artist list with exclusions and the optional filter applied;
-  returns a configuration error when the filter names an artist the index does
-  not contain.
+  normalised-order artist list with exclusions, the folder-ownership gate and
+  the optional filter applied; returns a configuration error when the filter
+  names an artist the index does not contain. Exclusions are decided before the
+  gate, so an artist that is both excluded and folder-less is reported as
+  excluded; the filter is decided before both, so an explicitly named artist is
+  neither excluded nor gated. Gated spellings are returned in
+  `ArtistSelection::no_folder`.
+- `LibraryIndex::owns_folder(artist_key) -> bool` - the gate: true when one of
+  that artist's albums was found in a folder named after the artist itself.
 - `DownloadBudget` - `new(limit: u32)`, `charge()`, `exhausted()`, with `0`
   meaning unlimited.
 
@@ -387,8 +413,8 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
 
 1. `scan_library(library.paths, filters)` walks the library once.
 2. `build_index` turns the scanned albums into the presence index.
-3. `select_artists` applies exclusions and the optional filter, and orders the
-   result.
+3. `select_artists` applies exclusions, the folder-ownership gate and the
+   optional filter, and orders the result.
 4. For each artist, while the budget is not exhausted:
 
    a. `discover_artist_albums(provider, db, artist, discography_config)`
@@ -410,6 +436,8 @@ Notices emitted by a discover run, in this order when present:
 - `discover: no eligible library artists found; nothing to do`
 - `discover: <N> album(s) already present; skipped`
 - `discover: excluded <N> artist(s) by discover.exclude_artists`
+- `discover: <N> artist(s) skipped: no folder of their own`
+- `discover: <N> artist(s) skipped from cached resolution failures`
 - `discover: <N> artist(s) unresolved on MusicBrainz: <name>, ...` (first ten
   names, then `and N more`)
 - `discover: <N> artist(s) had no albums matching discography.allowed_types`
@@ -464,7 +492,10 @@ Per-album outcome sections and per-album downloads are unchanged.
   processed-album records as every other mode, and reads the same discography
   cache.
 - Existing summaries are unchanged: `NoCandidates` renders in the `Failed`
-  section with its current reason text.
+  section with its current reason text. (Superseded on 2026-09-18: discovery's
+  artist selection gained the folder-ownership gate, so the run summary now also
+  carries `discover: <N> artist(s) skipped: no folder of their own`; see the
+  reporting contract above.)
 - Scheduled mode needs no change: it dispatches the same validated plan.
 
 ## Deliberate limits
@@ -476,6 +507,12 @@ Per-album outcome sections and per-album downloads are unchanged.
   Narrowed by the superseded note above: tolerance is still zero unless a folder
   names the plain title.
 - **No completeness threshold.** A 2-of-12 album counts as present.
+- **Folder ownership gates the sweep (2026-09-18).** An artist is only swept
+  when one of its albums was found in a folder named after the artist itself, so
+  the accepted cost is that an artist whose albums live in a differently named
+  folder, or in a folder the write path sanitised, is skipped unless it is named
+  with `--artist`. Recorded here because it is a deliberate narrowing of what
+  "an artist in my library" means, not an inference bug.
 - **No automatic MBID discovery.** `discography.artist_mbids` is the fix for an
   artist MusicBrainz cannot resolve automatically.
 - **No per-artist cap.** A single prolific artist can consume the whole
@@ -552,6 +589,10 @@ Per-album outcome sections and per-album downloads are unchanged.
 - An unresolved artist produces no broad artist search and no download.
 - A provider error produces a skip, not a legacy fallback.
 - Three consecutive provider errors abort the run.
+- Selection: an artist that owns no folder of its own is gated out of the
+  sweep, the folder's owner is still selected, an artist with one matching
+  folder among several is selected, an excluded artist is reported as excluded
+  rather than gated, and an explicitly named artist bypasses the gate.
 - A successful download emits the usual notification.
 - Artist-only manual skips present albums and reports the aggregate notice.
 - Artist-only manual with every album present issues no search at all.

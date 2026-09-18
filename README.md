@@ -19,8 +19,12 @@ Automated Soulseek music downloader with library quality upgrading.
   `filters.min_bit_rate` is set, so a peer that reports one is preferred; it is still admitted, because its
   real quality is verified after download.
 - **Discover mode** — derives the artist list from your library (tags first,
-  folder names as the fallback), asks MusicBrainz which conceptual albums each
-  artist is missing, and downloads only those. Albums already present are never
+  folder names as the fallback), keeps only the artists that own a folder of
+  their own, asks MusicBrainz which conceptual albums each of those is missing,
+  and downloads only those. An artist the library only knows as a guest inside
+  another artist's folder is skipped, and the run summary reports how many were
+  skipped that way; name one explicitly with `--artist` to process it anyway.
+  Albums already present are never
   searched or re-downloaded, and each run stops after
   `discover.max_cycle_downloads` download attempts so a large library fills in
   over successive runs. Release types come from `discography.allowed_types`.
@@ -29,7 +33,7 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Authoritative artist discography** — artist-only manual runs resolve conceptual albums from MusicBrainz
   release groups (cached locally for 30 days) and then run one sequential `Artist Album` Soulseek search per
   eligible album, oldest first. The same authoritative resolution powers `discover` mode for every artist
-  derived from your library. Release categories and optional MusicBrainz artist IDs are configurable; the
+  it sweeps — those that own a folder named after them. Release categories and optional MusicBrainz artist IDs are configurable; the
   previous folder heuristic remains the explicit opt-out and the visible fallback.
 - **Quality filtering** — filter Soulseek results by file extension, minimum
   bitrate, excluded keywords, and upload availability. With
@@ -169,7 +173,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `auto`, `manual`, `batch`, or `discover`. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library, and that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--schedule` | Run immediately, then repeat the same validated auto, manual, batch, or discover operation after each interval. | `false` |
@@ -281,6 +285,16 @@ is unaffected, and so is a venue-and-date title such as
 
 Controls `discover` mode, which fills gaps in your library for artists you
 already have.
+
+Gap filling follows folders, not tags. An artist is only swept when at least one
+of its albums was found in a folder named after the artist itself, so an album
+tagged `ARTIST=Apashe` that sits inside the `Bassnectar` folder does not make
+Apashe an artist discover fills: it is skipped, counted in the run summary as
+`discover: N artist(s) skipped: no folder of their own`, and named in the debug
+log. Name such an artist with `--artist` to process it anyway. The accepted cost
+is that an artist whose albums live in a folder with a different name — beyond
+case, spacing, or width folding, which the gate tolerates — or in a
+folder the organiser sanitised, is no longer swept automatically.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
@@ -617,13 +631,17 @@ success and failure counts on completion. Lines starting with `#` are treated as
 ### Discover mode
 
 Fills in what an existing library is missing. Seakarr walks `library.paths` once and derives
-the artist list from tags where present, falling back to folder names. Each artist is resolved
+the artist list from tags where present, falling back to folder names, keeping only the artists
+that own a folder named after them. Each swept artist is resolved
 on MusicBrainz using the same authoritative resolution as artist-only manual mode, and the
 release groups in `discography.allowed_types` are the only candidates. Albums already present
 in the library are skipped, and the remainder runs through the same search, ranking,
 download, organisation, and notification pipeline as the other modes, oldest album first.
-`discover.exclude_artists` skips aggregator names before any lookup, `--artist` optionally
-narrows the run to one artist already in the library, and the run stops after
+`discover.exclude_artists` skips aggregator names before any lookup, the
+folder-ownership gate keeps an artist the library knows only as a guest inside
+another artist's folder out of the sweep, `--artist` optionally
+names one artist already in the library to process on its own (overriding both
+the exclusion list and the gate), and the run stops after
 `discover.max_cycle_downloads` download attempts so a large library fills in over successive
 runs.
 
@@ -642,7 +660,9 @@ extra sub-folders outside the album folder.
 An album split across marker-shaped folders (`Gold (Disc 1)/`, `Gold (Disc 2)/` under one album
 folder) reads as two albums and is documented as a limit rather than corrected; the derived artist
 folder is then the marker folder's parent (`Gold/`), which also feeds the discover destination pair
-when those are the artist's only albums. A placed album that keeps a marker folder is therefore
+when those are the artist's only albums. Such an artist owns no folder named after the tag
+spelling, so the folder gate keeps it out of an automatic sweep; `--artist` processes it. A placed
+album that keeps a marker folder is therefore
 indexed under the marker name, not the album title, so a later run with a cleared database or
 `--ignore-processed` can download it again. On the upgrade path the same shape can also nest one
 level too deep, giving `<artist>/Gold (Disc 1)/Gold (Disc 1)/...`, because the disc folder is
@@ -945,8 +965,10 @@ library.
 **Q: How do I fill in missing albums for one artist only?**
 
 Run `--mode discover --artist "Artist Name"`. The name must already exist in
-your library; discover only narrows the list it derives from your library, it
-never adds an artist you do not have. To fetch a specific album instead, use
+your library; discover derives the artist list from your library and never adds
+an artist you do not have. Naming one explicitly also bypasses the
+folder-ownership gate, which is how you reach an artist whose albums sit in a
+folder named after somebody else. To fetch a specific album instead, use
 `--mode manual --artist "Artist Name" --album "Album Title"`.
 
 **Q: Where do discover downloads end up?**
@@ -974,8 +996,10 @@ invisible to the scan instead of merely re-downloaded: an artist whose albums ar
 and drops out of the work list altogether, while an artist that also has albums in folders keeps its entry and its flat
 albums are searched and kept again on every run, whatever their tags say. The processed-album record still suppresses
 the album on later runs. Note that
-`--artist` narrowing and the artist work list are unchanged: they still key on the tag spelling, so a name spelled
-differently on disk than in its tags cannot be selected by `--artist`. Note that a later auto run with
+`--artist` narrowing still keys on the tag spelling, and the artist work list now also requires the
+artist to own a folder of its own, so a name spelled
+differently on disk than in its tags is skipped by the sweep and has to be named with `--artist`.
+Case, spacing and width differences fold, so only a genuinely different spelling is skipped. Note that a later auto run with
 `library_upgrade.enabled` removes every leftover staging
 directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a
 permanent one.

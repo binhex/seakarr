@@ -28,10 +28,17 @@ pub struct ScannedAlbum {
     /// single value would be whichever file the unsorted walk happened to see
     /// first, which the walk-order-independence contract excludes.
     pub album_dirs: std::collections::BTreeSet<String>,
+    /// On-disk names of every artist folder this album was found in. Like
+    /// `album_dirs`, a set rather than the single recorded location: a merged
+    /// album (same tag artist and album in two folders) keeps one `artist_dir`
+    /// as its destination, but every folder that holds it is evidence that its
+    /// artist owns that folder, which is what the discover work list gates on.
+    pub artist_dirs: std::collections::BTreeSet<String>,
     /// On-disk name of the artist folder this album was found in. Path-derived
     /// (unlike `artist`, which prefers the embedded tag), so a caller that
     /// writes back into the library reuses the folder that already exists
-    /// instead of creating a second spelling beside it.
+    /// instead of creating a second spelling beside it. This is the recorded
+    /// location used as a destination; `artist_dirs` is the full evidence set.
     pub artist_dir: String,
     /// Total number of audio files grouped into this album (all formats).
     pub track_count: usize,
@@ -215,6 +222,7 @@ pub fn scan_library(
                     // recorded location's: presence accepts any of them, and a
                     // set does not depend on the order the walk visited them.
                     a.album_dirs.insert(album_dir.clone());
+                    a.artist_dirs.insert(artist_dir.clone());
                     a.track_count += 1;
                     if file_needs_upgrade {
                         a.needs_upgrade += 1;
@@ -232,6 +240,7 @@ pub fn scan_library(
                     artist: final_artist,
                     album: final_album,
                     album_dirs: std::collections::BTreeSet::from([album_dir.clone()]),
+                    artist_dirs: std::collections::BTreeSet::from([artist_dir.clone()]),
                     artist_dir: artist_dir.clone(),
                     track_count: 1,
                     needs_upgrade: usize::from(file_needs_upgrade),
@@ -375,6 +384,7 @@ mod tests {
                 artist: "Artist1".into(),
                 album: "Album1".into(),
                 album_dirs: ["Album1".to_string()].into_iter().collect(),
+                artist_dirs: ["Artist1".to_string()].into_iter().collect(),
                 artist_dir: "Artist1".into(),
                 track_count: 3,
                 needs_upgrade: 3,
@@ -387,6 +397,7 @@ mod tests {
                 artist: "Artist2".into(),
                 album: "Album2".into(),
                 album_dirs: ["Album2".to_string()].into_iter().collect(),
+                artist_dirs: ["Artist2".to_string()].into_iter().collect(),
                 artist_dir: "Artist2".into(),
                 track_count: 5,
                 needs_upgrade: 0,
@@ -600,6 +611,7 @@ mod tests {
             artist: "Artist".into(),
             album: "Album".into(),
             album_dirs: ["Album".to_string()].into_iter().collect(),
+            artist_dirs: ["Artist".to_string()].into_iter().collect(),
             artist_dir: "Artist".into(),
             track_count: 2,
             needs_upgrade: 2,

@@ -1719,6 +1719,7 @@ async fn run_discover_mode_with_provider(
 
     let mut counters = discover::DiscoverCounters {
         excluded: selection.excluded.len(),
+        no_folder: selection.no_folder.len(),
         budget_limit: config.discover.max_cycle_downloads,
         artists_total: selection.artists.len(),
         ..discover::DiscoverCounters::default()
@@ -4535,6 +4536,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_does_not_gap_fill_an_artist_filed_only_inside_another_artists_folder() {
+        // End-to-end shape of the report: Apashe-tagged albums filed in the
+        // Bassnectar folder. Discover must examine the folder's owner only, so
+        // no Apashe query is ever issued.
+        // Uniquely named fixtures: `LogCapture` keeps one process-wide window,
+        // so a spelling shared with another test could satisfy the log
+        // assertion below without this run emitting anything.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let folder = library.path().join("GatedFolderOwner");
+        let guest = folder.join("GuestAlbum");
+        let own = folder.join("OwnerAlbum");
+        std::fs::create_dir_all(&guest).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        write_minimal_flac_with_tags(
+            &guest.join("01 - track.flac"),
+            "GatedGuestArtist",
+            "GuestAlbum",
+        );
+        write_minimal_flac_with_tags(
+            &own.join("01 - track.flac"),
+            "GatedFolderOwner",
+            "OwnerAlbum",
+        );
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+        let capture = crate::test_support::LogCapture::start();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let queries = soulseek.search_queries.lock().unwrap().clone();
+        assert!(
+            queries
+                .iter()
+                .all(|query| !query.contains("GatedGuestArtist")),
+            "an artist filed only inside another artist's folder must not be gap-filled: {queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.contains("GatedFolderOwner")),
+            "the folder's own artist is still a work item: {queries:?}"
+        );
+        // The gate must be attributable in the run summary, not just counted: the
+        // operator's workaround for an artist they want but the gate skipped is
+        // to name it with `--artist`, which needs the spelling to be visible.
+        let logs = capture.text();
+        assert!(
+            logs.contains("skipping GatedGuestArtist") && logs.contains("no folder of its own"),
+            "the gated artist must be named in the log, got:\n{logs}"
+        );
+        // Two separate obligations: the per-artist debug line above, and the
+        // operator-facing summary line the README documents. Only asserting the
+        // first would stay green if the counter wiring were dropped.
+        assert!(
+            logs.contains("discover: 1 artist(s) skipped: no folder of their own"),
+            "the run summary must carry the gate's count, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_places_a_download_in_the_artist_library_folder() {
         let soulseek = MockClient::new();
         // The peer's folder is named differently from the MusicBrainz title, so
@@ -5089,6 +5163,11 @@ mod tests {
         // spelling looks for it, so presence has to follow the artist folder.
         // Otherwise the album is searched and downloaded again whenever the
         // processed record is gone.
+        //
+        // The artist is named explicitly because the folder gate now removes it
+        // from an unfiltered sweep: neither spelling owns the folder they live
+        // in. Without the filter this test would assert an empty run and would
+        // stop guarding the presence rule it exists for.
         let soulseek = MockClient::new();
         let (mut config, db, staging) = artist_only_fixture();
         let library = TempDir::new().unwrap();
@@ -5112,7 +5191,7 @@ mod tests {
             &soulseek,
             &config,
             &db,
-            None,
+            Some("Aesop Rock"),
             false,
             staging.path(),
             &provider,
@@ -5133,6 +5212,12 @@ mod tests {
         // MusicBrainz query can use a spelling the artist folder does not have.
         // The destination must still be the folder the walk saw: writing the tag
         // spelling would create a second artist tree beside the real one.
+        //
+        // Discovery's own sweep skips such an artist (it owns no folder under
+        // the tag spelling — see `discover::select_artists`), so this rule is
+        // exercised the way the operator reaches it: by naming the artist
+        // explicitly, which overrides the folder gate as it overrides
+        // `discover.exclude_artists`.
         let soulseek = MockClient::new();
         search_index(
             &soulseek,
@@ -5161,7 +5246,7 @@ mod tests {
             &soulseek,
             &config,
             &db,
-            None,
+            Some("Guns 'n' Roses"),
             false,
             staging.path(),
             &provider,

@@ -62,7 +62,8 @@ struct Cli {
     #[arg(long)]
     batch_file: Option<PathBuf>,
 
-    /// Artist for manual mode
+    /// Artist for manual mode; in discover mode a narrowing filter that also
+    /// overrides discover.exclude_artists and the folder-ownership gate
     #[arg(long)]
     artist: Option<String>,
 

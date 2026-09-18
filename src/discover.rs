@@ -70,6 +70,16 @@ impl LibraryIndex {
         self.artists.contains_key(&normalize_catalog_key(artist))
     }
 
+    /// True when the library holds an album of this artist in a folder named
+    /// after the artist itself — the on-disk evidence that the operator
+    /// collects this artist under that name rather than meeting it as a guest
+    /// inside somebody else's folder.
+    pub fn owns_folder(&self, artist_key: &str) -> bool {
+        self.artists
+            .get(artist_key)
+            .is_some_and(|entry| entry.artist_folders.contains(artist_key))
+    }
+
     /// True when this artist/album pair is present in the library.
     ///
     /// Matching is a whole normalised title match, not an identity match: a
@@ -183,7 +193,13 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
             continue;
         }
         let album_key = normalize_album_key(&album.album);
-        let artist_dir_key = normalize_catalog_key(&album.artist_dir);
+        let artist_dir_keys: BTreeSet<String> = album
+            .artist_dirs
+            .iter()
+            .chain(std::iter::once(&album.artist_dir))
+            .map(|dir| normalize_catalog_key(dir))
+            .filter(|key| !key.is_empty())
+            .collect();
         let album_dir_keys: Vec<String> = album
             .album_dirs
             .iter()
@@ -194,20 +210,20 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
             *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
             entry.albums.insert(album_key.clone());
             entry.album_folders.extend(album_dir_keys.iter().cloned());
-            if !artist_dir_key.is_empty() {
-                entry.artist_folders.insert(artist_dir_key.clone());
-            }
+            entry.artist_folders.extend(artist_dir_keys.iter().cloned());
             *entry
                 .destinations
                 .entry((album.path.clone(), album.artist_dir.clone()))
                 .or_insert(0) += 1;
         }
-        // What this folder holds, so presence can be scoped to it: the tag
-        // spelling and every folder spelling the album is reachable under.
-        if !artist_dir_key.is_empty() {
+        // What each folder holds, so presence can be scoped to it: the tag
+        // spelling and every folder spelling the album is reachable under. A
+        // merged album is recorded under every folder it was found in, not only
+        // the recorded location, because it really does sit in each of them.
+        for artist_dir_key in artist_dir_keys {
             let folder = index.folders.entry(artist_dir_key).or_default();
-            folder.extend(album_dir_keys);
-            folder.insert(album_key);
+            folder.extend(album_dir_keys.iter().cloned());
+            folder.insert(album_key.clone());
         }
     }
     index
@@ -251,6 +267,9 @@ pub struct ArtistSelection {
     pub artists: Vec<SelectedArtist>,
     /// Library spellings skipped because an exclusion matched their key.
     pub excluded: Vec<String>,
+    /// Library spellings skipped because the artist has no folder of its own,
+    /// so the library only knows it as a guest inside another artist's folder.
+    pub no_folder: Vec<String>,
 }
 
 /// Build the deterministic artist work list.
@@ -296,6 +315,24 @@ pub fn select_artists(
         }
         if excluded_keys.contains(key) && !selected_by_filter {
             selection.excluded.push(name.to_string());
+            continue;
+        }
+        // Gap filling follows folders, not tags. An artist whose library presence
+        // exists only inside another artist's folder — a guest on a compilation,
+        // a box-set name, a collaboration spelling — is not an artist the
+        // operator collects under that name, so it is skipped instead of having
+        // its whole discography fetched. An explicit `--artist` overrides the
+        // gate, as it already overrides the exclusion list.
+        if !selected_by_filter && !index.owns_folder(key) {
+            // Debug, not info: a large library gates hundreds of spellings, and
+            // the summary carries the count. The names still have to be
+            // recoverable, because the workaround for an artist that is wanted
+            // but gated (its albums live in a differently named folder) is to
+            // name it with `--artist`.
+            tracing::debug!(
+                "discover: skipping {name} ({key}): no folder of its own; name it with --artist to process it"
+            );
+            selection.no_folder.push(name.to_string());
             continue;
         }
         // Every indexed album registers a destination, so the lookup cannot
@@ -365,6 +402,9 @@ pub struct DiscoverCounters {
     pub present: usize,
     /// Artists skipped by `discover.exclude_artists`.
     pub excluded: usize,
+    /// Artists skipped because they have no folder of their own, so the library
+    /// only knows them as guests inside another artist's folder.
+    pub no_folder: usize,
     /// Artists MusicBrainz could not resolve, in encounter order.
     pub unresolved: Vec<String>,
     /// Artists skipped because a previous run recorded a resolution failure,
@@ -409,6 +449,12 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
         notices.push(format!(
             "discover: excluded {} artist(s) by discover.exclude_artists",
             counters.excluded
+        ));
+    }
+    if counters.no_folder > 0 {
+        notices.push(format!(
+            "discover: {} artist(s) skipped: no folder of their own",
+            counters.no_folder
         ));
     }
     if !counters.cached_failures.is_empty() {
@@ -504,6 +550,7 @@ mod tests {
             artist: artist.to_string(),
             album: album.to_string(),
             album_dirs: [album_dir.to_string()].into_iter().collect(),
+            artist_dirs: [artist_dir.to_string()].into_iter().collect(),
             artist_dir: artist_dir.to_string(),
             track_count: 1,
             needs_upgrade: 0,
@@ -1145,6 +1192,207 @@ mod tests {
     }
 
     #[test]
+    fn an_artist_without_a_folder_of_its_own_is_not_gap_filled() {
+        // The reported bug. Albums tagged ARTIST=Apashe filed inside the
+        // Bassnectar folder made discover treat Apashe as an artist to fill and
+        // fetch its whole discography. An artist whose library presence exists
+        // only inside another artist's folder is not an artist the operator
+        // collects under that name, so it is not gap-filled.
+        let index = build_index(&[scanned_at(
+            "Apashe",
+            "Machines Should Work",
+            "/library",
+            "Bassnectar",
+        )]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert!(
+            selection.artists.is_empty(),
+            "an artist with no folder of its own must not be selected: {:?}",
+            selected_names(&selection)
+        );
+        assert_eq!(
+            selection.no_folder,
+            ["Apashe"],
+            "the skip must be reported, not silent"
+        );
+    }
+
+    #[test]
+    fn a_folder_owner_keeps_being_gap_filled_while_its_guest_artist_does_not() {
+        // One folder, two tag spellings: the artist whose folder it is stays a
+        // work item, the guest tagged inside it does not.
+        let index = build_index(&[
+            scanned_at("Apashe", "Antagonist", "/library", "Bassnectar"),
+            scanned_at("Bassnectar", "All Colors", "/library", "Bassnectar"),
+        ]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert_eq!(selected_names(&selection), ["Bassnectar"]);
+        assert_eq!(selection.no_folder, ["Apashe"]);
+    }
+
+    #[test]
+    fn an_explicit_filter_still_selects_an_artist_without_its_own_folder() {
+        // `--artist` is a deliberate one-off request, so it overrides the folder
+        // gate exactly as it already overrides discover.exclude_artists.
+        let index = build_index(&[scanned_at(
+            "Apashe",
+            "Machines Should Work",
+            "/library",
+            "Bassnectar",
+        )]);
+
+        let selection = select_artists(&index, &[], Some("Apashe")).unwrap();
+
+        assert_eq!(selected_names(&selection), ["Apashe"]);
+        assert!(
+            selection.no_folder.is_empty(),
+            "an explicitly named artist is not a gated skip"
+        );
+    }
+
+    #[test]
+    fn the_folder_gate_is_reported_in_the_run_summary() {
+        let counters = DiscoverCounters {
+            no_folder: 3,
+            artists_total: 1,
+            ..DiscoverCounters::default()
+        };
+        // The whole line, not a substring: "13 artist(s) …" also contains
+        // "3 artist(s) …", so a count regression would slip past a partial match.
+        assert!(
+            discover_notices(&counters)
+                .contains(&"discover: 3 artist(s) skipped: no folder of their own".to_string()),
+            "the gate must be visible in the run summary, not silent"
+        );
+    }
+
+    #[test]
+    fn an_artist_owns_a_folder_however_the_merged_album_chose_its_location() {
+        // A merged album (same tag artist and album in two folders) keeps one
+        // folder as its recorded location, but the artist still owns the other
+        // one. The gate asks the folder set, not the recorded location, so the
+        // artist is swept whichever way the location contest went.
+        let mut merged = scanned_in("Zed", "Album", "Album", "/root", "Compilations");
+        merged.artist_dirs = ["Compilations".to_string(), "Zed".to_string()]
+            .into_iter()
+            .collect();
+        let index = build_index(&[merged]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert_eq!(selected_names(&selection), ["Zed"]);
+        assert!(selection.no_folder.is_empty());
+    }
+
+    #[test]
+    fn an_album_with_no_usable_artist_folder_fails_closed() {
+        // Belt and braces: the scanner never produces an empty artist folder
+        // (path components are non-empty), but if one reached the index it must
+        // not satisfy the gate for the artist whose entry it belongs to.
+        let index = build_index(&[scanned_in("Ghost", "Album", "Album", "/library", "")]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert!(
+            selection.artists.is_empty(),
+            "an unusable folder is no evidence of ownership"
+        );
+        assert_eq!(selection.no_folder, ["Ghost"]);
+    }
+
+    #[test]
+    fn the_gate_normalises_both_sides_before_comparing() {
+        // Gate fairness rests on folding both sides: a folder whose casing (or
+        // spacing, or width) differs from the tag spelling still names the
+        // artist, so a raw-string comparison would gate out real artists.
+        let index = build_index(&[scanned_at(
+            "SIGUR ROS",
+            "Agaetis Byrjun",
+            "/library",
+            "Sigur Ros",
+        )]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert_eq!(selected_names(&selection), ["SIGUR ROS"]);
+        assert!(selection.no_folder.is_empty());
+
+        // Spacing and width fold too, not only casing: the gate compares
+        // normalised keys, so a doubled space or a fullwidth space on either
+        // side still names the same artist.
+        for (tag, folder) in [
+            ("SIGUR  ROS", "Sigur Ros"),
+            ("SIGUR ROS", "Sigur\u{3000}Ros"),
+        ] {
+            let index = build_index(&[scanned_at(tag, "Agaetis Byrjun", "/library", folder)]);
+            let selection = select_artists(&index, &[], None).unwrap();
+            assert_eq!(
+                selected_names(&selection),
+                [tag],
+                "tag {tag:?} in folder {folder:?} must still be swept"
+            );
+        }
+    }
+
+    #[test]
+    fn an_artist_with_albums_in_several_folders_is_selected_when_one_matches() {
+        // The gate asks whether the artist owns *a* folder, not whether every
+        // album sits in one: one matching folder is enough to keep the artist
+        // in the work list, however its other albums are filed.
+        let index = build_index(&[
+            scanned_at("Apashe", "Antagonist", "/library", "Bassnectar"),
+            scanned_at("Apashe", "Renaissance", "/library", "Apashe"),
+        ]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+
+        assert_eq!(selected_names(&selection), ["Apashe"]);
+        assert!(selection.no_folder.is_empty());
+    }
+
+    #[test]
+    fn an_excluded_artist_is_reported_as_excluded_not_as_a_gated_skip() {
+        // Exclusions are decided first, so an artist that is both excluded and
+        // folder-less is attributed to the list the operator wrote, and the
+        // gate count stays meaningful.
+        let index = build_index(&[
+            scanned_at("Apashe", "Antagonist", "/library", "Bassnectar"),
+            scanned_at("Bassnectar", "All Colors", "/library", "Bassnectar"),
+            scanned_at("Burial", "Untrue", "/library", "Nobody"),
+        ]);
+
+        let selection =
+            select_artists(&index, &["Apashe".to_string(), "Burial".to_string()], None).unwrap();
+
+        assert_eq!(selected_names(&selection), ["Bassnectar"]);
+        assert_eq!(selection.excluded, ["Apashe", "Burial"]);
+        assert!(
+            selection.no_folder.is_empty(),
+            "an excluded artist must not also be counted as gated"
+        );
+    }
+
+    #[test]
+    fn a_folder_name_the_write_path_sanitised_does_not_satisfy_the_gate() {
+        // Accepted cost of the gate, pinned so it cannot change silently. The
+        // organise pattern sanitises `%artist%` (a slash becomes a hyphen), so
+        // an artist tagged `AC/DC` can own a folder spelled `AC-DC` and still be
+        // gated out. Naming it explicitly is the workaround.
+        let index = build_index(&[scanned_at("AC/DC", "Back in Black", "/library", "AC-DC")]);
+
+        let selection = select_artists(&index, &[], None).unwrap();
+        assert!(selection.artists.is_empty());
+        assert_eq!(selection.no_folder, ["AC/DC"]);
+
+        let named = select_artists(&index, &[], Some("AC/DC")).unwrap();
+        assert_eq!(selected_names(&named), ["AC/DC"]);
+    }
+
+    #[test]
     fn an_unknown_filter_artist_is_a_configuration_error() {
         let error = select_artists(&library_fixture(), &[], Some("Nobody")).unwrap_err();
         assert!(
@@ -1257,8 +1505,9 @@ mod tests {
         let counters = DiscoverCounters {
             present: 12,
             excluded: 2,
+            no_folder: 3,
             unresolved: vec!["Mystery Artist".to_string()],
-            cached_failures: Vec::new(),
+            cached_failures: vec!["Cached Artist".to_string()],
             no_eligible_albums: 1,
             provider_failed: vec![("Offline Artist".to_string(), "connection reset".to_string())],
             budget_reached_at: Some("Beta Band".to_string()),
@@ -1271,6 +1520,8 @@ mod tests {
             vec![
                 "discover: 12 album(s) already present; skipped".to_string(),
                 "discover: excluded 2 artist(s) by discover.exclude_artists".to_string(),
+                "discover: 3 artist(s) skipped: no folder of their own".to_string(),
+                "discover: 1 artist(s) skipped from cached resolution failures".to_string(),
                 "discover: 1 artist(s) unresolved on MusicBrainz: Mystery Artist".to_string(),
                 "discover: 1 artist(s) had no albums matching discography.allowed_types"
                     .to_string(),

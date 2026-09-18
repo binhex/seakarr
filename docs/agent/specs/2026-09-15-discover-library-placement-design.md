@@ -23,7 +23,9 @@ library folder — the directory the artist's existing albums were found in —
 using the configured organize pattern, and the staging copy is removed once the
 copy succeeds. Nothing else changes: auto, artist-only manual, explicit manual,
 and batch behaviour, the presence index, the download budget, and the reporting
-contract all stay as they are.
+contract all stay as they are. (Superseded on 2026-09-18: discovery's artist
+selection later gained the folder-ownership gate, which adds one summary line;
+see the gap-filling design's reporting contract.)
 
 ## Scope
 
@@ -268,11 +270,15 @@ with the existing rule that only `Downloaded` and `Failed` outcomes reach the
 download stage and therefore charge. The album is retried on a later run
 because only successes become processed records.
 
-### Notifications, reporting, budget, and recovery are unchanged
+### Notifications, reporting, budget, and recovery: one superseded line
 
 Placement reuses the shared success tail: mark processed as `success`, remove
-staging, notify once. No new notice, counter, or report section is introduced; a
-placement failure appears in the existing `Failed` section with its reason. The
+staging, notify once. This design introduced no new notice, counter, or report
+section; a placement failure appears in the existing `Failed` section with its
+reason. (Superseded on 2026-09-18: discovery's artist selection later gained the
+folder-ownership gate and its `discover: <N> artist(s) skipped: no folder of
+their own` summary line, so the run summary is no longer byte-identical to this
+design's contract.) The
 budget rule is untouched. Cancellation is untouched: Ctrl+C stops before the
 next album and a cancelled download cleans its own staging. Discover does not
 participate in upgrade recovery, and after this change it leaves no staging
@@ -383,8 +389,9 @@ argument.
    with their album counts. It also records, per artist folder name, which album
    presence keys that folder holds, which is what scopes the artist-folder
    follow in `contains_album`.
-3. `select_artists` applies exclusions and the optional filter, orders the
-   result, and attaches each selected artist's destination.
+3. `select_artists` applies exclusions, the folder-ownership gate and the
+   optional filter, orders the result, and attaches each selected artist's
+   destination.
 4. For each artist, while the budget is not exhausted:
    1. `discover_artist_albums` resolves the artist's conceptual albums.
    2. `missing_albums` removes albums already present.
@@ -457,8 +464,10 @@ argument.
   its meaning and default.
 - The database schema is unchanged. Discover still writes the same
   processed-album records.
-- The reporting contract is unchanged: no new notices, and placement failures
-  render in the existing `Failed` section.
+- The reporting contract is unchanged by this design: no new notices, and
+  placement failures render in the existing `Failed` section. (Superseded on
+  2026-09-18 by the folder-ownership gate's summary line; see the gap-filling
+  design's reporting contract.)
 
 ## Deliberate limits
 
@@ -594,7 +603,9 @@ argument.
 - `artist_destination` picks the majority pair and breaks ties alphabetically,
   independent of insert order.
 - `select_artists` returns `SelectedArtist` entries carrying the query spelling
-  and the destination, with exclusions and the optional filter unchanged.
+  and the destination, with exclusions and the optional filter unchanged. (The
+  folder-ownership gate was added on 2026-09-18; see the gap-filling design's
+  artist-source section.)
 - Presence, ordering, and budget tests are adapted for the selection type and
   otherwise unchanged.
 
@@ -667,6 +678,9 @@ Unchanged: discover resolution, `--artist` narrowing, and the `--album` and
    upgrade destination, and its existing tests pass.
 9. Artist-only manual, explicit manual, and batch modes are unchanged.
 10. No new configuration keys, no schema change, and no new report notices.
+    (Superseded on 2026-09-18: discovery's artist selection later gained the
+    folder-ownership gate, which adds one summary line; see the gap-filling
+    design's reporting contract.)
 
 ## External contracts
 
