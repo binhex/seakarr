@@ -1,6 +1,6 @@
 [package]
 name = "seakarr"
-version = "0.26.5"
+version = "0.26.6"
 edition = "2021"
 # The real floor, and it was already implicit before this change: the vendored
 # workspace member is edition 2024 and uses `slice::as_chunks_mut`, this crate
