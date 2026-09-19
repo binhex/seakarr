@@ -224,68 +224,102 @@ pub enum LibraryTarget<'a> {
 /// Reason a downloaded set must not be written into the library, or `None` when
 /// it may be.
 ///
-/// The pre-download `min_tracks` gate counts every quality-passing file in a
-/// peer's result, but only the largest single album directory is ever downloaded,
-/// so a result can pass that gate and still yield a handful of files. An album
-/// whose title is also one of its track titles makes that routine: the peer's
-/// copies of the *track* match the query by filename, and the largest group is
-/// then that one track. Neither shape is an album, so the downloaded set is
-/// checked here, at the last point before the library write, on the discover
-/// `Place` and generic-organize paths. The library-upgrade path does not call
-/// this: its own gate compares the download against `needs_upgrade`, the number of
-/// files that failed the quality gate for that album — a different reference, not
-/// a stronger one, so the two gates do not subsume each other.
+/// This is the post-download half of one shared rule —
+/// [`crate::filter::incomplete_download`] — applied to the same set the
+/// pre-download filter already judged (identical quality filter, identical
+/// grouping), so no run reaches it today: the filter refuses such a set before
+/// anything is fetched. It is kept as a defensive backstop for a future change to
+/// the download layer, and the paths that call it (discover `Place` and generic
+/// organize) are backstops in the same sense. The library-upgrade path does not
+/// call it: its own gate compares the
+/// download against `needs_upgrade`, the number of files that failed the quality
+/// gate for that album — a different reference, not a stronger one, so the two
+/// gates do not subsume each other.
 ///
 /// `min_tracks == 0` disables the gate, exactly as it disables the pre-download
 /// gate, so EPs and singles stay reachable for operators who ask for them.
 fn library_write_refusal(downloaded: &[PathBuf], min_tracks: u32) -> Option<String> {
-    if min_tracks == 0 {
-        return None;
-    }
-    if downloaded.len() < min_tracks as usize {
-        return Some(format!(
-            "only {} of at least {min_tracks} tracks were downloaded",
-            downloaded.len()
-        ));
-    }
-    // Track numbering is judged only when the read is credible, and it often is
-    // not. `track_number_from_filename` takes the *first* numeric token in the
-    // name, so every file of "Blink 182 - Enema of the State - 01 - Dumpweed.flac"
-    // reports track 182, and a peer that numbers only some of its files (an
-    // "Intro.flac" beside "02 - Two.flac") leaves files with no number at all.
-    // Two guards follow from that:
-    //
-    // - every downloaded file must have parsed a number, or the set is mixed and
-    //   nothing can be concluded from it; and
-    // - at least two distinct values must have been seen, because a run of one
-    //   repeated value is either a phantom read or a genuinely repeated track
-    //   number (the project supports duplicate track numbers, so the two are
-    //   indistinguishable here).
-    //
-    // Both guards mean this half deliberately misses some real fragments — a
-    // single numbered file, or a set that repeats one number — which the count
-    // half still catches whenever the set is shorter than `min_tracks`.
-    let numbers: Vec<u32> = downloaded
+    let names: Vec<&str> = downloaded
         .iter()
         .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
-        .filter_map(crate::tracks::track_number_from_filename)
         .collect();
-    let mut distinct = numbers.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    if numbers.len() == downloaded.len() {
-        if let Some(&start) = distinct.first() {
-            // A disc and track fused into one value ("101" for disc 1 track 1, "205"
-            // for disc 2 track 5) carries the same signal as the hyphenated "1-01"
-            // form, which `track_number_from_filename` already unwraps, so the same
-            // modulo test applies to the fused spelling.
-            let starts_at_track_one = distinct.iter().any(|number| number % 100 == 1);
-            if distinct.len() >= 2 && !starts_at_track_one {
-                return Some(format!("the tracks start at track {start} instead of 1"));
+    crate::filter::incomplete_download(&names, min_tracks, crate::filter::TrackOneAnchor::Required)
+        .map(|kind| kind.reason())
+}
+
+/// Remove `dir` and its now-empty subdirectories, deepest first, and report what
+/// kept a directory in place. `None` means the tree is gone (a directory that never
+/// existed included).
+///
+/// `remove_dir` refuses a non-empty directory, so the emptiness check and the
+/// removal are one operation: nothing this run did not stage can be deleted, and a
+/// file staged concurrently between the download and this call cannot be caught by
+/// a stale scan.
+fn remove_empty_staging_dirs(dir: &Path) -> Option<PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                remove_empty_staging_dirs(&path);
             }
         }
     }
-    None
+    match std::fs::remove_dir(dir) {
+        Ok(()) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // A non-empty directory names its first entry; any other failure (an
+        // unwritable parent, a racing removal) names the directory itself, so the
+        // caller always warns about something that is really still on disk.
+        Err(_) => first_remaining_entry(dir).or_else(|| Some(dir.to_path_buf())),
+    }
+}
+
+/// The first entry left in `dir`, for a warning that names what stayed. The entry
+/// may be a file or a subdirectory.
+fn first_remaining_entry(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .next()
+        .map(|entry| entry.path())
+}
+
+/// Drop a refused album's staged files. A refusal means the set is never
+/// written to the library, so keeping it would accumulate unusable audio in
+/// `storage.staging_dir` while the album is re-downloaded from scratch on the
+/// next run.
+///
+/// Exactly the paths this run staged are removed, never anything else. The staging
+/// slug is `artist--album`, which two different pairs can collapse onto (`A--B` +
+/// `C` and `A` + `B--C`), and albums are processed concurrently, so the directory
+/// can hold another album's file; directories are removed only once they are empty
+/// and anything left behind is named in a warning. A directory that was never
+/// created is not a failure.
+///
+/// Ownership is by path, so a foreign file that happens to land on the same path as
+/// one of ours is removed with ours — the two are indistinguishable, and the slug
+/// collapse that produces that state is the same one the warning below describes.
+fn discard_refused_staging(album_staging: &Path, downloaded: &[PathBuf]) {
+    for path in downloaded {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "Failed to remove the staged file {path:?} of a refused download: {e}"
+            ),
+        }
+    }
+    if let Some(remaining) = remove_empty_staging_dirs(album_staging) {
+        if remaining == album_staging {
+            tracing::warn!(
+                "Leaving {album_staging:?} in place: it could not be removed, and it may hold an entry this run did not stage (another album on the same artist--album staging name, or leftovers from an earlier run)"
+            );
+        } else {
+            tracing::warn!(
+                "Leaving {album_staging:?} in place: it still holds {remaining:?}, the first entry this run did not stage (a file or subdirectory — another album on the same artist--album staging name, or leftovers from an earlier run)"
+            );
+        }
+    }
 }
 
 /// Shared tail for both library writes: drop the staging copy, record the
@@ -430,6 +464,17 @@ async fn process_album_internal(
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
 
+    // The completeness rule's track-1 anchor applies to a new album, not to a
+    // library-upgrade candidate: the library already holds its own track 1 and the
+    // upgrade only replaces the files that failed the quality gate, so a peer
+    // delivering just those files is a legitimate source. This mirrors where the
+    // post-download gate applies the anchor — `library_write_refusal` on the
+    // placement and organize paths, not the upgrade path's `expected_tracks`.
+    let anchor = match &target {
+        Some(LibraryTarget::Upgrade { .. }) => filter::TrackOneAnchor::NotRequired,
+        _ => filter::TrackOneAnchor::Required,
+    };
+
     // Search for artist + album unless artist-only mode supplied results that
     // were already discovered and grouped in one artist query.
     let presearched = presearched_results.is_some();
@@ -445,6 +490,7 @@ async fn process_album_internal(
                 &config.filters,
                 library_track_count,
                 config.download.max_queue_length,
+                anchor,
             )
             .await
             {
@@ -501,6 +547,7 @@ async fn process_album_internal(
         library_track_count,
         filter_album,
         config.download.max_queue_length,
+        anchor,
     );
     // Track which results were last filtered (for rejection summary)
     let mut last_filtered_results: Vec<crate::client::SearchResult> = results.clone();
@@ -578,6 +625,7 @@ async fn process_album_internal(
                                         // would leave us with nothing.
                                         None,
                                         config.download.max_queue_length,
+                                        anchor,
                                     );
                                     last_filtered_results = title_results.clone();
                                     summarising_title_results = true;
@@ -634,6 +682,7 @@ async fn process_album_internal(
                     // Title-search results are never album-gated.
                     None,
                     config.download.max_queue_length,
+                    anchor,
                 );
                 if rejection_summary.has_rejections() {
                     tracing::info!(
@@ -664,6 +713,7 @@ async fn process_album_internal(
                 filter_album
             },
             config.download.max_queue_length,
+            anchor,
         );
         let availability_requirement = if config.download.max_queue_length == 0 {
             "free slot".to_string()
@@ -786,6 +836,7 @@ async fn process_album_internal(
                     downloaded.len(),
                     expected_tracks,
                 );
+                discard_refused_staging(&album_staging, &downloaded);
                 mark_album_processed_if_identifiable(db, artist, album, "failed")?;
                 return Ok(AlbumOutcome::Failed {
                     reason: "incomplete download, library upgrade skipped".into(),
@@ -870,6 +921,7 @@ async fn process_album_internal(
                     "{artist} - {}: incomplete download ({reason}), skipping library placement",
                     album.unwrap_or("?")
                 );
+                discard_refused_staging(&album_staging, &downloaded);
                 mark_album_processed_if_identifiable(db, artist, album, "failed")?;
                 return Ok(AlbumOutcome::Failed {
                     reason: format!("incomplete download, library placement skipped: {reason}"),
@@ -949,6 +1001,7 @@ async fn process_album_internal(
                 "{artist} - {}: incomplete download ({reason}), skipping organize",
                 album.unwrap_or("?")
             );
+            discard_refused_staging(&album_staging, &downloaded);
             mark_album_processed_if_identifiable(db, artist, album, "failed")?;
             return Ok(AlbumOutcome::Failed {
                 reason: format!("incomplete download, organize skipped: {reason}"),
@@ -1348,6 +1401,9 @@ async fn run_legacy_artist_only_mode(
         &config.filters,
         None,
         config.download.max_queue_length,
+        // Artist-only results are handed to each album, and every one of those is a
+        // new album (there is no upgrade target in this path).
+        filter::TrackOneAnchor::Required,
     )
     .await?;
     let duration_ms = search_start.elapsed().as_millis() as u64;
@@ -2610,11 +2666,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_download_is_not_written_to_the_library() {
-        // The pre-download min_tracks gate counts every quality-passing file in a
-        // peer's result, but only the largest single album directory is ever
-        // downloaded. A result can therefore pass that gate and still yield one
-        // file — a one-track "album" must not reach the library.
+    async fn a_short_album_group_is_refused_before_the_download() {
+        // The shape that produced the reported staging leftovers: a peer's result
+        // spans several album directories, so it counts enough files overall, but
+        // the album group that would actually be downloaded holds a single track.
+        // Counting the whole result let it through, the album was downloaded in
+        // full and refused at the library write, and the refused files stayed in
+        // `storage.staging_dir`. The filter counts the largest album group now, so
+        // the rejection lands before anything is fetched.
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "peer".into(),
@@ -2644,7 +2703,7 @@ mod tests {
         let library = TempDir::new().unwrap();
 
         let mut config = make_test_config();
-        // Three passing files clear the pre-download gate; only one is downloaded.
+        // The largest album group holds one file; the whole result holds three.
         config.filters.min_tracks = 3;
 
         let result = process_album(
@@ -2667,27 +2726,36 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
-            "a one-track set is not an album and must not be placed, got {result:?}"
+            matches!(&result, AlbumOutcome::NoCandidates { reason } if reason.contains("no results passed filters")),
+            "a one-track album group is not an album and must be refused before the download, got {result:?}"
+        );
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "no transfer may be started for a set that can never be placed"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Test Album").exists(),
+            "a refused set must not be staged"
         );
         assert!(
             !library.path().join("Test Artist/Test Album").exists(),
             "nothing may be written into the library for an incomplete set"
         );
-        // The refused set survives this run. A later auto run with
-        // `library_upgrade.enabled: true` removes it, because its album status is
-        // not "success"; nothing else does.
-        let staged = std::fs::read_dir(staging.path().join("Test Artist--Test Album"))
-            .expect("the album staging directory must survive a refusal")
-            .count();
-        assert_eq!(staged, 1, "the downloaded file must be left in staging");
     }
 
     #[tokio::test]
-    async fn download_without_track_one_is_not_written_to_the_library() {
+    async fn a_set_without_track_one_is_refused_before_the_download() {
         // The reported shape: two contiguous tracks from the middle of an album
         // (nine and ten). Contiguous numbering alone does not make a complete
-        // album, so the set must not be placed.
+        // album. The anchor half of the completeness rule now refuses this in the
+        // filter, before anything is fetched, rather than after the download.
+        // The two post-download refusal arms that remain (Place and organize) are
+        // backstops a run can no longer reach, because `download_album` returns
+        // Err rather than a short set when any file fails; their decision is
+        // covered by the `library_write_refusal` unit tests and their cleanup by
+        // `discard_refused_staging_removes_our_tree_and_tolerates_a_missing_directory`,
+        // while `refused_download_leaves_no_staging_copy` covers the Upgrade arm
+        // end to end.
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "peer".into(),
@@ -2734,31 +2802,23 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
-            "tracks nine and ten are not a complete album, got {result:?}"
+            matches!(&result, AlbumOutcome::NoCandidates { reason } if reason.contains("no results passed filters")),
+            "tracks nine and ten are not a complete album and must be refused before the download, got {result:?}"
         );
-        // The refusal must be recorded, and the serving peer demoted, or the same
-        // fragment is re-picked from the same peer on every cycle.
+        // The refusal must be recorded, or the same fragment is re-selected from
+        // the same peer on every cycle.
         assert_eq!(
             db.get_album_status("Test Artist", "Test Album").unwrap(),
             Some("failed".to_string()),
             "the refused album must be recorded as failed"
         );
-        // The two delivered tracks are credited as successes, and the album-level
-        // failure adds one more, unsuccessful, entry — so the demotion is real but
-        // light: this peer now reads 2 successes of 3, which the reliability factor
-        // only just separates from an unmeasured peer.
-        let reputation = db.get_reputation_map().unwrap();
-        let peer = reputation
-            .get("peer")
-            .expect("the serving peer must be recorded");
-        assert_eq!(
-            peer.total_downloads, 3,
-            "two tracks plus the album-level failure"
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "no transfer may be started for a set that can never be placed"
         );
-        assert_eq!(
-            peer.successful, 2,
-            "both delivered tracks were usable audio"
+        assert!(
+            !staging.path().join("Test Artist--Test Album").exists(),
+            "a refused set must not be staged"
         );
         assert!(
             !library.path().join("Test Artist/Test Album").exists(),
@@ -2834,9 +2894,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_download_is_not_organized_into_the_library() {
+    async fn a_short_album_group_is_not_organized_into_the_library() {
         // The generic organize path (manual and batch runs, target: None) writes
-        // straight into library.paths[0] and had no completeness check at all.
+        // straight into library.paths[0]. Its completeness refusal is now a
+        // backstop: a result whose largest album group is a one-track fragment is
+        // refused by the filter before the download, so nothing is fetched, staged
+        // or organized.
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "peer".into(),
@@ -2888,28 +2951,21 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
-            "the organize path must refuse a one-track set, got {result:?}"
+            matches!(&result, AlbumOutcome::NoCandidates { reason } if reason.contains("no results passed filters")),
+            "the organize path must not receive a one-track album group, got {result:?}"
         );
         assert_eq!(
             db.get_album_status("Test Artist", "Test Album").unwrap(),
             Some("failed".to_string()),
-            "the organize refusal must also record the album as failed"
+            "the filter refusal must also record the album as failed"
         );
-        // One delivered track is credited as a success and the album-level failure
-        // adds a second, unsuccessful entry. Asserting only that the peer exists
-        // would pass on the track success alone, with the demotion removed.
-        let reputation = db.get_reputation_map().unwrap();
-        let peer = reputation
-            .get("peer")
-            .expect("the serving peer must be recorded");
-        assert_eq!(
-            peer.total_downloads, 2,
-            "the organize refusal must also demote the serving peer"
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "no transfer may be started for a set that can never be organized"
         );
-        assert_eq!(
-            peer.successful, 1,
-            "only the delivered track was usable audio"
+        assert!(
+            !staging.path().join("Test Artist--Test Album").exists(),
+            "a refused set must not be staged"
         );
         assert!(
             !library.path().join("Test Artist/Test Album").exists(),
@@ -3170,9 +3226,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_organize_path_also_refuses_a_set_without_track_one() {
-        // The numbering half of the gate applies on the organize path too, not only
-        // on the placement path.
+    async fn the_organize_path_never_sees_a_set_without_track_one() {
+        // The organizer's own numbering refusal is now a backstop: the filter
+        // refuses a set that starts past track 1 before the download, so the
+        // organize path is never handed one.
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "peer".into(),
@@ -3219,8 +3276,20 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
-            "the organize path must refuse a set starting at track 9, got {result:?}"
+            matches!(&result, AlbumOutcome::NoCandidates { reason } if reason.contains("no results passed filters")),
+            "a set starting at track 9 must be refused before the download, got {result:?}"
+        );
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "no transfer may be started for a set that can never be organized"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Test Album").exists(),
+            "a refused set must not be staged"
+        );
+        assert!(
+            !library.path().join("Test Artist").exists(),
+            "nothing may be organized into the library for a fragment"
         );
     }
 
@@ -7105,6 +7174,235 @@ mod tests {
                 .exists(),
             "nothing may be copied when the completeness gate rejects"
         );
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_may_deliver_only_the_files_that_need_replacing() {
+        // The library already holds its own track 1, so a peer sharing only the
+        // non-conforming files is a legitimate upgrade source: the anchor half of
+        // the completeness rule belongs to the library-write gate, which the
+        // upgrade path does not use (it compares against `expected_tracks`).
+        // Applying the anchor here would refuse the set before the download and
+        // cost auto mode its partial-repair source.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(r"Test Artist\Test Album\03 - three.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Test Album\04 - four.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Test Album\05 - five.flac", 900, 10_000_000),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3; // the count half must still apply
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = false;
+        config.filters.peer_track_count = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            Some(3), // three library files need replacing
+            Some(LibraryTarget::Upgrade {
+                root: target.path(),
+                expected_tracks: 3,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Downloaded { .. }),
+            "the upgrade must proceed from a peer that shares only the files the library needs, got {result:?}"
+        );
+        assert!(
+            target
+                .path()
+                .join("Test Artist")
+                .join("Test Album")
+                .join("04 - four.flac")
+                .exists(),
+            "the delivered replacements must be copied into the library"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_download_leaves_no_staging_copy() {
+        // A completeness refusal means the set is never written to the library,
+        // so its staged files must go with it. Leaving them behind is how the
+        // refused albums accumulated in `storage.staging_dir` (the reported 2 GiB
+        // of "incomplete download, library placement skipped" albums such as
+        // Cyantific "Archive 1" and Danny Byrd "Atomic Funk").
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+        *client.write_files.lock().unwrap() = true;
+
+        let mut config = make_test_config();
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = false;
+        // The peer-track-count filter is a separate mechanism that would reject
+        // this single-file peer before any download; disable it so the
+        // completeness gate is what decides.
+        config.filters.peer_track_count = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            Some(2), // the library album has 2 files needing upgrade
+            Some(LibraryTarget::Upgrade {
+                root: target.path(),
+                expected_tracks: 2,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "expected the completeness gate to reject, got {result:?}"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Test Album").exists(),
+            "a refused download must not be left in the staging directory"
+        );
+        // The serving peer is demoted at the album level as well as credited for
+        // the track it did deliver, so a peer that serves fragments sinks in the
+        // ranking instead of being re-picked every cycle.
+        let reputation = db.get_reputation_map().unwrap();
+        let peer = reputation
+            .get("peer")
+            .expect("the serving peer must be recorded");
+        assert_eq!(
+            peer.total_downloads, 2,
+            "one delivered track plus the album-level failure"
+        );
+        assert_eq!(
+            peer.successful, 1,
+            "only the delivered track was usable audio"
+        );
+    }
+
+    #[test]
+    fn discard_refused_staging_removes_our_tree_and_tolerates_a_missing_directory() {
+        // Supplementary guard for the helper the three refusal arms call: it must
+        // clear a staged tree (including disc subdirectories) and must stay quiet
+        // when a refusal happens with nothing staged, which is not a failure.
+        let root = TempDir::new().unwrap();
+        discard_refused_staging(&root.path().join("never-created"), &[]);
+
+        let album = root.path().join("Test Artist--Test Album");
+        std::fs::create_dir_all(album.join("disc 1")).unwrap();
+        let ours = album.join("disc 1/01 - Track.flac");
+        std::fs::write(&ours, b"not audio").unwrap();
+        discard_refused_staging(&album, std::slice::from_ref(&ours));
+        assert!(
+            !album.exists(),
+            "a refused album's staged tree must be removed, disc subdirectories included"
+        );
+    }
+
+    #[test]
+    fn discard_refused_staging_keeps_a_foreign_file_that_repeats_our_basename() {
+        // Ownership must be by staged path, not by basename: another album on the
+        // same staging name routinely holds the same track names, one flat and one
+        // under a disc folder. A basename test accepts `CD 01/01 - Track.flac` as
+        // ours and deletes it with the tree.
+        let root = TempDir::new().unwrap();
+        let album = root.path().join("Test Artist--Test Album");
+        std::fs::create_dir_all(album.join("CD 01")).unwrap();
+        let ours = album.join("01 - Track.flac");
+        let foreign = album.join("CD 01/01 - Track.flac");
+        std::fs::write(&ours, b"not audio").unwrap();
+        std::fs::write(&foreign, b"not audio").unwrap();
+
+        discard_refused_staging(&album, std::slice::from_ref(&ours));
+
+        assert!(
+            foreign.exists(),
+            "a file this run did not stage must survive even when its basename matches one of ours"
+        );
+        assert!(!ours.exists(), "our own file must be removed");
+        assert!(
+            album.exists(),
+            "the directory holding a foreign file must be left in place"
+        );
+    }
+
+    #[test]
+    fn discard_refused_staging_reports_a_path_that_cannot_be_removed() {
+        // A staging path that is not a removable directory (here a plain file) must
+        // be reported, not silently ignored: the warning names the path itself when
+        // no entry can be read from it.
+        let root = TempDir::new().unwrap();
+        let not_a_dir = root.path().join("Test Artist--Test Album");
+        std::fs::write(&not_a_dir, b"not audio").unwrap();
+
+        discard_refused_staging(&not_a_dir, &[]);
+
+        assert!(
+            not_a_dir.exists(),
+            "a path this run did not stage must survive, even when it is not a directory"
+        );
+    }
+
+    #[test]
+    fn discard_refused_staging_keeps_a_directory_holding_another_albums_file() {
+        // The staging name is artist--album, so two different pairs can collapse
+        // onto one directory (A--B + C and A + B--C) and albums run concurrently.
+        // Deleting the tree there would delete a download this run did not stage,
+        // so the directory is left alone with a warning instead.
+        let root = TempDir::new().unwrap();
+        let album = root.path().join("Test Artist--Test Album");
+        std::fs::create_dir_all(&album).unwrap();
+        let ours = album.join("01 - Ours.flac");
+        let foreign = album.join("02 - Theirs.flac");
+        std::fs::write(&ours, b"not audio").unwrap();
+        std::fs::write(&foreign, b"not audio").unwrap();
+
+        discard_refused_staging(&album, std::slice::from_ref(&ours));
+
+        assert!(
+            foreign.exists(),
+            "another album's staged file must survive a refusal in this one"
+        );
+        assert!(
+            !ours.exists(),
+            "the refused album's own staged file must still be removed"
+        );
+        assert!(album.exists(), "the shared directory must be left in place");
     }
 
     #[tokio::test]

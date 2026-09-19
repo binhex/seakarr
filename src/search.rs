@@ -801,6 +801,7 @@ fn tier_has_usable_results(
     library_track_count: Option<usize>,
     album: Option<&str>,
     max_queue_length: u32,
+    anchor: crate::filter::TrackOneAnchor,
 ) -> bool {
     !crate::filter::filter_results_with_queue_limit(
         results,
@@ -808,6 +809,7 @@ fn tier_has_usable_results(
         library_track_count,
         album,
         max_queue_length,
+        anchor,
     )
     .is_empty()
 }
@@ -875,6 +877,7 @@ pub async fn search_album_with_fallback(
         filters,
         library_track_count,
         0,
+        crate::filter::TrackOneAnchor::Required,
     )
     .await
 }
@@ -882,7 +885,11 @@ pub async fn search_album_with_fallback(
 /// Queue-aware variant of [`search_album_with_fallback`]. A tier is usable
 /// when it yields at least one result that passes the queue-aware filter
 /// pipeline, so a zero-slot candidate admitted by a positive queue cap does
-/// not trigger unnecessary fallback searches.
+/// not trigger unnecessary fallback searches. `anchor` must match the caller's
+/// completeness rule, or a tier is judged usable by a different gate than the
+/// one the caller will apply (see [`crate::filter::TrackOneAnchor`]).
+#[allow(clippy::too_many_arguments)] // mirrors the sibling tier signatures it
+                                     // forwards to the filter pipeline
 pub(crate) async fn search_album_with_fallback_with_queue_limit(
     client: &dyn SoulseekClient,
     artist: &str,
@@ -891,6 +898,7 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
     filters: &FilterConfig,
     library_track_count: Option<usize>,
     max_queue_length: u32,
+    anchor: crate::filter::TrackOneAnchor,
 ) -> Result<SearchOutcome> {
     // The first tier whose raw results were non-empty but did not survive
     // filtering. Returned when no tier yields a usable (filter-passing)
@@ -923,6 +931,7 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
             library_track_count,
             album,
             max_queue_length,
+            anchor,
         ) {
             return Ok(SearchOutcome { results });
         }
@@ -951,6 +960,7 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                         library_track_count,
                         album,
                         max_queue_length,
+                        anchor,
                     ) {
                         return Ok(SearchOutcome {
                             results: lower_results,
@@ -992,6 +1002,7 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                         library_track_count,
                         album,
                         max_queue_length,
+                        anchor,
                     ) {
                         return Ok(SearchOutcome {
                             results: norm_results,
@@ -1022,6 +1033,7 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                         library_track_count,
                         album,
                         max_queue_length,
+                        anchor,
                     ) {
                         return Ok(SearchOutcome {
                             results: artist_matches,
@@ -2401,6 +2413,7 @@ mod tests {
             &test_filters(),
             None,
             3,
+            crate::filter::TrackOneAnchor::Required,
         )
         .await
         .unwrap();

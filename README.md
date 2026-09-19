@@ -355,8 +355,8 @@ Controls which Soulseek search results pass the quality gate.
 | `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. Auto mode's upgrade scan does not read bit depth, so a library of 16-bit files is never flagged for upgrade because of this setting; it only rejects candidates whose advertised or measured depth is lower. | `0` |
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
-| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. | `true` |
-| `min_tracks` | Minimum number of quality-passing tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). Applies regardless of `contiguous_tracks`. Set `0` to disable. Also enforced **after** download on the discover-placement and organize paths: a downloaded set shorter than `min_tracks`, or one whose numbered files (if any) do not include track 1, is left in staging and the album is recorded failed rather than written into the library. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
+| `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. This toggle governs the gap check only; the track-1 half of the completeness rule is part of `min_tracks` and is disabled only by `min_tracks: 0`. | `true` |
+| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule has two halves and is measured on the largest album group — the set that will actually be downloaded — so a result cannot pass on files from directories that will not be fetched: the group must reach `min_tracks`, and (for a new album) its numbered files, when every name parses with at least two distinct values, must include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the discover-placement and organize paths as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
 | `peer_track_count` | In auto mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that auto mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
@@ -491,36 +491,70 @@ Queue timeouts and rejections keep reporting the position in their existing warn
 
 #### Incomplete downloads are not written to the library
 
-The pre-download `min_tracks` gate counts every quality-passing file in a peer's search result,
-but only the largest single album directory is ever downloaded — so a result can clear that gate
-and still produce a handful of files. An album whose title is also one of its track titles makes
-that routine: peers' copies of the *track* match the query by filename, and the largest group is
-then that one track. Contiguous numbering alone does not make an album either, so a set of tracks
-nine and ten passes the contiguity check while being a fragment of something longer.
+The same completeness rule runs twice, on one shared implementation
+(`filter::incomplete_download`, which classifies the refusal so neither site re-derives half of it
+and drifts). Before the download, the filter judges the set that will actually be fetched — the
+largest album group, the directory (or collapsed multi-disc set) that `download_album` really
+downloads. For a **new** album it rejects a result that could never be placed, so the transfer is
+not started at all; a **library-upgrade** candidate is judged by the count half alone, because the
+library already holds its own track 1 and the upgrade only replaces the files that failed the quality
+gate. The library write then applies the rule again as a defensive backstop. Both sites see the same
+set by construction: the identical quality filter and the identical grouping feed both, so the
+backstop cannot fire for a set the filter approved, and no operator should expect its warning.
 
-Those sets are therefore refused at the last point before the library write, on the discover
-placement path and the generic organize path. The library-upgrade path is unchanged: it compares
-the download against `needs_upgrade`, the number of files that failed the quality gate for that
-album, which is a different reference rather than a stronger one. A refused set logs
+What the rule catches is a result that would otherwise be downloaded for nothing. Counting the whole
+result instead of the group is the routine case: an album whose title is also one of its track titles
+makes peers' copies of the *track* match the query by filename, so the result counts plenty of files
+while the largest album group is that one track. Contiguous numbering alone does not make an album
+either, so a set of tracks nine and ten is a fragment of something longer however tight its numbering
+looks.
+
+Such a result is rejected before the download, and the rejection appears in the run's rejection
+summary:
 
 ```text
-WARN seakarr::runner: Aquasky - Shadow Era Pt. 1: incomplete download (only 1 of at least 5 tracks were downloaded), skipping library placement
+INFO seakarr::runner: Cyantific — Archive 1: 167 files from 18 users, 0 passed filters (need: ["flac"] format, free slot or queue position <= 100, contiguous track numbers)
+  → rejected: 1 missing track 1
 ```
 
-and the album is recorded failed rather than written, with its files left in `storage.staging_dir`.
-Nothing removes them on their own: a later `auto` run cleans up leftover staging for any album that
-is not recorded as successful only when `library_upgrade.enabled` is `true`, and `discover` never
-runs that pass — so a discover-only operator keeps the refused files until they clean staging
-themselves. The serving peer is recorded as an album failure too. The demotion is real but light:
-the tracks that peer did deliver are already credited as successes for the same download, so the
-album-level failure only tips the balance against a peer that has a positive history.
+A group that is too short reports the count half instead (`→ rejected: 1 below min track`). The
+per-result reason (`only 3 of at least 5 tracks in the largest album group`) is logged at DEBUG for
+the rejected peer, so it takes `--log-level DEBUG` to see it.
 
-Two conditions make up the check, and only `min_tracks: 0` disables both halves — the pre-download
-gate's own "set it to 0 or 1 for EPs" advice does not reach the numbering half:
+Should a refusal ever happen after the download instead — the backstop above, or the library-upgrade
+path's own `expected_tracks` gate — the album is recorded failed and its staged files are removed with
+it, so a refusal leaves nothing of its own in `storage.staging_dir`. A directory that still
+holds an entry this run did not stage (another album on the same `artist--album` staging name, or
+leftovers from an earlier run) is left in place, with a warning naming the first such entry — a file
+or a subdirectory. Ownership is by path, so a foreign file that lands on the same path as one of
+ours goes with ours; the two cannot be told apart. The serving peer is
+recorded as an album failure too. The demotion is real but light: the tracks that peer did deliver are
+already credited as successes for the same download, so the album-level failure only tips the balance
+against a peer that has a positive history.
 
-- **the set is shorter than `min_tracks`**; and
+The library-upgrade path's refusal logs its own wording:
+
+```text
+WARN seakarr::runner: Aquasky - Shadow Era Pt. 1: download incomplete (3/6 tracks), skipping library upgrade
+```
+
+Two conditions make up the rule. The anchor is part of it rather than part of the
+`contiguous_tracks` toggle — turning the gap check off for an unnumbered collection does not
+disable the anchor — and only `min_tracks: 0` disables both halves. The anchor is skipped for
+library-upgrade candidates, which only have to deliver the files the library needs replaced.
+
+- **the set is shorter than `min_tracks`** — measured on the largest album group, the set that will
+  actually be downloaded, and applied in every mode; and
 - **its numbered files, if any, do not include track 1** — a set of tracks nine and ten is a
-  fragment however contiguous it looks.
+  fragment however contiguous it looks. This half applies to new albums; an upgrade candidate is
+  exempt, because the library keeps its own track 1.
+
+Both conditions are checked in the filter before the download, and again by the library write after
+it, on the discover-placement and organize paths. Because the anchor reads the *first* numeric token
+of each name, a compilation whose files lead with a varying number (`2 Unlimited - 01 - ...`,
+`3 Doors Down - 02 - ...`) is judged on those phantom numbers, and can be refused by the anchor
+when no name parses to a track 1. That class is not new to the library write, which always applied
+this rule, but it is now also refused before the download in every mode.
 
 The numbering half is deliberately cautious, and misses several real fragments as a result. It
 judges a set only when **every** downloaded file parsed a number, so a mixed set — an `Intro.flac`
@@ -539,11 +573,13 @@ Track numbers are read as tracks, not as fragments, when they are `1` or when th
 digits are `01`: a rip that fuses the disc and track number (`101` for disc 1 track 1) counts as
 starting at track 1, just as the hyphenated `1-01` form does.
 
-Note that this refusal also applies to genuine EPs and singles on the organize path: an album
-shorter than `min_tracks` is downloaded and then refused, so auto mode with
-`library_upgrade.enabled: false` (the shipped default) needs `min_tracks: 0` or `1` to replace a
-short album rather than refusing it every cycle. With `library_upgrade.enabled: true` the
-library-upgrade path's `needs_upgrade` reference decides instead.
+Note that the count half also applies to genuine EPs and singles: an album shorter than
+`min_tracks` is refused in the filter, before any download, in every mode — the target is not
+consulted first. Auto mode with `library_upgrade.enabled: false` (the shipped default) needs
+`min_tracks: 0` or `1` to replace a short album rather than refusing it every cycle. With
+`library_upgrade.enabled: true` and `min_tracks` low enough to admit the album, the library-upgrade
+path's own `needs_upgrade` reference decides the copy after the download, and that path may be
+served by a peer sharing only the non-conforming files.
 
 ### `pid`
 
@@ -600,7 +636,12 @@ Seakarr has four operating modes:
    offer a free upload slot, while a positive limit also admits zero-slot peers
    whose queue position is validated during download. When
    `filters.contiguous_tracks` is enabled, results whose downloadable track
-   numbers have gaps (or none at all) are rejected before ranking.
+   numbers have gaps (or none at all) are rejected before ranking. The
+   completeness rule (`filters.min_tracks`) also runs here, in every mode: it is
+   measured on the largest album group — the set that would actually be
+   downloaded — and it rejects a group that is too short or whose credible
+   numbering never reaches track 1, so a result that could never be placed is
+   rejected before the transfer rather than after it.
    Ranks candidates by `speed × slot_bonus × bitrate_bonus × album_bonus × reliability_factor` (reliability and
    measured-speed reputation adjust the advertised speed; `album_bonus` is 1.5 when the peer's folder matches the
    album name, 1.1 when the name appears elsewhere in the path, 1.0 otherwise).

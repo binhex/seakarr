@@ -167,7 +167,11 @@ pub enum LibraryTarget<'a> {
 
 `Upgrade` is auto mode's gated copy-back: the completeness gate, the copy, and
 the optional quality-deletion pass. `Place` is discover mode's placement: the
-same copy, no completeness gate, no quality deletion. The invalid state
+same copy, no completeness gate, no quality deletion. (**Superseded on
+2026-09-18**, when `library_write_refusal` added the completeness gate to
+`Place`, and **extended on 2026-09-19**: the same rule now also runs in the
+pre-download filter, so `Place`'s gate is a backstop. `Place` still applies no
+quality deletion.) The invalid state
 disappears from the type, and the defensive failure arm is deleted rather than
 kept.
 
@@ -242,12 +246,15 @@ Everything else is inherited: `sanitize_component` on the album, track, title,
 and extension values, parent-directory creation, multi-disc subdirectory
 preservation, cross-filesystem safety, and the commit order.
 
-There is no completeness gate. A new album has no library track-count baseline,
-and presence semantics already treat any audio file under the album folder as
-present, so a gate here would only reject albums for a reason the rest of the
-design does not share. There is no `delete_lesser_quality` pass either: it is an
-upgrade action, comparing a download against the file it replaces, and nothing
-is being replaced here.
+There is no completeness gate. (**Superseded on 2026-09-18** by the
+`library_write_refusal` gate, and again on 2026-09-19, when the same rule
+moved into the pre-download filter; the reasoning below is the original design
+rationale and no longer describes the code.) A new album has no library
+track-count baseline, and presence semantics already treat any audio file
+under the album folder as present, so a gate here would only reject albums for
+a reason the rest of the design does not share. There is no
+`delete_lesser_quality` pass either: it is an upgrade action, comparing a
+download against the file it replaces, and nothing is being replaced here.
 
 ### The album folder takes the MusicBrainz title
 
@@ -274,6 +281,13 @@ directory retained, so no downloaded data is lost. The album is recorded
 with the existing rule that only `Downloaded` and `Failed` outcomes reach the
 download stage and therefore charge. The album is retried on a later run
 because only successes become processed records.
+
+(**Superseded on 2026-09-19.** A completeness *refusal* is no longer one of
+these outcomes: `incomplete download, library placement skipped` now removes the
+staged files rather than retaining them, and the same completeness rule runs in
+the pre-download filter, so a set that could never be placed is normally
+rejected before the transfer. A copy or directory-creation failure still retains
+staging.)
 
 ### Notifications, reporting, budget, and recovery: one superseded line
 
@@ -415,7 +429,9 @@ argument.
 
 - **Placement copy or directory creation fails** — `Failed` with
   `library placement failed: <cause>`; staging retained; album recorded
-  `failed`; budget charged. The album is retried on a later run only when no
+  `failed`; budget charged. A completeness refusal instead removes the staged
+  files (superseded on 2026-09-19; see the error-handling note above). The album
+  is retried on a later run only when no
   audio file reached the album folder: a failure after the first file landed
   leaves a folder the presence index treats as present, so that album is
   reported as already present from then on. The retained copy is also not
@@ -636,7 +652,10 @@ cancellation guard for their downloads, so no listener outlives a run. Only the
   `%album%`: covered by the `organizer` placement tests and by
   `destination_keeps_the_on_disk_artist_folder_spelling` in `discover`.
 - A single-track peer group places successfully, so placement applies no
-  completeness gate against a library track count.
+  completeness gate against a library track count. (Superseded on 2026-09-18 by
+  the `library_write_refusal` gate: with `min_tracks >= 2` a single-file set is
+  the `TooShort` case and is refused — as of 2026-09-19 normally by the
+  pre-download filter, so it never reaches placement.)
 - A destination file that parses as audio is kept rather than overwritten, and
   one that does not parse is replaced: covered by the `organizer` placement
   tests.
@@ -645,6 +664,10 @@ cancellation guard for their downloads, so no listener outlives a run. Only the
   tests.
 - A blocked destination yields `Failed`, retains staging, charges the budget,
   and records `failed`.
+- A completeness refusal removes the staged files, records `failed`, and (on the
+  post-download path) has already been charged: a `Failed` outcome consumes one
+  discover budget unit at the download stage, unlike a pre-download
+  `NoCandidates` rejection, which never reaches it. (Added 2026-09-19.)
 - Auto mode regression: `Upgrade` still enforces both halves of the
   completeness gate — `test_library_upgrade_completeness_uses_library_track_count_not_peer_folder_size`
   for the accepted case and `test_library_upgrade_rejects_an_incomplete_download`
@@ -682,14 +705,22 @@ Unchanged: discover resolution, `--artist` narrowing, and the `--album` and
 3. Placement is unconditional in discover mode: it does not depend on
    `storage.organize` or `library_upgrade.enabled`.
 4. The placement path applies no completeness gate and no quality deletion.
+   (Superseded on 2026-09-18 by the fragment gate in `library_write_refusal`, and
+   extended on 2026-09-19: the same rule now also runs in the pre-download
+   filter. The placement path still applies no quality deletion.)
 5. The staging album directory is removed after a successful copy; a removal
    failure is a warning only.
 6. A placement failure is a `Failed` outcome with staging retained and the
-   budget charged.
+   budget charged. (Superseded on 2026-09-19 for the completeness refusal, which
+   now removes the staged files and is normally reached before the download; a
+   copy or directory-creation failure still retains staging.)
 7. Disc-nested albums resolve their artist directory and library location
    correctly, and library-side and peer-side path parsing share one disc rule.
 8. Auto mode's behaviour is unchanged except for the corrected disc-nested
-   upgrade destination, and its existing tests pass.
+   upgrade destination, and its existing tests pass. (Superseded on 2026-09-19:
+   the pre-download filter now applies the completeness rule in every mode, and
+   a completeness refusal on any path removes the staged files, so auto mode's
+   Upgrade refusal no longer retains staging.)
 9. Artist-only manual mode is unchanged apart from cancellation: its library scan
    is cancellable and a cancelled scan stops the run rather than warning about a
    scan failure. Explicit manual and batch modes are unchanged apart from sharing

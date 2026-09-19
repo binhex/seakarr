@@ -3,11 +3,16 @@ use crate::config::FilterConfig;
 use unicode_normalization::UnicodeNormalization;
 
 /// Filter search results by extension, bitrate, excluded words, free slots,
-/// minimum track count (`min_tracks`), contiguous track numbers (when
+/// the download-completeness rule, contiguous track numbers (when
 /// `contiguous_tracks` is enabled), and — in auto mode — the library track
 /// count (`peer_track_count`): results whose usable track count is below the
-/// library's existing track count are rejected. Returns only results with at
-/// least `min_tracks` matching files (or at least one when `min_tracks` is 0).
+/// library's existing track count are rejected.
+///
+/// Completeness is judged on the largest album group — the files
+/// `download_album` actually fetches — never on the whole result: a result must
+/// hold at least `min_tracks` files in that group (or at least one when
+/// `min_tracks` is 0) and, when its numbering is credible, must reach track 1.
+/// See [`incomplete_download`].
 ///
 /// When `album` is `Some`, results whose file paths do not contain the album
 /// name as whole words are also rejected (primary artist+album search tier).
@@ -23,18 +28,27 @@ pub fn filter_results(
     library_track_count: Option<usize>,
     album: Option<&str>,
 ) -> Vec<SearchResult> {
-    filter_results_with_queue_limit(results, config, library_track_count, album, 0)
+    filter_results_with_queue_limit(
+        results,
+        config,
+        library_track_count,
+        album,
+        0,
+        TrackOneAnchor::Required,
+    )
 }
 
 /// Queue-aware variant of [`filter_results`]. A zero-slot result is kept only
 /// when `max_queue_length` is positive; its reported queue position is
-/// validated when the download is actually queued.
+/// validated when the download is actually queued. `anchor` selects whether the
+/// completeness rule's track-1 half applies (see [`TrackOneAnchor`]).
 pub(crate) fn filter_results_with_queue_limit(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
     album: Option<&str>,
     max_queue_length: u32,
+    anchor: TrackOneAnchor,
 ) -> Vec<SearchResult> {
     results
         .iter()
@@ -72,15 +86,21 @@ pub(crate) fn filter_results_with_queue_limit(
             };
             if !config.contiguous_tracks {
                 // Toggle off: count safe, quality-passing files (mirroring
-                // download_album) and reject incomplete shares below
-                // min_tracks. min_tracks.max(1) keeps the "at least one
-                // usable file" floor when the gate is disabled (0).
+                // download_album) and reject incomplete shares. min_tracks == 0
+                // keeps the "at least one usable file" floor when the gate is
+                // disabled (0).
                 let passing: Vec<&FileInfo> =
                     r.files.iter().filter(|f| safe_and_passing(f)).collect();
-                // min_tracks == 0 disables the gate but never accepts a
-                // result with zero usable files.
-                let min = config.min_tracks.max(1) as usize;
-                if passing.len() < min {
+                // Same completeness rule as the contiguous branch, over the same
+                // downloadable set. min_tracks == 0 disables both halves but
+                // never accepts a result with zero usable files.
+                if let Some(kind) =
+                    incomplete_download(&downloadable_basenames(&passing), config.min_tracks, anchor)
+                {
+                    tracing::debug!("result from {} rejected: {}", r.username, kind.filter_reason());
+                    return false;
+                }
+                if passing.is_empty() {
                     return false;
                 }
                 // Library track count check (auto mode only).
@@ -111,15 +131,16 @@ pub(crate) fn filter_results_with_queue_limit(
                 return true;
             }
             let passing: Vec<&FileInfo> = r.files.iter().filter(|f| safe_and_passing(f)).collect();
-            if passing.len() < config.min_tracks as usize {
-                // Incomplete share: fewer tracks than the configured minimum
-                // (e.g. a single track of a 16-track album).
-                tracing::debug!(
-                    "result from {} rejected: {} passing files below min_tracks={}",
-                    r.username,
-                    passing.len(),
-                    config.min_tracks
-                );
+            // The completeness gate judges the set that will actually be
+            // downloaded — the largest single album directory — with the same
+            // rule the post-download library write applies. Counting every
+            // passing file in the result instead let a peer through whose album
+            // group was a fragment: the whole album was downloaded, refused at
+            // the library write, and left in the staging directory.
+            if let Some(kind) =
+                incomplete_download(&downloadable_basenames(&passing), config.min_tracks, anchor)
+            {
+                tracing::debug!("result from {} rejected: {}", r.username, kind.filter_reason());
                 return false;
             }
             if passing.is_empty() {
@@ -174,6 +195,150 @@ pub(crate) fn filter_results_with_queue_limit(
             true
         })
         .cloned()
+        .collect()
+}
+
+/// Whether the completeness rule's track-1 anchor applies to a search.
+///
+/// The anchor asks whether a downloaded set reaches track 1, which is what makes a
+/// set a complete *new* album. A library-upgrade candidate is judged differently:
+/// the library already holds its own track 1, and the upgrade only replaces the
+/// files that failed the quality gate, so a peer delivering just those files is a
+/// legitimate source. This mirrors where the post-download gate applies the anchor
+/// (`library_write_refusal` on the placement and organize paths) and where it does
+/// not (the upgrade path's `expected_tracks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackOneAnchor {
+    /// A new album: the downloaded set must reach track 1.
+    Required,
+    /// A library-upgrade candidate: only the files needing replacement must arrive.
+    NotRequired,
+}
+
+/// Why a downloaded set is not a complete album.
+///
+/// The pre-download filter, the rejection summary and the post-download library
+/// write all branch on this classification instead of re-deriving half of the
+/// rule themselves, which is how the pre-download and post-download gates drifted
+/// apart in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncompleteDownload {
+    /// Fewer files in the downloadable set than `min_tracks` allows.
+    TooShort { found: usize, min_tracks: u32 },
+    /// The numbering is credible, has at least two distinct values, and never
+    /// reaches track 1.
+    MissingTrackOne { start: u32 },
+}
+
+impl IncompleteDownload {
+    /// The operator-facing reason for a refusal after the download, as reported
+    /// in the `Failed` outcome and its warning.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            IncompleteDownload::TooShort { found, min_tracks } => {
+                format!("only {found} of at least {min_tracks} tracks were downloaded")
+            }
+            IncompleteDownload::MissingTrackOne { start } => {
+                format!("the tracks start at track {start} instead of 1")
+            }
+        }
+    }
+
+    /// The same refusal as seen by the pre-download filter, where nothing has been
+    /// transferred yet: it names the downloadable set rather than a download.
+    pub(crate) fn filter_reason(self) -> String {
+        match self {
+            IncompleteDownload::TooShort { found, min_tracks } => {
+                format!("only {found} of at least {min_tracks} tracks in the largest album group")
+            }
+            IncompleteDownload::MissingTrackOne { start } => {
+                format!("the tracks start at track {start} instead of 1")
+            }
+        }
+    }
+}
+
+/// The download-completeness rule, shared by the pre-download filter and the
+/// post-download library write. Both apply it to the same set — the files of the
+/// largest album group, which is what `download_album` fetches — through the same
+/// quality filter and the same grouping, so the two see identical name lists by
+/// construction. The pre-download call is the decisive one; the library-write call
+/// is a defensive backstop for a future change to the download layer.
+///
+/// `names` are the basenames of the files that will be (or were) downloaded, and
+/// `min_tracks` disables both halves when it is 0, matching the documented escape
+/// hatch for EPs and singles. The count half always applies; the numbering half
+/// applies only when `anchor` is [`TrackOneAnchor::Required`].
+///
+/// A set is refused when it is shorter than `min_tracks`, or when its numbered
+/// files are credible and none of them is track 1 — a gap-free run of 02..10 is
+/// still a fragment of something longer. The numbering half is deliberately
+/// cautious, and misses several real fragments as a result. It judges a set
+/// only when **every** file parsed a number, so a mixed set — an `Intro.flac`
+/// beside `02 - Two.flac` — is left alone. It also requires at least **two
+/// distinct** parsed values, because `track_number_from_filename` reads the
+/// *first* numeric token: every file of
+/// `Blink 182 - Enema of the State - 01 - Dumpweed.flac` reports track 182, and
+/// a single repeated value is indistinguishable from a set that genuinely
+/// repeats one track number, which the project supports. A lone numbered file
+/// is not judged either, since one value can never be distinct.
+///
+/// Track numbers are read as tracks, not as fragments, when they are `1` or
+/// when their last two digits are `01`: a rip that fuses the disc and track
+/// number (`101` for disc 1 track 1) counts as starting at track 1, just as the
+/// hyphenated `1-01` form does.
+pub(crate) fn incomplete_download(
+    names: &[&str],
+    min_tracks: u32,
+    anchor: TrackOneAnchor,
+) -> Option<IncompleteDownload> {
+    if min_tracks == 0 {
+        return None;
+    }
+    if names.len() < min_tracks as usize {
+        return Some(IncompleteDownload::TooShort {
+            found: names.len(),
+            min_tracks,
+        });
+    }
+    if anchor == TrackOneAnchor::NotRequired {
+        return None;
+    }
+    let numbers: Vec<u32> = names
+        .iter()
+        .filter_map(|name| crate::tracks::track_number_from_filename(name))
+        .collect();
+    let mut distinct = numbers.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if numbers.len() == names.len() {
+        if let Some(&start) = distinct.first() {
+            // A disc and track fused into one value ("101" for disc 1 track 1,
+            // "205" for disc 2 track 5) carries the same signal as the
+            // hyphenated "1-01" form, which `track_number_from_filename`
+            // already unwraps, so the same modulo test applies to the fused
+            // spelling.
+            let starts_at_track_one = distinct.iter().any(|number| number % 100 == 1);
+            if distinct.len() >= 2 && !starts_at_track_one {
+                return Some(IncompleteDownload::MissingTrackOne { start });
+            }
+        }
+    }
+    None
+}
+
+/// Basenames of the files `download_album` would fetch for this result: the
+/// largest single album group, with the discs of a multi-disc album collapsed
+/// into one group exactly as the download does.
+fn downloadable_basenames<'a>(passing: &[&'a FileInfo]) -> Vec<&'a str> {
+    crate::download::largest_album_group(passing)
+        .iter()
+        .map(|file| {
+            file.name
+                .rsplit_once(['/', '\\'])
+                .map(|(_, basename)| basename)
+                .unwrap_or(file.name.as_str())
+        })
         .collect()
 }
 
@@ -697,14 +862,28 @@ mod tests {
             vec![make_file("Album/01 - track.flac", 900, 30_000_000)],
         )];
 
-        let filtered = filter_results_with_queue_limit(&results, &cfg, None, None, 3);
+        let filtered = filter_results_with_queue_limit(
+            &results,
+            &cfg,
+            None,
+            None,
+            3,
+            TrackOneAnchor::Required,
+        );
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].username, "queued-peer");
 
         // The rejection summary must agree: a positive cap is not a
         // free-slot rejection.
-        let summary = summarize_rejections_with_queue_limit(&results, &cfg, None, None, 3);
+        let summary = summarize_rejections_with_queue_limit(
+            &results,
+            &cfg,
+            None,
+            None,
+            3,
+            TrackOneAnchor::Required,
+        );
         assert_eq!(summary.no_free_slots, 0);
     }
 
@@ -1309,6 +1488,252 @@ mod tests {
     }
 
     #[test]
+    fn test_contiguity_rejects_a_run_that_starts_after_track_one() {
+        // Regression for the Cyantific "Archive 1" leftovers: a gap-free run
+        // that never reaches track 1 (02..10 here, 02..06 below) passed this
+        // filter, was downloaded in full, and was refused only at the library
+        // write — the download was wasted and the partial album stayed in
+        // `storage.staging_dir`. The pre-download gate must apply the same
+        // track-1 anchor the post-download gate applies.
+        let cfg = FilterConfig {
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        let files = (2..=6)
+            .map(|n| make_file(&format!("{n:02} - track.flac"), 900, 30_000_000))
+            .collect();
+        let results = vec![make_result("user1", 500, 1, files)];
+
+        let filtered = filter_results(&results, &cfg, None, None);
+        assert!(
+            filtered.is_empty(),
+            "a gap-free run of 02..06 has no track 1 and is a fragment, so it must not be downloaded"
+        );
+    }
+
+    #[test]
+    fn test_min_tracks_counts_the_largest_album_group() {
+        // Regression for the Charlie Parker "The Happy \"Bird\"" leftovers:
+        // the filter counted every quality-passing file in the result (5), but
+        // only the largest single album directory (3) is ever downloaded, so the
+        // album cleared the pre-download gate and was refused after the
+        // download. The count must measure the set that will be downloaded —
+        // the largest album group — exactly as `download_album` does.
+        let files = vec![
+            make_file(r"Music\Artist\Album\01 - A.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Album\02 - B.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\01 - C.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\02 - D.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\03 - E.flac", 900, 30_000_000),
+        ];
+        let results = vec![make_result("user1", 500, 1, files)];
+
+        let cfg = FilterConfig {
+            min_tracks: 4,
+            ..default_filter_config()
+        };
+        assert!(
+            filter_results(&results, &cfg, None, None).is_empty(),
+            "the largest album group holds 3 files, below min_tracks=4, so the result must be rejected up front"
+        );
+
+        // Control: the same result is accepted once the largest group satisfies
+        // the floor — the rejection above is about the group, not the total.
+        let cfg = FilterConfig {
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        assert_eq!(
+            filter_results(&results, &cfg, None, None).len(),
+            1,
+            "a 3-file largest group meets min_tracks=3"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_download_classifies_both_halves_and_its_guards() {
+        // Direct cover for the shared rule's internals: the fused disc-track
+        // spelling, the two "cannot judge this set" guards, the count half, the
+        // anchor switch, and the min_tracks 0 escape hatch. These were only
+        // exercised indirectly through `filter_results` before.
+        use IncompleteDownload::{MissingTrackOne, TooShort};
+        use TrackOneAnchor::{NotRequired, Required};
+
+        // Count half, with the found/minimum pair the log needs.
+        assert_eq!(
+            incomplete_download(&["01 - A.flac", "02 - B.flac"], 3, Required),
+            Some(TooShort {
+                found: 2,
+                min_tracks: 3
+            })
+        );
+        // Numbering half: a credible gap-free run that starts past track 1.
+        assert_eq!(
+            incomplete_download(&["02 - A.flac", "03 - B.flac"], 2, Required),
+            Some(MissingTrackOne { start: 2 })
+        );
+        // Fused disc+track ("101" is disc 1 track 1) is anchored at track 1: read
+        // literally it would be `MissingTrackOne` (1 and 2 are distinct, neither is
+        // 1), so this assertion is what pins the `% 100 == 1` rule.
+        assert_eq!(
+            incomplete_download(&["101 - A.flac", "102 - B.flac"], 2, Required),
+            None
+        );
+        // The hyphenated disc-track form is unwrapped to the track number alone, so
+        // "1-01" and "1-02" parse to 1 and 2: the set has two distinct values and it
+        // is the anchor (1 % 100 == 1) that accepts it.
+        assert_eq!(
+            incomplete_download(&["1-01 - A.flac", "1-02 - B.flac"], 2, Required),
+            None
+        );
+        // Track 100 is not a fused track-1: 100 % 100 == 0.
+        assert_eq!(
+            incomplete_download(&["100 - A.flac", "02 - B.flac"], 2, Required),
+            Some(MissingTrackOne { start: 2 })
+        );
+        // Guards: a mixed set, a lone numbered file, and one repeated value are
+        // all left alone because the read is not credible. The repeated-value case is
+        // the discriminating one: without the at-least-two-distinct guard the anchor
+        // would refuse 7 and 7.
+        assert_eq!(
+            incomplete_download(&["Intro.flac", "02 - B.flac"], 2, Required),
+            None
+        );
+        assert_eq!(incomplete_download(&["01 - A.flac"], 1, Required), None);
+        assert_eq!(
+            incomplete_download(&["07 - A.flac", "07 - B.flac"], 2, Required),
+            None
+        );
+        // min_tracks 0 disables both halves.
+        assert_eq!(
+            incomplete_download(&["02 - A.flac", "03 - B.flac"], 0, Required),
+            None
+        );
+        // A library-upgrade candidate skips the anchor — the library holds track 1
+        // — but the count half still applies to it.
+        assert_eq!(
+            incomplete_download(&["02 - A.flac", "03 - B.flac"], 2, NotRequired),
+            None,
+            "an upgrade may be served by a peer that shares only the files it needs"
+        );
+        assert_eq!(
+            incomplete_download(&["02 - A.flac"], 2, NotRequired),
+            Some(TooShort {
+                found: 1,
+                min_tracks: 2
+            }),
+            "the count half is not an upgrade exemption"
+        );
+    }
+
+    #[test]
+    fn test_the_anchor_switch_changes_what_the_filter_accepts() {
+        // The same result is refused as a new album and accepted as an upgrade
+        // candidate: the only difference is the anchor.
+        let cfg = FilterConfig {
+            min_tracks: 2,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("09 - Nine.flac", 900, 30_000_000),
+                make_file("10 - Ten.flac", 900, 30_000_000),
+            ],
+        )];
+
+        assert!(
+            filter_results_with_queue_limit(
+                &results,
+                &cfg,
+                None,
+                None,
+                0,
+                TrackOneAnchor::Required
+            )
+            .is_empty(),
+            "a run of 09..10 is not a new album"
+        );
+        assert_eq!(
+            filter_results_with_queue_limit(
+                &results,
+                &cfg,
+                None,
+                None,
+                0,
+                TrackOneAnchor::NotRequired
+            )
+            .len(),
+            1,
+            "the same run is a usable upgrade source"
+        );
+    }
+
+    #[test]
+    fn test_toggle_off_still_refuses_a_run_without_track_one() {
+        // The anchor belongs to the completeness rule, not to the gap check, so
+        // turning `contiguous_tracks` off for an unnumbered collection does not
+        // disable it — only `min_tracks: 0` does. Deleting the off-branch call
+        // must fail this test.
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 2,
+            ..default_filter_config()
+        };
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("09 - Nine.flac", 900, 30_000_000),
+                make_file("10 - Ten.flac", 900, 30_000_000),
+            ],
+        )];
+        assert!(
+            filter_results(&results, &cfg, None, None).is_empty(),
+            "a run of 09..10 is a fragment even with the gap check disabled"
+        );
+    }
+
+    #[test]
+    fn test_toggle_off_min_tracks_counts_the_largest_album_group() {
+        // The group-aware count applies on the off branch too: the peer would
+        // otherwise be downloaded for a 3-file album group while the result as a
+        // whole clears the floor.
+        let files = vec![
+            make_file(r"Music\Artist\Album\01 - A.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Album\02 - B.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\01 - C.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\02 - D.flac", 900, 30_000_000),
+            make_file(r"Music\Artist\Other\03 - E.flac", 900, 30_000_000),
+        ];
+        let results = vec![make_result("user1", 500, 1, files)];
+
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 4,
+            ..default_filter_config()
+        };
+        assert!(
+            filter_results(&results, &cfg, None, None).is_empty(),
+            "the largest album group holds 3 files, below min_tracks=4, even with the gap check disabled"
+        );
+
+        let cfg = FilterConfig {
+            contiguous_tracks: false,
+            min_tracks: 3,
+            ..default_filter_config()
+        };
+        assert_eq!(
+            filter_results(&results, &cfg, None, None).len(),
+            1,
+            "a 3-file largest group meets min_tracks=3"
+        );
+    }
+
+    #[test]
     fn test_min_tracks_preempts_peer_track_count() {
         // With default min_tracks=3, a 2-track peer is rejected by min_tracks
         // before the library track count check runs — even if the library has
@@ -1413,6 +1838,10 @@ pub struct FilterRejectionSummary {
     pub non_contiguous: usize,
     /// Results rejected because below min_tracks
     pub below_min_tracks: usize,
+    /// Results rejected because the set that would be downloaded is a fragment
+    /// of something longer: a credible numbering run that never reaches track 1.
+    /// A set that is merely too short is counted in `below_min_tracks` instead.
+    pub incomplete_download: usize,
     /// Results rejected because none of their files passed the quality gate, so
     /// the track-count floor never applied (reported separately so the log names
     /// the gate that actually rejected them, e.g. `min_tracks: 0`)
@@ -1436,6 +1865,7 @@ impl FilterRejectionSummary {
             || self.no_free_slots > 0
             || self.non_contiguous > 0
             || self.below_min_tracks > 0
+            || self.incomplete_download > 0
             || self.no_usable_files > 0
             || self.peer_track_count_rejected > 0
             || self.bitrate_rejected > 0
@@ -1486,6 +1916,9 @@ impl FilterRejectionSummary {
                 if self.below_min_tracks == 1 { "" } else { "s" }
             ));
         }
+        if self.incomplete_download > 0 {
+            parts.push(format!("{} missing track 1", self.incomplete_download));
+        }
         if self.no_usable_files > 0 {
             parts.push(format!("{} with no usable files", self.no_usable_files));
         }
@@ -1535,17 +1968,27 @@ pub fn summarize_rejections(
     library_track_count: Option<usize>,
     album: Option<&str>,
 ) -> FilterRejectionSummary {
-    summarize_rejections_with_queue_limit(results, config, library_track_count, album, 0)
+    summarize_rejections_with_queue_limit(
+        results,
+        config,
+        library_track_count,
+        album,
+        0,
+        TrackOneAnchor::Required,
+    )
 }
 
 /// Queue-aware variant of [`summarize_rejections`]. A zero-slot result is
-/// counted as a free-slot rejection only when `max_queue_length` is 0.
+/// counted as a free-slot rejection only when `max_queue_length` is 0. `anchor`
+/// must match the value the results were filtered with, or the buckets describe a
+/// different gate than the one that ran.
 pub(crate) fn summarize_rejections_with_queue_limit(
     results: &[SearchResult],
     config: &FilterConfig,
     library_track_count: Option<usize>,
     album: Option<&str>,
     max_queue_length: u32,
+    anchor: TrackOneAnchor,
 ) -> FilterRejectionSummary {
     let mut summary = FilterRejectionSummary::default();
     let mut ext_counts: std::collections::BTreeMap<String, usize> =
@@ -1623,18 +2066,34 @@ pub(crate) fn summarize_rejections_with_queue_limit(
             passing_files.push(f);
         }
 
-        // A result with no usable files is rejected by `filter_results` before
-        // its track count matters, so report that gate rather than the floor.
+        // A result with no quality-passing file at all is bucketed separately:
+        // with `min_tracks > 0` the shared rule classifies it as `TooShort`
+        // (`0 < min_tracks`), but naming the gate that actually emptied the result
+        // is more useful here than reporting a track-count shortfall.
         if passing_files.is_empty() {
             summary.no_usable_files += 1;
             continue;
         }
-        // Min tracks check (mirror filter_results: min_tracks=0 still
-        // enforces floor of 1 for zero-passing-file rejection)
-        let min = config.min_tracks.max(1) as usize;
-        if passing_files.len() < min {
-            summary.below_min_tracks += 1;
-            continue;
+        // Completeness rule, shared with `filter_results` and measured on the
+        // same set it judges: the largest album group, not every passing file in
+        // the result. The classification decides the bucket, so this summary
+        // cannot disagree with the gate about which half refused a set — with the
+        // one deliberate exception above, where a result with no quality-passing
+        // file is reported as `no_usable_files` rather than as `TooShort`.
+        match incomplete_download(
+            &downloadable_basenames(&passing_files),
+            config.min_tracks,
+            anchor,
+        ) {
+            Some(IncompleteDownload::TooShort { .. }) => {
+                summary.below_min_tracks += 1;
+                continue;
+            }
+            Some(IncompleteDownload::MissingTrackOne { .. }) => {
+                summary.incomplete_download += 1;
+                continue;
+            }
+            None => {}
         }
 
         // Contiguity check (only if enabled and we have files)
@@ -1734,6 +2193,35 @@ mod rejection_summary_tests {
         assert!(summary
             .summary_line()
             .contains("6 not in allowed formats (mostly: mp3)"));
+    }
+
+    #[test]
+    fn test_summary_counts_a_set_without_track_one_as_a_rejection() {
+        // The summary must agree with `filter_results`: a gap-free run that never
+        // reaches track 1 is refused there, so it cannot be silently counted as a
+        // passing result here. Regression for the Cyantific "Archive 1" shape,
+        // whose rejection was invisible in the "0 passed filters" breakdown.
+        let cfg = default_filter_config();
+        let results = vec![make_result(
+            "user1",
+            500,
+            1,
+            vec![
+                make_file("02 - Two.flac", 900, 10_000_000),
+                make_file("03 - Three.flac", 900, 10_000_000),
+                make_file("04 - Four.flac", 900, 10_000_000),
+            ],
+        )];
+        let summary = summarize_rejections(&results, &cfg, None, None);
+        assert!(
+            summary.has_rejections(),
+            "a run of 02..04 is refused by the filter, so the summary must report a rejection"
+        );
+        assert_eq!(
+            summary.incomplete_download, 1,
+            "the fragment must be attributed to the completeness rule"
+        );
+        assert!(summary.summary_line().contains("1 missing track 1"));
     }
 
     #[test]
