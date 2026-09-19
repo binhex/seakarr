@@ -677,7 +677,13 @@ pub(crate) async fn discover_artist_albums_at(
                 let candidates = provider.search_artists(artist).await?;
                 let resolved = resolve_artist(&artist_key, &candidates)?;
                 if let ArtistResolution::ScoreDominance(evidence) = &resolved.resolution {
-                    tracing::info!(
+                    // Debug, not info: this fires for every artist MusicBrainz
+                    // returns more than one exact canonical match for, which is a
+                    // routine catalogue quirk rather than an operator-actionable
+                    // event. The evidence keeps the decision auditable when the
+                    // level is raised, and the selection is not silent either way:
+                    // the chosen name and MBID reach the caller and the cache.
+                    tracing::debug!(
                         artist = %artist,
                         selected_name = %resolved.candidate.name,
                         selected_mbid = %resolved.candidate.id,
@@ -2588,7 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn dominant_selection_logs_its_evidence_at_info() {
+    fn dominant_selection_logs_its_evidence_at_debug() {
         let db = Database::open_in_memory().unwrap();
         // A distinctive artist spelling, deliberately unlike the Ils fixture the
         // parallel dominance tests share: the capture window separates capture
@@ -2650,8 +2656,8 @@ mod tests {
             .find(|line| line.contains("selected_mbid=11111111-aaaa-4aaa-8aaa-000000000001"))
             .unwrap_or_else(|| panic!("no dominance evidence record, got:\n{logs}"));
         assert!(
-            record.contains(" INFO "),
-            "the evidence must be logged at INFO, got: {record}"
+            record.starts_with("DEBUG "),
+            "the evidence must be logged at DEBUG, got: {record}"
         );
         for field in [
             "resolved duplicate canonical artist name by search-score dominance",

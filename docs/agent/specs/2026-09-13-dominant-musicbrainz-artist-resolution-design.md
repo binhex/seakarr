@@ -36,7 +36,7 @@ In scope:
 - retain MusicBrainz artist-search scores in the provider model;
 - rank canonical exact-name candidates deterministically;
 - select a unique score-100 candidate with a margin of at least 10;
-- log evidence for automatic selection among duplicate exact names;
+- log evidence for automatic selection among duplicate exact names (at DEBUG);
 - preserve configured MBID, cache, stale-cache, and legacy-fallback behavior;
 - add resolver, provider, orchestration, and logging tests;
 - update user documentation for automatic artist resolution.
@@ -194,8 +194,14 @@ cache.
 
 ## Observability
 
-A selection among multiple canonical exact-name candidates emits one INFO event
+A selection among multiple canonical exact-name candidates emits one DEBUG event
 with structured fields for:
+
+(Raised to INFO while the rule was new; lowered on 2026-09-19 because it fires
+for every artist MusicBrainz returns several exact canonical matches for, which
+is a routine catalogue quirk rather than an operator-actionable event. The
+evidence stays available at DEBUG, and the chosen name and MBID still reach the
+cache and the caller either way.)
 
 - requested artist;
 - selected canonical artist name;
@@ -275,7 +281,7 @@ Discovery tests must prove:
 - an unresolved score decision uses compatible stale cache when available;
 - unresolved selection without compatible cache retains the visible legacy
   fallback;
-- INFO logging includes chosen MBID and score evidence;
+- DEBUG logging includes chosen MBID and score evidence (INFO until 2026-09-19);
 - WARN and run-summary behavior for fallback is unchanged.
 
 All tests use mocked providers or wiremock. No test calls live MusicBrainz or
