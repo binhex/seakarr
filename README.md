@@ -422,6 +422,16 @@ also named individually at debug level, because grouping them by folder name sil
 file goes unnoticed. Two debug lines add detail without filling an info-level log: one every 500 audio
 files, and one per unreadable file.
 
+On an interactive terminal the per-minute line is replaced by a spinner that
+updates a single line in place — `Scanning library: 4948 audio file(s), 408
+album(s) (60s elapsed)` — carrying the same counts and elapsed time, so a long
+scan shows movement without scrolling. The counts come from the walk itself, so
+a stalled read freezes them while the spinner keeps ticking, exactly as the
+per-minute line does today. The per-minute line is still written to the log file
+while the spinner is live, and a headless run (no terminal attached) keeps the
+log lines unchanged. The starting, complete and cancelled lines still reach both
+the console and the file.
+
 #### Download log lines
 
 Every completed album produces one completion line naming its final destination:

@@ -74,6 +74,83 @@ pub(crate) const KNOWN_AUDIO_EXTENSIONS: &[&str] = &[
 /// and a time-based cadence is untestable without waiting.
 const SCAN_PROGRESS_EVERY_FILES: usize = 500;
 
+/// The counts both progress outputs share: `"4948 audio file(s)"` joined with
+/// the album count.
+///
+/// The info heartbeat and the interactive spinner both report the walk's
+/// progress at the same moments, and one formatter is what keeps them from
+/// drifting into two different numbers for the same moment.
+#[must_use]
+pub fn scan_counts(files: usize, albums: usize) -> String {
+    format!("{files} audio file(s), {albums} album(s)")
+}
+
+/// How long the walk may run between interactive progress updates.
+///
+/// The counts come from the walk itself, so this is the smallest interval that
+/// still reads as live without re-rendering once per file on a library of tens
+/// of thousands.
+const SCAN_PROGRESS_UPDATE_SECS: u64 = 1;
+
+/// What the walk reports while it runs, for callers that render it.
+///
+/// The walk owns the counting and the cadence; the implementor owns the
+/// rendering. `finish` exists because the closing info line must be emitted
+/// after the renderer has released whatever it holds - a log filter that hides
+/// the heartbeat, for instance - and `Drop` alone cannot order that.
+pub trait ScanProgress {
+    /// Report the counts seen so far. Called at most once a second from the
+    /// same per-entry point as the heartbeat, and once with zero counts before
+    /// the walk starts.
+    fn update(&self, files: usize, albums: usize, elapsed: std::time::Duration);
+
+    /// The walk is over; release anything held. Called on every return path,
+    /// before the closing info line. Must be idempotent.
+    fn finish(&self);
+}
+
+/// True when enough time has passed for another interactive update.
+fn progress_due(
+    last: std::time::Instant,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    now.duration_since(last) >= interval
+}
+
+/// Report the walk's progress to `progress` when the spinner interval is due,
+/// advancing the clock it is given. Returns whether it reported.
+///
+/// Mirrors [`maybe_report_heartbeat`]: decision and emission are one function
+/// so a test can drive the schedule with an injected `now`.
+fn maybe_report_progress(
+    progress: Option<&dyn ScanProgress>,
+    last: &mut std::time::Instant,
+    now: std::time::Instant,
+    files_seen: usize,
+    albums: usize,
+    started: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    let Some(progress) = progress else {
+        return false;
+    };
+    if !progress_due(*last, now, interval) {
+        return false;
+    }
+    *last = now;
+    progress.update(files_seen, albums, now.duration_since(started));
+    true
+}
+
+/// Release the indicator, if one is attached. Called before every closing line
+/// and before every early return, so the renderer can never outlive its walk.
+fn finish_progress(progress: Option<&dyn ScanProgress>) {
+    if let Some(progress) = progress {
+        progress.finish();
+    }
+}
+
 /// How long the walk may run before it reports progress at info level.
 ///
 /// The shipped `logging.level` is INFO, so a debug-only heartbeat would still
@@ -104,7 +181,8 @@ fn maybe_report_heartbeat(
     }
     *last = now;
     tracing::info!(
-        "Library scan still running: {files_seen} audio file(s), {albums} album(s) ({:.0}s elapsed)",
+        "Library scan still running: {} ({:.0}s elapsed)",
+        scan_counts(files_seen, albums),
         now.duration_since(started).as_secs_f64()
     );
     true
@@ -151,6 +229,10 @@ struct AudioTags {
 /// whose tags cannot be read, and an info line with the final counts when it
 /// ends. Before this, a stalled scan was indistinguishable from a hang.
 ///
+/// When `progress` is supplied, the walk also reports the same counts to it
+/// once a second and releases it before the closing line, which is how the
+/// interactive spinner is driven.
+///
 /// # Errors
 ///
 /// [`SeakarrError::Cancelled`] when `cancel` is set, and
@@ -159,12 +241,15 @@ pub fn scan_library(
     library_paths: &[String],
     filters: &crate::config::FilterConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<&dyn ScanProgress>,
 ) -> Result<Vec<ScannedAlbum>> {
     scan_library_with_heartbeat(
         library_paths,
         filters,
         cancel,
         std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS),
+        std::time::Duration::from_secs(SCAN_PROGRESS_UPDATE_SECS),
+        progress,
     )
 }
 
@@ -178,6 +263,8 @@ fn scan_library_with_heartbeat(
     filters: &crate::config::FilterConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     heartbeat_every: std::time::Duration,
+    progress_every: std::time::Duration,
+    progress: Option<&dyn ScanProgress>,
 ) -> Result<Vec<ScannedAlbum>> {
     let mut albums: std::collections::BTreeMap<(String, String), ScannedAlbum> =
         std::collections::BTreeMap::new();
@@ -204,6 +291,7 @@ fn scan_library_with_heartbeat(
     );
     let scan_started = std::time::Instant::now();
     let mut last_heartbeat = scan_started;
+    let mut last_progress = scan_started;
     let mut files_seen: usize = 0;
     let mut unreadable: usize = 0;
     // Acquire, which is sufficient alongside every other reader of this flag
@@ -212,9 +300,14 @@ fn scan_library_with_heartbeat(
     // the question of whether it was a mistake.
     let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
 
+    if let Some(progress) = progress {
+        progress.update(0, 0, std::time::Duration::ZERO);
+    }
+
     for (root_index, lib_path_str) in library_paths.iter().enumerate() {
         let lib_path = Path::new(lib_path_str);
         if !lib_path.exists() {
+            finish_progress(progress);
             return Err(SeakarrError::Scanner(format!(
                 "library path does not exist: {lib_path_str}"
             )));
@@ -229,6 +322,7 @@ fn scan_library_with_heartbeat(
             // cancellation message is what has actually been handled rather
             // than one file more.
             if cancelled() {
+                finish_progress(progress);
                 tracing::info!("Library scan cancelled by user after {files_seen} audio file(s)");
                 return Err(SeakarrError::Cancelled);
             }
@@ -236,13 +330,23 @@ fn scan_library_with_heartbeat(
             // rather than per audio file: a tree dominated by non-audio entries
             // walks for minutes without touching a single tag, and must still
             // show movement at the level operators actually run with.
+            let now = std::time::Instant::now();
             maybe_report_heartbeat(
                 &mut last_heartbeat,
-                std::time::Instant::now(),
+                now,
                 files_seen,
                 albums.len(),
                 scan_started,
                 heartbeat_every,
+            );
+            maybe_report_progress(
+                progress,
+                &mut last_progress,
+                now,
+                files_seen,
+                albums.len(),
+                scan_started,
+                progress_every,
             );
             if !entry.file_type().is_file() {
                 continue;
@@ -410,6 +514,10 @@ fn scan_library_with_heartbeat(
     }
 
     let album_count = albums.len();
+    if let Some(progress) = progress {
+        progress.update(files_seen, album_count, scan_started.elapsed());
+        progress.finish();
+    }
     tracing::info!(
         "Library scan complete: {files_seen} audio file(s), {album_count} album(s), {unreadable} unreadable file(s) in {:.1}s",
         scan_started.elapsed().as_secs_f64()
@@ -558,12 +666,137 @@ mod tests {
     // output that makes the phase observable.
 
     #[test]
+    fn scan_counts_renders_the_shared_counts_text() {
+        // One formatter feeds both the info heartbeat and the interactive
+        // spinner, so the two can never report different numbers for the
+        // same moment. Exact text: both outputs are read by an operator.
+        assert_eq!(scan_counts(4948, 408), "4948 audio file(s), 408 album(s)");
+        assert_eq!(scan_counts(0, 0), "0 audio file(s), 0 album(s)");
+    }
+
+    /// Records what the walk reports, so the seam can be asserted directly.
+    #[derive(Default)]
+    struct RecordingProgress {
+        updates: std::sync::Mutex<Vec<(usize, usize)>>,
+        finishes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScanProgress for RecordingProgress {
+        fn update(&self, files: usize, albums: usize, _elapsed: std::time::Duration) {
+            self.updates.lock().unwrap().push((files, albums));
+        }
+
+        fn finish(&self) {
+            self.finishes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn progress_due_only_fires_after_the_interval() {
+        // Synthetic instants, mirroring `heartbeat_due`: a wall-clock test
+        // would need a real second to elapse and would prove less.
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(1);
+        assert!(!progress_due(start, start, interval));
+        assert!(!progress_due(
+            start,
+            start + std::time::Duration::from_millis(999),
+            interval
+        ));
+        assert!(progress_due(
+            start,
+            start + std::time::Duration::from_secs(1),
+            interval
+        ));
+    }
+
+    #[test]
+    fn maybe_report_progress_does_nothing_without_a_renderer() {
+        // A headless run passes `None`; the check must not fire, so nothing
+        // downstream can observe a bar that was never created.
+        let start = std::time::Instant::now();
+        let mut last = start;
+        assert!(!maybe_report_progress(
+            None,
+            &mut last,
+            start + std::time::Duration::from_secs(5),
+            10,
+            2,
+            start,
+            std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(
+            last, start,
+            "the clock must not advance when nothing reported"
+        );
+    }
+
+    #[test]
+    fn scan_reports_its_counts_to_the_indicator_and_finishes_once() {
+        // The walk owns the counting and the cadence; the renderer owns the
+        // drawing. This pins the numbers the spinner receives, that they only
+        // ever grow, and that the walk releases the renderer exactly once -
+        // the closing info line depends on that release having happened.
+        let dir = library_with_albums(1);
+        let progress = RecordingProgress::default();
+
+        let albums = scan_library_with_heartbeat(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            std::time::Duration::from_secs(SCAN_HEARTBEAT_SECS),
+            std::time::Duration::ZERO,
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert_eq!(albums.len(), 1);
+        let updates = progress.updates.lock().unwrap().clone();
+        assert_eq!(
+            updates.first(),
+            Some(&(0, 0)),
+            "the bar must appear with zero counts before the walk starts"
+        );
+        assert_eq!(
+            updates.last(),
+            Some(&(2, 1)),
+            "the last update must carry the walk's final counts"
+        );
+        assert!(
+            updates.windows(2).all(|pair| pair[1] >= pair[0]),
+            "the counts must never go backwards, got {updates:?}"
+        );
+        // The start and end updates are emitted by the walk directly, so they
+        // alone would also pass with the per-entry wiring disconnected. These
+        // two assertions are what pin the loop's own reporting.
+        assert!(
+            updates.len() > 2,
+            "the walk must report from its own loop, not only at the start and end: {updates:?}"
+        );
+        assert!(
+            updates.iter().any(|(files, _)| *files == 1),
+            "a per-entry update must carry a partial count: {updates:?}"
+        );
+        assert_eq!(
+            progress.finishes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the walk must release the indicator exactly once"
+        );
+    }
+
+    #[test]
     fn scan_reports_a_start_line_naming_its_roots() {
         let dir = library_with_albums(1);
         let capture = LogCapture::start();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(albums.len(), 1);
         let logs = capture.text();
@@ -580,8 +813,13 @@ mod tests {
         let dir = library_with_albums(7);
         let capture = LogCapture::start();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(albums.len(), 7);
         let logs = capture.text();
@@ -608,8 +846,13 @@ mod tests {
         fs::write(&broken, b"this is not a flac stream").unwrap();
         let capture = LogCapture::start();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             albums.len(),
@@ -642,7 +885,13 @@ mod tests {
         }
         let capture = LogCapture::start();
 
-        scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         let logs = capture.text();
         assert!(
@@ -665,6 +914,8 @@ mod tests {
             &FilterConfig::default(),
             None,
             std::time::Duration::ZERO,
+            std::time::Duration::from_secs(SCAN_PROGRESS_UPDATE_SECS),
+            None,
         )
         .unwrap();
 
@@ -775,6 +1026,7 @@ mod tests {
             &library_paths(dir.path()),
             &FilterConfig::default(),
             Some(&cancel),
+            None,
         );
 
         assert!(
@@ -795,8 +1047,13 @@ mod tests {
     #[test]
     fn test_scan_empty_directory() {
         let dir = TempDir::new().unwrap();
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(albums.is_empty());
     }
 
@@ -815,8 +1072,13 @@ mod tests {
         fs::create_dir_all(&mp3_dir).unwrap();
         fs::write(mp3_dir.join("track.mp3"), b"fake mp3 data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 2);
         // Both albums should be present
         let artists: Vec<&str> = albums.iter().map(|a| a.artist.as_str()).collect();
@@ -885,8 +1147,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -923,8 +1190,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - Track.ogg"), b"fake ogg data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         let config = crate::config::FilterConfig {
             allowed_extensions: vec!["flac".into()],
             min_bit_rate: 0,
@@ -963,8 +1235,13 @@ mod tests {
             write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Tagged", "Album");
         }
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(albums.len(), 1, "the tagged copies are one album");
         assert_eq!(
@@ -990,8 +1267,13 @@ mod tests {
             write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
         }
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(albums.len(), 1, "the tagged copies are one album");
         assert_eq!(albums[0].track_count, 2);
@@ -1026,6 +1308,7 @@ mod tests {
             ],
             &FilterConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1050,7 +1333,7 @@ mod tests {
             min_bit_depth: 24,
             ..FilterConfig::default()
         };
-        let albums = scan_library(&library_paths(dir.path()), &filters, None).unwrap();
+        let albums = scan_library(&library_paths(dir.path()), &filters, None, None).unwrap();
         assert!(
             find_albums_to_upgrade(&albums, &filters).is_empty(),
             "bit depth must not flag an album for upgrade"
@@ -1114,8 +1397,13 @@ mod tests {
             .unwrap();
         }
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         let album = &albums[0];
         assert_eq!(album.track_count, 24);
@@ -1148,8 +1436,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -1166,8 +1459,13 @@ mod tests {
             fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
         }
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1, "both discs are one album");
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -1188,8 +1486,13 @@ mod tests {
         fs::create_dir_all(&disc_dir).unwrap();
         fs::write(disc_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -1214,8 +1517,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Album");
@@ -1235,8 +1543,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Album");
         assert_eq!(albums[0].album, "FLAC");
@@ -1251,8 +1564,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(albums.is_empty());
     }
 
@@ -1263,8 +1581,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             albums.len(),
             1,
@@ -1287,8 +1610,13 @@ mod tests {
         fs::create_dir_all(&album_dir).unwrap();
         fs::write(album_dir.join("01 - track.flac"), b"fake flac data").unwrap();
 
-        let albums =
-            scan_library(&library_paths(dir.path()), &FilterConfig::default(), None).unwrap();
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].artist, "Artist");
         assert_eq!(albums[0].album, "Gold (Disc 1)");

@@ -15,6 +15,7 @@ use crate::discography::{
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, DownloadDestination, RunReport};
+use crate::scan_progress;
 use crate::{discover, download, filter, notifier, organizer, scanner, search};
 
 /// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
@@ -94,11 +95,25 @@ pub fn arm_cancellation() -> (Arc<AtomicBool>, CancellationGuard) {
 ///
 /// `Ok(None)` means the user cancelled: the caller returns without doing any
 /// work, and `main` releases the PID lock as it unwinds.
+///
+/// The indicator is created here rather than inside the walk, so the scan and
+/// the downloads share one `ProgressDisplay` and the terminal has one owner per
+/// run. With `progress: None` (a headless run) no bar is created and the
+/// console heartbeat is left alone.
 fn scan_library_cancellable(
     config: &Config,
     cancel: &AtomicBool,
+    progress: Option<&ProgressDisplay>,
 ) -> Result<Option<Vec<scanner::ScannedAlbum>>> {
-    match scanner::scan_library(&config.library.paths, &config.filters, Some(cancel)) {
+    let outcome = with_scan_indicator(progress, |walk_progress| {
+        scanner::scan_library(
+            &config.library.paths,
+            &config.filters,
+            Some(cancel),
+            walk_progress,
+        )
+    });
+    match outcome {
         Ok(albums) => Ok(Some(albums)),
         Err(SeakarrError::Cancelled) => {
             tracing::info!("Library scan cancelled — aborting before any work item");
@@ -106,6 +121,21 @@ fn scan_library_cancellable(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Run `scan` with the interactive scan indicator attached.
+///
+/// One helper for every library scan in the run, so the indicator is built in
+/// exactly one place and each scan reports and releases it the same way. With
+/// `progress: None` (a headless run) no bar is created and the console
+/// heartbeat is left alone.
+fn with_scan_indicator<T>(
+    progress: Option<&ProgressDisplay>,
+    scan: impl FnOnce(Option<&dyn scanner::ScanProgress>) -> T,
+) -> T {
+    let indicator =
+        scan_progress::ScanIndicator::start(progress, scan_progress::installed_console_filter());
+    scan(Some(&indicator))
 }
 
 /// Record every track's measured speed + success/failure into the peer
@@ -1092,9 +1122,18 @@ pub async fn run_auto_mode(
     // listener on every return path, so a no-op cycle cannot leak one.
     let (cancel, _guard) = arm_cancellation();
 
+    // The display is created before the scan, not after it: the scan owns the
+    // first bar and the downloads own the rest, and one owner per run keeps a
+    // single MultiProgress writing to stderr.
+    let progress = if is_interactive() {
+        Some(Arc::new(ProgressDisplay::new()))
+    } else {
+        None
+    };
+
     // Scan library
     tracing::info!("Scanning library...");
-    let Some(albums) = scan_library_cancellable(config, &cancel)? else {
+    let Some(albums) = scan_library_cancellable(config, &cancel, progress.as_deref())? else {
         return Ok(());
     };
     let targets_with_counts = scanner::find_albums_to_upgrade(&albums, &config.filters);
@@ -1135,12 +1174,6 @@ pub async fn run_auto_mode(
     if let Err(e) = organizer::recover_interrupted_upgrades(config, db, staging_dir) {
         tracing::warn!("Library upgrade recovery scan failed: {e}");
     }
-
-    let progress = if is_interactive() {
-        Some(Arc::new(ProgressDisplay::new()))
-    } else {
-        None
-    };
 
     // Shared cancellation flag, created by `arm_cancellation` before the scan.
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
@@ -1415,27 +1448,31 @@ async fn run_legacy_artist_only_mode(
     // does. The documented promise is that --artist X fetches only what is
     // missing, and this heuristic path is both the explicit opt-out and the
     // automatic fallback during a MusicBrainz outage.
-    let index =
-        match discover::index_from_paths(&config.library.paths, &config.filters, Some(cancel)) {
-            Ok(index) => index,
-            // A user cancellation is not a scan failure: stop the run rather than
-            // warn about a broken library and drop the presence check.
-            Err(SeakarrError::Cancelled) => {
-                tracing::info!(
-                    "{artist}: library scan cancelled by user — stopping before any album"
-                );
-                return Ok(ArtistOnlyRun {
-                    outcomes: Vec::new(),
-                    notice: Some(format!("{artist}: library scan cancelled by user")),
-                });
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "{artist}: library scan failed ({error}); skipping the already-present check"
-                );
-                discover::LibraryIndex::default()
-            }
-        };
+    let index = match with_scan_indicator(progress, |walk_progress| {
+        discover::index_from_paths(
+            &config.library.paths,
+            &config.filters,
+            Some(cancel),
+            walk_progress,
+        )
+    }) {
+        Ok(index) => index,
+        // A user cancellation is not a scan failure: stop the run rather than
+        // warn about a broken library and drop the presence check.
+        Err(SeakarrError::Cancelled) => {
+            tracing::info!("{artist}: library scan cancelled by user — stopping before any album");
+            return Ok(ArtistOnlyRun {
+                outcomes: Vec::new(),
+                notice: Some(format!("{artist}: library scan cancelled by user")),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                "{artist}: library scan failed ({error}); skipping the already-present check"
+            );
+            discover::LibraryIndex::default()
+        }
+    };
 
     let albums = search::group_artist_results(&outcome.results, artist);
     if albums.is_empty() {
@@ -1534,11 +1571,14 @@ async fn run_artist_only_mode_with_provider(
             }
             // A failing scan must not break artist-only manual mode, which
             // worked without a library before: warn and filter nothing.
-            let index = match discover::index_from_paths(
-                &config.library.paths,
-                &config.filters,
-                Some(cancel),
-            ) {
+            let index = match with_scan_indicator(progress, |walk_progress| {
+                discover::index_from_paths(
+                    &config.library.paths,
+                    &config.filters,
+                    Some(cancel),
+                    walk_progress,
+                )
+            }) {
                 Ok(index) => index,
                 // As on the legacy path: a cancelled scan stops the run instead
                 // of warning about a failure and continuing without a presence
@@ -1847,7 +1887,15 @@ async fn run_discover_mode_with_provider(
     // the listener on every return path.
     let (cancel, _guard) = arm_cancellation();
 
-    let Some(scanned) = scan_library_cancellable(config, &cancel)? else {
+    // Created before the scan so the scan's indicator and the later downloads
+    // share one display, and so a headless run creates none at all.
+    let progress = if is_interactive() {
+        Some(ProgressDisplay::new())
+    } else {
+        None
+    };
+
+    let Some(scanned) = scan_library_cancellable(config, &cancel, progress.as_ref())? else {
         return Ok(());
     };
     let index = discover::build_index(&scanned);
@@ -1873,12 +1921,6 @@ async fn run_discover_mode_with_provider(
     let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
     let mut report = RunReport::new();
     let mut consecutive_provider_failures: u32 = 0;
-
-    let progress = if is_interactive() {
-        Some(ProgressDisplay::new())
-    } else {
-        None
-    };
 
     for artist in &selection.artists {
         if budget.exhausted() {
@@ -2224,6 +2266,83 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn scan_shows_and_releases_exactly_one_indicator_bar() {
+        // The scan's indicator is the run's first bar, and the download bars
+        // come later: one created, one released, so the terminal is free when
+        // the downloads start.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        let (mut config, _db, _staging) = artist_only_fixture();
+        config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let display = ProgressDisplay::new();
+
+        let outcome = scan_library_cancellable(&config, &cancel, Some(&display)).unwrap();
+
+        assert!(outcome.is_some(), "the scan must still return the library");
+        assert_eq!(display.scan_bars_created(), 1);
+        assert_eq!(display.scan_bars_finished(), 1);
+        assert_eq!(
+            display.created_bars(),
+            0,
+            "the scan must not create a transfer bar"
+        );
+        // Created and released alone would also hold if the bar were merely
+        // built and dropped without the walk ever driving it, so assert the
+        // walk reported through the port: the start update and the final one.
+        assert!(
+            display.scan_bars_updated() >= 2,
+            "the walk must drive the indicator, not merely have one created"
+        );
+    }
+
+    #[test]
+    fn a_headless_scan_creates_no_indicator_bar() {
+        // Nothing to observe without a display, so this pins the contract that
+        // matters: with no display the scan still works and returns the library
+        // without touching the terminal.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        let (mut config, _db, _staging) = artist_only_fixture();
+        config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let outcome = scan_library_cancellable(&config, &cancel, None).unwrap();
+
+        let albums = outcome.expect("a headless scan must return the library");
+        assert_eq!(albums.len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_scan_still_releases_its_indicator_bar() {
+        // Cancellation is the path most likely to strand a bar, and a stranded
+        // scan bar would sit on the terminal for the rest of the run. The walk
+        // releases before it returns `Cancelled`, and `Drop` covers the rest.
+        let dir = TempDir::new().unwrap();
+        let album_dir = dir.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(&album_dir.join("01 - track.flac"), "Artist", "Album");
+        let (mut config, _db, _staging) = artist_only_fixture();
+        config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let display = ProgressDisplay::new();
+
+        let outcome = scan_library_cancellable(&config, &cancel, Some(&display)).unwrap();
+
+        assert!(outcome.is_none(), "a cancelled scan reports no albums");
+        assert_eq!(display.scan_bars_created(), 1);
+        assert_eq!(
+            display.scan_bars_finished(),
+            display.scan_bars_created(),
+            "every created scan bar must be released"
+        );
+    }
+
+    #[test]
     fn a_cancelled_scan_reports_nothing_to_do() {
         // The seam both runners use. A cancelled scan must come back as "no work"
         // rather than as a completed scan: an empty scan would look like a library
@@ -2237,7 +2356,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
         let capture = crate::test_support::LogCapture::start();
 
-        let outcome = scan_library_cancellable(&config, &cancel).unwrap();
+        let outcome = scan_library_cancellable(&config, &cancel, None).unwrap();
 
         assert!(
             outcome.is_none(),
@@ -2263,7 +2382,7 @@ mod tests {
         config.library.paths = vec![dir.path().to_string_lossy().into_owned()];
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let outcome = scan_library_cancellable(&config, &cancel).unwrap();
+        let outcome = scan_library_cancellable(&config, &cancel, None).unwrap();
 
         let albums = outcome.expect("an uncancelled scan must return the library");
         assert_eq!(albums.len(), 1);
@@ -2350,6 +2469,62 @@ mod tests {
                 .is_some_and(|notice| notice.contains("cancelled")),
             "the cancellation must be reported, got {:?}",
             run.notice
+        );
+    }
+
+    #[tokio::test]
+    async fn an_artist_only_run_shows_and_releases_one_indicator_bar() {
+        // The legacy artist-only path scans the library for its presence check
+        // through `discover::index_from_paths`, which is the third library scan
+        // in the program. It must use the same indicator as the other two, or
+        // the same long walk feels silent on `--artist` runs.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Test Artist",
+            &[("Test Artist Old", "Old"), ("Test Artist New", "New")],
+        );
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let present = library.path().join("Test Artist").join("Old");
+        std::fs::create_dir_all(&present).unwrap();
+        write_minimal_flac_with_tags(&present.join("01 - track.flac"), "Test Artist", "Old");
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        // Cancelled so the run stops at the scan: this test is about the
+        // indicator's lifecycle, and the cancelled walk is the deterministic
+        // exit that most easily strands a bar.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let display = ProgressDisplay::new();
+        let _capture = crate::test_support::LogCapture::start();
+
+        let run = run_legacy_artist_only_mode(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            Some(&display),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(run.outcomes.is_empty());
+        assert_eq!(
+            display.scan_bars_created(),
+            1,
+            "the artist-only library scan must show the scan indicator"
+        );
+        assert_eq!(
+            display.scan_bars_finished(),
+            1,
+            "the indicator must be released when the scan stops"
+        );
+        assert_eq!(
+            display.created_bars(),
+            0,
+            "a library scan must not create a transfer bar"
         );
     }
 

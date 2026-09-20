@@ -520,16 +520,21 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
 ///
 /// [`SeakarrError::Cancelled`] when the walk is cancelled, and
 /// [`SeakarrError::Scanner`] when a configured root does not exist.
+///
+/// `progress` is forwarded to the walk unchanged, so a caller that has an
+/// interactive scan indicator gets the same reporting as any other library
+/// scan.
 pub fn index_from_paths(
     paths: &[String],
     filters: &FilterConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<&dyn crate::scanner::ScanProgress>,
 ) -> Result<LibraryIndex> {
     if paths.is_empty() {
         return Ok(LibraryIndex::default());
     }
     Ok(build_index(&crate::scanner::scan_library(
-        paths, filters, cancel,
+        paths, filters, cancel, progress,
     )?))
 }
 
@@ -702,6 +707,7 @@ mod tests {
         let scanned = scan_library(
             &[library.path().to_string_lossy().into_owned()],
             &FilterConfig::default(),
+            None,
             None,
         )
         .unwrap();

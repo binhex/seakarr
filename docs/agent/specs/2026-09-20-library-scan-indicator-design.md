@@ -35,8 +35,8 @@ spinner that updates a single line in place.
   against about 7 albums a second), so a stalled read shows up sooner.
 - The console shows the **spinner instead of** the per-minute line, while the
   **log file keeps** that line unchanged.
-- The indicator covers **every library scan**: auto mode's startup scan and a
-  discover run's scan.
+- The indicator covers **every library scan**: auto mode's startup scan, a
+  discover run's scan, and an artist-only manual run's presence scan.
 - The indicator is **owned by the scan and driven through a narrow callback**, so
   the renderer stays out of the walk and a run keeps one terminal owner.
 
@@ -55,8 +55,14 @@ with
 ```rust
 pub trait ScanProgress {
     fn update(&self, files: usize, albums: usize, elapsed: Duration);
+    fn finish(&self);
 }
 ```
+
+`finish` is the walk's release signal, and it exists because the closing info
+line must be logged *after* the renderer has released the console filter;
+relying on `Drop` alone would order that wrongly, since the indicator outlives
+the call in the caller. It is idempotent, so `Drop` can call it too.
 
 The walk already carries `files_seen`, `albums` and its start instant, so the
 callback adds no accounting. It is called from the same per-entry point as the
@@ -195,8 +201,13 @@ the flag is still checked once per walk entry and still surfaces as
    lines as today.
 5. The spinner is cleared exactly once and the console filter restored on every
    exit path, including cancellation and panic.
-6. The indicator covers every library scan: auto mode's startup scan and a
-   discover run's scan, both through `scan_library_cancellable`.
+6. The indicator covers every library scan: auto mode's startup scan, a discover
+   run's scan, and an artist-only manual run's presence scan (which goes through
+   `discover::index_from_paths`). Every one of them attaches it through the single
+   helper `runner::with_scan_indicator`, so no scan can drift from the others.
+   (Extended on 2026-09-20 after implementation found the third site: the
+   original criterion named only `scan_library_cancellable`, which left
+   `--artist` runs silent.)
 7. No new configuration keys, no schema change, and no change to the scan's
    results: counts, grouping and unreadable-file handling are untouched.
 8. The tick set and template match the queue spinner.

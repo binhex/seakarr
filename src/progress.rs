@@ -8,7 +8,8 @@ pub fn is_interactive() -> bool {
     std::io::stderr().is_terminal()
 }
 
-/// Manages download progress bars — one per active track download.
+/// Manages the run's terminal bars: one per active track download, one queue
+/// bar per file waiting in a peer's queue, and one for the library scan.
 ///
 /// Wraps `indicatif::MultiProgress` so multiple concurrent album downloads
 /// each get their own progress bar. Callers should check `is_interactive()`
@@ -32,6 +33,16 @@ pub struct ProgressDisplay {
     /// update is observable: without it, an implementation that created a second
     /// bar instead of updating the first would pass every test.
     queue_bars_updated: AtomicUsize,
+    /// Monotonic count of scan bars created. The scan bar is the one bar that
+    /// legitimately exists before any transfer: the walk is not a download, so
+    /// folding it into `bars_created` would break that contract's meaning.
+    scan_bars_created: AtomicUsize,
+    /// Monotonic count of scan bars released. Must equal `scan_bars_created`
+    /// once a scan returns: the terminal must be free for the download bars.
+    scan_bars_finished: AtomicUsize,
+    /// Monotonic count of scan-bar message updates, so an implementation that
+    /// created a second bar instead of updating the first is caught.
+    scan_bars_updated: AtomicUsize,
 }
 
 impl ProgressDisplay {
@@ -46,6 +57,9 @@ impl ProgressDisplay {
             queue_bars_created: AtomicUsize::new(0),
             queue_bars_finished: AtomicUsize::new(0),
             queue_bars_updated: AtomicUsize::new(0),
+            scan_bars_created: AtomicUsize::new(0),
+            scan_bars_finished: AtomicUsize::new(0),
+            scan_bars_updated: AtomicUsize::new(0),
         }
     }
 
@@ -68,6 +82,21 @@ impl ProgressDisplay {
     /// Number of queue-bar message updates so far (monotonic).
     pub fn queue_bars_updated(&self) -> usize {
         self.queue_bars_updated.load(Ordering::SeqCst)
+    }
+
+    /// Number of scan bars created so far (monotonic).
+    pub fn scan_bars_created(&self) -> usize {
+        self.scan_bars_created.load(Ordering::SeqCst)
+    }
+
+    /// Number of scan bars released so far (monotonic).
+    pub fn scan_bars_finished(&self) -> usize {
+        self.scan_bars_finished.load(Ordering::SeqCst)
+    }
+
+    /// Number of scan-bar message updates so far (monotonic).
+    pub fn scan_bars_updated(&self) -> usize {
+        self.scan_bars_updated.load(Ordering::SeqCst)
     }
 
     /// Update an existing queue bar in place.
@@ -127,6 +156,36 @@ impl ProgressDisplay {
         bar.finish_and_clear();
     }
 
+    /// Create the library scan's bar.
+    ///
+    /// A spinner, not a bar with a length: the walk cannot know how many files
+    /// or albums it will find until it has found them, so there is no total to
+    /// divide by. Same template and tick set as the queue bar, because the
+    /// requirement is the queue's spinner.
+    pub fn create_scan_bar(&self, message: &str) -> ProgressBar {
+        self.scan_bars_created.fetch_add(1, Ordering::SeqCst);
+        let bar = self.multi.add(ProgressBar::new_spinner());
+        let style = ProgressStyle::with_template("  {spinner} {msg}")
+            .expect("valid scan bar template")
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        bar.set_style(style);
+        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        bar.set_message(safe_label(message, SCAN_LABEL_MAX));
+        bar
+    }
+
+    /// Update the scan bar's message in place.
+    pub fn update_scan_bar(&self, bar: &ProgressBar, message: &str) {
+        self.scan_bars_updated.fetch_add(1, Ordering::SeqCst);
+        bar.set_message(safe_label(message, SCAN_LABEL_MAX));
+    }
+
+    /// Release the scan bar, leaving the terminal to the download bars.
+    pub fn clear_scan_bar(&self, bar: ProgressBar) {
+        self.scan_bars_finished.fetch_add(1, Ordering::SeqCst);
+        bar.finish_and_clear();
+    }
+
     /// Remove all bars (call when download session ends).
     pub fn clear(&self) {
         let _ = self.multi.clear();
@@ -153,6 +212,12 @@ fn safe_label(text: &str, max_chars: usize) -> String {
 /// the whole reason the bar exists, and truncating the tail is exactly what
 /// would drop it.
 pub const QUEUE_LABEL_MAX: usize = 48 + 3 + 24 + " queue position unknown".len();
+
+/// Longest message [`ProgressDisplay::create_scan_bar`] can render: the fixed
+/// wording, a seven-digit file count, a six-digit album count and a five-digit
+/// second count. The elapsed time is the tail, so a cap below this would
+/// truncate the number the operator is watching.
+pub const SCAN_LABEL_MAX: usize = 96;
 
 /// Message for a queued file's bar: `08 Moondance.flac - peer queue #42`.
 ///
@@ -252,6 +317,65 @@ mod tests {
         );
         bar.finish();
         display.clear();
+    }
+
+    #[test]
+    fn scan_bar_counters_are_separate_from_the_other_bar_counters() {
+        let display = ProgressDisplay::new();
+        let bar = display.create_scan_bar("Scanning library: 0 audio file(s)");
+        assert_eq!(display.scan_bars_created(), 1);
+        assert_eq!(display.scan_bars_finished(), 0);
+        assert_eq!(
+            display.created_bars(),
+            0,
+            "a scan bar is not a transfer bar"
+        );
+        assert_eq!(
+            display.queue_bars_created(),
+            0,
+            "a scan bar is not a queue bar"
+        );
+        display.update_scan_bar(&bar, "Scanning library: 2 audio file(s)");
+        assert_eq!(display.scan_bars_updated(), 1);
+        display.clear_scan_bar(bar);
+        assert_eq!(display.scan_bars_finished(), 1);
+    }
+
+    #[test]
+    fn scan_bar_ticks_exactly_like_the_queue_bar() {
+        // "Same as the queue" is the requirement, so the tick characters are
+        // compared against the queue bar's rather than hard-coded: changing one
+        // bar's ticks without the other fails this test.
+        let display = ProgressDisplay::new();
+        let scan = display.create_scan_bar("Scanning library: 0 audio file(s)");
+        let queue = display.create_queue_bar("01 - Track.flac - peer queue #1");
+        let scan_style = scan.style();
+        let queue_style = queue.style();
+        let scan_ticks: Vec<&str> = (0..10).map(|i| scan_style.get_tick_str(i)).collect();
+        let queue_ticks: Vec<&str> = (0..10).map(|i| queue_style.get_tick_str(i)).collect();
+        assert_eq!(
+            scan_ticks, queue_ticks,
+            "the scan spinner must tick like the queue spinner"
+        );
+        display.clear_scan_bar(scan);
+        display.clear_queue_bar(queue);
+    }
+
+    #[test]
+    fn scan_label_cap_covers_the_longest_real_message() {
+        // `create_scan_bar` truncates at SCAN_LABEL_MAX, and the tail of the
+        // message is the elapsed time: a cap below a real message would cut it
+        // off. Seven-digit file counts, six-digit album counts and five-digit
+        // second counts are the bounds a real library can reach.
+        let longest = format!(
+            "Scanning library: {} audio file(s), {} album(s) ({}s elapsed)",
+            9_999_999, 999_999, 99_999
+        );
+        assert!(
+            longest.chars().count() <= SCAN_LABEL_MAX,
+            "SCAN_LABEL_MAX ({SCAN_LABEL_MAX}) truncates a real message ({} chars)",
+            longest.chars().count()
+        );
     }
 
     #[test]

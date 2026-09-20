@@ -17,6 +17,7 @@ pub mod organizer;
 pub mod progress;
 pub mod report;
 pub mod runner;
+pub mod scan_progress;
 pub mod scanner;
 pub mod search;
 pub mod tracks;

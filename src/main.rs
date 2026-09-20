@@ -10,6 +10,32 @@ use seakarr::error::{Result, SeakarrError};
 use seakarr::mode::ExecutionPlan;
 use seakarr::runner;
 
+/// The console layer's own filter.
+///
+/// Everything the registry filter already admitted passes, minus the scan
+/// heartbeat while the interactive spinner is showing it instead. Only the
+/// console layer carries this filter: the file layer keeps the per-minute line
+/// whether or not a terminal is attached.
+fn console_targets(heartbeat: bool) -> tracing_subscriber::filter::Targets {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    let base = Targets::new().with_default(LevelFilter::TRACE);
+    if heartbeat {
+        base
+    } else {
+        base.with_target("seakarr::scanner", LevelFilter::OFF)
+    }
+}
+
+/// Adapts a closure to the indicator's console-filter port, so the reload
+/// handle's subscriber type never has to be named here.
+struct ConsoleFilterFn<F: Fn(bool) + Send + Sync>(F);
+
+impl<F: Fn(bool) + Send + Sync> seakarr::scan_progress::ConsoleFilter for ConsoleFilterFn<F> {
+    fn set_console_heartbeat(&self, enabled: bool) {
+        (self.0)(enabled);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "seakarr",
@@ -178,15 +204,31 @@ async fn run() -> Result<()> {
     let filter_str = format!("{},lofty=error,soulseek_rs=error", config.logging.level);
     let env_filter = EnvFilter::try_new(&filter_str).unwrap_or_else(|_| EnvFilter::new("INFO"));
 
+    let (console_filter, console_handle) =
+        tracing_subscriber::reload::Layer::new(console_targets(true));
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::Layer::new().with_writer(std::io::stdout))
+        .with(
+            fmt::Layer::new()
+                .with_writer(std::io::stdout)
+                .with_filter(console_filter),
+        )
         .with(
             fmt::Layer::new()
                 .with_writer(file_appender)
                 .with_ansi(false),
         )
         .init();
+    seakarr::scan_progress::install_console_filter(std::sync::Arc::new(ConsoleFilterFn(
+        move |enabled: bool| {
+            if let Err(error) = console_handle.modify(|targets| *targets = console_targets(enabled))
+            {
+                // Losing the filter is not worth failing a scan over: the
+                // heartbeat would simply keep printing to the console.
+                tracing::debug!("could not update the console scan filter: {error}");
+            }
+        },
+    )));
 
     // --test: structural validation, then exit
     if cli.test {
@@ -647,6 +689,64 @@ mod tests {
     use seakarr::client::MockClient;
     use seakarr::db::Database;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_console_filter_hides_and_restores_the_scan_heartbeat() {
+        use seakarr::scan_progress::ConsoleFilter;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // A writer we can read back, so the assertion is about what actually
+        // reached the console rather than about the filter's internal state.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let (filter, handle) = tracing_subscriber::reload::Layer::new(console_targets(true));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(filter),
+        );
+        let driver = ConsoleFilterFn(move |enabled: bool| {
+            let _ = handle.modify(|targets| *targets = console_targets(enabled));
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "seakarr::scanner", "heartbeat visible");
+            driver.set_console_heartbeat(false);
+            tracing::info!(target: "seakarr::scanner", "heartbeat suppressed");
+            tracing::info!(
+                target: "seakarr::runner",
+                "other target still shown"
+            );
+            driver.set_console_heartbeat(true);
+            tracing::info!(target: "seakarr::scanner", "heartbeat restored");
+        });
+
+        let captured_text = captured.0.lock().unwrap().clone();
+        let text = String::from_utf8(captured_text).unwrap();
+        assert!(text.contains("heartbeat visible"), "got:\n{text}");
+        assert!(!text.contains("heartbeat suppressed"), "got:\n{text}");
+        assert!(
+            text.contains("other target still shown"),
+            "suppression must be scoped to the scanner target, got:\n{text}"
+        );
+        assert!(text.contains("heartbeat restored"), "got:\n{text}");
+    }
 
     // Regression: a validated manual plan must reach the manual runner with
     // its artist and album criteria instead of being reinterpreted by the cycle.
