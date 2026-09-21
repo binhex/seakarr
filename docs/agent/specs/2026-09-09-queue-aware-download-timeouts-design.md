@@ -1,5 +1,14 @@
 # Queue-aware download timeouts
 
+> **Superseded in part (2026-09-21).** Two decisions below were revised by the
+> below-floor/stall follow-up work: `timeout_secs` is now armed by the peer's
+> accept (any `InProgress`, including the zero-byte offset handshake) rather than
+> at the first real progress status, and a below-floor abort after
+> `speed_check_wait_secs` is a permanent candidate failure
+> (`SeakarrError::SlowDownload`) instead of being retried in place. The
+> `max_queue_time_secs` / `max_start_time_secs` semantics and the rest of this
+> design are unchanged.
+
 ## Problem
 
 `DownloadConfig` already exposes `max_queue_length`,
@@ -64,7 +73,8 @@ timestamp and first-transfer timestamp:
   this limit.
 - The earlier enabled queue deadline wins.
 - `timeout_secs` starts only at the first real `InProgress` status and is reset
-  only by later `InProgress` updates.
+  only by later `InProgress` updates. *(Superseded 2026-09-21: armed by the
+  peer's accept — see the note above.)*
 - A `Queued` or pre-start `Paused` status consumes queue time and never starts
   or resets the transfer inactivity timer.
 - A post-start `Paused` status counts as inactivity and does not reset the
@@ -77,7 +87,9 @@ queue-timeout error. The error is treated as peer-specific and is not retried
 against the same peer. `download_album` proceeds to the next ranked candidate.
 Cancellation remains higher priority than timeout and continues to clean up
 staging. Transfer failures, quality rejections, and post-start inactivity
-retain their existing retry/fallback behavior.
+retain their existing retry/fallback behavior. *(Superseded 2026-09-21 for
+below-floor speed: that abort is now a permanent candidate failure, not an
+in-place retry — see the note above.)*
 
 ## Design
 

@@ -1,5 +1,11 @@
 # Download log visibility
 
+> **Superseded in part (2026-09-21).** Item 2 below reads "first `InProgress`":
+> that signal is now the first `InProgress` that *reports bytes*. The transfer-start
+> point moved from the peer's accept/offset handshake to the first byte-carrying
+> progress report, so a peer that accepts and then goes silent gets its queued line
+> at the 5-second grace instead. The rest of this design is unchanged.
+
 ## Problem
 
 Two operator-reported defects in the download log, both about information the
@@ -163,7 +169,8 @@ silence that motivated the report:
 
 1. first positive position observation — the line carries the position;
 2. first `InProgress` — the line carries no position, because the peer went
-   straight to transferring;
+   straight to transferring; *(superseded 2026-09-21: the first `InProgress` that
+   reports bytes — see the note above)*
 3. 5-second grace elapsed — the line carries no position, and any later position
    reaches the started line and `DEBUG`.
 

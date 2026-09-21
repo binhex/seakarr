@@ -45,8 +45,10 @@ Automated Soulseek music downloader with library quality upgrading.
   of advertised and measured throughput plus a reliability factor, so fast, reliable peers are preferred and
   slow or error-prone peers are demoted — regardless of what you search for. Controlled by
   `search.peer_reputation` (default `true`).
-- **Download resilience** — speed monitoring with configurable minimums (slow
-  peers cancelled mid-transfer), queue-wait limits while a transfer sits in a
+- **Download resilience** — speed monitoring with configurable minimums (a peer
+  whose smoothed speed is below `min_upload_speed_kbps` past
+  `speed_check_wait_secs` is cancelled and treated as a failed candidate rather
+  than re-queued, because the same peer cannot get faster), queue-wait limits while a transfer sits in a
   remote queue (`max_queue_time_secs`, `max_start_time_secs`), stall timeout
   with cancel, per-file retries with configurable count and delay, and
   candidate fallback (try the next ranked peer once retries are exhausted).
@@ -367,9 +369,9 @@ Controls which Soulseek search results pass the quality gate.
 | `max_queue_length` | `0` requires a free upload slot during candidate selection; later telemetry does not retroactively reject an admitted free-slot peer. A positive value also permits zero-slot peers only when a reported positive queue position is at or below the limit. Unknown positions and wire position `0` do not prove a zero-slot peer is within the limit. | `0` |
 | `max_start_time_secs` | Maximum seconds from first reaching queue position `1` until the first transfer progress. `0` disables this queue-head limit. | `120` |
 | `max_queue_time_secs` | Maximum total seconds from enqueue until the first transfer progress. `0` disables this total queue limit. | `1800` |
-| `min_upload_speed_kbps` | Cancel transfers where measured speed drops below this threshold. `0` disables the speed check. | `250` |
-| `speed_check_wait_secs` | Seconds to wait after a transfer starts before measuring speed. | `30` |
-| `timeout_secs` | Post-start inactivity timeout — starts at the first `InProgress` status, resets only on later `InProgress` events, and is not reset by a paused status. Cancels the transfer when no update arrives within this period. `0` disables the inactivity timeout, like the queue limits. | `180` |
+| `min_upload_speed_kbps` | Cancel a transfer whose smoothed speed (the average the progress bar displays over the transfer's own samples) is below this threshold once `speed_check_wait_secs` has passed since the transfer started. The candidate is then abandoned without re-asking the same peer — the same peer cannot get faster, and a new request only puts the file back in its queue — so the next ranked candidate is tried. `0` disables the speed check. | `250` |
+| `speed_check_wait_secs` | Seconds of real transfer progress before the smoothed speed may cancel a transfer. A resumed transfer counts its offset handshake (the surviving `.part` size) as the start. | `30` |
+| `timeout_secs` | Inactivity timeout — ends a transfer when no `InProgress` status arrives within this period. The clock is armed by every `InProgress` status, including the zero-byte offset handshake (so a peer that accepts and then goes silent is bounded even when both queue limits are disabled), and reset by later ones; it is not reset by a paused status. `0` disables the inactivity timeout, like the queue limits. | `180` |
 | `max_download_time_mins` | Hard wallclock ceiling in minutes for a single album download session. *(Reserved for future use — not yet enforced.)* | `120` |
 | `max_retries` | Per-file retry attempts on the same peer before falling back to the next candidate. `0` disables retries. At most `10`. | `4` |
 | `retry_delay_secs` | Seconds to wait between retry attempts. At most `300`. | `30` |
@@ -661,12 +663,15 @@ Seakarr has four operating modes:
    `max_queue_time_secs` caps the total wait from enqueue and
    `max_start_time_secs` caps the wait after reaching queue position `1`; a
    peer that exceeds either limit is abandoned and the next candidate is tried
-   without retrying the same peer. After transfer progress begins,
+   without retrying the same peer. Once the peer accepts the transfer,
    `timeout_secs` guards against inactivity (the per-album stall timeout for
-   unresponsive peers). If the speed drops below `min_upload_speed_kbps`, the
-   transfer is cancelled and the next candidate is tried. Per-file retries with
-   configurable count and delay (`max_retries`, `retry_delay_secs`) re-attempt
-   the same peer before falling back to the next candidate.
+   unresponsive peers). If the smoothed speed at least `speed_check_wait_secs`
+   after the transfer started is below `min_upload_speed_kbps`, the transfer is
+   cancelled and the candidate is abandoned — re-asking the same peer only puts
+   the file back in its queue — so the next candidate is tried without spending
+   the per-file retries. Per-file retries with configurable count and delay
+   (`max_retries`, `retry_delay_secs`) re-attempt the same peer for transient
+   failures before falling back to the next candidate.
 6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
    into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
 7. **Persist & notify** — the album is marked as processed in SQLite and the success payload is POSTed to each
@@ -861,10 +866,11 @@ admitted with an advertised free slot is not retroactively rejected by later
 telemetry; a positive limit applies the position check to every candidate.
 `max_queue_time_secs`
 limits total queue wait, `max_start_time_secs` limits the wait after reaching
-position `1`, and `timeout_secs` controls inactivity only after transfer
-progress begins. With the defaults, a silent pre-start wait can therefore last
-up to `max_queue_time_secs: 1800`, rather than the post-start
-`timeout_secs: 180`.
+position `1`, and `timeout_secs` controls inactivity from the peer's accept (its
+first `InProgress`, including the zero-byte offset handshake) onwards. With the
+defaults, a peer that never accepts is bounded only by
+`max_queue_time_secs: 1800`, while one that accepts and then goes silent is
+bounded by `timeout_secs: 180`.
 
 **Q: How do I prevent seakarr from downloading files with certain words in the filename?**
 

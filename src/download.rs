@@ -79,9 +79,9 @@ pub struct DownloadStats {
 /// safe point — between attempts or within the status polling loop — and
 /// is never retried.
 ///
-/// The progress bar is created lazily on the first `InProgress` status —
-/// before that point no bar renders. Pass `None` for `progress` to skip
-/// the bar entirely.
+/// The progress bar is created lazily on the first `InProgress` status that
+/// reports bytes — before that point no bar renders. Pass `None` for
+/// `progress` to skip the bar entirely.
 ///
 /// This entry point assumes the candidate has a free upload slot. Callers
 /// that know the candidate's advertised slot count use
@@ -155,19 +155,32 @@ pub async fn download_file_for_candidate(
     // the candidate-list fallback provides the real diversity. Permanent
     // failures waste one delay window per retry, then fall back.
     //
-    // The one exception is a quality-verification rejection (SeakarrError::
-    // QualityRejected): the file was downloaded and its bitrate/bitdepth
-    // found to be below the configured minimum. Re-downloading the same
-    // file from the same peer cannot change its quality, so retrying would
-    // only burn retry_delay_secs on a doomed attempt. The error is returned
-    // immediately so download_album falls through to the next ranked
-    // candidate, which may hold a better copy.
+    // The exceptions are failures the same peer+file cannot recover from.
+    // A quality-verification rejection (SeakarrError::QualityRejected): the
+    // file was downloaded and its bitrate/bitdepth found to be below the
+    // configured minimum, and re-downloading it from the same peer cannot
+    // change its quality. A below-floor speed abort (SeakarrError::
+    // SlowDownload): the peer's measured rate stayed under
+    // min_upload_speed_kbps past speed_check_wait_secs, and asking again only
+    // puts the file back in that peer's queue — which is what produced the
+    // "queued, started, retrying, queued" cycle on a starved peer. Retrying
+    // either would only burn retry_delay_secs on a doomed attempt. Both
+    // errors are returned immediately so download_album falls through to the
+    // next ranked candidate, which may hold a better copy or serve faster.
     //
     // NOTE: with very low retry_delay_secs (< ~30 s), the vendor crate's
     // transfer thread may still be winding down (30 s socket read timeout)
     // when the retry opens a new connection to the same peer+file. Both
     // threads write to the same .part file (O_APPEND). The default 30 s
     // delay makes this negligible; lower values risk interleaved writes.
+    //
+    // The same window exists on the candidate-fallback path, where no retry
+    // delay intervenes at all: a transfer the vendor thread finished just as
+    // this attempt aborted can still rename its `.part` into a staging
+    // directory `download_album` has already removed and another candidate now
+    // owns. That race predates this loop — it applies to every non-retryable
+    // abort (queue limits, quality rejection, below-floor speed) — and the
+    // vendor's own read timeout is what bounds it.
     // Effective-transfer-time accumulator: the recorded throughput excludes
     // queue wait (a busy-but-fast peer is not demoted) but includes every
     // retry_delay_secs sleep and the final transfer's real duration, so a
@@ -216,7 +229,8 @@ pub async fn download_file_for_candidate(
                 if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
                     return Err(e);
                 }
-                // Permanent quality rejection: do not retry the same peer+file.
+                // Permanent failure (quality rejection, queue policy, or
+                // below-floor speed): do not retry the same peer+file.
                 if !is_retryable(&e) {
                     return Err(e);
                 }
@@ -229,16 +243,19 @@ pub async fn download_file_for_candidate(
     Err(last_err.unwrap())
 }
 
-/// Classify a download error for the per-peer retry loop. Two error kinds are
-/// permanent: a quality rejection (the same file downloaded again from the
-/// same peer has the same bitrate/bitdepth) and a queue policy failure (the
-/// peer's queue cannot improve by waiting again). Every other failure
-/// (timeouts, refused transfers, dropped connections) is treated as transient
-/// and retried.
+/// Classify a download error for the per-peer retry loop. Three error kinds
+/// are permanent: a quality rejection (the same file downloaded again from the
+/// same peer has the same bitrate/bitdepth), a queue policy failure (the
+/// peer's queue cannot improve by waiting again), and a below-floor speed
+/// abort (the same peer+file cannot get faster, so re-requesting it only
+/// re-enters that peer's queue). Every other failure (timeouts, refused
+/// transfers, dropped connections) is treated as transient and retried.
 fn is_retryable(error: &SeakarrError) -> bool {
     !matches!(
         error,
-        SeakarrError::QualityRejected(_) | SeakarrError::QueueTimeout(_)
+        SeakarrError::QualityRejected(_)
+            | SeakarrError::QueueTimeout(_)
+            | SeakarrError::SlowDownload(_)
     )
 }
 
@@ -322,6 +339,18 @@ fn earliest_queue_deadline(
     }
 }
 
+/// The earlier of two optional deadlines; `None` means that limit is disabled.
+fn earliest_deadline(
+    first: Option<tokio::time::Instant>,
+    second: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (only, None) => only,
+        (None, only) => only,
+    }
+}
+
 /// Reject a positive peer-reported queue position above an active cap.
 /// Cap-zero candidates have already proved a free slot before queueing and
 /// are not retroactively rejected by later telemetry.
@@ -365,17 +394,44 @@ async fn stop_with_error(
 ///
 /// Every path that leaves the queue before the transfer starts calls this:
 /// transfer start, position rejection, both fail-closed rejections, queue
-/// deadline expiry, channel close, cancellation, a peer-side failure, and a
-/// completion that never sent `InProgress`.
+/// deadline expiry, a stalled transfer that never started, channel close,
+/// cancellation, a peer-side failure, and a completion that never sent
+/// `InProgress`.
 ///
 /// The two fail-closed rejections are defensive no-ops today: a queue bar exists
 /// only once a positive in-bound position was observed, and that same block stores
-/// the position, so their `observed_queue_position.is_none()` guard implies no bar.
+/// the position, so their `queue.observed_position.is_none()` guard implies no bar.
 /// They are kept so a future change that creates a bar earlier cannot leak one.
 fn clear_queue_bar(progress: Option<&ProgressDisplay>, queue_bar: &mut Option<ProgressBar>) {
     if let (Some(display), Some(bar)) = (progress, queue_bar.take()) {
         display.clear_queue_bar(bar);
     }
+}
+
+/// End an attempt that received no status within `timeout_secs` of the last
+/// accepted event.
+///
+/// Retryable, unlike a queue limit: a stall can be temporary, so the retry loop
+/// (or the candidate fallback once retries are exhausted) is the existing answer
+/// to it. Used from both arms that can observe the expiry: the loop top, when a
+/// status already in the channel beat the poll timer, and the poll timeout.
+async fn expire_stalled_transfer(
+    handle: &mut DownloadHandle,
+    bar: &Option<ProgressBar>,
+    cancel: Option<&Arc<AtomicBool>>,
+    basename: &str,
+    timeout_secs: u64,
+) -> SeakarrError {
+    // A cancellation that landed during the final poll window outranks the
+    // timeout, exactly as it does for both queue limits — and an attempt the
+    // operator stopped must not be logged as a timeout.
+    let error = if cancellation_requested(cancel) {
+        SeakarrError::Download("download cancelled by user".into())
+    } else {
+        tracing::warn!("Download of {basename} timed out after {timeout_secs}s");
+        SeakarrError::Download("download timed out".into())
+    };
+    stop_with_error(handle, bar, error).await
 }
 
 /// End a queued attempt whose queue deadline expired, naming the limit that
@@ -405,10 +461,10 @@ async fn expire_queue_wait(
             config.max_start_time_secs,
         ),
     };
-    tracing::warn!("Download queue timeout: {reason}");
     let error = if cancellation_requested(cancel) {
         SeakarrError::Download("download cancelled by user".into())
     } else {
+        tracing::warn!("Download queue timeout: {reason}");
         SeakarrError::QueueTimeout(reason)
     };
     stop_with_error(handle, bar, error).await
@@ -424,10 +480,10 @@ async fn reject_queued_attempt(
     cancel: Option<&Arc<AtomicBool>>,
     reason: String,
 ) -> SeakarrError {
-    tracing::warn!("Download queue rejected: {reason}");
     let error = if cancellation_requested(cancel) {
         SeakarrError::Download("download cancelled by user".into())
     } else {
+        tracing::warn!("Download queue rejected: {reason}");
         SeakarrError::QueueTimeout(reason)
     };
     stop_with_error(handle, bar, error).await
@@ -447,8 +503,13 @@ fn emit_queue_notice(basename: &str, username: &str, position: Option<u32>) {
     }
 }
 
-/// Announce that a queued file has started transferring, with the wait it
-/// served. The free-slot form is used when no position was ever reported and the
+/// Announce that a queued file has started transferring, with the queue wait it
+/// served.
+///
+/// The wait runs from enqueue to the peer's accept — that is when the queue
+/// ended — while the line itself is emitted at the first byte-carrying progress
+/// report, so the starved interval between the two is not counted as queueing.
+/// The free-slot form is used when no position was ever reported and the
 /// transfer began inside the immediacy window (`IMMEDIATE_START_WINDOW`), so it
 /// never queued in any meaningful sense — the notice grace is a bound on how long
 /// the queued line waits, not a definition of immediacy.
@@ -478,19 +539,358 @@ fn emit_download_started(
     }
 }
 
+/// Queue-phase state of one attempt: everything the wait from enqueue to the
+/// first byte depends on.
+///
+/// Extracted from `download_once` so each transition — the deferred notice, the
+/// peer's position telemetry, the deadline selection and the queue-bar release —
+/// is a small function of its own instead of another nesting level inside the
+/// poll loop. Every method is synchronous and free of I/O, so the queue policy
+/// can be tested without a client.
+struct QueueWait {
+    /// When the file was queued: the base for the total queue limit and for the
+    /// wait reported in the started line.
+    enqueued_at: tokio::time::Instant,
+    /// When the deferred queued notice stops waiting for a position.
+    notice_grace_deadline: tokio::time::Instant,
+    /// Whether the notice has been emitted. Guards the grace, start and expiry
+    /// paths so the line can never be duplicated.
+    notice_emitted: bool,
+    /// `max_queue_time_secs` deadline; `None` when the limit is disabled.
+    total_deadline: Option<tokio::time::Instant>,
+    /// First position-1 observation, which starts the `max_start_time_secs`
+    /// clock only at that point.
+    head_at: Option<tokio::time::Instant>,
+    /// Last positive position the peer reported, for the timeout message.
+    observed_position: Option<u32>,
+    /// Queue bar, created on the first position observation and released on
+    /// every path out of the queue, so no attempt can leave a bar behind.
+    bar: Option<ProgressBar>,
+}
+
+impl QueueWait {
+    fn new(enqueued_at: tokio::time::Instant, config: &DownloadConfig) -> Self {
+        Self {
+            enqueued_at,
+            notice_grace_deadline: enqueued_at + QUEUE_NOTICE_GRACE,
+            notice_emitted: false,
+            total_deadline: enabled_deadline(enqueued_at, config.max_queue_time_secs),
+            head_at: None,
+            observed_position: None,
+            bar: None,
+        }
+    }
+
+    /// Whether the notice grace has expired with no position, notice or start.
+    fn notice_is_due(&self, now: tokio::time::Instant) -> bool {
+        !self.notice_emitted && now >= self.notice_grace_deadline
+    }
+
+    /// Emit the queued notice without a position, once.
+    ///
+    /// Used where the wait ends without the peer ever reporting a position: the
+    /// grace expiring, the transfer starting, a queue limit expiring, or a
+    /// completion that skipped progress entirely.
+    fn notice(&mut self, basename: &str, username: &str) {
+        if !self.notice_emitted {
+            emit_queue_notice(basename, username, None);
+            self.notice_emitted = true;
+        }
+    }
+
+    /// Record a reported queue position and emit or update what it drives.
+    ///
+    /// Returns the rejection reason when the position exceeds the configured
+    /// `max_queue_length`, so the caller can end the attempt with it. A zero or
+    /// absent position is ignored: neither proves a zero-slot peer is in bounds.
+    fn observe(
+        &mut self,
+        position: Option<u32>,
+        now: tokio::time::Instant,
+        basename: &str,
+        username: &str,
+        config: &DownloadConfig,
+        progress: Option<&ProgressDisplay>,
+    ) -> Option<String> {
+        let position = position.filter(|position| *position > 0)?;
+        if let Some(detail) = queue_position_rejection(position, config.max_queue_length) {
+            return Some(format!("{basename} from {username} {detail}"));
+        }
+        if !self.notice_emitted {
+            emit_queue_notice(basename, username, Some(position));
+            self.notice_emitted = true;
+        } else if self.observed_position != Some(position) {
+            tracing::debug!("Queue position for {basename} from {username}: {position}");
+        }
+        if let Some(display) = progress {
+            let label = crate::progress::queue_label(basename, username, Some(position));
+            match &self.bar {
+                Some(existing) => display.update_queue_bar(existing, &label),
+                None => self.bar = Some(display.create_queue_bar(&label)),
+            }
+        }
+        self.observed_position = Some(position);
+        if position == 1 && self.head_at.is_none() {
+            self.head_at = Some(now);
+        }
+        None
+    }
+
+    /// The earliest enabled limit that bounds a wait for the transfer to start,
+    /// with the limit that produced it.
+    fn active_deadline(
+        &self,
+        config: &DownloadConfig,
+    ) -> Option<(tokio::time::Instant, QueueDeadlineKind)> {
+        let head_deadline = self
+            .head_at
+            .and_then(|head| enabled_deadline(head, config.max_start_time_secs));
+        earliest_queue_deadline(self.total_deadline, head_deadline)
+    }
+
+    /// Release the queue bar, if this attempt created one.
+    fn release_bar(&mut self, progress: Option<&ProgressDisplay>) {
+        clear_queue_bar(progress, &mut self.bar);
+    }
+
+    /// The wait served since enqueue, as reported in the started line.
+    fn wait(&self, now: tokio::time::Instant) -> std::time::Duration {
+        now.duration_since(self.enqueued_at)
+    }
+}
+
+/// Transfer-phase state of one attempt: the clock the inactivity and speed limits
+/// are measured from, the bar that tracks the transfer, and the running speed
+/// average that bar displays.
+///
+/// Like `QueueWait`, this exists so `download_once` stays a thin poll loop: each
+/// transfer limit is applied by a small method that can be tested directly.
+struct TransferProgress {
+    /// Set by the first `InProgress` of any kind: the peer accepted the transfer,
+    /// so the queue wait is over. This is the clock the recorded throughput is
+    /// measured from (the accept-to-first-byte phase is transfer time, not queue
+    /// time), and the base for the pre-start inactivity bound below.
+    accepted_at: Option<tokio::time::Instant>,
+    /// Set by the first progress sample that reports a positive
+    /// `bytes_downloaded`. A fresh transfer's offset handshake reports zero
+    /// bytes, so it cannot start the clock; a resumed transfer's handshake
+    /// reports the surviving `.part` size (the vendor sends `part.written`),
+    /// which does start it.
+    started_at: Option<tokio::time::Instant>,
+    /// `timeout_secs` deadline. Armed by every accepted `InProgress` — including
+    /// the zero-byte offset handshake, which is what bounds a peer that accepts
+    /// and then sends nothing — and reset by every progress sample. `None` when
+    /// the limit is disabled.
+    deadline: Option<tokio::time::Instant>,
+    /// Whether a below-floor sample may end the attempt. Armed by the first
+    /// sample *after* the one that started the transfer, so the zero-speed
+    /// handshake echo that begins a resumed transfer is never judged against the
+    /// floor (with `speed_check_wait_secs: 0` it would otherwise abort a healthy
+    /// peer on the spot).
+    floor_armed: bool,
+    /// Last peer-reported total, so the bar can be snapped to 100% on
+    /// completion (the final sample may lag the actual end).
+    total_bytes: u64,
+    /// EMA of the reported speed, so the displayed speed does not jump around.
+    speed_ema: Option<f64>,
+    /// Transfer bar, created on the first progress sample. Before the transfer
+    /// starts no bar may render (a 0 B/[total] [0%] bar used to appear before
+    /// the bridge even started).
+    bar: Option<ProgressBar>,
+}
+
+impl TransferProgress {
+    const fn new() -> Self {
+        Self {
+            accepted_at: None,
+            started_at: None,
+            deadline: None,
+            floor_armed: false,
+            total_bytes: 0,
+            speed_ema: None,
+            bar: None,
+        }
+    }
+
+    const fn has_started(&self) -> bool {
+        self.started_at.is_some()
+    }
+
+    /// When the peer accepted the transfer, if it has reported anything yet.
+    const fn accepted_at(&self) -> Option<tokio::time::Instant> {
+        self.accepted_at
+    }
+
+    /// Record that the peer accepted the transfer, and re-arm the inactivity
+    /// deadline.
+    ///
+    /// Called for every `InProgress`. Before the byte-gated start this is the
+    /// only limit that covers a peer which accepts and then goes silent: with
+    /// both queue limits disabled, nothing else would ever end the attempt.
+    fn note_accepted(&mut self, now: tokio::time::Instant, config: &DownloadConfig) {
+        self.accepted_at.get_or_insert(now);
+        self.deadline = enabled_deadline(now, config.timeout_secs);
+    }
+
+    /// Start the transfer clock and create the bar for a non-empty file.
+    ///
+    /// Zero-length transfers get no bar: indicatif renders `len == 0` as 100%
+    /// (state.rs:282), which reproduces the bug this creation point exists to fix.
+    /// A file small enough that the peer never reports progress (its reports are
+    /// one per ~120 KB of reads) also completes without one — the queue bar is
+    /// released by the completion path and nothing is left on the terminal. The
+    /// peer reports one fixed total for a transfer, so a transfer that starts
+    /// without a total never gains a bar later.
+    fn start(
+        &mut self,
+        now: tokio::time::Instant,
+        total_bytes: u64,
+        basename: &str,
+        progress: Option<&ProgressDisplay>,
+    ) {
+        self.started_at = Some(now);
+        self.floor_armed = false;
+        if total_bytes > 0 {
+            if let Some(display) = progress {
+                self.bar = Some(display.create_bar(basename, total_bytes));
+            }
+        }
+    }
+
+    /// Apply one progress sample: reset the inactivity deadline, enforce the
+    /// speed floor on the smoothed rate once the wait period has passed, and
+    /// update the bar.
+    ///
+    /// The sample that started the transfer is exempt from both the floor and
+    /// the average (see `floor_armed`). The returned error ends the attempt: the
+    /// transfer is cancelled and drained first, because `download_album` removes
+    /// the staging directory immediately afterwards and must not race the
+    /// transfer thread.
+    #[allow(clippy::too_many_arguments)]
+    async fn sample(
+        &mut self,
+        handle: &mut DownloadHandle,
+        cancel: Option<&Arc<AtomicBool>>,
+        now: tokio::time::Instant,
+        config: &DownloadConfig,
+        speed_bytes_per_sec: u64,
+        bytes_downloaded: u64,
+        total_bytes: u64,
+    ) -> Result<()> {
+        // Any accepted `InProgress` — including the zero-byte offset handshake —
+        // arms and re-arms `timeout_secs`, so queue wait never counts against it.
+        // As with `max_queue_length` and `max_start_time_secs`, `0` disables the
+        // inactivity timeout instead of expiring immediately.
+        self.deadline = enabled_deadline(now, config.timeout_secs);
+        self.total_bytes = total_bytes;
+        // Smooth the reported rate, then judge the smoothed value: the floor is
+        // applied to the same average the bar displays, so a jittery ~120 KB
+        // window cannot abandon an otherwise-fast peer once the average is
+        // seeded. A peer that is slow from the start is still caught by its first
+        // judged sample, whatever that value blends with by then.
+        //
+        // The sample that started the transfer is kept out of the average, not
+        // just out of the verdict: a resumed transfer's handshake reports the
+        // `.part` size with a zero speed, and seeding the average with that zero
+        // would hold every later sample down (0.7^k of it each time), so the
+        // first judged sample would be measured at a fraction of the peer's real
+        // rate. The first judged sample therefore seeds the average unsmoothed,
+        // which still rejects a peer that is slow from the start.
+        let smoothed = if self.floor_armed {
+            let smoothed = ema_update(self.speed_ema, speed_bytes_per_sec as f64, SPEED_EMA_ALPHA);
+            self.speed_ema = Some(smoothed);
+            smoothed
+        } else {
+            speed_bytes_per_sec as f64
+        };
+        // Speed check: only once the transfer has actually started transferring
+        // (not just been accepted), and past the wait period. The wait is measured
+        // against the caller's sample instant, which is the same `now` used for
+        // the inactivity deadline above, so both limits read one clock.
+        if self.floor_armed {
+            if let Some(started_at) = self.started_at {
+                if config.min_upload_speed_kbps > 0
+                    && now.duration_since(started_at).as_secs() >= config.speed_check_wait_secs
+                {
+                    let speed_kbps = (smoothed / 1024.0) as u32;
+                    if speed_kbps < config.min_upload_speed_kbps {
+                        // A cancellation that landed while the poll was pending
+                        // outranks the verdict, exactly as it does for both queue
+                        // limits: the operator asked to stop, and the surviving
+                        // error has to say so.
+                        let error = if cancellation_requested(cancel) {
+                            SeakarrError::Download("download cancelled by user".into())
+                        } else {
+                            SeakarrError::SlowDownload(format!(
+                                "speed {speed_kbps} KB/s below minimum {} KB/s",
+                                config.min_upload_speed_kbps
+                            ))
+                        };
+                        return Err(stop_with_error(handle, &self.bar, error).await);
+                    }
+                }
+            }
+        }
+        self.floor_armed = true;
+        // Update progress bar if present with the same smoothed speed.
+        if let Some(bar) = &self.bar {
+            bar.set_position(bytes_downloaded);
+            bar.set_prefix(format_speed(smoothed as u64));
+        }
+        Ok(())
+    }
+
+    /// Whether no status arrived within `timeout_secs` of the last accepted
+    /// event — the last progress sample, or the peer's acceptance when the
+    /// transfer has not produced a byte yet.
+    fn is_inactive(&self, now: tokio::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Snap the bar to the peer's last reported total and remove it.
+    ///
+    /// `finish_and_clear` removes the bar from the terminal so the next track
+    /// starts with a single bar (no "double progress bar" effect).
+    fn complete(&self) {
+        if let Some(bar) = &self.bar {
+            bar.set_position(self.total_bytes);
+            bar.finish_and_clear();
+        }
+    }
+
+    /// Remove the bar after a failed attempt.
+    fn clear(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+
+    /// The transfer duration, or zero when the peer never reported anything.
+    ///
+    /// Measured from the accept, not from the first byte: the phase between the
+    /// peer accepting and its first progress sample is transfer time, not queue
+    /// wait, so it belongs in the recorded throughput. A completed transfer that
+    /// sent no `InProgress` at all still records zero.
+    fn elapsed(&self) -> std::time::Duration {
+        self.accepted_at
+            .map(|accepted_at| accepted_at.elapsed())
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+}
+
 /// Single download attempt for `download_file_for_candidate` (no retry loop).
 /// Queues the transfer and polls status until success, failure, timeout, or
-/// cancel. Returns the destination path plus the transfer duration (first
-/// InProgress to completion). The `basename` parameter must be pre-validated by
-/// the caller.
+/// cancel. Returns the destination path plus the transfer duration (the peer's
+/// accept to completion). The `basename` parameter must be pre-validated by the
+/// caller.
 ///
-/// Queue wait and transfer inactivity are timed separately: `timeout_secs`
-/// starts at the first real progress event and is reset only by further
-/// progress, while the queue wait is bounded by `max_queue_time_secs` (from
-/// enqueue) and `max_start_time_secs` (from the first position-1 observation).
-/// Observed queue positions are validated against `max_queue_length`, and a
-/// zero-slot candidate with a positive cap must prove an in-bound position
-/// before its first progress event.
+/// Queue wait and transfer inactivity are timed separately: `timeout_secs` is
+/// armed by the peer's accept and by every later `InProgress`, and is not reset
+/// by a paused status, while the queue wait is bounded by `max_queue_time_secs`
+/// (from enqueue) and `max_start_time_secs` (from the first position-1
+/// observation). Observed queue positions are validated against
+/// `max_queue_length`, and a zero-slot candidate with a positive cap must prove
+/// an in-bound position before its first byte-carrying progress event.
 #[allow(clippy::too_many_arguments)]
 async fn download_once(
     client: &dyn SoulseekClient,
@@ -508,53 +908,21 @@ async fn download_once(
         Ok(h) => h,
         Err(e) => return Err(e),
     };
-    // Queue state. `total_queue_deadline` bounds the whole wait from enqueue;
-    // `queue_head_at` records the first position-1 observation, which starts
-    // the `max_start_time_secs` clock only at that point. Either is `None`
-    // when its limit is zero (disabled).
-    let enqueued_at = tokio::time::Instant::now();
-    // The queued notice is deferred until one of three things happens: the peer
-    // reports a position, the transfer starts, or the grace expires.
-    // `notice_emitted` guards all three so the line can never be duplicated.
-    let notice_grace_deadline = enqueued_at + QUEUE_NOTICE_GRACE;
-    let mut notice_emitted = false;
-    let total_queue_deadline = enabled_deadline(enqueued_at, config.max_queue_time_secs);
-    let mut queue_head_at: Option<tokio::time::Instant> = None;
-    let mut observed_queue_position: Option<u32> = None;
-    // Transfer state. The deadline starts at the first real progress event,
-    // so queue wait is never charged against `timeout_secs`.
-    let mut transfer_start: Option<tokio::time::Instant> = None;
-    let mut transfer_deadline: Option<tokio::time::Instant> = None;
+    let mut queue = QueueWait::new(tokio::time::Instant::now(), config);
+    let mut transfer = TransferProgress::new();
     // A zero-slot candidate with a positive cap is expected to queue, so it
     // must prove an in-bound position before it may start transferring.
     let requires_queue_position = config.max_queue_length > 0 && peer_slots == 0;
-    // Progress bar for this transfer, created lazily on the first InProgress
-    // status. Before the transfer actually starts no bar may render — the
-    // user should only see progress once a download is underway (the bar was
-    // previously created eagerly in download_album from search metadata,
-    // so a 0 B/[total] [0%] bar appeared before the bridge even started).
-    let mut bar: Option<ProgressBar> = None;
-    // Queue bar for this attempt. Created on the first position observation and
-    // released on every path out of the queue, so no attempt can leave a bar
-    // behind.
-    let mut queue_bar: Option<ProgressBar> = None;
-    // Track the peer's reported total so the bar can be snapped to 100%
-    // on completion (the final InProgress may lag the actual end).
-    let mut last_total_bytes: u64 = 0;
-    // Exponential moving average of the transfer speed. Smooths out
-    // the raw instantaneous speed_bytes_per_sec from each InProgress
-    // status so the displayed speed doesn't jump around.
-    let mut speed_ema: Option<f64> = None;
 
     loop {
         // Honour cancellation (Ctrl+C / SIGINT) first: it outranks every
         // queue and transfer deadline. The caller (download_album) removes
         // the staging dir.
         if cancellation_requested(cancel) {
-            clear_queue_bar(progress, &mut queue_bar);
+            queue.release_bar(progress);
             return Err(stop_with_error(
                 &mut handle,
-                &bar,
+                &transfer.bar,
                 SeakarrError::Download("download cancelled by user".into()),
             )
             .await);
@@ -566,52 +934,66 @@ async fn download_once(
         // `Queued { queue_position: None }`) keeps the poll alive, so a check
         // inside the timeout arm can be starved and the queued line never
         // emitted — the silence this notice exists to remove.
-        if !notice_emitted && now >= notice_grace_deadline {
-            emit_queue_notice(basename, username, None);
-            notice_emitted = true;
+        if queue.notice_is_due(now) {
+            queue.notice(basename, username);
         }
-        // While queued, the earliest of the total queue limit and the
-        // queue-head limit bounds the wait. Once the transfer has started,
-        // only transfer inactivity matters.
-        let head_deadline =
-            queue_head_at.and_then(|head| enabled_deadline(head, config.max_start_time_secs));
-        let active_queue_deadline = earliest_queue_deadline(total_queue_deadline, head_deadline);
-        let active_deadline = if transfer_start.is_some() {
-            transfer_deadline
+        // While queued, the earliest of the total queue limit and the queue-head
+        // limit bounds the wait. Once the transfer has started, only transfer
+        // inactivity matters.
+        let active_queue_deadline = queue.active_deadline(config);
+        // While the transfer has not started, the queue limits bound the wait —
+        // and so does `timeout_secs` measured from the peer's accept, armed by
+        // `note_accepted`. With both queue limits disabled that accept clock is
+        // the only bound a peer which accepts and then goes silent has.
+        let active_deadline = if transfer.has_started() {
+            transfer.deadline
         } else {
-            active_queue_deadline.map(|(deadline, _)| deadline)
+            earliest_deadline(
+                active_queue_deadline.map(|(deadline, _)| deadline),
+                transfer.deadline,
+            )
         };
-        if transfer_start.is_none() {
-            if let Some((deadline, kind)) = active_queue_deadline {
-                if now >= deadline {
-                    // Reachable when a status already in the channel beats the
-                    // poll timer: `timeout` polls the channel before its timer, so
-                    // a message can be handled and the loop top then observe the
-                    // deadline. Without this the expiry swallows the queued line.
-                    // Idempotent through `notice_emitted`, and the arm returns.
-                    //
-                    // Coverage limitation: which arm observes an expiry that lands
-                    // exactly on a status arrival is scheduler-dependent, so this
-                    // arm is not deterministically testable. It is kept as
-                    // defence for the deadline that the poll-timeout arm would
-                    // otherwise swallow, and both lines are deliberately cheap and
-                    // idempotent.
-                    if !notice_emitted {
-                        emit_queue_notice(basename, username, None);
-                    }
-                    clear_queue_bar(progress, &mut queue_bar);
-                    return Err(expire_queue_wait(
-                        &mut handle,
-                        &bar,
-                        cancel,
-                        kind,
-                        basename,
-                        username,
-                        config,
-                        observed_queue_position,
-                    )
-                    .await);
-                }
+        // The accept clock can expire with no status pending, so it is checked
+        // here as well as in the poll-timeout arm: a status that was already in
+        // the channel beats the poll timer, and without this the expiry would be
+        // delayed by another poll window.
+        if transfer.is_inactive(now) {
+            queue.release_bar(progress);
+            return Err(expire_stalled_transfer(
+                &mut handle,
+                &transfer.bar,
+                cancel,
+                basename,
+                config.timeout_secs,
+            )
+            .await);
+        }
+        // A deadline that a status already in the channel beat the poll timer to.
+        // Reachable because `timeout` polls the channel before its timer: a
+        // message is handled, and the loop top then observes the expiry. Without
+        // this the expiry would swallow the queued line. Both the notice and the
+        // expiry are idempotent, and the arm returns.
+        //
+        // Coverage limitation: which arm observes an expiry that lands exactly on
+        // a status arrival is scheduler-dependent, so this arm is not
+        // deterministically testable. It is kept as defence for the deadline the
+        // poll-timeout arm would otherwise swallow, and both lines are
+        // deliberately cheap and idempotent.
+        if let Some((deadline, kind)) = active_queue_deadline.filter(|_| !transfer.has_started()) {
+            if now >= deadline {
+                queue.notice(basename, username);
+                queue.release_bar(progress);
+                return Err(expire_queue_wait(
+                    &mut handle,
+                    &transfer.bar,
+                    cancel,
+                    kind,
+                    basename,
+                    username,
+                    config,
+                    queue.observed_position,
+                )
+                .await);
             }
         }
         // Poll status with a short timeout so cancellation and deadline
@@ -630,79 +1012,67 @@ async fn download_once(
                 total_bytes,
             })) => {
                 let now = tokio::time::Instant::now();
+                // Any `InProgress` proves the peer accepted the transfer, so the
+                // accept clock starts (or is re-armed) here — before the
+                // byte-gated start block, which only the handshake's successors
+                // can reach.
+                transfer.note_accepted(now, config);
                 // Fail closed: a zero-slot candidate with a positive cap must
                 // not start on an unproven position, or a peer could keep the
                 // file queued and then start it outside the configured policy.
-                if transfer_start.is_none()
+                if !transfer.has_started()
                     && requires_queue_position
-                    && observed_queue_position.is_none()
+                    && queue.observed_position.is_none()
                 {
                     let reason = format!(
                         "{basename} from {username} started with an unknown queue position while max_queue_length={}",
                         config.max_queue_length
                     );
-                    clear_queue_bar(progress, &mut queue_bar);
-                    return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
+                    queue.release_bar(progress);
+                    return Err(
+                        reject_queued_attempt(&mut handle, &transfer.bar, cancel, reason).await,
+                    );
                 }
-                if transfer_start.is_none() {
-                    clear_queue_bar(progress, &mut queue_bar);
-                    if !notice_emitted {
-                        emit_queue_notice(basename, username, None);
-                        notice_emitted = true;
-                    }
+                // The peer's offset handshake reports the resume offset with a
+                // zero speed the moment it accepts the transfer, before a byte
+                // is read (download_peer.rs `start_transfer`). Only a report
+                // that carries bytes is real progress: counting the echo as the
+                // start began the speed clock while the peer was still draining
+                // its own queue, so a starved peer was cancelled for being too
+                // slow and then retried. Until bytes arrive, the queue limits
+                // stay in charge of the wait.
+                if !transfer.has_started() && bytes_downloaded > 0 {
+                    queue.release_bar(progress);
+                    queue.notice(basename, username);
+                    // The wait reported is the queue wait, and that ends when the
+                    // peer accepts rather than when its first bytes arrive: a
+                    // peer that accepted at once but needed a moment for its
+                    // first ~120 KB report is still reported as immediate, and
+                    // the starved interval shows up in whatever ends the attempt.
                     emit_download_started(
                         basename,
                         username,
-                        now.duration_since(enqueued_at),
-                        observed_queue_position,
+                        queue.wait(transfer.accepted_at().unwrap_or(now)),
+                        queue.observed_position,
                     );
-                    transfer_start = Some(now);
-                    // Create the progress bar only once the transfer has
-                    // actually started (first InProgress). Skip for
-                    // zero-length transfers — indicatif renders len==0 as
-                    // 100% (state.rs:282), which reproduces the bug.
-                    if total_bytes > 0 {
-                        if let Some(p) = progress {
-                            bar = Some(p.create_bar(basename, total_bytes));
-                        }
-                    }
+                    transfer.start(now, total_bytes, basename, progress);
                 }
-                // Real progress is the only thing that starts (and resets)
-                // `timeout_secs`; queue wait never counts against it. As with
-                // `max_queue_length` and `max_start_time_secs`, `0` disables the
-                // inactivity timeout instead of expiring immediately.
-                transfer_deadline = enabled_deadline(now, config.timeout_secs);
-                last_total_bytes = total_bytes;
-                // Speed check: only after the transfer has actually started
-                // transferring (not just queued), and past the wait period.
-                if config.min_upload_speed_kbps > 0 {
-                    if let Some(ts) = transfer_start {
-                        if ts.elapsed().as_secs() >= config.speed_check_wait_secs {
-                            let speed_kbps = (speed_bytes_per_sec / 1024) as u32;
-                            if speed_kbps < config.min_upload_speed_kbps {
-                                // Cancel and drain before returning —
-                                // download_album calls remove_dir_all and must
-                                // not race the transfer thread.
-                                return Err(stop_with_error(
-                                    &mut handle,
-                                    &bar,
-                                    SeakarrError::Download(format!(
-                                        "speed {speed_kbps} KB/s below minimum {} KB/s",
-                                        config.min_upload_speed_kbps
-                                    )),
-                                )
-                                .await);
-                            }
-                        }
-                    }
-                }
-                // Update progress bar if present — use EMA-smoothed
-                // speed for display so it doesn't jump around.
-                let smoothed = ema_update(speed_ema, speed_bytes_per_sec as f64, SPEED_EMA_ALPHA);
-                speed_ema = Some(smoothed);
-                if let Some(bar) = &bar {
-                    bar.set_position(bytes_downloaded);
-                    bar.set_prefix(format_speed(smoothed as u64));
+                // Everything measured from the transfer start — the inactivity
+                // deadline, the speed floor and the progress bar — runs only once
+                // real bytes have arrived, so a queued peer is never charged
+                // against them.
+                if transfer.has_started() {
+                    transfer
+                        .sample(
+                            &mut handle,
+                            cancel,
+                            now,
+                            config,
+                            speed_bytes_per_sec,
+                            bytes_downloaded,
+                            total_bytes,
+                        )
+                        .await?;
                 }
             }
             Ok(Some(DownloadStatus::Completed)) => {
@@ -710,51 +1080,39 @@ async fn download_once(
                 // attempt that completes without ever proving its position
                 // must not be accepted. Free-slot candidates are unaffected
                 // and keep the zero-throughput path below.
-                if transfer_start.is_none()
+                if !transfer.has_started()
                     && requires_queue_position
-                    && observed_queue_position.is_none()
+                    && queue.observed_position.is_none()
                 {
                     let reason = format!(
                         "{basename} from {username} completed without a queue position while max_queue_length={}",
                         config.max_queue_length
                     );
-                    clear_queue_bar(progress, &mut queue_bar);
-                    return Err(reject_queued_attempt(&mut handle, &bar, cancel, reason).await);
+                    queue.release_bar(progress);
+                    return Err(
+                        reject_queued_attempt(&mut handle, &transfer.bar, cancel, reason).await,
+                    );
                 }
-                // A transfer can reach Completed without ever sending
-                // InProgress. It never entered the transfer-start block, so the
-                // started line is emitted here to keep the "one started line per
-                // downloaded file" contract.
-                //
-                // `notice_emitted` is deliberately not set here: the arm returns
-                // immediately below, so the write would be dead and clippy rejects
-                // it (`unused_assignments`). One queued line is still guaranteed,
-                // because this arm runs at most once per attempt.
-                if transfer_start.is_none() {
-                    if !notice_emitted {
-                        emit_queue_notice(basename, username, None);
-                    }
+                // A transfer can reach Completed without ever sending InProgress.
+                // It never started, so the started line is emitted here to keep
+                // the "one started line per downloaded file" contract. The queued
+                // notice goes with it: this arm is the only chance to report the
+                // wait, because it returns immediately below.
+                if !transfer.has_started() {
+                    queue.notice(basename, username);
                     emit_download_started(
                         basename,
                         username,
-                        now.duration_since(enqueued_at),
-                        observed_queue_position,
+                        queue.wait(transfer.accepted_at().unwrap_or(now)),
+                        queue.observed_position,
                     );
                 }
                 // The same short-circuit applies to the queue bar: the
                 // transfer-start release is never reached, and the bar holds a
                 // steady tick, so leaving it would keep a spinner on the terminal
                 // for the rest of the run.
-                clear_queue_bar(progress, &mut queue_bar);
-                if let Some(bar) = &bar {
-                    // Snap to 100% before clearing — the final InProgress
-                    // may have left the bar below the total.
-                    // finish_and_clear() removes the bar from the terminal
-                    // so the next track starts with a single bar (no
-                    // "double progress bar" effect).
-                    bar.set_position(last_total_bytes);
-                    bar.finish_and_clear();
-                }
+                queue.release_bar(progress);
+                transfer.complete();
                 let dest = dir.join(basename);
                 tracing::info!("Download staged: {basename} -> {}", dest.display());
 
@@ -771,56 +1129,30 @@ async fn download_once(
                     return Err(e);
                 }
 
-                return Ok((
-                    dest,
-                    transfer_start
-                        .map(|ts| ts.elapsed())
-                        .unwrap_or(std::time::Duration::ZERO),
-                ));
+                return Ok((dest, transfer.elapsed()));
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 tracing::warn!("Download of {basename} failed: {reason}");
-                clear_queue_bar(progress, &mut queue_bar);
-                if let Some(bar) = &bar {
-                    bar.finish_and_clear();
-                }
+                queue.release_bar(progress);
+                transfer.clear();
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
             }
             Ok(Some(DownloadStatus::Queued { queue_position })) => {
                 // Positions are only meaningful before the transfer starts: a
-                // late Queued must not re-enter queue state or reset any
-                // deadline.
-                if transfer_start.is_none() {
-                    if let Some(position) = queue_position.filter(|position| *position > 0) {
-                        if let Some(detail) =
-                            queue_position_rejection(position, config.max_queue_length)
-                        {
-                            let reason = format!("{basename} from {username} {detail}");
-                            clear_queue_bar(progress, &mut queue_bar);
-                            return Err(
-                                reject_queued_attempt(&mut handle, &bar, cancel, reason).await
-                            );
-                        }
-                        if !notice_emitted {
-                            emit_queue_notice(basename, username, Some(position));
-                            notice_emitted = true;
-                        } else if observed_queue_position != Some(position) {
-                            tracing::debug!(
-                                "Queue position for {basename} from {username}: {position}"
-                            );
-                        }
-                        if let Some(display) = progress {
-                            let label =
-                                crate::progress::queue_label(basename, username, Some(position));
-                            match &queue_bar {
-                                Some(existing) => display.update_queue_bar(existing, &label),
-                                None => queue_bar = Some(display.create_queue_bar(&label)),
-                            }
-                        }
-                        observed_queue_position = Some(position);
-                        if position == 1 && queue_head_at.is_none() {
-                            queue_head_at = Some(tokio::time::Instant::now());
-                        }
+                // late Queued must not re-enter queue state or reset any deadline.
+                if !transfer.has_started() {
+                    let now = tokio::time::Instant::now();
+                    let rejected =
+                        queue.observe(queue_position, now, basename, username, config, progress);
+                    if let Some(reason) = rejected {
+                        queue.release_bar(progress);
+                        return Err(reject_queued_attempt(
+                            &mut handle,
+                            &transfer.bar,
+                            cancel,
+                            reason,
+                        )
+                        .await);
                     }
                 }
             }
@@ -829,58 +1161,54 @@ async fn download_once(
             // state once the transfer has started.
             Ok(Some(DownloadStatus::Paused { .. })) => {}
             Ok(None) => {
-                if let Some(bar) = &bar {
-                    bar.finish_and_clear();
-                }
+                transfer.clear();
                 tracing::warn!("Download channel closed for {basename}");
-                clear_queue_bar(progress, &mut queue_bar);
+                queue.release_bar(progress);
                 return Err(SeakarrError::Download(
                     "download channel closed unexpectedly".into(),
                 ));
             }
             Err(_elapsed) => {
                 // The poll window expired — check the active deadline before
-                // declaring the attempt dead. Only the deadline that applies
-                // to the current phase can expire.
+                // declaring the attempt dead. Only the deadline that applies to
+                // the current phase can expire.
                 let now = tokio::time::Instant::now();
-                if transfer_start.is_some() {
-                    if transfer_deadline.is_some_and(|deadline| now >= deadline) {
-                        tracing::warn!(
-                            "Download of {basename} timed out after {}s",
-                            config.timeout_secs
-                        );
-                        return Err(stop_with_error(
-                            &mut handle,
-                            &bar,
-                            SeakarrError::Download("download timed out".into()),
-                        )
-                        .await);
-                    }
-                } else if let Some((deadline, kind)) = active_queue_deadline {
+                if transfer.is_inactive(now) {
+                    // The queue bar survives until the first byte, so this
+                    // pre-start exit must release it: the Err arm is the usual
+                    // observer for a peer that accepts and then goes silent.
+                    queue.release_bar(progress);
+                    return Err(expire_stalled_transfer(
+                        &mut handle,
+                        &transfer.bar,
+                        cancel,
+                        basename,
+                        config.timeout_secs,
+                    )
+                    .await);
+                }
+                if let Some((deadline, kind)) =
+                    active_queue_deadline.filter(|_| !transfer.has_started())
+                {
                     if now >= deadline {
                         // A queue limit shorter than the notice grace expires
                         // first. Emitting the notice here keeps the wait visible
                         // instead of letting the expiry swallow it, so the queued
-                        // line is never skipped whatever the limits are.
-                        //
-                        // `None` rather than `observed_queue_position`: that field
-                        // is assigned only where the notice is emitted, so a stored
-                        // position implies `notice_emitted` and this call can never
-                        // carry one. A position that did arrive reaches the
-                        // `QueueTimeout` warning instead.
-                        if !notice_emitted {
-                            emit_queue_notice(basename, username, None);
-                        }
-                        clear_queue_bar(progress, &mut queue_bar);
+                        // line is never skipped whatever the limits are. The notice
+                        // carries no position by design: a stored position implies
+                        // the notice was already emitted, and a position that did
+                        // arrive reaches the `QueueTimeout` warning instead.
+                        queue.notice(basename, username);
+                        queue.release_bar(progress);
                         return Err(expire_queue_wait(
                             &mut handle,
-                            &bar,
+                            &transfer.bar,
                             cancel,
                             kind,
                             basename,
                             username,
                             config,
-                            observed_queue_position,
+                            queue.observed_position,
                         )
                         .await);
                     }
@@ -1399,8 +1727,8 @@ mod tests {
     }
 
     /// A client whose download status channel the test drives manually, so
-    /// the moment a transfer "starts" (first InProgress) is under the test's
-    /// control rather than raced against a background task.
+    /// the moment a transfer "starts" (first byte-carrying `InProgress`) is
+    /// under the test's control rather than raced against a background task.
     struct ControllableClient {
         /// Set when `download()` is called — signals the transfer was queued.
         download_called: Arc<std::sync::atomic::AtomicBool>,
@@ -2518,42 +2846,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_monitors_speed() {
-        let client = MockClient::new();
-        *client.download_speed.lock().unwrap() = 100_000; // 100 KB/s — slow
-        let dir = TempDir::new().unwrap();
-        let file = make_file("track.flac", 900, 10_000_000);
-
-        let mut config = default_dl_config();
-        config.min_upload_speed_kbps = 200; // require >200 KB/s
-        config.speed_check_wait_secs = 0;
-
-        let result = download_file(
-            &client,
-            &file,
-            "testuser",
-            dir.path(),
-            &config,
-            &default_filter_config_test(),
-            None,
-            None,
-        )
-        .await;
-        // Should detect slow speed and return error
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_download_slow_speed_fails() {
+        // A peer that cannot reach `min_upload_speed_kbps` fails the download.
+        // `download_file` retries transient failures on the same peer, but a
+        // below-floor abort is permanent for that peer — asking again only puts
+        // the file back in that peer's queue — so one attempt is made and the
+        // candidate fallback takes over.
         let client = MockClient::new();
-        *client.download_speed.lock().unwrap() = 100_000; // Always slow → will retry and fail
+        *client.download_speed.lock().unwrap() = 100_000; // 100 KB/s
         let dir = TempDir::new().unwrap();
         let file = make_file("track.flac", 900, 10_000_000);
 
         let mut config = default_dl_config();
         config.min_upload_speed_kbps = 1_000_000;
-        config.max_retries = 2;
-        config.retry_delay_secs = 0;
 
         let result = download_file(
             &client,
@@ -2567,6 +2872,11 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+        assert_eq!(
+            client.download_filenames.lock().unwrap().len(),
+            1,
+            "a below-floor peer must not be re-queued in place"
+        );
     }
 
     #[tokio::test]
@@ -3027,12 +3337,510 @@ mod tests {
         assert!(!is_retryable(&SeakarrError::QualityRejected(
             "bitdepth 16 below minimum 24".into()
         )));
+        // A below-floor transfer is the peer's rate, not a transient fault:
+        // re-requesting it only re-enters that peer's queue.
+        assert!(!is_retryable(&SeakarrError::SlowDownload(
+            "speed 310 KB/s below minimum 400 KB/s".into()
+        )));
         assert!(is_retryable(&SeakarrError::Download(
             "transfer failed: user declined".into()
         )));
         assert!(is_retryable(&SeakarrError::Download(
             "download timed out".into()
         )));
+    }
+
+    // ── Extracted wait-state units (QueueWait / TransferProgress) ──
+    //
+    // `download_once` is now a poll loop over these two state machines, so their
+    // transitions are pinned here directly rather than only through the scripted
+    // client: a deadline mix-up or a dropped queue position is far cheaper to
+    // localise at this level.
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_picks_the_earlier_enabled_limit() {
+        // The head limit only starts at the first position-1 observation, so it
+        // can expire before or after the total limit; the earliest one must win,
+        // and it must report which limit produced it. A limit of 0 is disabled,
+        // not immediate.
+        let mut config = default_dl_config();
+        config.max_queue_time_secs = 1800;
+        config.max_start_time_secs = 120;
+        let start = tokio::time::Instant::now();
+        let mut queue = QueueWait::new(start, &config);
+
+        let (deadline, kind) = queue
+            .active_deadline(&config)
+            .expect("total limit is enabled");
+        assert_eq!(kind, QueueDeadlineKind::TotalQueue);
+        assert_eq!(deadline, start + Duration::from_secs(1800));
+
+        // Reaching position 1 at +10s starts the head clock, which then wins.
+        assert!(queue
+            .observe(
+                Some(1),
+                start + Duration::from_secs(10),
+                "01.flac",
+                "peer",
+                &config,
+                None
+            )
+            .is_none());
+        let (deadline, kind) = queue
+            .active_deadline(&config)
+            .expect("head limit is enabled");
+        assert_eq!(kind, QueueDeadlineKind::QueueHead);
+        assert_eq!(deadline, start + Duration::from_secs(130));
+
+        // Both limits disabled: the wait is unbounded. The total limit is
+        // snapshotted when the attempt is queued, so this needs a fresh state.
+        config.max_queue_time_secs = 0;
+        config.max_start_time_secs = 0;
+        let mut unbounded = QueueWait::new(start, &config);
+        assert!(unbounded
+            .observe(Some(1), start, "01.flac", "peer", &config, None)
+            .is_none());
+        assert!(unbounded.active_deadline(&config).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_ignores_unusable_positions_and_rejects_over_limit_ones() {
+        let mut config = default_dl_config();
+        config.max_queue_length = 3;
+        let start = tokio::time::Instant::now();
+        let mut queue = QueueWait::new(start, &config);
+
+        // Wire position 0 and "no position" prove nothing about a zero-slot
+        // peer: neither may be recorded, rejected, or reported.
+        for position in [Some(0), None] {
+            assert!(queue
+                .observe(position, start, "01.flac", "peer", &config, None)
+                .is_none());
+        }
+        assert_eq!(queue.observed_position, None);
+        assert!(!queue.notice_emitted, "an unusable position emits nothing");
+
+        // A position above the cap is rejected, naming the position and limit.
+        let reason = queue
+            .observe(Some(4), start, "01.flac", "peer", &config, None)
+            .expect("position 4 exceeds max_queue_length=3");
+        assert!(
+            reason.contains("position 4") && reason.contains("max_queue_length=3"),
+            "the rejection must name the position and the limit, got: {reason}"
+        );
+
+        // In-bounds positions are recorded, and the first one emits the notice.
+        assert!(queue
+            .observe(Some(2), start, "01.flac", "peer", &config, None)
+            .is_none());
+        assert_eq!(queue.observed_position, Some(2));
+        assert!(queue.notice_emitted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_emits_the_notice_once_and_times_the_wait_from_enqueue() {
+        let config = default_dl_config();
+        let start = tokio::time::Instant::now();
+        let mut queue = QueueWait::new(start, &config);
+
+        assert!(!queue.notice_is_due(start), "the grace has not expired yet");
+        assert!(queue.notice_is_due(start + QUEUE_NOTICE_GRACE));
+        queue.notice("01.flac", "peer");
+        assert!(queue.notice_emitted);
+        // Once emitted, the grace can no longer re-arm it.
+        assert!(!queue.notice_is_due(start + Duration::from_secs(600)));
+        queue.notice("01.flac", "peer");
+        assert_eq!(
+            queue.wait(start + Duration::from_secs(42)),
+            Duration::from_secs(42),
+            "the started line reports the wait from enqueue"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_holds_the_speed_floor_until_real_bytes_arrive() {
+        // The peer's offset handshake reports zero bytes with zero speed before a
+        // byte is read, so it must not start the clock: a peer still draining its
+        // own queue would be cancelled for a speed it never had a chance to
+        // reach. Once real bytes arrive, the floor applies after the wait period.
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 30;
+        let start = tokio::time::Instant::now();
+        let mut transfer = TransferProgress::new();
+        assert!(!transfer.has_started(), "a new transfer has no start clock");
+
+        transfer.start(start, 10_000_000, "01.flac", None);
+        assert!(transfer.has_started());
+
+        // The sender is dropped so the cancel-and-drain on the fatal sample
+        // returns immediately instead of waiting out its window.
+        let (status_tx, status_rx) = mpsc::channel(1);
+        drop(status_tx);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut handle = DownloadHandle {
+            status_rx,
+            cancel_tx,
+        };
+
+        transfer
+            .sample(
+                &mut handle,
+                None,
+                start + Duration::from_secs(1),
+                &config,
+                1_024,
+                100,
+                10_000_000,
+            )
+            .await
+            .expect("a below-floor sample inside the wait window is not fatal");
+
+        let error = transfer
+            .sample(
+                &mut handle,
+                None,
+                start + Duration::from_secs(31),
+                &config,
+                1_024,
+                200,
+                10_000_000,
+            )
+            .await
+            .expect_err("a below-floor sample past the wait window must fail");
+        assert!(
+            matches!(error, SeakarrError::SlowDownload(_)),
+            "a below-floor abort must be the permanent SlowDownload, got: {error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_inactivity_starts_with_the_transfer() {
+        let mut config = default_dl_config();
+        config.timeout_secs = 20;
+        let now = tokio::time::Instant::now();
+        let mut transfer = TransferProgress::new();
+        assert!(
+            !transfer.is_inactive(now),
+            "an unstarted transfer has no inactivity timeout"
+        );
+
+        transfer.start(now, 10_000_000, "01.flac", None);
+        let (status_tx, status_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut handle = DownloadHandle {
+            status_rx,
+            cancel_tx,
+        };
+
+        transfer
+            .sample(&mut handle, None, now, &config, 0, 0, 10_000_000)
+            .await
+            .expect("a sample is applied");
+        assert!(!transfer.is_inactive(now + Duration::from_secs(19)));
+        assert!(transfer.is_inactive(now + Duration::from_secs(20)));
+
+        // A later sample resets the deadline.
+        transfer
+            .sample(
+                &mut handle,
+                None,
+                now + Duration::from_secs(25),
+                &config,
+                0,
+                0,
+                10_000_000,
+            )
+            .await
+            .expect("a sample is applied");
+        assert!(!transfer.is_inactive(now + Duration::from_secs(30)));
+
+        // 0 disables the inactivity timeout, like the queue limits.
+        config.timeout_secs = 0;
+        transfer
+            .sample(&mut handle, None, now, &config, 0, 0, 10_000_000)
+            .await
+            .expect("a sample is applied");
+        assert!(!transfer.is_inactive(now + Duration::from_secs(1_000)));
+        drop(status_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_tolerates_one_slow_sample_window() {
+        // The floor is judged on the smoothed rate, so a single jittery ~120 KB
+        // window cannot permanently abandon a peer that is otherwise far above
+        // the floor. With the raw sample it would (240 KB/s < 400 KB/s).
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 30;
+        let start = tokio::time::Instant::now();
+        let mut transfer = TransferProgress::new();
+        let (status_tx, status_rx) = mpsc::channel(1);
+        drop(status_tx);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut handle = DownloadHandle {
+            status_rx,
+            cancel_tx,
+        };
+
+        transfer.start(start, 10_000_000, "01.flac", None);
+        // Past the wait period: two fast windows, then one 120 KB window at
+        // 240 KB/s (the instantaneous rate the vendor would report for a hiccup).
+        for (secs, speed) in [(31_u64, 5_000_000_u64), (32, 5_000_000), (33, 245_760)] {
+            transfer
+                .sample(
+                    &mut handle,
+                    None,
+                    start + Duration::from_secs(secs),
+                    &config,
+                    speed,
+                    100,
+                    10_000_000,
+                )
+                .await
+                .expect("a single slow window must not end the attempt");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_transfer_is_judged_on_its_own_first_sample() {
+        // The zero-speed handshake must not seed the average either: seeding it
+        // held every later sample down (0.7^k of the zero each time), so the first
+        // judged sample measured a peer at a fraction of its real rate and — with
+        // the permanent classification — abandoned it. 480 KB/s against a 400 KB/s
+        // floor must survive with `speed_check_wait_secs: 0`.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(5_000_000, 0, 10_000_000),
+            ),
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(6_000_000, 491_520, 10_000_000),
+            ),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 0;
+        config.max_retries = 0;
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\resumed-floor.flac",
+            "resumed-floor-peer",
+            &config,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a peer above the floor must not be judged on an average seeded by the \
+             handshake's zero: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_outranks_the_speed_verdict() {
+        // The queue limits and the stall timeout all let a cancellation outrank
+        // the limit they tripped; the floor must too, or a Ctrl+C during the poll
+        // window surfaces as a permanent speed failure instead of a cancellation.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_900)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(120_000, 300_000, 10_000_000),
+            ),
+            // Due exactly at the end of the poll window the flag lands in, so the
+            // verdict is evaluated with the cancellation already set.
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(240_000, 300_000, 10_000_000),
+            ),
+            status_step(Duration::from_secs(600), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 0;
+        config.max_retries = 0;
+
+        let (_dir, result) =
+            download_with_script(&client, 1, 10_000_000, &config, Some(&cancel)).await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("download cancelled by user"),
+            "a cancellation during the poll window must outrank the floor verdict: {error:?}"
+        );
+        assert!(!matches!(error, SeakarrError::SlowDownload(_)));
+        assert_eq!(client.cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_outranks_the_stall_timeout() {
+        // The accept clock ends an accepted-but-silent peer; a cancellation that
+        // landed in the final poll window must be what the attempt reports, the
+        // same way it does for both queue limits.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2_900)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+            status_step(Duration::from_secs(600), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.timeout_secs = 2;
+        config.max_retries = 0;
+
+        let (_dir, result) =
+            download_with_script(&client, 1, 10_000_000, &config, Some(&cancel)).await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("download cancelled by user"),
+            "a cancellation during the stall window must outrank the timeout: {error:?}"
+        );
+        assert_eq!(client.cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_but_silent_peer_is_retried_like_any_stall() {
+        // A stall — accepted, then no `InProgress` at all — stays *retryable*, as
+        // it was before the byte gate: only the below-floor verdict is permanent.
+        // Pinned so the choice is explicit: a pre-start stall does re-request the
+        // same peer, at the cost of one retry window per attempt.
+        let client = ScriptedClient::new(vec![
+            vec![
+                status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+                status_step(Duration::from_secs(600), DownloadStatus::Completed),
+            ],
+            vec![
+                status_step(
+                    Duration::from_secs(1),
+                    in_progress_sample(10_000_000, 5_000_000, 10_000_000),
+                ),
+                status_step(Duration::from_secs(1), DownloadStatus::Completed),
+            ],
+        ]);
+        let mut config = default_dl_config();
+        config.timeout_secs = 20;
+        config.max_retries = 1;
+        config.retry_delay_secs = 0;
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\stalled.flac",
+            "stalled-peer",
+            &config,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the stall must be retried on the same peer: {result:?}"
+        );
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_creates_no_bar_for_a_zero_length_file() {
+        // indicatif renders a zero-length bar as 100%, so a zero-length transfer
+        // must not get one at all: the bar is what the lazy creation point avoids.
+        let display = ProgressDisplay::new();
+        let mut transfer = TransferProgress::new();
+        transfer.start(tokio::time::Instant::now(), 0, "empty.flac", Some(&display));
+        assert!(transfer.bar.is_none());
+        assert!(transfer.has_started(), "the transfer clock still starts");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_bounds_a_peer_that_accepts_and_goes_silent() {
+        // `note_accepted` covers the accept->first-byte phase. Without it a peer
+        // that accepts and then sends nothing has no bound at all once both queue
+        // limits are configured to 0 — the attempt would hold a concurrency slot,
+        // the transfer thread and the `.part` file until Ctrl+C.
+        let mut config = default_dl_config();
+        config.timeout_secs = 20;
+        let now = tokio::time::Instant::now();
+        let mut transfer = TransferProgress::new();
+        assert!(
+            !transfer.is_inactive(now),
+            "nothing is armed before the peer accepts"
+        );
+
+        transfer.note_accepted(now, &config);
+        assert!(!transfer.has_started(), "accepting is not starting");
+        assert!(!transfer.is_inactive(now + Duration::from_secs(19)));
+        assert!(transfer.is_inactive(now + Duration::from_secs(20)));
+
+        // A later status re-arms it, so a peer that dribbles statuses is not cut
+        // off by the accept clock.
+        transfer.note_accepted(now + Duration::from_secs(25), &config);
+        assert!(!transfer.is_inactive(now + Duration::from_secs(30)));
+
+        // 0 disables the inactivity timeout, like the queue limits.
+        config.timeout_secs = 0;
+        transfer.note_accepted(now, &config);
+        assert!(!transfer.is_inactive(now + Duration::from_secs(1_000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transfer_progress_records_the_duration_from_the_accept() {
+        // The accept-to-first-byte phase is transfer time, not queue wait: a peer
+        // that accepts and then stalls before its first sample must not be
+        // credited with a fast transfer, and a sub-120 KB file must not record
+        // 0.0 (the vendor's first sample needs ~120 KB of reads).
+        let mut config = default_dl_config();
+        config.timeout_secs = 180;
+        let accepted = tokio::time::Instant::now();
+        let mut transfer = TransferProgress::new();
+        assert_eq!(
+            transfer.elapsed(),
+            Duration::ZERO,
+            "nothing is recorded before the peer accepts"
+        );
+
+        transfer.note_accepted(accepted, &config);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(transfer.elapsed(), Duration::from_secs(30));
+
+        let (status_tx, status_rx) = mpsc::channel(1);
+        drop(status_tx);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut handle = DownloadHandle {
+            status_rx,
+            cancel_tx,
+        };
+        let started = tokio::time::Instant::now();
+        transfer.start(started, 10_000_000, "01.flac", None);
+        transfer
+            .sample(
+                &mut handle,
+                None,
+                started,
+                &config,
+                1_000_000,
+                100,
+                10_000_000,
+            )
+            .await
+            .expect("a sample is applied");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            transfer.elapsed(),
+            Duration::from_secs(40),
+            "the stall before the first byte is transfer time, not queue time"
+        );
     }
 
     // ── Queue-aware download state machine ──
@@ -3611,6 +4419,299 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_below_floor_peer_is_not_retried_in_place() {
+        // A peer that cannot reach `min_upload_speed_kbps` cannot get faster by
+        // being asked again: re-requesting it drops the file back to the rear of
+        // the same queue. The reported bug is exactly that cycle (position
+        // 7 -> 6 -> 6 -> 5, each attempt aborted ~30s after "Download
+        // started"), so the abort must fail the candidate and let
+        // `download_album` fall back to the next ranked peer.
+        //
+        // The second script exists so the test proves the point by observation:
+        // if the attempt were retried in place, the mock would serve a fast
+        // transfer and the call count would be 2.
+        let client = ScriptedClient::new(vec![
+            vec![
+                status_step(
+                    Duration::from_secs(1),
+                    in_progress_sample(120_000, 300_000, 10_000_000),
+                ),
+                status_step(
+                    Duration::from_secs(31),
+                    in_progress_sample(240_000, 300_000, 10_000_000),
+                ),
+                status_step(Duration::from_secs(60), DownloadStatus::Completed),
+            ],
+            vec![
+                status_step(
+                    Duration::from_secs(1),
+                    in_progress_sample(10_000_000, 5_000_000, 10_000_000),
+                ),
+                status_step(Duration::from_secs(1), DownloadStatus::Completed),
+            ],
+        ]);
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 30;
+        config.max_retries = 1;
+
+        let (_dir, result) = download_with_script(&client, 1, 10_000_000, &config, None).await;
+
+        let reason = match result {
+            Err(e) => e.to_string(),
+            Ok(done) => panic!("a below-floor peer must fail the attempt, got {done:?}"),
+        };
+        assert!(
+            reason.contains("below minimum 400 KB/s"),
+            "the abort must name the speed floor, got: {reason}"
+        );
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            1,
+            "a below-floor peer must not be re-queued in place"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_handshake_report_does_not_start_the_transfer() {
+        // The vendored client reports the resume offset with speed 0.0 as soon
+        // as the peer answers TransferResponse(allowed), before any byte is read
+        // (download_peer.rs `start_transfer`). Counting that echo as the transfer
+        // start began the speed clock while the peer was still draining its own
+        // queue, so a peer that sent nothing for the first 30s was cancelled for
+        // being too slow and then retried. The start clock must wait for real
+        // bytes, which keeps the queue limits in charge while the peer is starved.
+        let client = ScriptedClient::new(vec![vec![
+            // Offset handshake echo: nothing downloaded yet.
+            status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+            // 31s later the first real bytes arrive, far below the 400 KB/s floor.
+            status_step(
+                Duration::from_secs(31),
+                in_progress_sample(120_000, 3_072, 10_000_000),
+            ),
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(10_000_000, 5_000_000, 10_000_000),
+            ),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 30;
+        // No retry: the starved-window abort must surface as this attempt's
+        // failure, not as a second call that runs out of scripts.
+        config.max_retries = 0;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\starved.flac",
+            "starved-peer",
+            &config,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a peer that only starts after its own queue drains must not be cancelled: {result:?}"
+        );
+        let logs = capture.text();
+        assert_eq!(
+            logs.matches("Download started: starved.flac").count(),
+            1,
+            "exactly one started line per file, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("Download started: starved.flac from starved-peer after 1s queued"),
+            "the started line reports the queue wait, which ended at the peer's accept (1s), \
+             not the starved interval before the first byte, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_peer_that_never_sends_bytes_is_timed_out() {
+        // The peer answers the transfer request with a zero-byte offset handshake
+        // and then goes silent. The queue limits are at their defaults, so the
+        // accept clock is the only bound: without it the attempt would hold a
+        // concurrency slot, the transfer thread and the `.part` file for half an
+        // hour — and forever when both queue limits are configured to 0.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+            // Far beyond the timeout, so the attempt must end before this arrives.
+            status_step(Duration::from_secs(600), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.timeout_secs = 20;
+        config.max_retries = 0;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\silent.flac",
+            "silent-peer",
+            &config,
+        )
+        .await;
+
+        let reason = match result {
+            Err(SeakarrError::Download(reason)) => reason,
+            other => panic!("expected the retryable stall timeout, got {other:?}"),
+        };
+        assert!(
+            reason.contains("timed out"),
+            "the accept clock must end the attempt, got: {reason}"
+        );
+        let logs = capture.text();
+        assert!(
+            !logs.contains("Download started: silent.flac"),
+            "a peer that sent no byte must not be reported as started, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_byte_less_progress_status_does_not_disarm_the_queue_limit() {
+        // The offset handshake is an `InProgress`, but it is not progress: the
+        // queue limit must still be the deadline that ends this wait. A
+        // regression that let the handshake count as the transfer start (arming
+        // the transfer deadline and retiring the queue limits) changes the
+        // outcome to a stall timeout.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+            status_step(Duration::from_secs(600), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_queue_time_secs = 5;
+        config.max_retries = 0;
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\byte-less.flac",
+            "byte-less-peer",
+            &config,
+        )
+        .await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("max_queue_time_secs"),
+            "the queue limit must be what ends the wait, got: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_handshake_starts_the_clock_without_a_speed_verdict() {
+        // A resumed transfer's handshake reports the surviving `.part` size with a
+        // zero speed. Those bytes start the clock, but the sample must not be
+        // judged against the speed floor: with `speed_check_wait_secs: 0` a zero
+        // speed would otherwise fail a healthy peer on the spot.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(4_000_000, 0, 10_000_000),
+            ),
+            status_step(
+                Duration::from_secs(1),
+                in_progress_sample(10_000_000, 5_000_000, 10_000_000),
+            ),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 400;
+        config.speed_check_wait_secs = 0;
+        config.max_retries = 0;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            1,
+            "Music\\Artist\\Album\\resumed.flac",
+            "resumed-peer",
+            &config,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the resume echo must not be judged against the speed floor: {result:?}"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.contains("Download started: resumed.flac from resumed-peer after 1s queued"),
+            "the resume echo must start the clock, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_peer_releases_its_queue_bar() {
+        // The queue bar survives until the first byte, so the stall timeout is a
+        // pre-start exit that must release it. The poll-timeout arm is the usual
+        // observer for a peer that accepts and then goes silent, and leaving the
+        // bar behind would keep a spinner on the terminal — once per retry.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(5)),
+            status_step(Duration::from_secs(1), in_progress_sample(0, 0, 10_000_000)),
+            status_step(Duration::from_secs(600), DownloadStatus::Completed),
+        ]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        config.timeout_secs = 20;
+        config.max_retries = 0;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+
+        assert!(
+            result.is_err(),
+            "an accepted peer that sends nothing must be timed out, got {result:?}"
+        );
+        assert_eq!(display.queue_bars_created(), 1);
+        assert_eq!(
+            display.queue_bars_finished(),
+            1,
+            "the stall timeout must release the queue bar"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_slot_candidate_cannot_complete_without_a_position() {
+        // The fail-closed rule has a second arm, reached only by a completion
+        // that never sent progress: a peer must not be accepted just because it
+        // finished, and the rejection must come before any started line.
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            DownloadStatus::Completed,
+        )]]);
+        let mut config = default_dl_config();
+        config.max_queue_length = 50;
+        config.max_retries = 0;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\Artist\\Album\\unproven.flac",
+            "unproven-peer",
+            &config,
+        )
+        .await;
+
+        let reason = queue_timeout_reason(&result);
+        assert!(
+            reason.contains("completed without a queue position"),
+            "the completion must be rejected as an unproven position, got: {reason}"
+        );
+        let logs = capture.text();
+        assert!(
+            !logs.contains("Download started: unproven.flac"),
+            "a rejected completion must not report a start, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_short_wait_without_a_position_is_not_called_immediate() {
         // The peer never reports a position and holds the transfer for longer than
         // one poll window. The log must report the wait instead of claiming the
@@ -3734,6 +4835,25 @@ mod tests {
         DownloadStatus::InProgress {
             speed_bytes_per_sec: 1_024,
             bytes_downloaded: total_bytes,
+            total_bytes,
+        }
+    }
+
+    /// An `InProgress` sample with explicit byte count and speed.
+    ///
+    /// The vendored client sends two shapes: the offset-handshake echo
+    /// (`part.written` bytes with speed `0.0`, emitted the moment the peer
+    /// accepts the transfer and before a byte is read) and real progress
+    /// samples (`bytes / elapsed`, always above zero). Tests that care about
+    /// that difference need to set both fields, which `in_progress` cannot.
+    fn in_progress_sample(
+        bytes_downloaded: u64,
+        speed_bytes_per_sec: u64,
+        total_bytes: u64,
+    ) -> DownloadStatus {
+        DownloadStatus::InProgress {
+            speed_bytes_per_sec,
+            bytes_downloaded,
             total_bytes,
         }
     }
