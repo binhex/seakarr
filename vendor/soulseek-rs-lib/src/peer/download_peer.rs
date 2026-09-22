@@ -32,6 +32,34 @@ pub enum DownloadError {
     IncompleteDownload { received: usize, expected: usize },
 }
 
+impl DownloadError {
+    /// Whether this failure is an expected, retryable outcome rather than an
+    /// operator-actionable fault.
+    ///
+    /// Two classes are expected. Races with the download store (the token or
+    /// its record is already gone when the file connection arrives) and
+    /// peer-side aborts (a refused or half-open connection, a peer that kills
+    /// the stream). Each is followed by a retry or the next candidate, so
+    /// logging them as errors only adds noise.
+    ///
+    /// Local faults - a failed write, an unresolvable path, a truncated
+    /// transfer, or a poisoned lock - stay errors: they need a human.
+    #[must_use]
+    pub const fn is_expected(&self) -> bool {
+        matches!(
+            self,
+            Self::TokenNotFound(_)
+                | Self::DownloadInfoMissing(_)
+                | Self::InvalidTokenBytes
+                | Self::ConnectionFailed(_)
+                | Self::InvalidAddress(_)
+                | Self::HandshakeFailed(_)
+                | Self::StreamReadError(_)
+                | Self::StreamWriteError(_)
+        )
+    }
+}
+
 impl std::fmt::Display for DownloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -483,6 +511,7 @@ impl DownloadPeer {
 mod tests {
     use super::{DownloadError, DownloadPeer, PartFile, extract_filename_from_path};
     use crate::types::{Download, DownloadMetadata, DownloadStatus};
+    use std::io;
     use std::sync::mpsc;
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
@@ -642,5 +671,46 @@ mod tests {
             "michel test file.mp3"
         );
         assert_eq!(extract_filename_from_path("file.mp3"), "file.mp3");
+    }
+
+    // The listener logs every failed incoming transfer once. Races with the
+    // download store and peer-side aborts are routine - a retry or the next
+    // candidate follows - so they are debug-level noise; only local faults
+    // stay errors. This pins the split so a new variant cannot silently join
+    // the quiet side.
+    #[test]
+    fn only_local_faults_are_operator_actionable() {
+        let peer_side = [
+            DownloadError::TokenNotFound(717_663),
+            DownloadError::DownloadInfoMissing(717_663),
+            DownloadError::InvalidTokenBytes,
+            DownloadError::ConnectionFailed(io::Error::other("refused")),
+            DownloadError::InvalidAddress("invalid-host:9999".to_string()),
+            DownloadError::HandshakeFailed(io::Error::other("aborted")),
+            DownloadError::StreamReadError(io::Error::other("reset")),
+            DownloadError::StreamWriteError(io::Error::other("broken pipe")),
+        ];
+        for error in peer_side {
+            assert!(
+                error.is_expected(),
+                "a peer-side failure must log at debug: {error}"
+            );
+        }
+
+        let local_faults = [
+            DownloadError::FileWriteError(io::Error::other("disk full")),
+            DownloadError::PathResolutionError("no parent directory".to_string()),
+            DownloadError::IncompleteDownload {
+                received: 5,
+                expected: 10,
+            },
+            DownloadError::LockPoisoned,
+        ];
+        for error in local_faults {
+            assert!(
+                !error.is_expected(),
+                "a local fault must stay an error: {error}"
+            );
+        }
     }
 }

@@ -312,10 +312,17 @@ fn handle_file_connection(
             );
         }
         Err(e) => {
-            error!(
-                "Failed to download file from {}:{} (token: {}) - Error: {}",
-                peer.host, peer.port, token, e
-            );
+            if e.is_expected() {
+                debug!(
+                    "Failed to download file from {}:{} (token: {}) - Error: {}",
+                    peer.host, peer.port, token, e
+                );
+            } else {
+                error!(
+                    "Failed to download file from {}:{} (token: {}) - Error: {}",
+                    peer.host, peer.port, token, e
+                );
+            }
             // A failed incoming transfer (e.g. a truncated/incomplete download)
             // must not leave the download stuck as Queued/InProgress forever.
             if let Some(failure_token) = failure_token {
