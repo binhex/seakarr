@@ -113,7 +113,8 @@ Out of scope:
    waits that previously sat at position 1 indefinitely; that is the intended repair and is
    recorded here as a behaviour change, not a display-only change.
 8. **`SoulseekClient::request_queue_position` is a required method**, not a defaulted one, so
-   a production client cannot silently skip the refresh. The seven implementations are
+   a production client cannot silently skip the refresh. It is `async` because the real
+   client's crate handle lives behind a `tokio::sync::Mutex`; the seven implementations are
    one-liners.
 9. **One `DEBUG` record per ask**, matching the existing `Queue position for X from Y: N`
    record, so a frozen number can be diagnosed as "we asked and the peer did not answer"
@@ -166,19 +167,24 @@ returning whether that succeeded.
 
 ### `src/client.rs`
 
-`SoulseekClient` gains a synchronous method (no I/O, so no `async`):
+`SoulseekClient` gains a method:
 
 ```rust
 /// Ask a peer where our queued copy of `filename` sits. Best-effort: a peer
 /// with no live control connection returns false and the wait is unaffected.
-fn request_queue_position(&self, username: &str, filename: &str) -> bool;
+async fn request_queue_position(&self, username: &str, filename: &str) -> bool;
 ```
 
-`RealClient` delegates to the crate. `MockClient` records the call and returns a canned
-value so tests can assert the cadence. The remaining doubles
-(`ScriptedClient`, `SelectiveFailClient`, `ControllableClient`, `RetryClient` in
-`src/download.rs`; `CancelAfterFirstSearchClient` in `src/runner.rs`) each get a one-line
-implementation.
+It is `async` because `RealClient` reaches the crate client through a
+`tokio::sync::Mutex` (`inner`), which cannot be locked from a synchronous method; the call
+itself does no I/O and never fails. `RealClient` delegates to the crate through
+`connected_client()` without reconnecting, and returns `false` when no session is live.
+`MockClient` records the call and returns a canned value so tests can assert the cadence.
+The remaining doubles (`ScriptedClient`, `SelectiveFailClient`, `ControllableClient`,
+`RetryClient` in `src/download.rs`; `CancelAfterFirstSearchClient` in `src/runner.rs`) each
+get a one-line implementation. Production ignores the return value deliberately: a peer
+that is gone cannot be helped by not asking again, and the queue limits still bound the
+wait.
 
 The **peer's** path is what goes on the wire — `file.name`, not the display `basename` — because
 the response is matched against `Download.filename` in the store. A basename would never
