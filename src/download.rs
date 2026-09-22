@@ -1473,7 +1473,12 @@ pub async fn download_album(
                     // those retries were exhausted, so fall back to the next
                     // ranked candidate — the candidate list is the outer
                     // fallback.
-                    tracing::warn!(
+                    //
+                    // Debug, not warn: the album outcome is reported once
+                    // (this function's error, then the runner's album line and
+                    // the run summary), so a warning here would multiply one
+                    // failure across every peer that was tried.
+                    tracing::debug!(
                         "Download of {} from {} failed after retries: {e}",
                         file.name,
                         candidate.username
@@ -2334,6 +2339,65 @@ mod tests {
         assert!(
             result.is_err(),
             "download_album must fail when a file download fails, got: {result:?}"
+        );
+    }
+
+    // The album outcome is reported once (the runner's album line and the run
+    // summary both carry it), so exhausting retries on one candidate must not
+    // add a second warning naming that peer. Fixture names are unique because
+    // `LogCapture` keeps recording while other tests run: a concurrent test's
+    // identical line must not be able to satisfy the guard.
+    #[tokio::test]
+    async fn a_candidate_retry_exhaustion_is_a_debug_record() {
+        let client = Arc::new(SelectiveFailClient::new(vec!["quiet-02.flac"]));
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "quiet-peer-3a91".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("quiet-01.flac", 900, 10_000_000),
+                make_file("quiet-02.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+        let capture = crate::test_support::LogCapture::start();
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a failed file must abandon the candidate, got: {result:?}"
+        );
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("failed after retries:")
+                    && line.contains("quiet-02.flac")
+                    && line.contains("quiet-peer-3a91")
+            })
+            .unwrap_or_else(|| {
+                panic!("no per-candidate failure line for this fixture, got:\n{logs}")
+            });
+        assert_eq!(
+            line.split_whitespace().next(),
+            Some("DEBUG"),
+            "a candidate retry exhaustion is not a warning: {line}"
         );
     }
 

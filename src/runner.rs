@@ -829,7 +829,11 @@ async fn process_album_internal(
             } else {
                 format!("all candidates exhausted: {e}")
             };
-            tracing::warn!(
+            // Debug, not warn: the outcome is already recorded in the run
+            // report (printed at INFO as `Failed (n):` with the same reason)
+            // and in the processed-albums table, so an inline warning would
+            // repeat the line the summary carries.
+            tracing::debug!(
                 "{artist} — {}: download failed ({reason}); {} candidates exhausted",
                 album.unwrap_or("(all)"),
                 ranked.len(),
@@ -7894,6 +7898,71 @@ mod tests {
             }
             other => panic!("Expected AlbumOutcome::Failed, got: {other:?}"),
         }
+    }
+
+    // An exhausted album is recorded in the run report (printed at INFO as
+    // `Failed (n):`) and in the processed-albums table, so the inline line must
+    // not repeat the same outcome as a warning. Distinctive names: `LogCapture`
+    // keeps one process-wide window, so a concurrent test's identical line must
+    // not be able to satisfy the guard.
+    #[tokio::test]
+    async fn an_exhausted_album_is_a_debug_record() {
+        let client = Arc::new(MockClient::new());
+        // Below the impossible floor below, so the candidate fails on speed.
+        *client.download_speed.lock().unwrap() = 100_000;
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "quiet-capture-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Quiet Capture Artist\Quiet Capture Album\01 - track.flac",
+                900,
+                10_000_000,
+            )],
+        }];
+
+        let mut config = make_test_config();
+        config.download.min_upload_speed_kbps = 10_000_000;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let capture = crate::test_support::LogCapture::start();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Quiet Capture Artist",
+            Some("Quiet Capture Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            matches!(result.unwrap(), AlbumOutcome::Failed { .. }),
+            "the album must report failure"
+        );
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("Quiet Capture Artist") && line.contains("candidates exhausted")
+            })
+            .unwrap_or_else(|| panic!("no album failure line for this fixture, got:\n{logs}"));
+        assert_eq!(
+            line.split_whitespace().next(),
+            Some("DEBUG"),
+            "an exhausted album is not an inline warning: {line}"
+        );
     }
 
     // Regression guard: the first SIGINT must set the cancellation flag so
