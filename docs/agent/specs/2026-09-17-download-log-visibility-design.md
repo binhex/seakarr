@@ -66,6 +66,13 @@ mentions one. For a peer deep in its upload queue the operator sees one line and
 then nothing until the queue limit expires or the transfer starts, with no way
 to tell "waiting at position 40" from "hung".
 
+> **Amended 2026-09-22:** the five-minute cadence below is no longer the
+> only source of positions. seakarr now asks its peer every 30 seconds while
+> an attempt is queued, so the interactive queue bar's number keeps up with
+> the queue. See `2026-09-22-queue-position-refresh-design.md`. The logging
+> decisions in this document — one notice, one started line, position
+> changes at `DEBUG` — are unchanged.
+
 The position is available. The vendored peer actor sends `PlaceInQueueRequest`
 immediately on `QueueUpload` and every 300 seconds while that file remains
 queued, and the status channel already carries it as

@@ -2269,6 +2269,37 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn discover_mode_requires_its_flag_and_a_library() {
+        // Two configuration guards that must fail before any provider call: the
+        // mode cannot derive artists without a library, and it needs the
+        // discography setting that gates release-group resolution.
+        let client = MockClient::new();
+        let db = Database::open_in_memory().unwrap();
+
+        let mut disabled = make_test_config();
+        disabled.discography.enabled = false;
+        disabled.library.paths = vec!["/media/Music".into()];
+        let error = run_discover_mode(&client, &disabled, &db, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("discography.enabled"),
+            "got {error:?}"
+        );
+
+        let mut empty_library = make_test_config();
+        empty_library.discography.enabled = true;
+        empty_library.library.paths.clear();
+        let error = run_discover_mode(&client, &empty_library, &db, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("library.paths is empty"),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn scan_shows_and_releases_exactly_one_indicator_bar() {
         // The scan's indicator is the run's first bar, and the download bars
@@ -4541,6 +4572,10 @@ mod tests {
             dir: &Path,
         ) -> Result<DownloadHandle> {
             self.inner.download(file, username, dir).await
+        }
+
+        async fn request_queue_position(&self, _username: &str, _filename: &str) -> bool {
+            false
         }
     }
 

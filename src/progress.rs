@@ -447,4 +447,23 @@ mod tests {
         let label = queue_label("01 - Track.flac", "peer", None);
         assert_eq!(label, "01 - Track.flac - peer queue position unknown");
     }
+
+    #[test]
+    fn update_queue_bar_replaces_the_number_in_place() {
+        // The bar exists so a deep queue costs one terminal line: an update must
+        // replace the message, not append to it.
+        let display = ProgressDisplay::new();
+        let bar = display.create_queue_bar(&queue_label("01 - Track.flac", "peer", Some(20)));
+        assert_eq!(bar.message(), "01 - Track.flac - peer queue #20");
+
+        display.update_queue_bar(&bar, &queue_label("01 - Track.flac", "peer", Some(12)));
+
+        assert_eq!(
+            bar.message(),
+            "01 - Track.flac - peer queue #12",
+            "the number must be replaced in place"
+        );
+        assert_eq!(display.queue_bars_updated(), 1);
+        display.clear_queue_bar(bar);
+    }
 }

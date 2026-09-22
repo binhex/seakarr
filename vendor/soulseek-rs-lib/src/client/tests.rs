@@ -861,3 +861,13 @@ fn a_replayed_transfer_response_does_not_start_a_second_transfer() {
         "a replayed TransferResponse must not dial the peer again"
     );
 }
+
+#[test]
+fn request_place_in_queue_is_false_with_no_peer_actor() {
+    // No login, so no peer registry exists: the call must report that the ask
+    // went nowhere instead of panicking or erroring. seakarr's queue limits
+    // still bound the wait, so this is not a failure condition.
+    let client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+
+    assert!(!client.request_place_in_queue("bob", "song.mp3"));
+}

@@ -71,6 +71,15 @@ pub trait SoulseekClient: Send + Sync {
     async fn search(&self, query: &str, timeout_secs: u64) -> Result<Vec<SearchResult>>;
     async fn download(&self, file: &FileInfo, username: &str, dir: &Path)
         -> Result<DownloadHandle>;
+    /// Ask a peer where our queued copy of `filename` sits. Best-effort: the
+    /// return value reports whether a peer actor was found to receive the ask, so
+    /// a username with no registry entry answers `false`. The wait is unaffected
+    /// either way, because the queue limits still bound it.
+    ///
+    /// `filename` is the peer's own share-relative path, the same value passed to
+    /// `download()`: the position response is matched against the download record
+    /// by that name, so a display basename would never match.
+    async fn request_queue_position(&self, username: &str, filename: &str) -> bool;
 }
 
 // ── Mock implementation for testing ──
@@ -241,6 +250,13 @@ impl SoulseekClient for MockClient {
             cancel_tx,
         })
     }
+
+    async fn request_queue_position(&self, _username: &str, _filename: &str) -> bool {
+        // This double models no peer actor, so it answers like one that was not
+        // found. Production ignores the value, and the cadence assertions live on
+        // ScriptedClient, which records every ask.
+        false
+    }
 }
 
 // ── Real client (soulseek-rs-lib wrapper) ──
@@ -255,6 +271,7 @@ impl SoulseekClient for MockClient {
 // `[lib] name`), even though the dependency key is `soulseek-rs-lib`.
 use soulseek_rs::actor::server_actor::PeerAddress;
 use soulseek_rs::client::{Client, ClientSettings};
+use soulseek_rs::error::SoulseekRs as SsError;
 use soulseek_rs::types::DownloadStatus as SsDownloadStatus;
 use soulseek_rs::types::File as SsFile;
 use soulseek_rs::types::SearchResult as SsSearchResult;
@@ -550,6 +567,38 @@ fn ss_file_to_domain(file: SsFile) -> FileInfo {
         name: file.name,
         size: file.size,
         attribs: file.attribs,
+    }
+}
+
+/// Map a crate search failure to the caller-facing error.
+///
+/// A session loss between the reconnect check and the send (e.g. displaced
+/// concurrently) surfaces as `NotConnected`; mapping it to `Disconnected` gives
+/// retry and abort logic one shape to recognise instead of the crate's own
+/// error types.
+fn map_search_error(query: &str, error: SsError) -> SeakarrError {
+    match error {
+        SsError::NotConnected => SeakarrError::Disconnected {
+            reason: format!("server connection lost while searching '{query}'"),
+        },
+        e => SeakarrError::Client(format!("search '{query}' failed: {e}")),
+    }
+}
+
+/// Map a crate queueing failure to the caller-facing error.
+///
+/// Symmetric with [`map_search_error`]: a session that went away between the
+/// reconnect check and the queue is `Disconnected`, not a download failure.
+fn map_download_error(filename: &str, username: &str, error: SsError) -> SeakarrError {
+    match error {
+        SsError::NotConnected => SeakarrError::Disconnected {
+            reason: format!(
+                "server connection lost while queueing download of '{filename}' from '{username}'"
+            ),
+        },
+        e => SeakarrError::Download(format!(
+            "failed to queue download of '{filename}' from '{username}': {e}"
+        )),
     }
 }
 
@@ -867,15 +916,7 @@ impl SoulseekClient for RealClient {
         })
         .await
         .map_err(|e| SeakarrError::Client(format!("search task panicked: {e}")))?
-        .map_err(|e| match e {
-            // A session loss between the reconnect check and the send (e.g.
-            // displaced concurrently) surfaces as NotConnected; map it to the
-            // caller-facing Disconnected so retry/abort logic sees one shape.
-            ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
-                reason: format!("server connection lost while searching '{query_owned}'"),
-            },
-            e => SeakarrError::Client(format!("search '{query_owned}' failed: {e}")),
-        })?;
+        .map_err(|e| map_search_error(&query_owned, e))?;
 
         Ok(results
             .into_iter()
@@ -906,21 +947,7 @@ impl SoulseekClient for RealClient {
         })
         .await
         .map_err(|e| SeakarrError::Download(format!("download task panicked: {e}")))?
-        .map_err(|e| match e {
-            // Symmetric with search(): a session loss between the reconnect
-            // check and the queue surfaces as NotConnected; map it to the
-            // caller-facing Disconnected so retry/abort logic sees one shape.
-            ::soulseek_rs::error::SoulseekRs::NotConnected => SeakarrError::Disconnected {
-                reason: format!(
-                    "server connection lost while queueing download of '{filename}' from '{username_owned}'"
-                ),
-            },
-            e => {
-                SeakarrError::Download(format!(
-                    "failed to queue download of '{filename}' from '{username_owned}': {e}"
-                ))
-            }
-        })?;
+        .map_err(|e| map_download_error(&filename, &username_owned, e))?;
 
         // Bridge the crate's std mpsc status channel onto a tokio channel, and
         // watch for cancellation, in detached tasks.
@@ -986,6 +1013,21 @@ impl SoulseekClient for RealClient {
             status_rx,
             cancel_tx,
         })
+    }
+
+    async fn request_queue_position(&self, username: &str, filename: &str) -> bool {
+        // Deliberately no `reconnect_if_needed`: a refresh must never trigger a
+        // login, and the queue limits still bound the wait.
+        //
+        // Known limit: this asks whichever client `inner` currently holds. A
+        // reconnect swaps it, so an in-flight download's later asks go to the new
+        // client's empty peer registry and answer false until the vendored crate's
+        // own five-minute timer reports again. Peer connections are independent of
+        // the server session, so the transfer itself continues.
+        let Ok(client) = self.connected_client().await else {
+            return false;
+        };
+        client.request_place_in_queue(username, filename)
     }
 }
 
@@ -1460,6 +1502,176 @@ mod real_client_tests {
         worker.await.unwrap();
     }
 
+    #[test]
+    fn non_interactive_progress_is_logged_without_a_bar() {
+        // The daemon path: no TTY, so the bridge prints progress itself. The
+        // throttle starts already expired, so the first progress status is logged
+        // and the next (immediately following) one is throttled - the intended
+        // once-per-five-seconds behaviour. Every status still reaches the consumer,
+        // including `Paused`, which carries no speed of its own.
+        let (crate_sender, crate_receiver) = std::sync::mpsc::channel();
+        let (forward_sender, mut forward_receiver) = tokio::sync::mpsc::channel(8);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let capture = crate::test_support::LogCapture::start();
+
+        crate_sender
+            .send(SsDownloadStatus::InProgress {
+                bytes_downloaded: 1_024,
+                total_bytes: 10_240,
+                speed_bytes_per_sec: 2_048.0,
+            })
+            .unwrap();
+        crate_sender
+            .send(SsDownloadStatus::Paused {
+                bytes_downloaded: 2_048,
+                total_bytes: 10_240,
+            })
+            .unwrap();
+        crate_sender.send(SsDownloadStatus::Completed).unwrap();
+
+        forward_transfer_status(
+            &crate_receiver,
+            &forward_sender,
+            &cancelled,
+            false,
+            "daemon.flac",
+        );
+
+        assert!(
+            matches!(
+                forward_receiver.try_recv(),
+                Ok(DownloadStatus::InProgress { .. })
+            ),
+            "the progress status must reach the consumer"
+        );
+        assert!(
+            matches!(
+                forward_receiver.try_recv(),
+                Ok(DownloadStatus::Paused { .. })
+            ),
+            "a paused status must not be dropped"
+        );
+        assert!(
+            matches!(forward_receiver.try_recv(), Ok(DownloadStatus::Completed)),
+            "the terminal status must reach the consumer"
+        );
+        let logs = capture.text();
+        assert_eq!(
+            logs.lines()
+                .filter(|line| line.contains("Downloading: daemon.flac"))
+                .count(),
+            1,
+            "the non-interactive path logs progress once, then throttles: {logs}"
+        );
+    }
+
+    #[test]
+    fn forward_transfer_status_returns_when_the_crate_closes_the_channel() {
+        // A dropped sender is how the crate signals "this transfer is over"; the
+        // bridge must return rather than keep polling an empty channel, and must
+        // forward nothing. A regression to spinning would hang the suite instead.
+        let (crate_sender, crate_receiver) = std::sync::mpsc::channel::<SsDownloadStatus>();
+        let (forward_sender, mut forward_receiver) = tokio::sync::mpsc::channel(4);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        drop(crate_sender);
+
+        forward_transfer_status(
+            &crate_receiver,
+            &forward_sender,
+            &cancelled,
+            false,
+            "closed.flac",
+        );
+
+        assert!(
+            forward_receiver.try_recv().is_err(),
+            "a closed crate channel must not forward a status"
+        );
+    }
+
+    #[test]
+    fn search_failures_map_to_the_caller_facing_error() {
+        // A lost session is Disconnected so retry logic can recognise it;
+        // anything else is a client error carrying the crate's own message.
+        assert!(matches!(
+            map_search_error("q", SsError::NotConnected),
+            SeakarrError::Disconnected { .. }
+        ));
+        let other = map_search_error("q", SsError::Timeout);
+        assert!(matches!(other, SeakarrError::Client(_)), "got {other:?}");
+        assert!(
+            other.to_string().contains("search 'q' failed"),
+            "got {other:?}"
+        );
+    }
+
+    #[test]
+    fn download_queueing_failures_map_to_the_caller_facing_error() {
+        assert!(matches!(
+            map_download_error("a.flac", "peer", SsError::NotConnected),
+            SeakarrError::Disconnected { .. }
+        ));
+        let other = map_download_error("a.flac", "peer", SsError::Timeout);
+        assert!(matches!(other, SeakarrError::Download(_)), "got {other:?}");
+        assert!(
+            other
+                .to_string()
+                .contains("failed to queue download of 'a.flac' from 'peer'"),
+            "got {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_on_a_dead_session_reports_failure_through_the_status_channel() {
+        // Without a server handle the crate cannot reach the peer, so it answers
+        // with a Failed status instead of an error. The bridge must forward that
+        // to the caller: it is what makes the album fall through to the next
+        // candidate instead of hanging on a transfer that can never start.
+        let rc = RealClient::new();
+        *rc.inner.lock().await = Some(Arc::new(Client::with_settings(ClientSettings::new(
+            "test-user",
+            "test-pass",
+        ))));
+        let file = FileInfo {
+            name: "Music\\A\\B\\01.flac".into(),
+            size: 1_000,
+            attribs: HashMap::new(),
+        };
+
+        let mut handle = rc
+            .download(&file, "peer", Path::new("/tmp"))
+            .await
+            .expect("queueing on a dead session must not error");
+        let status = tokio::time::timeout(StdDuration::from_secs(10), handle.status_rx.recv())
+            .await
+            .expect("the bridge must report a status")
+            .expect("the channel must stay open");
+
+        assert!(
+            matches!(status, DownloadStatus::Failed { .. }),
+            "a dead session must surface as a failed transfer, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_on_a_dead_session_maps_to_disconnected() {
+        // A crate client that exists but never logged in answers NotConnected.
+        // Callers must see one shape for "the session is gone" so retry and
+        // abort logic never has to know the crate's error types.
+        let rc = RealClient::new();
+        *rc.inner.lock().await = Some(Arc::new(Client::with_settings(ClientSettings::new(
+            "test-user",
+            "test-pass",
+        ))));
+
+        let error = rc.search("anything", 1).await.unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::Disconnected { .. }),
+            "a dead session must map to Disconnected, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn bridge_cleanup_removes_only_its_attempt() {
         let client = Arc::new(Client::new("test-user", "test-password"));
@@ -1586,6 +1798,16 @@ mod real_client_tests {
             ss_download_status_to_domain(SsDownloadStatus::TimedOut),
             DownloadStatus::Failed { reason } if reason.contains("timed out")
         ));
+    }
+
+    #[tokio::test]
+    async fn request_queue_position_is_false_without_a_connection() {
+        // No login, so no crate client to ask. The call must report "no peer
+        // actor" rather than erroring, because the queue limits still bound the
+        // wait.
+        let client = RealClient::new();
+
+        assert!(!client.request_queue_position("bob", "song.mp3").await);
     }
 
     #[test]

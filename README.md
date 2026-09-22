@@ -367,7 +367,7 @@ Controls which Soulseek search results pass the quality gate.
 | --- | ----------- | ------- |
 | `concurrent` | Maximum simultaneous album downloads, between `1` and `8`. Defaults to `1` — the Soulseek server floods peer connections for every search result and the client library spawns a thread per peer, so higher values multiply thread usage. | `1` |
 | `max_queue_length` | `0` requires a free upload slot during candidate selection; later telemetry does not retroactively reject an admitted free-slot peer. A positive value also permits zero-slot peers only when a reported positive queue position is at or below the limit. Unknown positions and wire position `0` do not prove a zero-slot peer is within the limit. | `0` |
-| `max_start_time_secs` | Maximum seconds from first reaching queue position `1` until the first transfer progress. `0` disables this queue-head limit. | `120` |
+| `max_start_time_secs` | Maximum seconds from first reaching queue position `1` until the first transfer progress. `0` disables this queue-head limit. Position reports are refreshed every 30 s while queued, so this limit arms from a fresh position-1 report. | `120` |
 | `max_queue_time_secs` | Maximum total seconds from enqueue until the first transfer progress. `0` disables this total queue limit. | `1800` |
 | `min_upload_speed_kbps` | Cancel a transfer whose smoothed speed (the average the progress bar displays over the transfer's own samples) is below this threshold once `speed_check_wait_secs` has passed since the transfer started. The candidate is then abandoned without re-asking the same peer — the same peer cannot get faster, and a new request only puts the file back in its queue — so the next ranked candidate is tried. `0` disables the speed check. | `250` |
 | `speed_check_wait_secs` | Seconds of real transfer progress before the smoothed speed may cancel a transfer. A resumed transfer counts its offset handshake (the surviving `.part` size) as the start. | `30` |
@@ -494,6 +494,10 @@ line:
 ```text
 DEBUG seakarr::download: Queue position for 08 Moondance.flac from nottucks: 9
 ```
+
+While the file waits, seakarr re-asks the peer for its position every 30 seconds, so that
+number keeps up with the queue instead of freezing at the first report. The refresh stops as
+soon as the transfer starts.
 
 A peer that never reports a position and does not start promptly is reported with the wait it
 actually served (`... after 12s queued`), so `immediately` is never printed for a transfer that
@@ -659,7 +663,8 @@ Seakarr has four operating modes:
    album name, 1.1 when the name appears elsewhere in the path, 1.0 otherwise).
 5. **Download** — downloads from the highest-ranked peer, monitoring transfer
    speed in real time. While a transfer waits in a remote queue, seakarr asks
-   the peer for its position immediately and every five minutes.
+   the peer for its position immediately, then every 30 seconds until the
+   transfer starts.
    `max_queue_time_secs` caps the total wait from enqueue and
    `max_start_time_secs` caps the wait after reaching queue position `1`; a
    peer that exceeds either limit is abandoned and the next candidate is tried

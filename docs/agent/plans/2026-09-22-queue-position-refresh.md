@@ -26,6 +26,35 @@ and locking that from a synchronous method would need `try_lock`, which fails wh
 holds it and would silently drop refreshes. The spec was amended (commit `6b7eccd`) so the method
 is `async`; the call itself does no I/O and never fails.
 
+## Amendments applied during implementation
+
+This plan is the execution record, so where the code deliberately diverges from it, the
+amendment is recorded here. The design of record is
+`docs/agent/specs/2026-09-22-queue-position-refresh-design.md`, which was updated for each of
+these.
+
+- **Task 1** — the actor's on-demand ask skips at `DEBUG` when the actor has no control stream,
+  instead of going through `send_message`, which logs an error. Otherwise a registered peer
+  whose connection just went away would log one error per 30-second ask until the client-ops
+  thread evicted it.
+- **Task 3** — `MockClient` does **not** record asks and does **not** return `true`: the
+  recording field and its self-referential test were removed by the tech-debt step as a test
+  that only exercised its own fixture, and the double now answers `false` because it models no
+  peer actor. The cadence assertions live on `ScriptedClient`, which records every ask. The
+  plan's Task 3 Steps 1 and 4 therefore describe a shape that no longer exists.
+- **Task 5** — the ask sits **after** the loop's exit checks (cancellation, transfer inactivity,
+  queue-deadline expiry) and before the status poll, not immediately after the notice check.
+  Placing it after the expiry checks is what makes "no ask after a queue timeout" literally
+  true; the `!transfer.has_started()` gate is load-bearing because the loop keeps polling after
+  the transfer starts.
+- **Task 6** — the download-level bar test asserts counters (`created=1, updated=2,
+  finished=1`), not rendered label text: the bar's message is not reachable from that level. The
+  in-place text replacement is asserted at the display level in `src/progress.rs`, and the test
+  was renamed to `reported_positions_update_the_queue_bar_in_place` because it pins the bar's
+  update contract, not the ask that produces fresh positions.
+- **Tasks 5 and 7** — the 95 s cap in the cadence test (rather than the plan's 90 s) and the
+  extra regression test for a wait that ends at the cap were added while fixing review findings.
+
 ## File structure
 
 | File | Change | Responsibility |
@@ -268,6 +297,10 @@ Expected: FAIL to compile with `error[E0599]: no method named 'request_queue_pos
 - [ ] **Step 3: Add the trait method**
 
 In `pub trait SoulseekClient`, after `download`:
+
+> **Amended during implementation:** `MockClient` answers `false` instead of recording asks, and
+> the shipped doc wording reports "whether a peer actor was found to receive the ask". See the
+> amendments section above.
 
 ```rust
     /// Ask a peer where our queued copy of `filename` sits. Best-effort: a peer
@@ -528,7 +561,12 @@ Expected: FAIL with `assertion left == right failed` — `left: []`, `right: [("
 
 - [ ] **Step 3: Wire the ask into the poll loop**
 
-In `download_once`, immediately after the notice check at the top of the loop:
+In `download_once`, after the notice check and the loop's exit checks, before the status poll:
+
+> **Amended during implementation:** the ask sits after the loop's exit checks (not immediately
+> after the notice check), is gated on `!transfer.has_started()`, and uses
+> `let _ = client.request_queue_position(username, &file.name).await;`. See the amendments
+> section above.
 
 ```rust
         if queue.notice_is_due(now) {

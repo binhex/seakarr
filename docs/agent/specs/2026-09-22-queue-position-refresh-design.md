@@ -114,8 +114,9 @@ Out of scope:
    recorded here as a behaviour change, not a display-only change.
 8. **`SoulseekClient::request_queue_position` is a required method**, not a defaulted one, so
    a production client cannot silently skip the refresh. It is `async` because the real
-   client's crate handle lives behind a `tokio::sync::Mutex`; the seven implementations are
-   one-liners.
+   client's crate handle lives behind a `tokio::sync::Mutex`. The remaining doubles are
+   one-liners; `MockClient` answers `false` because it models no peer actor, and
+   `ScriptedClient` records every ask.
 9. **One `DEBUG` record per ask**, matching the existing `Queue position for X from Y: N`
    record, so a frozen number can be diagnosed as "we asked and the peer did not answer"
    instead of guessed.
@@ -138,14 +139,23 @@ The dispatch gains one arm, and the actor gains one method:
 
 ```rust
 fn request_queue_position(&mut self, filename: &str) {
+    if self.stream.is_none() {
+        debug!(
+            "[peer:{}] no control connection; skipping on-demand queue position request",
+            self.peer_username()
+        );
+        return;
+    }
     self.send_message(MessageFactory::build_place_in_queue_request(filename));
 }
 ```
 
 No bookkeeping change. Sending does not depend on a `queue_position_requests` entry (the
-entry exists to drive the timer, not to gate a send), and `send_message` already handles a
-missing stream by logging and returning. A peer that is not currently polling therefore
-still answers an on-demand ask.
+entry exists to drive the timer, not to gate a send), so a peer that is not currently polling
+still answers an on-demand ask. A peer whose control connection is gone is skipped at `DEBUG`
+rather than through `send_message`, which would log an error once per ask: the ask is
+best-effort and repeats on the caller's cadence, and the download's own queue limits still
+bound the wait.
 
 ### `vendor/soulseek-rs-lib/src/client/mod.rs`
 
@@ -170,8 +180,9 @@ returning whether that succeeded.
 `SoulseekClient` gains a method:
 
 ```rust
-/// Ask a peer where our queued copy of `filename` sits. Best-effort: a peer
-/// with no live control connection returns false and the wait is unaffected.
+/// Ask a peer where our queued copy of `filename` sits. Best-effort: the
+/// return value reports whether a peer actor was found to receive the ask, so
+/// a username with no registry entry answers `false`.
 async fn request_queue_position(&self, username: &str, filename: &str) -> bool;
 ```
 
@@ -179,7 +190,8 @@ It is `async` because `RealClient` reaches the crate client through a
 `tokio::sync::Mutex` (`inner`), which cannot be locked from a synchronous method; the call
 itself does no I/O and never fails. `RealClient` delegates to the crate through
 `connected_client()` without reconnecting, and returns `false` when no session is live.
-`MockClient` records the call and returns a canned value so tests can assert the cadence.
+`MockClient` answers `false`, because it models no peer actor; the cadence assertions use
+`ScriptedClient`, which records every ask.
 The remaining doubles (`ScriptedClient`, `SelectiveFailClient`, `ControllableClient`,
 `RetryClient` in `src/download.rs`; `CancelAfterFirstSearchClient` in `src/runner.rs`) each
 get a one-line implementation. Production ignores the return value deliberately: a peer
@@ -224,22 +236,24 @@ fn position_request_is_due(&mut self, now: tokio::time::Instant) -> bool {
 already asks immediately at queue entry, so seakarr's first ask is a refresh, not a
 duplicate.
 
-The check goes at the **top of the poll loop**, immediately after the notice check, for the
-reason that check's own comment gives: a peer answering position-0 more often than the poll
-window keeps the poll alive, so a time-driven check buried in the timeout arm can be
-starved. The loop already wakes at least every `STATUS_POLL_INTERVAL` (200 ms), so an ask is
-never late by more than one poll window.
+The check goes in the poll loop, after its exit checks (cancellation, the transfer-inactivity
+expiry and the queue-deadline expiry) and before the status poll. It must precede the poll so
+a peer answering position-0 more often than the poll window cannot starve it, and sitting
+after the expiry checks is what makes "no ask after a queue timeout" literally true: an
+attempt that is expiring this iteration is not asked at all. The loop already wakes at least
+every `STATUS_POLL_INTERVAL` (200 ms), so an ask is never late by more than one poll window.
 
 ```rust
-if queue.position_request_is_due(now) {
+if !transfer.has_started() && queue.position_request_is_due(now) {
     tracing::debug!("Queue position request for {basename} from {username}");
-    client.request_queue_position(username, &file.name);
+    let _ = client.request_queue_position(username, &file.name).await;
 }
 ```
 
-Placement at the loop top gives the stop conditions for free: the transfer starting, a queue
-deadline expiring, a rejection verdict, or a cancellation all leave the loop, so no ask can
-outlive the wait it belongs to.
+The `!transfer.has_started()` gate is load-bearing rather than decorative: this loop keeps
+polling for progress after the transfer starts, so placement alone would not stop the ask. The
+remaining stop conditions come from the loop itself — a rejection verdict, a cancellation or an
+expiry returns out of it — so no ask can outlive the wait it belongs to.
 
 ### `src/progress.rs`
 
@@ -249,7 +263,7 @@ express everything this design needs.
 ## Data flow
 
 ```text
-poll loop top (every <=200 ms)
+poll loop, after its exit checks (every <=200 ms)
   ├─ queue.position_request_is_due(now) ─► client.request_queue_position(username, file.name)
   │                                            └─ PeerRegistry::send_to_peer
   │                                                 └─ actor: PlaceInQueueRequest (code 51)
@@ -264,8 +278,10 @@ poll loop top (every <=200 ms)
 
 ## Error handling
 
-- **No live peer actor** (dropped peer, no registry entry): the call returns `false`, nothing
-  is logged as an error, and the wait continues under its queue limits.
+- **No peer actor to ask** (no registry entry, or a poisoned context read): the call returns
+  `false` and the wait continues under its queue limits. A *registered* actor whose control
+  connection has since gone accepts the message and drops the ask at `DEBUG`, so the caller's
+  cadence never becomes an `ERROR` line while the client-ops thread catches up.
 - **Peer answers with the same position**: the bar re-renders identical text and no position
   `DEBUG` line is emitted, because `observe` only logs a change. An unchanged number is not
   evidence that the refresh stopped.
@@ -300,6 +316,11 @@ poll loop top (every <=200 ms)
   The `DEBUG` record shows that an ask was made; only the peer knows the rest.
 - No time-to-head estimate. Positions are not comparable between peers without that peer's
   turnover rate, and this protocol does not expose one.
+- A server-session reconnect swaps the crate client, and the ask is made through whichever
+  client is current. An in-flight download's later asks therefore find the new client's empty
+  peer registry and answer `false` until the vendored crate's own five-minute timer reports
+  again. The transfer continues, because peer connections are independent of the server
+  session, and the queue limits still bound the wait.
 
 ## Testing
 
@@ -316,14 +337,21 @@ seakarr (`cargo test -p seakarr`), using the paused-time scripted client:
 
 1. A wait that reports position 20 and then nothing, bounded by a queue limit longer than
    90 s, records asks at about 30 s, 60 s and 90 s — and none before 30 s.
-2. Positions 20 → 12 → 3 produce three bar updates, asserting the rendered label text
-   (`queue #20`, `queue #12`, `queue #3`), not merely the update counter.
-3. The ask counter stops growing after `InProgress`, after a queue-timeout expiry, and after
+2. Positions 20 → 12 → 3 reach the bar as one creation plus two in-place updates
+   (`created=1, updated=2, finished=1`), and `ProgressDisplay::update_queue_bar` replaces the
+   rendered number in place (`bar.message()` before and after). The download-level test
+   asserts the counters; the rendered text is asserted at the display level, where the bar's
+   message is reachable.
+3. The ask counter stops growing once the transfer has started — the first byte-carrying
+   `InProgress`, since `TransferProgress::start` is byte-gated, so a zero-byte accept
+   handshake keeps the refresh running — and it stops after a queue-timeout expiry and after
    cancellation; the queue bar is still released on each of those paths.
 4. The recorded filename is the peer's full path (`Music\Artist\Album\01.flac`), not the
    basename.
 5. The per-ask `DEBUG` record is emitted at `DEBUG` level only (captured-level assertion in
    the style of the existing log-level tests).
+6. An attempt whose queue cap lands on an ask instant records no ask for that instant, because
+   the ask sits after the loop-top expiry check.
 
 ## Acceptance criteria
 

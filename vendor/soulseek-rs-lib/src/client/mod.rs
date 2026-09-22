@@ -805,6 +805,32 @@ impl Client {
         })
     }
 
+    /// Ask `username` where our queued copy of `filename` currently sits.
+    ///
+    /// Returns whether a peer actor was found to receive the request. `false` is
+    /// not an error: a username with no registry entry, or a poisoned context
+    /// read, means the ask went nowhere, and the download's own queue limits still
+    /// bound the wait. A registered actor whose control connection has since gone
+    /// accepts the message and drops it at debug.
+    #[must_use = "returns whether the request reached a peer actor"]
+    pub fn request_place_in_queue(&self, username: &str, filename: &str) -> bool {
+        let registry = self
+            .context
+            .read_safe()
+            .ok()
+            .and_then(|ctx| ctx.peer_registry.clone());
+        registry.is_some_and(|registry| {
+            registry
+                .send_to_peer(
+                    username,
+                    PeerMessage::RequestQueuePosition {
+                        filename: filename.to_string(),
+                    },
+                )
+                .is_ok()
+        })
+    }
+
     /// Replace the shared directories at runtime: rescan into a fresh
     /// index (served to peers from then on) and re-announce the new
     /// folder/file counts to the server.

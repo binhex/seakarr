@@ -44,6 +44,11 @@ pub enum PeerMessage {
         filename: String,
         attempt_id: Option<u32>,
     },
+    /// Ask this peer for our current position in its upload queue, on demand.
+    /// The periodic timer is unaffected: this is the caller's cadence, not ours.
+    RequestQueuePosition {
+        filename: String,
+    },
     RequestTransfer(Download),
     /// A peer queued one of our shared files for download (they sent us code 43).
     IncomingQueueUpload(String),
@@ -272,6 +277,9 @@ impl PeerActor {
                 attempt_id,
             } => {
                 self.stop_queue_position_requests(&filename, attempt_id);
+            }
+            PeerMessage::RequestQueuePosition { filename } => {
+                self.request_queue_position(&filename);
             }
             PeerMessage::IncomingQueueUpload(filename) => {
                 self.handle_incoming_queue_upload(filename);
@@ -611,6 +619,27 @@ impl PeerActor {
                 request.next_request = now + QUEUE_POSITION_REQUEST_INTERVAL;
             }
         }
+    }
+
+    /// Send one position request without touching the periodic schedule.
+    ///
+    /// Deliberately independent of `queue_position_requests`: that entry exists to
+    /// drive the timer, not to gate a send, so a consumer asking on its own
+    /// cadence does not have to register first.
+    ///
+    /// A peer whose control connection is gone cannot be asked, so this skips at
+    /// debug instead of going through `send_message`, which logs an error: the ask
+    /// is best-effort and repeats on the caller's cadence, and the download's own
+    /// queue limits still bound the wait.
+    fn request_queue_position(&mut self, filename: &str) {
+        if self.stream.is_none() {
+            debug!(
+                "[peer:{}] no control connection; skipping on-demand queue position request",
+                self.peer_username()
+            );
+            return;
+        }
+        self.send_message(MessageFactory::build_place_in_queue_request(filename));
     }
 
     fn send_message(&mut self, message: Message) {
@@ -1044,6 +1073,65 @@ mod tests {
         far_end.read_exact(&mut actual).unwrap();
         assert_eq!(actual, expected);
         assert!(actor.queue_position_requests[&filename].next_request > Instant::now());
+    }
+
+    #[test]
+    fn an_on_demand_position_request_is_sent_and_leaves_the_timer_alone() {
+        let (mut actor, _rx, mut far_end) = connected_actor();
+        let filename = "song.mp3".to_string();
+
+        actor.handle_message(PeerMessage::RequestQueuePosition {
+            filename: filename.clone(),
+        });
+
+        let expected = MessageFactory::build_place_in_queue_request(&filename).get_buffer();
+        let mut actual = vec![0; expected.len()];
+        far_end.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            !actor.queue_position_requests.contains_key(&filename),
+            "an on-demand ask must not register the periodic timer"
+        );
+
+        // An entry that already exists keeps its own schedule: the ask is not a
+        // re-arm, so a consumer's cadence cannot nudge the five-minute timer.
+        let scheduled = Instant::now() + Duration::from_secs(120);
+        actor.queue_position_requests.insert(
+            filename.clone(),
+            QueuePositionRequest {
+                attempt_id: 1,
+                next_request: scheduled,
+            },
+        );
+        actor.handle_message(PeerMessage::RequestQueuePosition {
+            filename: filename.clone(),
+        });
+        let mut actual = vec![0; expected.len()];
+        far_end.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actor.queue_position_requests[&filename].next_request, scheduled,
+            "an existing timer entry must keep its schedule"
+        );
+    }
+
+    #[test]
+    fn an_on_demand_position_request_without_a_stream_is_skipped() {
+        // The client-ops thread may not have evicted a peer whose control
+        // connection is gone yet, so the ask must neither panic nor register a
+        // timer. That is all this can observe: the quiet-debug versus error-log
+        // difference it exists for needs a logger seam the vendored crate does not
+        // have, and `send_message` also returns without touching
+        // `queue_position_requests`, so the assertions hold either way.
+        let (mut actor, _rx) = make_actor(None);
+        let filename = "song.mp3".to_string();
+
+        actor.handle_message(PeerMessage::RequestQueuePosition { filename });
+
+        assert!(
+            actor.queue_position_requests.is_empty(),
+            "a skipped ask must not register the periodic timer"
+        );
     }
 
     #[test]

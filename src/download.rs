@@ -299,6 +299,14 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// answers cannot leave the run silent — the defect this notice fixes.
 const QUEUE_NOTICE_GRACE: Duration = Duration::from_secs(5);
 
+/// How often a queued attempt re-asks its peer for a position.
+///
+/// The vendored crate's own interval is five minutes, which outlives the queue
+/// cap this deployment runs (`max_queue_time_secs=300`), so a wait used to see
+/// one position report and a bar frozen at it. Fresh positions also arm the
+/// `max_start_time_secs` head deadline, which needs a position-1 report.
+const QUEUE_POSITION_REFRESH: Duration = Duration::from_secs(30);
+
 /// How long a transfer may take to start before it stops counting as immediate.
 ///
 /// Deliberately the poll window rather than `QUEUE_NOTICE_GRACE`: a peer that
@@ -563,6 +571,8 @@ struct QueueWait {
     head_at: Option<tokio::time::Instant>,
     /// Last positive position the peer reported, for the timeout message.
     observed_position: Option<u32>,
+    /// When the next on-demand position ask is due.
+    next_position_request: tokio::time::Instant,
     /// Queue bar, created on the first position observation and released on
     /// every path out of the queue, so no attempt can leave a bar behind.
     bar: Option<ProgressBar>,
@@ -577,6 +587,7 @@ impl QueueWait {
             total_deadline: enabled_deadline(enqueued_at, config.max_queue_time_secs),
             head_at: None,
             observed_position: None,
+            next_position_request: enqueued_at + QUEUE_POSITION_REFRESH,
             bar: None,
         }
     }
@@ -584,6 +595,21 @@ impl QueueWait {
     /// Whether the notice grace has expired with no position, notice or start.
     fn notice_is_due(&self, now: tokio::time::Instant) -> bool {
         !self.notice_emitted && now >= self.notice_grace_deadline
+    }
+
+    /// Whether a position ask is due, advancing the deadline when it is.
+    ///
+    /// The same shape as `notice_is_due`: both are time-driven checks evaluated in
+    /// the poll loop, so a busy status channel cannot starve them. Unlike the
+    /// notice, this one is called after the loop's exit checks, so an attempt that
+    /// is expiring this iteration is not asked at all, and it advances its
+    /// deadline, so calling it twice at the same instant asks only once.
+    fn position_request_is_due(&mut self, now: tokio::time::Instant) -> bool {
+        if now < self.next_position_request {
+            return false;
+        }
+        self.next_position_request = now + QUEUE_POSITION_REFRESH;
+        true
     }
 
     /// Emit the queued notice without a position, once.
@@ -995,6 +1021,19 @@ async fn download_once(
                 )
                 .await);
             }
+        }
+        // The position ask is a time-driven check that has to precede the poll, so
+        // a peer answering position-0 more often than the poll window cannot
+        // starve it. It sits after the exit checks above so an attempt that is
+        // expiring this iteration is not asked at all, which is what makes "no ask
+        // after a queue timeout" literally true. The vendored crate asks once at
+        // enqueue, so this is a refresh; the transfer-started gate is load-bearing
+        // because this loop keeps polling for progress after the transfer starts.
+        if !transfer.has_started() && queue.position_request_is_due(now) {
+            tracing::debug!("Queue position request for {basename} from {username}");
+            // Best-effort: a peer with no peer actor to ask answers false, and the
+            // queue limits still bound the wait.
+            let _ = client.request_queue_position(username, &file.name).await;
         }
         // Poll status with a short timeout so cancellation and deadline
         // expiry are checked frequently, and never later than the active
@@ -1563,6 +1602,89 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_candidate_with_only_unsafe_paths_is_skipped() {
+        // Every file in this candidate has a basename that escapes the download
+        // directory, so the candidate is abandoned before any request is queued,
+        // and the run reports the reason instead of downloading nothing quietly.
+        let client = ScriptedClient::new(vec![]);
+        let dir = TempDir::new().unwrap();
+        let candidates = vec![SearchResult {
+            username: "unsafe-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file("Music\\A\\B\\..hidden.flac", 900, 10_000_000),
+                make_file("Music\\A\\B\\..also-hidden.flac", 900, 10_000_000),
+            ],
+        }];
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+
+        let result = download_album(
+            &client,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("no safe files"),
+            "an unsafe candidate must be skipped with a reason, got {error:?}"
+        );
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            0,
+            "no request may be queued for a candidate with no safe file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_below_the_minimum_bit_depth_is_rejected_after_download() {
+        // The peer's metadata omits bit depth, so the file itself is checked. A
+        // 16-bit FLAC against a 24-bit floor must be rejected rather than
+        // accepted as an upgrade, and removed so it cannot be placed later.
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            DownloadStatus::Completed,
+        )]]);
+        let dir = TempDir::new().unwrap();
+        write_minimal_flac(&dir.path().join("depth.flac"));
+        let file = make_file("Music\\A\\B\\depth.flac", 900, 10_000_000);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        let mut filters = default_filter_config_test();
+        filters.min_bit_depth = 24;
+
+        let result = download_file_for_candidate(
+            &client,
+            &file,
+            "depth-peer",
+            1,
+            dir.path(),
+            &config,
+            &filters,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SeakarrError::QualityRejected(_))),
+            "a 16-bit file must not pass a 24-bit floor, got {result:?}"
+        );
+        assert!(
+            !dir.path().join("depth.flac").exists(),
+            "the rejected file is removed so it cannot be placed later"
+        );
+    }
+
     // EMA (exponential moving average) tests — verifies the smoothing
     // function used for speed display.
 
@@ -1781,6 +1903,10 @@ mod tests {
                 cancel_tx,
             })
         }
+
+        async fn request_queue_position(&self, _username: &str, _filename: &str) -> bool {
+            false
+        }
     }
 
     /// A client whose `download()` fails the first `failures` calls (e.g.
@@ -1859,6 +1985,10 @@ mod tests {
                 cancel_tx,
             })
         }
+
+        async fn request_queue_position(&self, _username: &str, _filename: &str) -> bool {
+            false
+        }
     }
 
     /// A client that fails downloads for specific filenames, simulating
@@ -1919,6 +2049,10 @@ mod tests {
                 status_rx,
                 cancel_tx,
             })
+        }
+
+        async fn request_queue_position(&self, _username: &str, _filename: &str) -> bool {
+            false
         }
     }
 
@@ -3467,6 +3601,27 @@ mod tests {
         assert!(unbounded.active_deadline(&config).is_none());
     }
 
+    #[test]
+    fn the_position_ask_is_due_every_thirty_seconds() {
+        // The vendored crate asks once at enqueue, so the first ask from seakarr
+        // is a refresh, never a duplicate.
+        let config = default_dl_config();
+        let start = tokio::time::Instant::now();
+        let mut queue = QueueWait::new(start, &config);
+
+        assert!(
+            !queue.position_request_is_due(start),
+            "the crate already asked at enqueue"
+        );
+        assert!(!queue.position_request_is_due(start + Duration::from_secs(29)));
+        assert!(queue.position_request_is_due(start + Duration::from_secs(30)));
+        assert!(
+            !queue.position_request_is_due(start + Duration::from_secs(59)),
+            "the deadline advances by one interval per ask"
+        );
+        assert!(queue.position_request_is_due(start + Duration::from_secs(60)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queue_wait_ignores_unusable_positions_and_rejects_over_limit_ones() {
         let mut config = default_dl_config();
@@ -3946,6 +4101,7 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         cancellations: Arc<std::sync::atomic::AtomicUsize>,
         usernames: Mutex<Vec<String>>,
+        position_asks: Mutex<Vec<(String, String)>>,
     }
 
     impl ScriptedClient {
@@ -3955,7 +4111,13 @@ mod tests {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 cancellations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 usernames: Mutex::new(Vec::new()),
+                position_asks: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Every position ask this client received, in call order.
+        fn asks(&self) -> Vec<(String, String)> {
+            self.position_asks.lock().unwrap().clone()
         }
     }
 
@@ -4025,6 +4187,14 @@ mod tests {
                 status_rx,
                 cancel_tx,
             })
+        }
+
+        async fn request_queue_position(&self, username: &str, filename: &str) -> bool {
+            self.position_asks
+                .lock()
+                .unwrap()
+                .push((username.to_string(), filename.to_string()));
+            true
         }
     }
 
@@ -5073,6 +5243,227 @@ mod tests {
                 .filter(|line| line.contains("queue-notice.flac"))
                 .any(|line| line.contains(" - position ")),
             "no position was reported, so none may be printed, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_wait_re_asks_its_peer_every_thirty_seconds() {
+        // A 95 s cap with a 30 s cadence gives three asks: at 30 s, 60 s and 90 s.
+        // The cap is deliberately off the cadence boundary: the ask sits after the
+        // loop's expiry checks, so an attempt that expires on an ask instant is not
+        // asked at all (see no_position_ask_is_sent_when_the_attempt_expires).
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(20),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 95;
+
+        let (_dir, result) =
+            download_with_named_script(&client, 0, "Music\\A\\B\\ask.flac", "ask-peer", &config)
+                .await;
+
+        assert!(result.is_err(), "the 95 s cap must end the wait");
+        assert_eq!(
+            client.asks(),
+            vec![("ask-peer".to_string(), "Music\\A\\B\\ask.flac".to_string()); 3],
+            "one ask per 30 s of waiting, carrying the peer's own path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_position_ask_is_recorded_at_debug_level() {
+        // Decision 9: the ask is observable at DEBUG and nowhere louder, so a
+        // frozen number can be told apart from a stopped refresh. The fixture
+        // names are unique because LogCapture keeps one process-wide window.
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(20),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 35;
+        let capture = crate::test_support::LogCapture::start();
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\A\\B\\logged.flac",
+            "logged-peer",
+            &config,
+        )
+        .await;
+        assert!(result.is_err(), "the 35 s cap must end the wait");
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| line.contains("Queue position request for logged.flac from logged-peer"))
+            .unwrap_or_else(|| panic!("no ask record for this fixture, got:\n{logs}"));
+        assert_eq!(
+            line.split_whitespace().next(),
+            Some("DEBUG"),
+            "the ask record must be debug-level: {line}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_position_ask_is_sent_when_the_attempt_expires() {
+        // A wait that ends at the cap records no ask for the instant the cap lands
+        // on: with a 90 s cap the asks due at 30 s and 60 s go out, and the one due
+        // at 90 s does not. In a quiet wait the expiry is observed in the
+        // poll-timeout arm rather than at the loop top, so this pins the cadence and
+        // the count rather than the ask's exact position in the loop; whether the
+        // loop top runs at the expiry instant is scheduler-dependent (see the expiry
+        // arm's coverage note).
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(20),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 90;
+
+        let (_dir, result) = download_with_named_script(
+            &client,
+            0,
+            "Music\\A\\B\\expire.flac",
+            "expire-peer",
+            &config,
+        )
+        .await;
+
+        assert!(result.is_err(), "the 90 s cap must end the wait");
+        assert_eq!(
+            client.asks(),
+            vec![
+                (
+                    "expire-peer".to_string(),
+                    "Music\\A\\B\\expire.flac".to_string()
+                );
+                2
+            ],
+            "the ask due on the expiry instant must not be sent"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reported_positions_update_the_queue_bar_in_place() {
+        // Repeated positions must reach the bar as one creation plus one update
+        // each, so a deep queue costs one terminal line. This pins the bar's
+        // update contract only - the ask that produces fresh positions is pinned
+        // by a_queued_wait_re_asks_its_peer_every_thirty_seconds.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(20)),
+            status_step(Duration::from_secs(30), queue_position(12)),
+            status_step(Duration::from_secs(30), queue_position(3)),
+            status_step(Duration::from_secs(1), in_progress(10_000_000)),
+            status_step(Duration::from_secs(1), DownloadStatus::Completed),
+        ]]);
+        let display = ProgressDisplay::new();
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+
+        let (_dir, result) =
+            download_with_script_and_progress(&client, 0, &display, &config, None).await;
+
+        assert!(result.is_ok(), "the transfer must complete, got {result:?}");
+        assert_eq!(
+            display.queue_bars_created(),
+            1,
+            "the first reported position creates the bar"
+        );
+        assert_eq!(
+            display.queue_bars_updated(),
+            2,
+            "each later position must update the bar in place"
+        );
+        assert_eq!(display.queue_bars_finished(), 1, "the bar is released once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_position_ask_is_sent_before_the_refresh_interval() {
+        // A 20 s cap ends the wait before the first 30 s ask is due.
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(20),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 20;
+
+        let (_dir, result) = download_with_script(&client, 0, 10_000_000, &config, None).await;
+
+        assert!(result.is_err(), "the 20 s cap must end the wait");
+        assert!(
+            client.asks().is_empty(),
+            "the crate already asked at enqueue; seakarr must not ask before 30 s, got {:?}",
+            client.asks()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_asks_stop_once_the_transfer_starts() {
+        // The transfer starts at 25 s, before the first ask is due, and the
+        // attempt then runs on for a minute: a refresh that outlived the queue
+        // would appear as asks at 30 s and 60 s.
+        let client = ScriptedClient::new(vec![vec![
+            status_step(Duration::from_secs(1), queue_position(20)),
+            status_step(Duration::from_secs(24), in_progress(10_000_000)),
+            status_step(Duration::from_secs(60), DownloadStatus::Completed),
+        ]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 600;
+
+        let (_dir, result) = download_with_script(&client, 0, 10_000_000, &config, None).await;
+
+        assert!(result.is_ok(), "the transfer must complete, got {result:?}");
+        assert!(
+            client.asks().is_empty(),
+            "a running transfer needs no position, got {:?}",
+            client.asks()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_asks_stop_on_cancellation() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let client = ScriptedClient::new(vec![vec![status_step(
+            Duration::from_secs(1),
+            queue_position(20),
+        )]]);
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.max_queue_length = 50;
+        config.max_queue_time_secs = 600;
+
+        let (_dir, result) =
+            download_with_script(&client, 0, 10_000_000, &config, Some(&cancel)).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("download cancelled by user"),
+            "cancellation must win"
+        );
+        assert!(
+            client.asks().is_empty(),
+            "a cancelled attempt must send nothing further, got {:?}",
+            client.asks()
         );
     }
 
