@@ -113,6 +113,17 @@ Out of scope:
     them (batch, and auto mode with `library_upgrade.enabled: false`), and `organize_pattern`
     remains the naming template for placement, upgrades and organize alike.
 
+## Refinements made during planning
+
+1. **The matching rule is specified exactly.** The resolver sanitises both the candidate folder
+   name and the artist through `organizer::sanitize_component`, then compares
+   `normalize_catalog_key` of each. This is what makes `AC/DC` (tag) find `AC-DC` (stored); a
+   bare case-insensitive comparison of raw names would not, and an earlier draft of the Error
+   handling section overstated it.
+2. **The skip path finishes through `finish_library_write`** rather than returning the outcome
+   directly, so an album left in staging still gets its processed record, its notification and
+   the summary destination it gets today.
+
 ## Architecture
 
 ### `src/discover.rs` — destination resolver
@@ -182,10 +193,19 @@ if let Some(existing) = existing_album_dir.filter(|dir| dir.is_dir()) {
         album.unwrap_or("?"),
         existing.display()
     );
-    return Ok(AlbumOutcome::Downloaded {
-        track_count: downloaded.len(),
-        destination: DownloadDestination::Staging(album_staging.to_path_buf()),
-    });
+    // The same finish a staging album gets at the tail of this function, so the
+    // processed record, the notification and the summary destination stay
+    // exactly as they are today.
+    return finish_library_write(
+        config,
+        db,
+        &album_staging,
+        artist,
+        album,
+        downloaded.len(),
+        DownloadDestination::Staging(album_staging.clone()),
+    )
+    .await;
 }
 ```
 
@@ -235,8 +255,10 @@ manual run (artist-only or explicit album)
 
 - **No library path configured**: resolver returns `None`; staging. Silent.
 - **Artist folder absent**: resolver returns `None`; staging, with the single `INFO` line.
-  Matching is case-insensitive on the sanitised name, so `AC/DC` and `ACDC` resolve to the same
-  existing folder, and the on-disk spelling is what gets written to.
+  Matching sanitises both sides and compares through `normalize_catalog_key` (`src/discography/mod.rs:14`:
+  NFKC, lowercased, whitespace collapsed), so the tag spelling finds the stored folder — `AC/DC`
+  matches a folder stored as `AC-DC`, because the sanitiser writes the separator as a hyphen — and
+  the on-disk spelling is what gets written to.
 - **Artist folder found**: always a single path component, because the resolver only returns a
   direct child of a configured root — exactly what `place_into_library` requires
   (`src/organizer.rs:483-490`). The verbatim pattern expansion substitutes `%artist%` last, so
