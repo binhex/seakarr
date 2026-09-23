@@ -236,9 +236,13 @@ fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::Sear
 /// `Upgrade` is auto mode's replacement of an album that already exists but
 /// fails the quality gate: it is gated by the caller on
 /// `library_upgrade.enabled`, compares the download against the library's own
-/// track count, and may delete lesser-quality files. `Place` is discover mode's
-/// placement of a newly downloaded album beside the artist's existing albums:
-/// it carries no completeness baseline and never deletes anything.
+/// track count, and may delete lesser-quality files. `Place` is the placement of
+/// a newly downloaded album beside the artist's existing albums, used by discover
+/// mode and by manual runs: it carries no completeness baseline and never deletes
+/// anything. `skip_existing_album` is manual mode's rule that an album folder
+/// which already exists keeps the download in staging instead of being written
+/// into; discover passes `false`. `StagingOnly` is a manual run with no artist
+/// folder to place into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryTarget<'a> {
     Upgrade {
@@ -248,7 +252,54 @@ pub enum LibraryTarget<'a> {
     Place {
         root: &'a Path,
         artist_dir: &'a str,
+        skip_existing_album: bool,
     },
+    /// A manual run whose artist has no library folder: the album stays in staging
+    /// and nothing is written to the library, not even by the generic organize
+    /// step, because a manual run never creates an artist folder.
+    StagingOnly,
+}
+
+/// The album directory placement would write into, when it already exists and the
+/// caller asked for the existing-album rule.
+///
+/// `skip_existing_album` callers use this to tell whether the album's folder is
+/// already on disk before anything is copied: placement never replaces a readable
+/// file, so writing into an existing folder could report success while adding
+/// nothing. `None` means the caller may place normally.
+fn existing_album_destination(
+    skip_existing_album: bool,
+    downloaded: &[PathBuf],
+    config: &Config,
+    root: &Path,
+    artist_dir: &str,
+    album: Option<&str>,
+) -> Option<PathBuf> {
+    if !skip_existing_album {
+        return None;
+    }
+    let album_dir = downloaded.first().and_then(|first| {
+        organizer::placement_album_dir(
+            root,
+            &config.storage.organize_pattern,
+            artist_dir,
+            album.unwrap_or("Unknown"),
+            first,
+        )
+    })?;
+    // Only a destination strictly below the artist folder is an album folder. A
+    // pattern that puts the tracks straight into the artist folder, writes to the
+    // library root, or omits `%artist%` derives that folder (or something outside it)
+    // instead; treating it as an existing album folder would make manual placement
+    // impossible under the pattern, and placement's own keep-existing rule handles
+    // files that are already there. `Path` equality compares components, so a
+    // pattern spelling the artist component with a redundant prefix (`./`) still
+    // matches.
+    let artist_dir_path = root.join(artist_dir);
+    if album_dir == artist_dir_path || !album_dir.starts_with(&artist_dir_path) {
+        return None;
+    }
+    album_dir.is_dir().then_some(album_dir)
 }
 
 /// Reason a downloaded set must not be written into the library, or `None` when
@@ -259,8 +310,9 @@ pub enum LibraryTarget<'a> {
 /// pre-download filter already judged (identical quality filter, identical
 /// grouping), so no run reaches it today: the filter refuses such a set before
 /// anything is fetched. It is kept as a defensive backstop for a future change to
-/// the download layer, and the paths that call it (discover `Place` and generic
-/// organize) are backstops in the same sense. The library-upgrade path does not
+/// the download layer, and the paths that call it (the `Place` arm, used by
+/// discover and by manual runs, and generic organize) are backstops in the same
+/// sense. The library-upgrade path does not
 /// call it: its own gate compares the
 /// download against `needs_upgrade`, the number of files that failed the quality
 /// gate for that album — a different reference, not a stronger one, so the two
@@ -404,6 +456,14 @@ async fn finish_library_write(
 /// early (the organize block below is bypassed): `Upgrade` copies back into an
 /// album's existing library directory behind the completeness gate, and
 /// `Place` writes a newly downloaded album beside the artist's existing albums.
+/// A `Place` target whose `skip_existing_album` is set keeps the download in
+/// staging instead, when a directory a placement would write into already
+/// exists — an album folder that already exists, whether or not it holds audio:
+/// placement never replaces a readable file, so the album completes as
+/// downloaded rather than being written into a folder that may already hold the
+/// album. `StagingOnly` also keeps the download in staging and additionally
+/// suppresses the generic organize step, because a manual run never creates an
+/// artist folder.
 ///
 /// When `config.search.peer_reputation` is on, the peer reputation map is
 /// loaded from the DB before ranking (measured speed + reliability factor
@@ -455,7 +515,15 @@ async fn process_album_internal(
     target: Option<LibraryTarget<'_>>,
     presearched_results: Option<Vec<crate::client::SearchResult>>,
 ) -> Result<AlbumOutcome> {
-    if artist.trim().is_empty() && config.storage.organize && !config.library.paths.is_empty() {
+    // Only a run that reaches the generic organize step needs an artist: that step
+    // builds `<root>/<artist>/<album>`, so an album-only batch line with organizing
+    // enabled cannot be organized. A manual album-only run passes `StagingOnly` and
+    // never organizes, so it proceeds and keeps its download in staging.
+    if artist.trim().is_empty()
+        && config.storage.organize
+        && !config.library.paths.is_empty()
+        && !matches!(target, Some(LibraryTarget::StagingOnly))
+    {
         return Err(SeakarrError::Config(
             "cannot organize an album-only download without an artist; provide --artist or disable storage.organize"
                 .into(),
@@ -930,7 +998,40 @@ async fn process_album_internal(
                 }
             }
         }
-        Some(LibraryTarget::Place { root, artist_dir }) => {
+        Some(LibraryTarget::Place {
+            root,
+            artist_dir,
+            skip_existing_album,
+        }) => {
+            // Manual mode's rule: an album folder that already exists wins, because
+            // placement never replaces a readable file and could otherwise report
+            // success while adding nothing. Checked before the completeness backstop
+            // below, so a refused set keeps its staging copy rather than being
+            // discarded.
+            if let Some(existing) = existing_album_destination(
+                skip_existing_album,
+                &downloaded,
+                config,
+                root,
+                artist_dir,
+                album,
+            ) {
+                tracing::info!(
+                    "{artist} - {}: album folder already exists at {}; leaving the download in staging",
+                    album.unwrap_or("?"),
+                    existing.display()
+                );
+                return finish_library_write(
+                    config,
+                    db,
+                    &album_staging,
+                    artist,
+                    album,
+                    downloaded.len(),
+                    DownloadDestination::Staging(album_staging.clone()),
+                )
+                .await;
+            }
             // A new album has no library track count to compare against, so the
             // completeness test here is the configured `min_tracks` plus the
             // numbering check instead (see `library_write_refusal`). Presence
@@ -1014,16 +1115,20 @@ async fn process_album_internal(
                 }
             }
         }
-        None => {}
+        None | Some(LibraryTarget::StagingOnly) => {}
     }
 
     // Organize (if enabled)
     // Album folder the generic organize step wrote into. `None` means the step
-    // did not run (organisation disabled, or no configured library path), so the
-    // album is staying in staging.
+    // did not run (organisation disabled, no configured library path, or a manual
+    // run with nowhere to place), so the album is staying in staging.
     let mut library_album_dir: Option<PathBuf> = None;
     let mut organize_ok = true;
-    if config.storage.organize && !config.library.paths.is_empty() {
+    // A manual run whose artist has no folder keeps its download in staging rather
+    // than letting the organize step create the folder: manual runs place only into
+    // an artist folder that already exists.
+    let organize_allowed = !matches!(target, Some(LibraryTarget::StagingOnly));
+    if organize_allowed && config.storage.organize && !config.library.paths.is_empty() {
         if let Some(reason) = library_write_refusal(&downloaded, config.filters.min_tracks) {
             // Same light peer demotion as the placement refusal above.
             if config.search.peer_reputation {
@@ -1318,11 +1423,69 @@ struct ArtistOnlyRun {
     notice: Option<String>,
 }
 
+/// The artist folder a manual run should place into, or `None` when the artist
+/// has none under a configured library path. Silent: the explanation for a
+/// download that stayed in staging is logged where the outcome is known, so a run
+/// with nothing to do does not claim its albums are in staging.
+fn resolve_manual_target(config: &Config, artist: &str) -> Option<(PathBuf, String)> {
+    // An album-only run names no artist: there is no folder to look for.
+    if artist.trim().is_empty() {
+        return None;
+    }
+    discover::resolve_artist_folder(config, artist)
+}
+
+/// Explain once per run that downloads stayed in staging because the artist has no
+/// library folder. Called only when an album really was downloaded and left in
+/// staging, so a run that skipped or failed every album stays quiet.
+fn log_no_artist_folder(artist: &str, config: &Config, destination: &Option<(PathBuf, String)>) {
+    // An album-only run never looked for an artist folder, so a line naming an empty
+    // artist would explain nothing.
+    if artist.trim().is_empty() {
+        return;
+    }
+    if destination.is_none() && !config.library.paths.is_empty() {
+        tracing::info!(
+            "{artist}: no library folder found under the configured library paths; downloads stay in staging"
+        );
+    }
+}
+
+/// Whether an outcome is a completed download that stayed where it was staged.
+fn stayed_in_staging(outcome: &AlbumOutcome) -> bool {
+    matches!(
+        outcome,
+        AlbumOutcome::Downloaded {
+            destination: DownloadDestination::Staging(_),
+            ..
+        }
+    )
+}
+
+/// Manual placement's target: the resolved artist folder with the existing-album
+/// rule, or [`LibraryTarget::StagingOnly`] when the artist has no library folder.
+/// A manual run never creates an artist folder, so that case keeps the download
+/// in staging and suppresses the generic organize step.
+fn manual_place_target(destination: &Option<(PathBuf, String)>) -> LibraryTarget<'_> {
+    match destination {
+        Some((root, artist_dir)) => LibraryTarget::Place {
+            root: root.as_path(),
+            artist_dir: artist_dir.as_str(),
+            skip_existing_album: true,
+        },
+        None => LibraryTarget::StagingOnly,
+    }
+}
+
 /// Process a fixed list of album targets. Each work item carries the album
 /// title and optional pre-searched Soulseek results: legacy grouping supplies
 /// `Some(results)` (no new query, no search-history row) while authoritative
 /// targets supply `None`, causing `process_album_internal` to run the normal
 /// targeted search and search-history recording.
+///
+/// `target` is the library write every album uses: manual callers pass the
+/// artist's existing folder with the existing-album rule, and `None` leaves the
+/// completed album to the generic organize step.
 #[allow(clippy::too_many_arguments)]
 async fn process_artist_album_work(
     client: &dyn SoulseekClient,
@@ -1334,6 +1497,7 @@ async fn process_artist_album_work(
     progress: Option<&ProgressDisplay>,
     cancel: &Arc<AtomicBool>,
     work: Vec<(String, Option<Vec<crate::client::SearchResult>>)>,
+    target: Option<LibraryTarget<'_>>,
 ) -> Result<Vec<(String, AlbumOutcome)>> {
     let mut outcomes = Vec::with_capacity(work.len());
     let processed_records = db.get_processed_albums()?;
@@ -1394,7 +1558,7 @@ async fn process_artist_album_work(
             progress,
             Some(cancel),
             library_track_count,
-            None,
+            target,
             presearched,
         )
         .await?;
@@ -1521,6 +1685,8 @@ async fn run_legacy_artist_only_mode(
         .filter(|album| !index.contains_album(artist, &album.album))
         .map(|album| (album.album, Some(album.results)))
         .collect();
+    let destination = resolve_manual_target(config, artist);
+    let target = Some(manual_place_target(&destination));
     let outcomes = process_artist_album_work(
         client,
         artist,
@@ -1531,8 +1697,15 @@ async fn run_legacy_artist_only_mode(
         progress,
         cancel,
         work,
+        target,
     )
     .await?;
+    if outcomes
+        .iter()
+        .any(|(_, outcome)| stayed_in_staging(outcome))
+    {
+        log_no_artist_folder(artist, config, &destination);
+    }
     Ok(ArtistOnlyRun { outcomes, notice })
 }
 
@@ -1624,6 +1797,8 @@ async fn run_artist_only_mode_with_provider(
                 .into_iter()
                 .map(|album| (album.title, None))
                 .collect();
+            let destination = resolve_manual_target(config, artist);
+            let target = Some(manual_place_target(&destination));
             let outcomes = process_artist_album_work(
                 client,
                 artist,
@@ -1634,8 +1809,15 @@ async fn run_artist_only_mode_with_provider(
                 progress,
                 cancel,
                 work,
+                target,
             )
             .await?;
+            if outcomes
+                .iter()
+                .any(|(_, outcome)| stayed_in_staging(outcome))
+            {
+                log_no_artist_folder(artist, config, &destination);
+            }
             Ok(ArtistOnlyRun { outcomes, notice })
         }
         DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
@@ -1948,6 +2130,7 @@ async fn run_discover_mode_with_provider(
         let placement = LibraryTarget::Place {
             root: artist.library_root.as_path(),
             artist_dir: artist.artist_dir.as_str(),
+            skip_existing_album: false,
         };
         counters.artists_examined += 1;
         match discover_artist_albums(
@@ -2220,6 +2403,8 @@ pub async fn run_manual_mode(
             }
         }
     } else {
+        let destination = resolve_manual_target(config, artist_name);
+        let target = Some(manual_place_target(&destination));
         let result = process_album(
             client,
             artist_name,
@@ -2231,9 +2416,12 @@ pub async fn run_manual_mode(
             progress_ref,
             Some(&cancel),
             derived_library_count,
-            None, // target: manual mode has no library write
+            target,
         )
         .await;
+        if result.as_ref().is_ok_and(stayed_in_staging) {
+            log_no_artist_folder(artist_name, config, &destination);
+        }
         match &result {
             Ok(outcome) => report.record(artist_name, album_display, outcome.clone()),
             Err(e) => {
@@ -2930,6 +3118,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Test Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3006,6 +3195,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Test Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3085,6 +3275,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Test Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3289,6 +3480,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Blink 182",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3351,6 +3543,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Test Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3418,6 +3611,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Test Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3624,6 +3818,7 @@ mod tests {
             Some(LibraryTarget::Place {
                 root: library.path(),
                 artist_dir: "Place Fixture Artist",
+                skip_existing_album: false,
             }),
         )
         .await
@@ -3865,7 +4060,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_album_only_mode_rejects_unsafe_organization() {
+    async fn album_only_batch_organization_is_rejected_without_an_artist() {
+        // The generic organize step builds `<root>/<artist>/<album>`, so a batch line
+        // with no artist cannot be organized. Batch passes no target, which is the
+        // shape this guard protects.
         let client = MockClient::new();
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
@@ -3875,9 +4073,21 @@ mod tests {
         config.storage.staging_dir = staging.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
 
-        let error = run_manual_mode(&client, None, Some("Test Album"), false, &config, &db)
-            .await
-            .expect_err("album-only organization must be rejected without an artist");
+        let error = process_album(
+            &client,
+            "",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("album-only organization must be rejected without an artist");
         assert!(
             matches!(&error, SeakarrError::Config(message) if message.contains("cannot organize")),
             "expected an actionable organization error, got {error:?}"
@@ -3885,6 +4095,192 @@ mod tests {
         assert!(
             client.search_queries.lock().unwrap().is_empty(),
             "unsafe album-only organization must be rejected before searching"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_album_only_with_organize_on_keeps_staging() {
+        // A manual album-only run never organizes, so the guard above must not reject
+        // it: the search proceeds and nothing is created in the library.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Real Artist", "Test Album")];
+        *client.write_files.lock().unwrap() = true;
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.storage.organize = true;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+
+        run_manual_mode(&client, None, Some("Test Album"), false, &config, &db)
+            .await
+            .expect("a manual album-only run must not be rejected for organizing");
+
+        assert!(
+            !client.search_queries.lock().unwrap().is_empty(),
+            "the run must search rather than aborting"
+        );
+        assert!(
+            staging
+                .path()
+                .join("--Test Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the album-only download must stay in staging"
+        );
+        assert!(
+            library.path().read_dir().unwrap().next().is_none(),
+            "nothing may be organized into the library"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_run_that_downloads_nothing_does_not_explain_staging() {
+        // The explanation belongs to an album that really stayed in staging, and the
+        // artist name in the line keeps the assertion to this test's own records.
+        let client = MockClient::new();
+        let (mut config, db, _staging) = artist_only_fixture();
+        config.library.paths = vec!["/definitely/not/here".to_string()];
+        config.discography.enabled = false;
+        let capture = crate::test_support::LogCapture::start();
+
+        run_manual_mode(
+            &client,
+            Some("Quiet Artist 4d2e"),
+            Some("Quiet Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("a run with no search results completes");
+
+        let logs = capture.text();
+        assert!(
+            !logs.lines().any(|line| {
+                line.contains("no library folder found") && line.contains("Quiet Artist 4d2e")
+            }),
+            "a run that downloaded nothing must not explain staging:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_without_library_paths_keeps_staging() {
+        // With no configured library path there is nothing to place into, so the
+        // explicit-album form keeps its download in staging.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        config.library.paths.clear();
+        config.storage.organize = true;
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--New Album")
+                .join("01 - track.flac")
+                .exists(),
+            "with no library path the download stays in staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_reports_a_placement_failure_and_keeps_staging() {
+        // A destination that exists as a file cannot be created as a directory, so
+        // placement fails. The album is reported failed with its staging copy kept,
+        // exactly as the shared arm does for discover.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        std::fs::write(
+            library.path().join("Test Artist").join("New Album"),
+            b"not a folder",
+        )
+        .unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("the run completes; the album is reported failed");
+
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--New Album")
+                .join("01 - track.flac")
+                .exists(),
+            "a failed placement must keep the staging copy"
+        );
+        assert_eq!(
+            std::fs::read(library.path().join("Test Artist").join("New Album")).unwrap(),
+            b"not a folder",
+            "the blocking file is untouched"
+        );
+        assert!(
+            db.get_processed_albums()
+                .unwrap()
+                .iter()
+                .any(|record| record.album == "New Album" && record.status == "failed"),
+            "the album must be recorded as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_places_with_a_pattern_that_has_no_artist_component() {
+        // `%track% - %title%.%ext%` derives the library root, which always exists, so a
+        // gate that only exempted the artist folder itself would treat the root as an
+        // existing album folder and never place anything.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize_pattern = "%track% - %title%.%ext%".into();
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            library.path().join("01 - track.flac").exists(),
+            "the pattern's destination is the library root, and the album must be placed there"
+        );
+        assert!(
+            !staging.path().join("Test Artist--New Album").exists(),
+            "a placed album leaves no staging copy"
         );
     }
 
@@ -4090,7 +4486,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artist_only_manual_mode_preserves_multi_disc_organization() {
+    async fn artist_only_manual_mode_keeps_a_multi_disc_album_in_staging_without_an_artist_folder()
+    {
+        // Supersedes the old "organize creates the artist folder" expectation: a
+        // manual run never creates an artist folder, so with storage.organize on and
+        // no folder for the artist the album stays in staging, disc folders and all.
         let client = MockClient::new();
         *client.write_files.lock().unwrap() = true;
         *client.search_results.lock().unwrap() = vec![SearchResult {
@@ -4122,11 +4522,233 @@ mod tests {
 
         run_manual_mode(&client, Some("Test Artist"), None, false, &config, &db)
             .await
-            .expect("artist-only manual mode must organize all discs");
+            .expect("artist-only manual mode must still download every disc");
 
-        let album_dir = library.path().join("Test Artist").join("Album One");
-        assert!(album_dir.join("CD 01/01 - one.flac").exists());
-        assert!(album_dir.join("CD 02/01 - one.flac").exists());
+        let staged = staging.path().join("Test Artist--Album One");
+        assert!(staged.join("CD 01/01 - one.flac").exists());
+        assert!(staged.join("CD 02/01 - one.flac").exists());
+        assert!(
+            !library.path().join("Test Artist").exists(),
+            "a manual run never creates an artist folder, even with storage.organize on"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_does_not_organize_a_folder_the_artist_does_not_have() {
+        // The explicit-album form takes the same route: with storage.organize on and
+        // no artist folder, the album stays in staging rather than being organized
+        // into a folder the run created itself.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize = true;
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--New Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must stay in staging when the artist folder does not exist"
+        );
+        assert!(
+            !library.path().join("Test Artist").exists(),
+            "the organize step must not run for a manual run"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_album_only_never_places_into_a_placeholder_folder() {
+        // An album-only run names no artist, so the resolver must not match a folder
+        // whose own name sanitises away to the placeholder - before the guard this
+        // filed the album under <library>/_/.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Real Artist", "Any Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, _staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        std::fs::create_dir_all(library.path().join("_")).unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+        let capture = crate::test_support::LogCapture::start();
+
+        run_manual_mode(&client, None, Some("Any Album"), false, &config, &db)
+            .await
+            .expect("an album-only manual run must complete");
+
+        assert!(
+            !client.download_filenames.lock().unwrap().is_empty(),
+            "the fixture must actually download something, or the assertion below is vacuous"
+        );
+        assert!(
+            !library.path().join("_").join("Any Album").exists(),
+            "an album-only run must not be filed under the placeholder folder"
+        );
+        // The blank name must not be reported as a missing artist folder either: a
+        // line for it renders as the target followed by an empty message, which only
+        // this test can produce, so the shared log window stays trustworthy.
+        let logs = capture.text();
+        assert!(
+            !logs.contains("seakarr::runner: : no library folder found"),
+            "an album-only run must not report a missing folder for an empty artist:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_places_with_a_pattern_that_omits_the_album_folder() {
+        // `%artist%/%track% - %title%.%ext%` writes tracks straight into the artist
+        // folder, so the derived directory is the artist folder itself. Treating that
+        // as an existing album folder would make manual placement impossible under
+        // the pattern; the files are placed and placement's keep rule handles
+        // collisions instead.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize_pattern = "%artist%/%track% - %title%.%ext%".into();
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("01 - track.flac")
+                .exists(),
+            "the pattern's destination is the artist folder, and the album must be placed there"
+        );
+        assert!(
+            !staging.path().join("Test Artist--New Album").exists(),
+            "a placed album leaves no staging copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_reports_an_album_folder_that_already_exists() {
+        // The reason a download stayed in staging must be visible: a unique artist
+        // name keeps the LogCapture assertion to this test's own line.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() =
+            vec![album_result("Report Folder Artist 9f2b", "Report Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Report Folder Artist 9f2b", "Report Album")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+        let capture = crate::test_support::LogCapture::start();
+
+        run_manual_mode(
+            &client,
+            Some("Report Folder Artist 9f2b"),
+            Some("Report Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        let logs = capture.text();
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("album folder already exists at")
+                    && line.contains("Report Album")
+                    && line.contains("Report Folder Artist 9f2b")
+            })
+            .unwrap_or_else(|| panic!("no existing-folder line for this fixture, got:\n{logs}"));
+        assert!(
+            line.contains("Report Folder Artist 9f2b"),
+            "the line must name the artist: {line}"
+        );
+        assert!(
+            staging
+                .path()
+                .join("Report Folder Artist 9f2b--Report Album")
+                .exists(),
+            "the download stays in staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_places_a_multi_disc_album_into_the_existing_artist_folder() {
+        // The shared copy path keeps per-disc subfolders; a manual placement must
+        // reach the library with the same shape staging has.
+        let client = MockClient::new();
+        *client.write_files.lock().unwrap() = true;
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "artist-peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(
+                    r"Test Artist\New Album\CD 01\01 - one.flac",
+                    900,
+                    10_000_000,
+                ),
+                make_file(
+                    r"Test Artist\New Album\CD 02\01 - two.flac",
+                    900,
+                    10_000_000,
+                ),
+            ],
+        }];
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        let album_dir = library.path().join("Test Artist").join("New Album");
+        assert!(
+            album_dir.join("CD 01/01 - one.flac").exists(),
+            "disc 1 must be placed under the album folder"
+        );
+        assert!(
+            album_dir.join("CD 02/01 - two.flac").exists(),
+            "disc 2 must be placed under the album folder"
+        );
+        assert!(
+            !staging.path().join("Test Artist--New Album").exists(),
+            "a placed album leaves no staging copy"
+        );
     }
 
     #[tokio::test]
@@ -5371,6 +5993,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placement_skips_when_the_album_folder_already_exists() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "Old Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Old Album")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize = false;
+
+        let outcome = process_album(
+            &client,
+            "Test Artist",
+            Some("Old Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+                skip_existing_album: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                AlbumOutcome::Downloaded {
+                    destination: DownloadDestination::Staging(_),
+                    ..
+                }
+            ),
+            "an existing album folder must keep the download in staging, got {outcome:?}"
+        );
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--Old Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the download stays in staging"
+        );
+        assert_eq!(
+            std::fs::read(
+                library
+                    .path()
+                    .join("Test Artist")
+                    .join("Old Album")
+                    .join("01 - track.flac")
+            )
+            .unwrap(),
+            b"fake flac data",
+            "the existing album folder is left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_still_writes_when_the_flag_is_off() {
+        // Discover's shape: same target, flag off, and the existing folder is
+        // written to (keeping files it already holds) exactly as before.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "Old Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Old Album")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize = false;
+
+        let outcome = process_album(
+            &client,
+            "Test Artist",
+            Some("Old Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Place {
+                root: library.path(),
+                artist_dir: "Test Artist",
+                skip_existing_album: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                AlbumOutcome::Downloaded {
+                    destination: DownloadDestination::Library(_),
+                    ..
+                }
+            ),
+            "placement with the flag off must report the library destination, got {outcome:?}"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Old Album").exists(),
+            "a placed album leaves no staging copy"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_placement_failure_retains_staging_and_charges_the_budget() {
         let soulseek = MockClient::new();
         search_index(
@@ -5823,20 +6555,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artist_only_mode_leaves_the_download_in_staging() {
-        // Only discover mode places files in the library. Artist-only, manual and
-        // batch runs keep their completed download in staging, so this locks the
-        // "only discover places" contract against a future reroute of
-        // artist-only runs through the placement path.
+    async fn artist_only_mode_places_into_the_existing_artist_folder() {
+        // Supersedes the old "only discover places" lock: a manual run now writes
+        // into the artist folder that already exists, and never creates one.
         let soulseek = MockClient::new();
         search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
         *soulseek.write_files.lock().unwrap() = true;
         let provider =
             FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1998")]);
+        let (config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        assert!(!config.storage.organize, "the organize step must stay off");
+
+        run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must be placed in the pre-existing artist folder"
+        );
+        assert!(
+            !staging.path().join("Test Artist--Album").exists(),
+            "a placed album leaves no staging copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_mode_without_an_artist_folder_keeps_staging() {
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Folderless Artist 8c1d",
+            &[("Folderless Artist 8c1d Ghost", "Ghost")],
+        );
+        *soulseek.write_files.lock().unwrap() = true;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("ghost", "Ghost", "2001")]);
         let (mut config, db, staging) = artist_only_fixture();
         let library = TempDir::new().unwrap();
         config.library.paths = vec![library.path().to_string_lossy().into_owned()];
-        assert!(!config.storage.organize, "the organize step must stay off");
+        let capture = crate::test_support::LogCapture::start();
+
+        run_artist_only_mode_with_provider(
+            &soulseek,
+            "Folderless Artist 8c1d",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            staging
+                .path()
+                .join("Folderless Artist 8c1d--Ghost")
+                .join("01 - track.flac")
+                .exists(),
+            "without an artist folder the album stays in staging"
+        );
+        assert!(
+            !library.path().join("Folderless Artist 8c1d").exists(),
+            "a manual run never creates an artist folder"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.lines().any(|line| line.contains("no library folder")
+                && line.contains("Folderless Artist 8c1d")),
+            "the run must explain why the album stayed in staging:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_only_mode_keeps_staging_when_the_album_folder_exists() {
+        // An album folder that holds no audio is not "present" to the scan, so the
+        // album is downloaded and then the existence gate keeps it in staging.
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
+        *soulseek.write_files.lock().unwrap() = true;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1998")]);
+        let (config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+        let library_str = library.path().to_string_lossy().into_owned();
+        std::fs::create_dir_all(library.path().join("Test Artist").join("Album")).unwrap();
+        let capture = crate::test_support::LogCapture::start();
 
         run_artist_only_mode_with_provider(
             &soulseek,
@@ -5858,11 +6679,26 @@ mod tests {
                 .join("Test Artist--Album")
                 .join("01 - track.flac")
                 .exists(),
-            "artist-only mode must leave the completed download in staging"
+            "an existing album folder keeps the download in staging"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.lines().any(|line| {
+                line.contains("album folder already exists at")
+                    && line.contains(library_str.as_str())
+            }),
+            "the run must name the existing album folder:\n{logs}"
         );
         assert!(
-            !library.path().join("Test Artist").exists(),
-            "artist-only mode must not place anything into the library"
+            library
+                .path()
+                .join("Test Artist")
+                .join("Album")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none(),
+            "the existing album folder is left untouched"
         );
     }
 
@@ -5921,6 +6757,7 @@ mod tests {
             "Test Artist",
             &[("Test Artist Missing", "Missing")],
         );
+        *soulseek.write_files.lock().unwrap() = true;
         let provider = FakeDiscographyProvider::with_groups(vec![
             release_group("present", "Present", "1999"),
             release_group("missing", "Missing", "2005"),
@@ -5997,6 +6834,7 @@ mod tests {
     async fn artist_only_manual_still_runs_when_the_library_path_is_missing() {
         let soulseek = MockClient::new();
         search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
+        *soulseek.write_files.lock().unwrap() = true;
         let provider =
             FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1999")]);
         let (mut config, db, staging) = artist_only_fixture();
@@ -6022,6 +6860,172 @@ mod tests {
             "an unusable library path must not stop artist-only manual mode"
         );
         assert!(matches!(run.outcomes[0].1, AlbumOutcome::Downloaded { .. }));
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--Album")
+                .join("01 - track.flac")
+                .exists(),
+            "an unusable library path must leave the download in staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_places_an_explicit_album_into_the_existing_artist_folder() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("New Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the explicit album must be placed in the existing artist folder"
+        );
+        assert!(
+            !staging.path().join("Test Artist--New Album").exists(),
+            "a placed album leaves no staging copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_with_an_explicit_album_does_not_walk_the_library() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, _staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Present")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+        let capture = crate::test_support::LogCapture::start();
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        // The scan announces its roots, and this fixture's library root is unique
+        // to this test, so the assertion cannot be satisfied or broken by another
+        // test's scan.
+        let root = library.path().to_str().unwrap();
+        let logs = capture.text();
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("Library scan starting") && line.contains(root)),
+            "the explicit-album form must resolve the artist folder without walking:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_with_an_explicit_album_keeps_staging_when_the_album_folder_exists() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "Old Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Test Artist", "Old Album")]);
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("Old Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        assert!(
+            staging
+                .path()
+                .join("Test Artist--Old Album")
+                .join("01 - track.flac")
+                .exists(),
+            "an existing album folder keeps the download in staging"
+        );
+        assert_eq!(
+            std::fs::read(
+                library
+                    .path()
+                    .join("Test Artist")
+                    .join("Old Album")
+                    .join("01 - track.flac")
+            )
+            .unwrap(),
+            b"fake flac data",
+            "the existing album folder is left untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_places_once_when_organize_is_on() {
+        // Spec decision 10: placement runs regardless of `storage.organize` and
+        // returns before the organize step. The library folder is spelled in lower
+        // case, so only placement - which writes the on-disk spelling verbatim - can
+        // put the files there; organize would write `Test Artist` instead.
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "New Album")];
+        *client.write_files.lock().unwrap() = true;
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("test artist", "Present")]);
+        // Placement writes the on-disk spelling, organize would write the tag spelling;
+        // on a case-insensitive filesystem the two are the same directory, so the
+        // negative assertion below describes the Linux target.
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        config.storage.organize = true;
+        config.discography.enabled = false;
+
+        run_manual_mode(
+            &client,
+            Some("Test Artist"),
+            Some("New Album"),
+            false,
+            &config,
+            &db,
+        )
+        .await
+        .expect("manual album mode must complete");
+
+        let album_dir = library.path().join("test artist").join("New Album");
+        assert!(
+            album_dir.join("01 - track.flac").exists(),
+            "placement must write the artist folder that exists, spelling and all"
+        );
+        assert!(
+            !library.path().join("Test Artist").exists(),
+            "the organize step must not run after an early placement return"
+        );
+        assert!(
+            !staging.path().join("Test Artist--New Album").exists(),
+            "a placed album leaves no staging copy"
+        );
     }
 
     #[tokio::test]

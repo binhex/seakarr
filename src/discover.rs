@@ -1,14 +1,18 @@
 //! Library gap-filling logic for `discover` mode.
 //!
-//! Pure, synchronous selection logic: an index of what the library already
-//! holds, the presence decision, the artist work list, and the per-run
-//! download budget. The caller owns all I/O.
+//! Selection logic and presence data: an index of what the library already
+//! holds, the presence decision, the artist work list, and the per-run download
+//! budget. Two entry points read the filesystem on the caller's behalf -
+//! [`index_from_paths`] walks the library and [`resolve_artist_folder`] lists the
+//! configured roots; the rest is pure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::discography::{normalize_album_key, normalize_catalog_key, AlbumTarget};
 use crate::error::{Result, SeakarrError};
+use crate::organizer::sanitize_component;
 use crate::scanner::ScannedAlbum;
 
 /// One library artist: every spelling seen, and the normalised album titles.
@@ -178,6 +182,78 @@ impl LibraryIndex {
             })
             .map(|((root, directory), _)| (root.as_path(), directory.as_str()))
     }
+}
+
+/// The library root and on-disk artist folder a manual run should place this
+/// artist's downloads into, or `None` when no configured library path holds a
+/// folder for the artist. The first configured path holding such a folder wins,
+/// so the destination depends on configuration order rather than on walk order.
+///
+/// Reads the filesystem rather than [`LibraryIndex`]: the index only lists
+/// artists the walk found audio for, so a failed or stale scan would silently
+/// change where a manual download lands. Both sides are sanitised and compared
+/// through [`normalize_catalog_key`], so the tag spelling agrees with the stored
+/// spelling (`AC/DC` with a folder written as `AC-DC`) and the comparison is
+/// case-insensitive. The returned folder name is the spelling that exists on
+/// disk, so placement lands inside the existing folder instead of beside a
+/// rewritten copy of it.
+///
+/// An artist with no name has no folder: an album-only manual run passes an empty
+/// name, and sanitising it would yield the non-empty placeholder, which would
+/// otherwise match any folder whose own name sanitises away (`_`, `***`, a
+/// whitespace-only directory). Such a folder is not an artist folder, so it is
+/// never a destination - and a name that sanitises away the same way is refused for
+/// the same reason.
+///
+/// A folder whose name is not valid UTF-8 is skipped, because names are compared as
+/// `String`s: matching a lossy spelling could make placement create a second folder
+/// beside the real one.
+///
+/// Cost of refusing names that sanitise away: an artist whose name is only punctuation
+/// cannot reach a folder the organize step created for it under the placeholder name,
+/// so such a manual run keeps its download in staging. Matching the placeholder instead
+/// is what the guard above exists to prevent.
+pub fn resolve_artist_folder(config: &Config, artist: &str) -> Option<(PathBuf, String)> {
+    if artist.trim().is_empty() {
+        return None;
+    }
+    let sanitized = sanitize_component(artist);
+    // A name that carries nothing the filesystem can keep (only punctuation or
+    // whitespace) sanitises to the placeholder, which must not match a folder whose
+    // own name sanitised away too: neither is an artist folder. Separators are not in
+    // this class, because the sanitiser rewrites them to `-`.
+    if sanitized == sanitize_component("") {
+        return None;
+    }
+    let wanted = normalize_catalog_key(&sanitized);
+    for root in &config.library.paths {
+        // A root that does not exist is simply not configured yet; any other failure
+        // (permissions, I/O) is worth naming, because otherwise the caller reports the
+        // artist as having no folder rather than the root as unreadable.
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!("library root {root} cannot be listed ({error}); skipping it");
+                continue;
+            }
+        };
+        // Sorted so a library holding two spellings of one artist resolves
+        // deterministically rather than following read_dir order.
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        if let Some(name) = names
+            .into_iter()
+            .find(|name| normalize_catalog_key(&sanitize_component(name)) == wanted)
+        {
+            return Some((PathBuf::from(root), name));
+        }
+    }
+    None
 }
 
 /// Index scanned albums by normalised artist key and album title.
@@ -548,6 +624,190 @@ mod tests {
     use crate::test_support::write_minimal_flac_with_tags;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn library_with_artist_folders(folders: &[&str]) -> TempDir {
+        let library = TempDir::new().unwrap();
+        for folder in folders {
+            std::fs::create_dir_all(library.path().join(folder)).unwrap();
+        }
+        library
+    }
+
+    fn config_with_roots(roots: &[&TempDir]) -> Config {
+        let mut config = Config::default();
+        config.library.paths = roots
+            .iter()
+            .map(|root| root.path().to_string_lossy().into_owned())
+            .collect();
+        config
+    }
+
+    #[test]
+    fn resolve_artist_folder_returns_the_on_disk_spelling() {
+        let library = library_with_artist_folders(&["the cinematic orchestra"]);
+        let config = config_with_roots(&[&library]);
+
+        let found = resolve_artist_folder(&config, "The Cinematic Orchestra");
+
+        assert_eq!(
+            found,
+            Some((
+                library.path().to_path_buf(),
+                "the cinematic orchestra".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_artist_folder_folds_the_tag_spelling_onto_the_stored_folder() {
+        // The sanitiser stores "AC/DC" as "AC-DC"; the tag spelling must find it.
+        let library = library_with_artist_folders(&["AC-DC"]);
+        let config = config_with_roots(&[&library]);
+
+        let found = resolve_artist_folder(&config, "AC/DC");
+
+        assert_eq!(
+            found,
+            Some((library.path().to_path_buf(), "AC-DC".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_artist_folder_is_none_when_the_artist_has_no_folder() {
+        let library = library_with_artist_folders(&["Someone Else"]);
+        let config = config_with_roots(&[&library]);
+
+        assert_eq!(
+            resolve_artist_folder(&config, "The Cinematic Orchestra"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_artist_folder_prefers_the_first_configured_root() {
+        let first = library_with_artist_folders(&["The Artist"]);
+        let second = library_with_artist_folders(&["The Artist"]);
+        let config = config_with_roots(&[&first, &second]);
+
+        let found = resolve_artist_folder(&config, "The Artist");
+
+        assert_eq!(
+            found,
+            Some((first.path().to_path_buf(), "The Artist".to_string())),
+            "configuration order decides, deterministically"
+        );
+    }
+
+    #[test]
+    fn resolve_artist_folder_ignores_a_file_named_like_the_artist() {
+        let library = TempDir::new().unwrap();
+        std::fs::write(library.path().join("The Artist"), b"not a folder").unwrap();
+        let config = config_with_roots(&[&library]);
+
+        assert_eq!(resolve_artist_folder(&config, "The Artist"), None);
+    }
+
+    #[test]
+    fn resolve_artist_folder_is_none_without_library_paths() {
+        let config = Config::default();
+
+        assert!(config.library.paths.is_empty());
+        assert_eq!(resolve_artist_folder(&config, "The Artist"), None);
+    }
+
+    #[test]
+    fn resolve_artist_folder_is_none_for_a_blank_artist() {
+        // An album-only manual run passes an empty artist. Sanitising that yields
+        // the non-empty "_" placeholder, which must not match a folder whose own
+        // name sanitises away: such a folder is not an artist folder.
+        let library = library_with_artist_folders(&["_", "***", "The Artist"]);
+        let config = config_with_roots(&[&library]);
+
+        assert_eq!(resolve_artist_folder(&config, ""), None);
+        assert_eq!(resolve_artist_folder(&config, "   "), None);
+        // A name that carries nothing the filesystem can keep is refused too, so it
+        // cannot match the placeholder folder either.
+        assert_eq!(resolve_artist_folder(&config, "***"), None);
+        assert_eq!(resolve_artist_folder(&config, "???"), None);
+    }
+
+    #[test]
+    fn resolve_artist_folder_skips_a_root_that_is_not_a_directory() {
+        // A file where a root belongs cannot be listed: the resolver must name it and try
+        // the next configured root rather than reporting the artist as missing.
+        let holder = TempDir::new().unwrap();
+        let file_root = holder.path().join("not-a-directory");
+        std::fs::write(&file_root, b"file").unwrap();
+        let library = library_with_artist_folders(&["The Artist"]);
+        let mut config = Config::default();
+        config.library.paths = vec![
+            file_root.to_string_lossy().into_owned(),
+            library.path().to_string_lossy().into_owned(),
+        ];
+        let capture = crate::test_support::LogCapture::start();
+
+        assert_eq!(
+            resolve_artist_folder(&config, "The Artist"),
+            Some((library.path().to_path_buf(), "The Artist".to_string()))
+        );
+        let logs = capture.text();
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("cannot be listed") && line.contains("not-a-directory")),
+            "an unlistable root must be reported as such:\n{logs}"
+        );
+    }
+
+    // Linux filesystems accept arbitrary bytes in a name; macOS rejects them at the
+    // syscall, so this fixture only exists here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_artist_folder_skips_a_non_utf8_folder() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let library = TempDir::new().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"The Art\xffist");
+        std::fs::create_dir_all(library.path().join(name)).unwrap();
+        let config = config_with_roots(&[&library]);
+
+        // The folder exists on disk, but its name is not valid UTF-8: a lossy match
+        // could make placement create a second folder beside the real one.
+        assert_eq!(resolve_artist_folder(&config, "The Art\u{fffd}ist"), None);
+    }
+
+    #[test]
+    fn resolve_artist_folder_skips_an_unusable_root() {
+        // A root that no longer exists (or is unreadable) must not stop the search:
+        // the next configured root still supplies the artist folder.
+        let missing = TempDir::new().unwrap();
+        let missing_path = missing.path().to_string_lossy().into_owned();
+        drop(missing);
+        let library = library_with_artist_folders(&["The Artist"]);
+        let mut config = Config::default();
+        config.library.paths = vec![missing_path, library.path().to_string_lossy().into_owned()];
+
+        assert_eq!(
+            resolve_artist_folder(&config, "The Artist"),
+            Some((library.path().to_path_buf(), "The Artist".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_artist_folder_prefers_the_smallest_spelling_within_a_root() {
+        // Created in reverse order. On a filesystem whose read_dir returns insertion
+        // order (tmpfs, a small ext4 directory) an unsorted resolver returns
+        // "the artist" and fails here; a hash-ordered directory may still return the
+        // sorted winner by chance, so this asserts the destination rather than proving
+        // the sort.
+        let library = library_with_artist_folders(&["the artist", "The Artist"]);
+        let config = config_with_roots(&[&library]);
+
+        assert_eq!(
+            resolve_artist_folder(&config, "The Artist"),
+            Some((library.path().to_path_buf(), "The Artist".to_string())),
+            "read_dir order must not decide the destination"
+        );
+    }
 
     fn scanned(artist: &str, album: &str) -> ScannedAlbum {
         scanned_at(artist, album, "/library", artist)

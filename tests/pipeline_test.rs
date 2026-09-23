@@ -62,7 +62,7 @@ async fn test_full_pipeline_manual_mode() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
-        None, // target: manual mode has no library write
+        None, // target: no library write for this direct call
     )
     .await;
 
@@ -188,7 +188,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
-        None, // target: manual mode has no library write
+        None, // target: no library write for this direct call
     )
     .await;
 

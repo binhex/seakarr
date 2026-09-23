@@ -23,6 +23,31 @@ Single subsystem: where a manual run's completed albums are written. One plan, n
 1. **The matching rule is now exact.** The resolver sanitises both the candidate folder name and the artist name through `organizer::sanitize_component`, then compares `normalize_catalog_key` of each. That is what makes the tag spelling `AC/DC` find a folder stored as `AC-DC`; a plain case-insensitive comparison of raw names would not, and the spec's Error handling bullet was corrected (commit `31e3a7d`).
 2. **The skip path finishes through `finish_library_write`** with a `Staging` destination rather than returning the outcome directly, so an album left in staging still gets its processed record, its notification and the summary destination it gets today. The spec's snippet and a new "Refinements made during planning" section record this.
 
+## Amendments applied during review
+
+The review loop changed four behaviours the tasks above specify. Where the code and this plan
+disagree, the code and `docs/agent/specs/2026-09-23-manual-library-placement-design.md` are
+authoritative.
+
+- **Manual runs never organize (round 1, user decision).** Task 4 Step 8 said the resolver
+  backing off would let the organize step create the artist folder "exactly as it does today".
+  The user decided the opposite: a manual run never creates an artist folder. `LibraryTarget`
+  gained `StagingOnly`, which `manual_place_target` returns when the artist has no folder, and
+  the organize gate is suppressed for it. The multi-disc organize test was rewritten to assert
+  the album stays in staging with no library folder created.
+- **The album-only organizer guard was relaxed (round 2).** `process_album_internal` rejects an
+  album-only run with `storage.organize: true`, which is right for a batch line but wrong for a
+  manual album-only search that never organizes; the guard now ignores `StagingOnly`, and the old
+  locking test was replaced by a batch-shape test plus a manual test.
+- **The destination-existence rule is "strictly below the artist folder" (round 2).** A lexical
+  comparison against the artist folder missed patterns whose expansion has no album component or
+  writes to the library root. The check now compares path components and requires the derived
+  directory to be a strict descendant. A `./`-prefixed pattern was named here as a third case and
+  is not one: `Path` equality already compares components.
+- **The resolver refuses names that sanitise away (round 2).** Blank names were guarded, but a
+  name such as `***` also sanitises to the placeholder and could match a `_` folder; non-UTF-8
+  folder names are now skipped rather than matched through a lossy spelling.
+
 ## File structure
 
 | File | Change | Responsibility |
@@ -734,16 +759,25 @@ In `src/runner.rs`, directly above `process_artist_album_work`:
 
 ```rust
 /// The artist folder a manual run should place into, or `None` when the artist
-/// has none under a configured library path. Logs once per run when library
-/// paths exist but the artist has no folder, so a non-placement is explained.
+/// has none under a configured library path. Silent: the explanation for a
+/// download that stayed in staging is logged where the outcome is known.
 fn resolve_manual_target(config: &Config, artist: &str) -> Option<(PathBuf, String)> {
-    let destination = discover::resolve_artist_folder(config, artist);
-    if destination.is_none() && !config.library.paths.is_empty() {
-        tracing::info!(
-            "{artist}: no library folder found under the configured library paths; albums stay in staging"
-        );
+    if artist.trim().is_empty() {
+        return None;
     }
-    destination
+    discover::resolve_artist_folder(config, artist)
+}
+
+/// Explain once per run that downloads stayed in staging because the artist has no
+/// library folder. Called only when an album really stayed in staging, and never for
+/// a blank artist, so a run with nothing to show for itself stays quiet.
+fn log_no_artist_folder(artist: &str, config: &Config, destination: &Option<(PathBuf, String)>) {
+    if artist.trim().is_empty() || destination.is_some() || config.library.paths.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "{artist}: no library folder found under the configured library paths; downloads stay in staging"
+    );
 }
 
 /// Manual placement's target: the resolved artist folder, with the

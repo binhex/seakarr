@@ -90,9 +90,9 @@ fn strip_leading_track_token(stem: &str) -> &str {
 /// names like `"02 - Track Two.flac"`. Files without a parseable track
 /// number fall back to track `"01"` with the stem unchanged as the title.
 ///
-/// This is the single source of truth for organize naming: both the
-/// auto-upgrade copy path and the manual organize path must produce the
-/// same destination names for the same staging files.
+/// This is the single source of truth for organize naming: every path that
+/// derives a library destination (the auto-upgrade copy, the organize step and
+/// the placement check) must produce the same names for the same staging files.
 pub fn organize_name_from_stem(stem: &str) -> (String, String) {
     let track = crate::tracks::track_number_from_filename(stem)
         .map(|n| format!("{n:02}"))
@@ -368,9 +368,11 @@ pub fn organize_file(input: OrganizeInput<'_>) -> Result<LibraryWriteOutcome> {
         }
         Err(e) => return Err(e.into()),
     }
-    // The generic organize path is the manual and batch route into the library
-    // and writes one file at a time. Without this the README's promise of
-    // per-file destinations at DEBUG holds only for the copy-based paths.
+    // The generic organize path is the route into the library for batch runs, and
+    // the fallback for an auto run with no library target of its own: every manual
+    // run passes a target instead, and `StagingOnly` suppresses this block. It
+    // writes one file at a time: without this the README's promise of per-file
+    // destinations at DEBUG holds only for the copy-based paths.
     tracing::debug!(
         "Organized: {} -> {}",
         input.src.display(),
@@ -466,8 +468,9 @@ pub fn copy_to_library(
 ///
 /// `artist_dir` must be a single ordinary path component. It is substituted
 /// into the pattern without sanitisation, so a value carrying a separator or
-/// `..` would write outside the library; the discover loop only ever passes the
-/// artist folder name produced by the library walk.
+/// `..` would write outside the library; the callers pass the on-disk artist
+/// folder name the library walk or [`crate::discover::resolve_artist_folder`]
+/// found, never a raw tag.
 ///
 /// # Errors
 ///
@@ -497,6 +500,33 @@ pub fn place_into_library(
         artist_component: ArtistComponent::Verbatim,
         existing_file: ExistingFile::KeepWhenValid,
     })
+}
+
+/// The album directory placement would write into for `first_downloaded`.
+///
+/// Derived exactly as [`copy_into_library`] derives it: expand the pattern with
+/// the artist value already final, then take the parent of the file path, which
+/// is recorded before any disc subdirectory is inserted. Used to tell whether the
+/// album's destination already exists before anything is copied.
+///
+/// `None` when the first path has no file stem, or when the expanded path has no
+/// parent directory to return.
+pub fn placement_album_dir(
+    library_root: &Path,
+    pattern: &str,
+    artist_dir: &str,
+    album: &str,
+    first_downloaded: &Path,
+) -> Option<PathBuf> {
+    let stem = first_downloaded.file_stem()?.to_string_lossy();
+    let ext = first_downloaded
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let (track, title) = organize_name_from_stem(&stem);
+    let relative =
+        expand_pattern_inner(pattern, artist_dir, album, &track, &title, &ext, "unknown");
+    library_root.join(relative).parent().map(Path::to_path_buf)
 }
 
 /// Everything one library write needs: the files to copy, where they go, and
@@ -948,6 +978,59 @@ mod tests {
     use crate::test_support::{write_minimal_flac, write_minimal_flac24};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn placement_album_dir_matches_the_copy_destination() {
+        let album_dir = placement_album_dir(
+            Path::new("/library"),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "The Artist",
+            "The Album",
+            Path::new("/staging/Artist--Album/01 - One.flac"),
+        );
+
+        assert_eq!(
+            album_dir,
+            Some(PathBuf::from("/library/The Artist/The Album"))
+        );
+    }
+
+    #[test]
+    fn placement_album_dir_follows_a_pattern_that_shapes_the_album_folder() {
+        // The album component carries another placeholder, so the destination is
+        // not simply `<root>/<artist>/<album>`: the check has to follow the pattern.
+        let album_dir = placement_album_dir(
+            Path::new("/library"),
+            "%artist%/%album% - %user%/%track% - %title%.%ext%",
+            "The Artist",
+            "The Album",
+            Path::new("/staging/Artist--Album/01 - One.flac"),
+        );
+
+        assert_eq!(
+            album_dir,
+            Some(PathBuf::from("/library/The Artist/The Album - unknown"))
+        );
+    }
+
+    #[test]
+    fn placement_album_dir_ignores_a_disc_subdirectory_in_staging() {
+        // `copy_into_library` records the album directory from the pattern, before
+        // it inserts the disc subdirectory, so a staging layout with a disc folder
+        // must not move the album directory down into it.
+        let album_dir = placement_album_dir(
+            Path::new("/library"),
+            "%artist%/%album%/%track% - %title%.%ext%",
+            "The Artist",
+            "The Album",
+            Path::new("/staging/Artist--Album/CD 01/01 - One.flac"),
+        );
+
+        assert_eq!(
+            album_dir,
+            Some(PathBuf::from("/library/The Artist/The Album"))
+        );
+    }
 
     #[test]
     fn test_expand_pattern() {

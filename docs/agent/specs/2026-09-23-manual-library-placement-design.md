@@ -81,10 +81,13 @@ Out of scope:
    a most-albums rule. Reading the directory directly makes the condition literal ("the artist
    folder must exist"), keeps working when a scan fails or is stale, and costs one listing per
    configured root instead of a walk.
-3. **An existing album folder means the download stays in staging.** Placement never replaces a
-   readable file, so writing into an existing folder could report success while adding nothing
-   — the exact confusion the operator wanted to avoid. Staying in staging keeps the download
-   visible and untouched for a manual decision.
+3. **An existing album folder means the download stays in staging.** Only a destination
+   strictly below the artist folder counts as an album folder: the artist folder itself (a
+   pattern without `%album%`) and the library root (a pattern without `%artist%`) are not album
+   folders, so those patterns still place. For a real album folder, placement never replaces a
+   readable file, so writing into an existing one could report success while adding nothing — the
+   exact confusion the operator wanted to avoid. Staying in staging keeps the download visible
+   and untouched for a manual decision.
 4. **The gate is implemented once, in the `Place` arm.** `LibraryTarget::Place` gains a
    `skip_existing_album` flag; discover and auto pass `false`, so their paths are byte-for-byte
    unaffected and only the album pipeline learns the rule.
@@ -102,13 +105,15 @@ Out of scope:
    configured) are the whole rule, and they are derived from state, not settings.
 9. **Batch mode is left alone** and recorded here as a deliberate exclusion, so a later change
    is a decision rather than an oversight.
-10. **Placement runs regardless of `storage.organize`.** A manual album with a placement target is
-   placed, or stays in staging when its album folder already exists; the generic organize step is
-   not reached for that album, because the `Place` arm returns. The accepted consequence is that
-   a configuration with `storage.organize: true` whose artist has no library folder yet now keeps
-   the manual download in staging instead of having organize create the folder. The "artist folder
-   must exist" condition is the whole point of the feature, and a follow-up change can retire the
-   organize step outright (see Out of scope).
+10. **Placement runs regardless of `storage.organize`, and a manual run never organizes.** An
+    album with a placement target is placed, or stays in staging when a directory a placement
+    would write into already exists. An artist with no library folder passes
+    `LibraryTarget::StagingOnly`: the album stays in staging and the generic organize step is
+    skipped for it, so `storage.organize: true` does not create an artist folder for a manual
+    run. That was settled during review (the implementation originally let organize create the
+    folder, which contradicted "a manual run never creates one"); the organize step keeps its
+    old behaviour for batch mode and for auto mode with `library_upgrade.enabled: false`, and
+    retiring it outright remains a follow-up change (see Out of scope).
 11. **The organize step and `storage.organize` stay in place** for the modes that still rely on
     them (batch, and auto mode with `library_upgrade.enabled: false`), and `organize_pattern`
     remains the naming template for placement, upgrades and organize alike.
@@ -187,6 +192,14 @@ let existing_album_dir = if skip_existing_album {
     None
 };
 
+// Only a destination strictly below the artist folder is an album folder: a pattern
+// that omits `%album%` derives the artist folder, one that omits `%artist%` derives
+// the library root, and neither is an album folder to collide with.
+let existing_album_dir = existing_album_dir.filter(|dir| {
+    let artist_dir_path = root.join(artist_dir);
+    dir != &artist_dir_path && dir.starts_with(&artist_dir_path)
+});
+
 if let Some(existing) = existing_album_dir.filter(|dir| dir.is_dir()) {
     tracing::info!(
         "{artist} - {}: album folder already exists at {}; leaving the download in staging",
@@ -215,35 +228,40 @@ destination in the report) and the failure path all stay as they are.
 
 Call sites:
 
-- `run_artist_only_mode_with_provider` (`:1545`) and `run_legacy_artist_only_mode` (`:1422`)
-  call `resolve_artist_folder` once per run, build `Option<LibraryTarget::Place>` from it, and
-  pass it to `process_artist_album_work` (`:1327`), which forwards it to the
-  `process_album_internal` call that passes `None` today (`:1397`).
-- `run_manual_mode` (`:2145`) builds the same target for its `process_album` call (`:2234`).
+- `run_artist_only_mode_with_provider` and `run_legacy_artist_only_mode` call
+  `resolve_artist_folder` once per run and pass `Some(manual_place_target(&destination))` to
+  `process_artist_album_work`, which forwards it to its `process_album_internal` call.
+- `run_manual_mode` builds the same target for its `process_album` call.
+- `manual_place_target` returns `LibraryTarget::Place { skip_existing_album: true }` when the
+  artist folder was found and `LibraryTarget::StagingOnly` when it was not.
 - Discover passes `skip_existing_album: false`; auto mode's `LibraryTarget::Upgrade` is
   untouched.
 
-When the resolver returns `None` and library paths are configured, the run logs once:
+Once per run, when library paths are configured and an album really was downloaded into staging
+because the artist has no folder, the run explains it:
 
 ```text
-{artist}: no library folder found under the configured library paths; albums stay in staging
+{artist}: no library folder found under the configured library paths; downloads stay in staging
 ```
 
-With no library path configured the resolver returns `None` silently — that configuration
-means staging is the destination, which is today's documented default.
+A run that placed, failed or skipped every album logs nothing, and an album-only run is silent
+because it never looked for an artist folder. With no library path configured the resolver returns
+`None` without a line — that configuration means staging is the destination, which is today's
+documented default.
 
 ## Data flow
 
 ```text
 manual run (artist-only or explicit album)
   ├─ resolve_artist_folder(config, artist)
-  │     └─ None ─────────────────────► target = None            (staging, today's behaviour)
+  │     └─ None ─────────────────────► target = StagingOnly   (stays in staging; organize suppressed)
   │     └─ Some((root, artist_dir)) ─► target = Place { skip_existing_album: true }
   │
   ├─ album downloaded into staging  (unchanged)
   │
   └─ Place arm
-        ├─ placement_album_dir(...).is_dir() ─► INFO + Downloaded -> Staging (kept in staging)
+        ├─ derived destination strictly below the artist folder, and existing
+        │     └──────────────────────────────► INFO + Downloaded -> Staging (kept in staging)
         ├─ place_into_library(...) ok ────────► finish_library_write -> Library
         │                                          (staging removed, processed=success, notify)
         └─ place_into_library(...) err ───────► error + Failed (staging kept)
@@ -267,10 +285,16 @@ manual run (artist-only or explicit album)
   removed; the album is reported as Downloaded → staging.
 - **Placement fails** (permissions, disk full, destination named as a directory): error logged,
   album Failed, staging kept — inherited from the existing arm (`:1006-1018`).
-- **Completeness backstop** (`library_write_refusal`, `:271`): the identical rule already runs
+- **Completeness backstop** (`library_write_refusal`): the identical rule already runs
   before the download (`src/filter.rs:98` and `:141`), so manual runs reach it no more often
   than discover does. If it fires, the album is Failed and the staging copy is discarded, as in
-  discover; `filters.min_tracks: 0` remains the escape hatch for singles and EPs.
+  discover; `filters.min_tracks: 0` remains the escape hatch for singles and EPs. One corner does
+  not reach it: the existing-album gate returns before the backstop, so a manual album whose
+  folder already exists keeps its staged files and is recorded as a success rather than being
+  refused — deliberate, because nothing is written into the library in that case. That staging
+  leftover is a normal `success` record, so a later auto run with `library_upgrade.enabled: true`
+  may adopt it into `library.paths[0]` through `recover_interrupted_upgrades`; keeping it out of
+  that recovery is a separate change.
 - **`--ignore-processed`**: unchanged. It cannot bypass the presence check and has no effect on
   placement.
 - **Scan failed or stale**: the presence check is blind (existing warn-and-continue behaviour),
@@ -314,10 +338,11 @@ destination now names the library when the album was placed).
 - Multi-root libraries resolve by configuration order, not by album counts.
 - Placement does not consider album quality or upgrade semantics; it copies what was
   downloaded, exactly as discover mode does.
-- Placement pre-empts the generic organize step for manual runs, so a configuration with
-  `storage.organize: true` no longer gets an artist folder created for a manual download: with no
-  existing folder the album stays in staging. Retiring the organize step is the follow-up change
-  that would remove this asymmetry.
+- Placement pre-empts the generic organize step for manual runs, and a manual run with no
+  existing artist folder passes `LibraryTarget::StagingOnly`, which suppresses organize as well:
+  a manual run never creates an artist folder, whatever `storage.organize` says. The organize
+  step keeps its old behaviour for batch mode and for auto mode with `library_upgrade.enabled:
+  false`; retiring it is the follow-up change that would remove this asymmetry.
 
 ## Testing
 
@@ -327,10 +352,13 @@ Updates to existing tests:
    `artist_only_mode_places_into_the_existing_artist_folder`: the track lands under
    `<library>/Test Artist/Album/…` and the staging copy is gone. Its "only discover places"
    comment is replaced by the new rule.
-2. `artist_only_manual_mode_downloads_each_discovered_album` (`:4046`) and
-   `artist_only_manual_mode_preserves_multi_disc_organization` (`:4093`) keep their intent and
-   gain the placement destination expectation, including disc subfolders surviving under the
-   placed album.
+2. `artist_only_manual_mode_downloads_each_discovered_album` keeps its intent. The multi-disc
+   test became
+   `artist_only_manual_mode_keeps_a_multi_disc_album_in_staging_without_an_artist_folder`:
+   with `storage.organize: true` and no artist folder the album stays in staging, disc folders
+   and all, and no library folder is created. A new
+   `manual_mode_places_a_multi_disc_album_into_the_existing_artist_folder` covers the placed
+   disc layout.
 3. `artist_only_manual_still_runs_when_the_library_path_is_missing` (`:5997`) additionally
    asserts the album stayed in staging.
 
@@ -340,8 +368,8 @@ New unit tests:
    absent; two roots resolve to the first configured; empty `library.paths` returns `None`;
    a file (not a directory) named like the artist is ignored.
 2. `placement_album_dir`: matches `copy_into_library`'s `album_dir` for the default pattern,
-   for a pattern with a year component, and for a multi-disc staging layout (the disc
-   subdirectory is not part of the album folder).
+   for a pattern whose album component carries another placeholder, and for a multi-disc staging
+   layout (the disc subdirectory is not part of the album folder).
 
 New integration tests:
 
@@ -354,9 +382,11 @@ New integration tests:
    library walk (no scan indicator/heartbeat in the captured log), proving the bounded listing
    replaced the walk.
 5. Explicit album, album folder already exists → staging kept.
-6. Placement failure (a pattern whose expansion names a directory, the documented
-    `Is a directory` failure) → album Failed and staging kept.
-7. No library paths → staging for both forms.
+6. Placement failure (a destination that cannot be created, for example a file where the
+   album folder belongs) → album Failed, staging copy kept, record marked failed.
+7. No library paths → staging for both forms: `artist_only_manual_still_runs_when_the_library_path_is_missing`
+   asserts it for the artist-only form and `manual_mode_without_library_paths_keeps_staging` for the
+   explicit-album form.
 
 Behaviour guards: the discover placement tests and the auto-mode upgrade tests must pass
 unchanged.
