@@ -12,8 +12,9 @@ Automated Soulseek music downloader with library quality upgrading.
 - **Automatic mode** — for each album needing an upgrade, searches the Soulseek network, ranks
   candidates by advertised speed (adjusted by measured-throughput reputation), free-slot bonus, bitrate bonus,
   album-name match and peer reliability, and downloads the best match. The result is written into your
-  library when `storage.organize` or `library_upgrade.enabled` is on; at the shipped defaults of `false` it
-  stays in `storage.staging_dir`. An upgrade whose every destination already holds a strictly better file
+  library when the artist already has a folder under a configured `library.paths` entry, and stays in
+  `storage.staging_dir` when it does not; an album selected by `library_upgrade.enabled` is replaced in
+  place. An upgrade whose every destination already holds a strictly better file
   keeps those files and still completes the album, so the staging copy is removed without a new file being
   written. A candidate whose files omit the bitrate attribute scores zero on the bitrate bonus once
   `filters.min_bit_rate` is set, so a peer that reports one is preferred; it is still admitted, because its
@@ -30,12 +31,14 @@ Automated Soulseek music downloader with library quality upgrading.
   over successive runs. Release types come from `discography.allowed_types`.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
-  A manual run places each completed album into the artist's existing library folder when one
-  exists under a configured `library.paths` entry; when the artist has no folder there, or the
-  pattern derives a destination strictly below the artist folder that a placement would write into
-  and that already exists, the
-  download stays in `storage.staging_dir`. An album-only run names no artist, so it always
-  stays in staging, silently; an artist-naming run with a configured library path explains a
+  A run places each completed album into the artist's existing library folder when one exists
+  anywhere under a configured `library.paths` entry; when the artist has no folder there, or the
+  album's destination folder already exists, a manual run keeps the download in
+  `storage.staging_dir` (batch and automatic runs merge into the existing folder instead, keeping
+  any file that already parses as audio). An
+  album-only request names no artist, so it always stays in staging and says nothing: only manual
+  mode can express one, because auto mode rejects `--album` on its own and a batch line is trimmed
+  before it is parsed, so a line written as `" - Album"` is read as an artist-only line. An artist-naming run with a configured library path explains a
   staging-only download once it has one.
 - **Authoritative artist discography** — artist-only manual runs resolve conceptual albums from MusicBrainz
   release groups (cached locally for 30 days) and then run one sequential `Artist Album` Soulseek search per
@@ -59,8 +62,8 @@ Automated Soulseek music downloader with library quality upgrading.
   remote queue (`max_queue_time_secs`, `max_start_time_secs`), stall timeout
   with cancel, per-file retries with configurable count and delay, and
   candidate fallback (try the next ranked peer once retries are exhausted).
-- **Post-download organisation** — move completed files from a staging directory into your library using a
-  configurable naming pattern (`%artist%/%album%/...`), with automatic duplicate handling. Every path
+- **Post-download placement** — move completed files from a staging directory into the artist's existing
+  library folder as `<artist folder>/<album title>/NN - Title.ext`. Every path
   component is sanitised before the folder is created: characters Windows reserves (`< > : " | ? *`),
   control characters, a trailing dot or space, and reserved device names are all removed or neutralised, so
   a library served to Windows clients over SMB renders every folder name instead of a mangled one. Path
@@ -90,7 +93,8 @@ Automated Soulseek music downloader with library quality upgrading.
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
 - A [Soulseek](https://www.slsknet.org/) account (username and password)
-- A music library organised as `Artist/Album/Track` directories (recommended)
+- A music library organised as `Artist/Album/Track` directories (recommended; artist folders may sit at
+  any depth below a configured root, for example `<root>/<genre>/<artist>/<album>`)
 
 ## Quick start
 
@@ -145,7 +149,8 @@ artist-only manual search resolves MusicBrainz conceptual albums first and then
 performs one sequential targeted Soulseek search per eligible album, oldest
 first. Explicit artist-plus-album manual searches now place their downloads into the artist's
 existing library folder; album-only manual searches keep theirs in staging, because an album has
-no artist folder; batch, auto, and library-upgrade flows are unchanged. If
+no artist folder; batch and automatic runs place the same way, and the library-upgrade copy-back
+is unchanged. If
 authoritative discovery cannot be established, the previous
 single-query folder heuristic remains available as a visible fallback; set
 `discography.enabled: false` to select it deliberately. `--test` performs the same mode and selector
@@ -154,10 +159,11 @@ album and batch mode requires a non-empty batch file path. To clear a configured
 fallback for one field, pass that selector explicitly as an empty value, such as
 `--mode manual --artist ""` together with `--album "The Wall"`. Album-only searches
 are intentionally album-name-only and are not recorded in processed-album history,
-so a later run may search or download them again. In batch mode, if
-`storage.organize` is enabled with library paths, an album-only line fails before
-searching because the organize step has no artist destination; a manual album-only
-run is unaffected and keeps its download in `staging_dir`.
+so a later run may search or download them again. An album-only
+manual request keeps its download in `storage.staging_dir` and says nothing about it, because
+placement needs an artist folder it cannot know. A batch file cannot express one at all: its lines
+are trimmed before parsing, so a line written as `" - Album"` is read as an artist-only line, and an
+artist-only line has no album to file either, so it also stays in staging.
 
 ## Options
 
@@ -189,8 +195,8 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `auto`, `manual`, `batch`, or `discover`. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library, and that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist. Manual downloads are placed into the artist's existing library folder when one exists. | *(from config)* |
-| `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; a destination strictly below the artist folder that a placement would write into and that already exists keeps the download in staging. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library, and that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
+| `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--schedule` | Run immediately, then repeat the same validated auto, manual, batch, or discover operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
@@ -206,13 +212,13 @@ YAML, it leaves search history and unrelated albums untouched, and it is
 intended for replacing corrupt or otherwise invalid downloaded files. The
 matching successful database record is deleted before the attempt; if the retry
 fails, the album remains eligible for normal future retries. In manual modes, a replacement is
-placed into the artist's existing library folder unless a destination strictly below the artist
-folder that a placement would write into already exists, in which case it stays in staging (there
+placed into the artist's existing library folder unless the album's destination folder already
+exists, in which case it stays in staging (there
 may be a different edition there, and
 placement never replaces a readable file); when the artist has no folder under a configured
-library path it stays in staging too, because a manual run never creates one and never uses the
-organize step. In batch mode, use `storage.organize: true` if the replacement should be moved
-into the library; otherwise it remains in staging until a later auto run with
+library path it stays in staging too, because placement never creates one. Batch and automatic
+runs merge into an album folder that already exists instead, and a replacement they leave in
+staging is one whose artist has no folder; it stays there until a later auto run with
 `library_upgrade.enabled: true` runs its recovery scan, which adopts a staging
 leftover with a matching successful record into `library.paths[0]` and deletes a
 leftover with no record. In auto mode, only albums
@@ -243,16 +249,15 @@ A default config is created automatically on first run. The file is divided into
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `paths` | Root directories to scan for music files, in priority order. Each path should contain `Artist/Album` subdirectories. When the same album is found under more than one root, the earliest listed entry supplies the location an upgrade writes back to, while the track counts from all copies are summed (so keep the entries non-overlapping: overlapping roots inflate the count the peer-completeness gate compares against). Discover placement is artist-level instead: it uses the root holding most of that artist's albums, with ties broken alphabetically, and manual placement uses the first configured entry that holds a folder for the artist, checking the album's destination folder under that same entry. Overridden by `--library-path`. | `[]` |
+| `paths` | Root directories to scan for music files, in priority order. Artist folders are looked up anywhere below each root, so a nested `<root>/<user>/<type>/<genre>/<subgenre>/<artist>/<album>` layout works as well as `<root>/Artist/Album`; when more than one folder matches an artist, the run warns naming the folder it chose and the ones it skipped; the winner is the first matching root in configuration order, and within one root the first in the walk's alphabetical, depth-first order (a deeper folder can win, and the warning names the choice). A folder nested inside another match is a self-titled album (`<artist>/<artist>`), not a second artist folder, so it is not treated as an ambiguity - and an artist whose name also matches an ancestor folder (`<root>/Rock/Rock` with the artist "Rock") resolves to that ancestor, as the direct-child lookup did before. When the same album is found under more than one root, the earliest listed entry supplies the location an upgrade writes back to, while the track counts from all copies are summed (so keep the entries non-overlapping: overlapping roots inflate the count the peer-completeness gate compares against). Discover placement is artist-level instead: it uses the root holding most of that artist's albums, with ties broken alphabetically, and manual placement uses the first configured entry that holds a folder for the artist, checking the album's destination folder under that same entry. Overridden by `--library-path`. | `[]` |
 | `scan_on_startup` | Rescan the library on startup (auto mode). *(Reserved for future use — not yet enforced.)* | `true` |
 
 ### `storage`
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `staging_dir` | Directory where in-progress downloads land before organisation. Auto-created if missing. Keep it outside every `library.paths` entry: a staging folder inside a library root is scanned as if it were albums of its own artist. | `downloads/staging` |
-| `organize` | Automatically move completed downloads into the library. Manual runs are excluded: they place only into an artist folder that already exists, and never create one. | `false` |
-| `organize_pattern` | Naming template for organised files. Placeholders: `%artist%`, `%album%`, `%track%`, `%title%`, `%ext%`, `%user%` (always expands to `unknown` today). Must be non-empty, relative, contain at least one ordinary path component, be free of `..` components, and must not end with a path separator. It must also expand to a distinct path per track: unlike the organize step, the library copy paths resolve a collision with the keep/overwrite rules instead of a `(1)` suffix, so a pattern that does not distinguish the tracks (for example one with neither `%track%` nor `%title%`) lets one track stand in for the rest. A pattern whose expansion names a path that already exists as a directory — `%artist%` alone, or `%artist%/%album%` when those match the on-disk folders — cannot be copied to at all, so every track fails with `Is a directory`. Placement warns when only some of the downloaded files were written; the upgrade path logs each kept file at INFO instead. Both discover and manual placement use it to shape the destination, manual placement even when `organize` is `false`. | `%artist%/%album%/%track% - %title%.%ext%` |
+| *(removed)* | `storage.organize` and `storage.organize_pattern` no longer exist: placement is the only library writer and the naming layout is fixed. A config file that still carries them keeps loading; they are dropped the next time the file is reconciled, with a `seakarr.yml.bak` backup. | — |
+| `staging_dir` | Directory where in-progress downloads land before they are placed into the library. Auto-created if missing. Keep it outside every `library.paths` entry: a staging folder inside a library root is scanned as if it were albums of its own artist. | `downloads/staging` |
 
 ### `search`
 
@@ -281,8 +286,8 @@ Controls authoritative MusicBrainz discovery. Artist-only manual runs resolve
 the artist's conceptual release groups before any Soulseek search, and
 `discover` mode applies the same resolution to every eligible artist derived
 from your library. Explicit artist-plus-album manual searches now place their downloads as
-described above; album-only manual searches keep theirs in staging; batch, auto, and
-library-upgrade flows are unchanged. The
+described above; album-only manual searches keep theirs in staging; batch and automatic runs
+place the same way, and only the library-upgrade copy-back is unchanged. The
 MusicBrainz API needs no account or API
 key.
 
@@ -317,7 +322,7 @@ Apashe an artist discover fills: it is skipped, counted in the run summary as
 log. Name such an artist with `--artist` to process it anyway. The accepted cost
 is that an artist whose albums live in a folder with a different name — beyond
 case, spacing, or width folding, which the gate tolerates — or in a
-folder the organiser sanitised, is no longer swept automatically.
+folder whose name sanitisation rewrote, is no longer swept automatically.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
@@ -375,7 +380,7 @@ Controls which Soulseek search results pass the quality gate.
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. This toggle governs the gap check only; the track-1 half of the completeness rule is part of `min_tracks` and is disabled only by `min_tracks: 0`. | `true` |
-| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule has two halves and is measured on the largest album group — the set that will actually be downloaded — so a result cannot pass on files from directories that will not be fetched: the group must reach `min_tracks`, and (for a new album) its numbered files, when every name parses with at least two distinct values, must include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement (discover and manual) and organize paths as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later auto run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
+| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule has two halves and is measured on the largest album group — the set that will actually be downloaded — so a result cannot pass on files from directories that will not be fetched: the group must reach `min_tracks`, and (for a new album) its numbered files, when every name parses with at least two distinct values, must include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement path as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later auto run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
 | `peer_track_count` | In auto mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that auto mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
@@ -413,7 +418,7 @@ places under the on-disk artist folder.
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `enabled` | Enable the library-upgrade workflow (auto mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. Requires at least one `library.paths` entry. | `false` |
-| `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly written copies (non-audio files are never deleted). The pass walks `<artist>/<album>` under the directory the album was found in (the library root itself only for a flat `<root>/Artist/Album` layout) and compares against the best written file, so two cases behave differently from the name: a pattern that writes outside that album folder leaves the old files judged against a replacement stored elsewhere, and a file kept because it scored higher than its own incoming copy can still be deleted when another track of the album scored higher. | `false` |
+| `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly written copies (non-audio files are never deleted). The pass walks `<artist>/<album>` under the directory the album was found in (the library root itself only for a flat `<root>/Artist/Album` layout) and compares against the best written file, so two cases behave differently from the name: the folder the pass walks is the one on disk, so a spelling the sanitiser would rewrite still leaves the old files judged against replacements stored in the sanitised folder, and a file kept because it scored higher than its own incoming copy can still be deleted when another track of the album scored higher. | `false` |
 
 ### `database`
 
@@ -460,10 +465,10 @@ INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 1 (8 tracks) -> /media
 ```
 
 The path is the album folder the write actually produced, after name sanitisation and disc
-subdirectory handling — not the raw `storage.organize_pattern`. For auto and batch runs, when
-`storage.organize` is `false` or `library.paths` is empty, the album stays where it was downloaded
-and the line says so; a manual run places into the artist's existing library folder whatever
-`storage.organize` says, and stays in staging only when it has nowhere to place:
+subdirectory handling. There are two destinations: the album was placed into the artist's existing
+library folder under a configured `library.paths` entry, or it stayed where it was downloaded
+because the artist has no folder there. With `library.paths` empty, staging is the destination in
+every mode:
 
 ```text
 INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 2 (6 tracks) -> /downloads/Aquasky--Shadow Era Pt. 2 (kept in staging)
@@ -477,13 +482,7 @@ INFO seakarr::download: Download staged: 08 Moondance.flac -> /downloads/Aquasky
 ```
 
 The same destination appears in the end-of-run summary and in the `message` of each success
-notification. Per-file library destinations are available at `DEBUG`:
-
-```text
-DEBUG seakarr::organizer: Organized: /downloads/Aquasky--Shadow Era Pt. 1/08 Moondance.flac -> /media/Music/Paul/Albums/Aquasky/Shadow Era Pt. 1/08 - Moondance.flac
-```
-
-A download that waits in a peer's upload queue reports its position in the same line that
+notification. A download that waits in a peer's upload queue reports its position in the same line that
 announces it, and reports how long it waited when it finally starts:
 
 ```text
@@ -584,7 +583,7 @@ library-upgrade candidates, which only have to deliver the files the library nee
   exempt, because the library keeps its own track 1.
 
 Both conditions are checked in the filter before the download, and again by the library write after
-it, on the discover-placement, manual-placement and organize paths (a manual album whose
+it, on the placement path (a manual album whose
 destination folder already exists is exempt, because nothing is written). Because the anchor reads the *first* numeric token
 of each name, a compilation whose files lead with a varying number (`2 Unlimited - 01 - ...`,
 `3 Doors Down - 02 - ...`) is judged on those phantom numbers, and can be refused by the anchor
@@ -695,15 +694,15 @@ Seakarr has four operating modes:
    the file back in its queue — so the next candidate is tried without spending
    the per-file retries. Per-file retries with configurable count and delay
    (`max_retries`, `retry_delay_secs`) re-attempt the same peer for transient
-   failures before falling back to the next candidate.
-6. **Organise** — if `storage.organize` is enabled, completed files are moved from the staging directory
-   into the library using the configured naming pattern. Duplicate filenames receive a `(1)` suffix.
-7. **Persist & notify** — the album is marked as processed in SQLite and the success payload is POSTed to each
+   failures before falling back to the next candidate. A completed album is placed into the artist's
+   existing library folder when the artist has one under a configured `library.paths` entry, and stays
+   in staging otherwise.
+6. **Persist & notify** — the album is marked as processed in SQLite and the success payload is POSTed to each
    configured `notifications.urls` webhook (if any).
 
 ### Manual mode
 
-Performs steps 3–5 and 7 above for an explicit album, or for every eligible album
+Performs steps 3–5 and 6 above for an explicit album, or for every eligible album
 resolved from an artist-only MusicBrainz discography lookup. Each resolved album
 then runs through the normal targeted `Artist Album` search, sequentially and
 oldest first; editions and remasters of the same conceptual album are
@@ -713,13 +712,12 @@ searches are supported. Artist-only manual runs also skip every album that is
 already present in the library, so `--artist X` fetches only what you are
 missing rather than re-downloading albums you already own. Completed albums are
 placed into that artist's existing library folder; when the artist has no folder
-under a configured library path, or the pattern derives a destination strictly
-below the artist folder that a placement would write into and that already exists, the
-download stays in `storage.staging_dir`.
+under a configured library path, or the album folder that a placement would write into
+already exists, the download stays in `storage.staging_dir`.
 
 Explicit artist-plus-album manual searches now place their downloads as described above;
 album-only manual searches keep theirs in staging; batch mode, automatic mode, and the
-library-upgrade workflow are unchanged and never consult
+library-upgrade workflow place the same way and never consult
 MusicBrainz. The legacy single-query folder heuristic is retained as the
 `discography.enabled: false` opt-out and as an automatic fallback when
 authoritative discovery cannot be established; automatic fallback is reported
@@ -727,7 +725,7 @@ with a WARN and a run-summary notice.
 
 ### Batch mode
 
-Reads a newline-separated text file of `artist - album` lines and performs steps 3–7 for each line. Reports
+Reads a newline-separated text file of `artist - album` lines and performs steps 3–6 for each line. Reports
 success and failure counts on completion. Lines starting with `#` are treated as comments.
 
 ### Discover mode
@@ -738,7 +736,7 @@ that own a folder named after them. Each swept artist is resolved
 on MusicBrainz using the same authoritative resolution as artist-only manual mode, and the
 release groups in `discography.allowed_types` are the only candidates. Albums already present
 in the library are skipped, and the remainder runs through the same search, ranking,
-download, organisation, and notification pipeline as the other modes, oldest album first.
+download, placement, and notification pipeline as the other modes, oldest album first.
 `discover.exclude_artists` skips aggregator names before any lookup, the
 folder-ownership gate keeps an artist the library knows only as a guest inside
 another artist's folder out of the sweep, `--artist` optionally
@@ -748,9 +746,9 @@ the exclusion list and the gate), and the run stops after
 runs.
 
 Each completed album is placed in the artist's own library folder — the directory that artist's
-existing albums were scanned from — using `storage.organize_pattern`, with `%artist%` expanded to the
-artist folder name that is actually on disk and `%album%` to the MusicBrainz title. Placement is
-unconditional in discover mode: it does not depend on `storage.organize` or on
+existing albums were scanned from — as `<artist folder>/<album title>/NN - Title.ext`, with the artist
+folder named exactly as it is on disk and the album folder named from the MusicBrainz title. Placement
+is unconditional in discover mode: it does not depend on
 `library_upgrade.enabled`, and `library_upgrade.delete_lesser_quality` never applies to it. Once the
 copy succeeds the staging directory for that album is removed, so discover leaves nothing behind.
 The scanner resolves the artist folder, album folder, and library location positionally and steps
@@ -769,8 +767,8 @@ indexed under the marker name, not the album title, so a later run with a cleare
 `--ignore-processed` can download it again. On the upgrade path the same shape can also nest one
 level too deep, giving `<artist>/Gold (Disc 1)/Gold (Disc 1)/...`, because the disc folder is
 preserved under an album whose own name is that marker. A manual run places albums into the
-artist's existing library folder, and never organizes: with no folder for the artist the download
-stays in `staging_dir`, whatever `storage.organize` says.
+artist's existing library folder and never creates one: with no folder for the artist the download
+stays in `staging_dir`.
 
 ### Scheduled mode
 
@@ -908,7 +906,7 @@ name contains "vinyl", "demo", or "live" (case-insensitive).
 **Q: What happens if my staging directory and library are on different filesystems?**
 
 `fs::rename` cannot move a file across mount points, so seakarr detects the cross-device error and falls
-back to copying the file into the library and then deleting the staging copy. The organized file lands in
+back to copying the file into the library and then deleting the staging copy. The file lands in
 the correct library location regardless of filesystem layout.
 
 **Q: Can I run multiple instances of seakarr at once?**
@@ -1083,13 +1081,15 @@ folder named after somebody else. To fetch a specific album instead, use
 
 In the artist's own library folder, beside the albums that artist already has. Manual runs
 (`--artist` with or without `--album`) place the same way, except that they require the artist
-folder to exist already: no manual run creates one, and a destination strictly below the artist
-folder that a placement would write into and that already exists keeps the download in staging. The destination comes from a directory listing of the configured roots,
-so the explicit-album form never walks the library; the artist folder must be a direct child of a
-configured root, so a nested library layout keeps the download in staging. Discover derives the
-destination from the same scan that produces its artist list, so a nested library such as
-`Music/<user>/Albums/<genre>/<style>/<artist>/` keeps its layout instead of writing a second artist
-tree under `library.paths[0]`. The folder itself comes from `%artist%` in `storage.organize_pattern`, expanded to the on-disk artist folder name, so a pattern that omits `%artist%` writes beside that folder — under its parent directory, which is the library root only in a flat `<root>/Artist/Album` layout — instead of inside it. Likewise, a pattern that keeps `%artist%` but omits `%album%` (for example `%artist%/%track% - %title%.%ext%`) writes every album directly into the artist's folder, so tracks from different albums can sit side by side there; keep `%album%` in the pattern for that reason. The staging copy is deleted once the album is placed. Placement never replaces a file
+folder to exist already: no run creates one, and an album folder that already exists keeps the
+download in staging. The artist folder is looked up anywhere below each configured root, so a nested
+library such as `Music/<user>/Albums/<genre>/<style>/<artist>/` places into that artist folder instead
+of writing a second artist tree under `library.paths[0]`; when more than one folder matches the artist,
+the first in configuration order wins and the run warns naming the folder it chose and the ones it
+skipped. The lookup reads directory names only, so it never opens a file or a tag. Every placement
+writes the fixed layout `<artist folder>/<album title>/NN - Title.ext`, with the artist folder name
+exactly as it is on disk. Discover derives its destination from the same scan that produces its artist
+list. The staging copy is deleted once the album is placed. Placement never replaces a file
 that already parses as audio, because the album folder may belong to a different edition of the album — only a file
 that cannot be opened at all (junk bytes, an empty file, an unrelated format) is replaced. The check reads the metadata
 header, so a copy interrupted after that header still parses: it is kept as it stands and the incoming file for that
@@ -1103,11 +1103,7 @@ album counts as present, because the presence check accepts the album folder nam
 embedded album tag, and accepts the artist folder name as well as the tag spelling. A peer whose album tag or artist
 tag is spelled differently from the MusicBrainz title therefore cannot make a later run re-download an album seakarr
 placed itself, and the `--ignore-processed` override cannot reach it either: both sides of the lookup cover both
-spellings. This holds for a pattern that keeps `%album%`; a pattern that omits it writes every album straight into the
-artist folder (see the pattern note above), where no album folder exists for the scan to match. Those albums are
-invisible to the scan instead of merely re-downloaded: an artist whose albums are all written flat has no index entry
-and drops out of the work list altogether, while an artist that also has albums in folders keeps its entry and its flat
-albums are searched and kept again on every run, whatever their tags say. The processed-album record still suppresses
+spellings. Every placement writes an album folder, so the presence check always has a folder name to match. The processed-album record still suppresses
 the album on later runs. Note that
 `--artist` narrowing still keys on the tag spelling, and the artist work list now also requires the
 artist to own a folder of its own, so a name spelled

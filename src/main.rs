@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -628,6 +629,11 @@ async fn run_batch_mode(
     // modes so the listener cannot outlive the cycle.
     let (cancel, _guard) = seakarr::runner::arm_cancellation();
 
+    // One artist-folder index per run: the lookup walks the configured roots for
+    // directory names only, at most once, and only when a line needs it.
+    let artist_folders = seakarr::discover::ArtistFolderIndex::new(config);
+    let mut explained: BTreeSet<String> = BTreeSet::new();
+
     for line in &lines {
         // Check cancellation between batch lines — stop processing
         // remaining albums after Ctrl+C.
@@ -645,6 +651,14 @@ async fn run_batch_mode(
         }
         let album_display = album.unwrap_or("(all)");
 
+        // Batch files its own downloads: an artist the library already holds is
+        // placed into, and one it does not hold keeps the download in staging.
+        // An artist-only line names no album, so there is nothing to file into the
+        // artist folder; only a line naming both is placed.
+        let target = match album {
+            Some(_) => seakarr::runner::automatic_place_target(&artist_folders, artist),
+            None => seakarr::runner::LibraryTarget::StagingOnly,
+        };
         match seakarr::runner::process_album(
             client,
             artist,
@@ -656,11 +670,23 @@ async fn run_batch_mode(
             progress.as_ref(),
             Some(&cancel),
             None, // library_track_count (batch mode: no scanner data)
-            None, // target: batch mode has no library write
+            Some(target),
         )
         .await
         {
-            Ok(outcome) => report.record(artist, album_display, outcome),
+            Ok(outcome) => {
+                // An artist-only line stages by rule rather than because a folder is
+                // missing, so the "no library folder found" explanation would be false.
+                if album.is_some() {
+                    seakarr::runner::explain_staging_outcome(
+                        artist,
+                        config,
+                        &outcome,
+                        &mut explained,
+                    );
+                }
+                report.record(artist, album_display, outcome)
+            }
             Err(e) => {
                 tracing::error!("Batch: failed {artist} — {album_display}: {e}");
                 report.record(
@@ -1119,6 +1145,154 @@ mod tests {
         assert!(
             queries.iter().any(|query| query.contains("Michael Bolton")),
             "manual plan must use its artist, got queries: {queries:?}"
+        );
+    }
+
+    // A batch line naming only an artist ("Artist") has no album to file, so the run
+    // must keep the download in staging rather than inventing an album folder (it
+    // used to write a folder literally named "Unknown"). A batch line can never be
+    // album-only: `run_batch_mode` trims each line, so " - Album" becomes "- Album"
+    // and parses as an artist-only line.
+    // Runs on one thread so the thread-local subscriber below sees every event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_artist_only_batch_line_keeps_its_download_in_staging() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![seakarr::client::SearchResult {
+            username: "peer".to_string(),
+            speed: 500,
+            slots: 1,
+            files: vec![seakarr::client::FileInfo {
+                name: "Music\\peer\\Artist\\01 - Track.flac".to_string(),
+                size: 10_000_000,
+                attribs: std::collections::HashMap::new(),
+            }],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let mut config = Config::default();
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls = vec![];
+        config.filters.min_tracks = 0;
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let library = temp.path().join("library");
+        config.library.paths = vec![library.to_string_lossy().into_owned()];
+        // The artist folder exists, so a placement target would be found: without the
+        // album-is-required rule the run would write <library>/Artist/Unknown.
+        std::fs::create_dir_all(library.join("Artist")).unwrap();
+        let batch_path = temp.path().join("wantlist.txt");
+        std::fs::write(&batch_path, "Artist\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Batch {
+            file_path: batch_path.to_string_lossy().into_owned(),
+        };
+
+        // A thread-local capture, because the library's LogCapture is not reachable
+        // from this crate. An artist-only line stages by rule, so claiming no folder
+        // was found would be false whenever the artist folder exists.
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        dispatch_execution_plan(&client, &plan, &config, &db, false)
+            .await
+            .expect("an artist-only batch line must complete");
+        drop(guard);
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("no library folder found") && line.contains("Artist")),
+            "an artist-only line stages by rule, so it must not claim no folder was found:\n{logs}"
+        );
+
+        assert!(
+            temp.path()
+                .join("Artist--unknown")
+                .join("01 - Track.flac")
+                .exists(),
+            "an artist-only line has no album to file, so its download stays in staging"
+        );
+        let albums: Vec<String> = std::fs::read_dir(library.join("Artist"))
+            .expect("the artist folder is readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            albums.is_empty(),
+            "an artist-only line must not invent an album folder, found {albums:?}"
+        );
+    }
+
+    // A batch line naming an artist and an album places into that artist's existing
+    // library folder, which is the behaviour the batch target exists for.
+    #[tokio::test]
+    async fn a_batch_line_places_into_the_existing_artist_folder() {
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![seakarr::client::SearchResult {
+            username: "peer".to_string(),
+            speed: 500,
+            slots: 1,
+            files: vec![seakarr::client::FileInfo {
+                name: "Music\\peer\\Artist\\Album\\01 - Track.flac".to_string(),
+                size: 10_000_000,
+                attribs: std::collections::HashMap::new(),
+            }],
+        }];
+        *client.write_files.lock().unwrap() = true;
+        let mut config = Config::default();
+        config.download.min_upload_speed_kbps = 0;
+        config.download.speed_check_wait_secs = 0;
+        config.download.max_retries = 1;
+        config.download.retry_delay_secs = 0;
+        config.notifications.urls = vec![];
+        config.filters.min_tracks = 0;
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let library = temp.path().join("library");
+        config.library.paths = vec![library.to_string_lossy().into_owned()];
+        std::fs::create_dir_all(library.join("Artist")).unwrap();
+        let batch_path = temp.path().join("wantlist.txt");
+        std::fs::write(&batch_path, "Artist - Album\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Batch {
+            file_path: batch_path.to_string_lossy().into_owned(),
+        };
+
+        dispatch_execution_plan(&client, &plan, &config, &db, false)
+            .await
+            .expect("a batch line must complete");
+
+        assert!(
+            library
+                .join("Artist")
+                .join("Album")
+                .join("01 - Track.flac")
+                .exists(),
+            "the album must be placed into the artist folder the library already holds"
+        );
+        assert!(
+            !temp.path().join("Artist--Album").exists(),
+            "a placed album leaves no staging copy"
         );
     }
 

@@ -85,10 +85,6 @@ pub struct LibraryConfig {
 pub struct StorageConfig {
     #[serde(default = "default_staging_dir")]
     pub staging_dir: String,
-    #[serde(default)]
-    pub organize: bool,
-    #[serde(default = "default_organize_pattern")]
-    pub organize_pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,9 +354,6 @@ fn default_min_tracks() -> u32 {
 }
 fn default_staging_dir() -> String {
     "downloads/staging".into()
-}
-fn default_organize_pattern() -> String {
-    "%artist%/%album%/%track% - %title%.%ext%".into()
 }
 fn default_search_mode() -> String {
     "auto".into()
@@ -930,36 +923,6 @@ impl Config {
                 u64::MAX / 60
             )));
         }
-        // The organize pattern is joined onto the library root. An absolute
-        // pattern, a parent component, or a Windows root-only or prefix-only
-        // pattern can all write outside the library — `Path::join` discards
-        // part or all of the root for those forms. This matters most on the
-        // discover placement path, whose documented contract is to write inside
-        // the artist's own library folder.
-        let pattern_components: Vec<std::path::Component<'_>> =
-            Path::new(&self.storage.organize_pattern)
-                .components()
-                .collect();
-        let pattern_is_contained = !pattern_components.is_empty()
-            && pattern_components.iter().all(|component| {
-                matches!(
-                    component,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            })
-            // At least one ordinary component: a pattern made only of `.`
-            // components expands to the library root itself, and the
-            // duplicate-suffix branch of `organize_file` then resolves that
-            // existing path to a sibling of the library root.
-            && pattern_components
-                .iter()
-                .any(|component| matches!(component, std::path::Component::Normal(_)));
-        if !pattern_is_contained {
-            return Err(SeakarrError::Config(format!(
-                "storage.organize_pattern must be a non-empty relative path inside the library, must contain at least one ordinary path component, and must not contain \"..\" components, got {:?}",
-                self.storage.organize_pattern
-            )));
-        }
         // The login retry policy backs off exponentially, so its bounds matter as
         // much as the download retry bounds.
         self.validate_login_bounds()?;
@@ -982,14 +945,6 @@ impl Config {
         }) {
             return Err(SeakarrError::Config(format!(
                 "filters.allowed_extensions entries must be a bare extension of ASCII letters and digits, got {invalid:?}"
-            )));
-        }
-        // A trailing separator names a directory, so every copy would fail with
-        // "Is a directory" at the destination.
-        if self.storage.organize_pattern.ends_with(['/', '\\']) {
-            return Err(SeakarrError::Config(format!(
-                "storage.organize_pattern must name a file, not end with a path separator, got {:?}",
-                self.storage.organize_pattern
             )));
         }
         self.validate_discography()?;
@@ -1198,8 +1153,6 @@ impl Default for Config {
             },
             storage: StorageConfig {
                 staging_dir: default_staging_dir(),
-                organize: false,
-                organize_pattern: default_organize_pattern(),
             },
             search: SearchConfig {
                 default_mode: default_search_mode(),
@@ -1292,8 +1245,6 @@ library:
 
 storage:
   staging_dir: "downloads/staging"
-  organize: false
-  organize_pattern: "%artist%/%album%/%track% - %title%.%ext%"
 
 search:
   default_mode: "auto"
@@ -1461,6 +1412,119 @@ schedule:
         assert_eq!(config.search.timeout_secs, 15);
         assert_eq!(config.filters.allowed_extensions, vec!["flac"]);
         assert!(config.filters.peer_track_count);
+    }
+
+    #[test]
+    fn album_folder_stays_inside_the_artist_folder() {
+        // The pattern validation used to guarantee this for every configured
+        // pattern. Placement now derives the album folder itself, so the
+        // guarantee has to hold for hostile metadata instead of for config.
+        let album_dir = crate::organizer::album_dir_for(
+            std::path::Path::new("/library"),
+            "Artist",
+            "../../etc/passwd",
+        )
+        .expect("an artist folder name of one component is usable");
+
+        assert!(
+            album_dir.starts_with("/library/Artist"),
+            "an album title must not escape the artist folder, got {album_dir:?}"
+        );
+        assert_eq!(
+            album_dir.parent(),
+            Some(std::path::Path::new("/library/Artist")),
+            "the album folder is exactly one level under the artist folder, so a hostile \
+             title cannot add a path segment"
+        );
+    }
+
+    #[test]
+    fn each_section_default_mirrors_the_top_level_default() {
+        // `#[serde(default)]` on Config lets a YAML file omit whole sections, and
+        // each section's own Default has to be the same value Config::default()
+        // carries: otherwise a partial file would silently differ from the
+        // generated one, which is the single source of truth.
+        let defaults = Config::default();
+        macro_rules! mirrors {
+            ($section:ty, $field:ident) => {
+                assert_eq!(
+                    serde_yaml::to_string(&<$section>::default()).unwrap(),
+                    serde_yaml::to_string(&defaults.$field).unwrap(),
+                    concat!(
+                        stringify!($section),
+                        "::default() must mirror Config::default().",
+                        stringify!($field)
+                    )
+                );
+            };
+        }
+        mirrors!(SoulseekConfig, soulseek);
+        mirrors!(LibraryConfig, library);
+        mirrors!(StorageConfig, storage);
+        mirrors!(SearchConfig, search);
+        mirrors!(DiscographyConfig, discography);
+        mirrors!(DiscoverConfig, discover);
+        mirrors!(FilterConfig, filters);
+        mirrors!(DownloadConfig, download);
+        mirrors!(DatabaseConfig, database);
+        mirrors!(LoggingConfig, logging);
+        mirrors!(PidConfig, pid);
+        mirrors!(NotificationConfig, notifications);
+        mirrors!(LibraryUpgradeConfig, library_upgrade);
+        mirrors!(ScheduleConfig, schedule);
+    }
+
+    #[test]
+    fn a_flow_style_search_section_still_reports_a_real_line() {
+        // A flow mapping is one line. Reconciliation rewrites such a file into the
+        // canonical block form, and the reported line must point at the FINAL
+        // on-disk config: it is the line the user is told to edit, so a number that
+        // only matches the input would send them to the wrong place.
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("seakarr.yml");
+        let yaml = "soulseek:\n  username: user\n  password: pass\nsearch: {default_mode: auto}\n";
+        fs::write(&config_file, yaml).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert_eq!(config.search.default_mode, "auto");
+        let source = config.source().expect("loaded config has source");
+        let final_contents = fs::read_to_string(&config_file).unwrap();
+        let expected = final_contents
+            .lines()
+            .position(|line| line.trim_start().starts_with("default_mode:"))
+            .map(|index| index + 1)
+            .expect("the reconciled config names search.default_mode");
+        assert_eq!(
+            source.default_mode_line, expected,
+            "the reported line must belong to the final on-disk config"
+        );
+    }
+
+    #[test]
+    fn removed_storage_keys_are_dropped_by_reconciliation() {
+        // Both keys are gone from the schema. An existing config that still
+        // carries them must keep loading, and the reconciliation that runs on
+        // load must write the file back without them — leaving them in place
+        // would advertise settings that no longer do anything.
+        let dir = TempDir::new().unwrap();
+        let config_file = dir.path().join("seakarr.yml");
+        let yaml = "\
+soulseek:\n  username: user\n  password: pass\nstorage:\n  staging_dir: downloads/staging\n  organize: true\n  organize_pattern: \"%album%/%artist%/%track% - %title%.%ext%\"\n";
+        fs::write(&config_file, yaml).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert_eq!(config.storage.staging_dir, "downloads/staging");
+        let written = fs::read_to_string(&config_file).unwrap();
+        assert!(
+            !written.contains("organize"),
+            "the reconciled config must not keep the removed keys:\n{written}"
+        );
+        assert!(
+            dir.path().join("seakarr.yml.bak").exists(),
+            "reconciliation must keep a backup of the original file"
+        );
     }
 
     #[test]
@@ -1805,8 +1869,6 @@ download:
   retry_delay_secs: 30
 storage:
   staging_dir: /tmp/staging
-  organize: true
-  organize_pattern: "%artist%/%album%/%track% - %title%.%ext%"
 logging:
   level: INFO
   path: ""
@@ -1999,62 +2061,6 @@ library_upgrade:
         config.library_upgrade.enabled = true;
         config.library.paths = vec!["/music".into()];
         assert!(config.validate().is_ok());
-    }
-
-    fn pattern_error(pattern: &str) -> Option<String> {
-        let mut config = Config::default();
-        config.soulseek.username = "u".into();
-        config.soulseek.password = "p".into();
-        config.storage.organize_pattern = pattern.to_string();
-        config.validate().err().map(|error| error.to_string())
-    }
-
-    #[test]
-    fn test_organize_pattern_must_stay_inside_the_library() {
-        for pattern in [
-            "/tmp/outside/%album%/%track%.%ext%",
-            "../outside/%album%/%track%.%ext%",
-            "%artist%/../../%album%/%track%.%ext%",
-            "",
-        ] {
-            let err = pattern_error(pattern)
-                .unwrap_or_else(|| panic!("pattern {pattern:?} must be rejected"));
-            assert!(
-                err.contains("storage.organize_pattern"),
-                "pattern {pattern:?} produced: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_organize_pattern_inside_the_library_is_accepted() {
-        for pattern in [
-            "%artist%/%album%/%track% - %title%.%ext%",
-            "./%artist%/%album%/%ext%",
-        ] {
-            assert!(
-                pattern_error(pattern).is_none(),
-                "pattern {pattern:?} must be accepted, got {:?}",
-                pattern_error(pattern)
-            );
-        }
-    }
-
-    /// Windows: a root-only or prefix-only pattern escapes the library even
-    /// though `is_absolute()` is false for it, because `Path::join` discards
-    /// part or all of the base path. On Unix both strings are single ordinary
-    /// components and are contained, which is why this case is platform-gated.
-    #[cfg(windows)]
-    #[test]
-    fn test_organize_pattern_rejects_windows_root_only_forms() {
-        for pattern in [
-            r"\evil\%album%\%track%.%ext%",
-            r"D:evil\%album%\%track%.%ext%",
-        ] {
-            let err = pattern_error(pattern)
-                .unwrap_or_else(|| panic!("pattern {pattern:?} must be rejected"));
-            assert!(err.contains("storage.organize_pattern"), "got: {err}");
-        }
     }
 
     // CLI merging keeps the effective in-memory Config consistent with the
@@ -2818,42 +2824,6 @@ search:
     }
 
     #[test]
-    fn organize_pattern_must_have_an_ordinary_component() {
-        // `Path::components` reduces these to bare `.` components, which expand
-        // to the library root itself; the duplicate-suffix branch of
-        // `organize_file` then names a sibling of the library root, outside it.
-        for pattern in [".", "./.", "././"] {
-            let mut config = Config::default();
-            config.storage.organize_pattern = pattern.to_string();
-            let error = config
-                .validate_non_credential_constraints()
-                .expect_err("a pattern with no ordinary component must be rejected");
-            assert!(
-                error.to_string().contains("organize_pattern"),
-                "{pattern:?} produced: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn organize_pattern_must_name_a_file_not_a_directory() {
-        // Path::components drops a trailing separator, so the containment check
-        // accepts it, but the expanded path then names a directory and every
-        // copy fails with "Is a directory".
-        for pattern in ["%artist%/%album%/", "%artist%/%album%/%track%.%ext%\\"] {
-            let mut config = Config::default();
-            config.storage.organize_pattern = pattern.to_string();
-            let error = config
-                .validate_non_credential_constraints()
-                .expect_err("a directory-shaped pattern must be rejected");
-            assert!(
-                error.to_string().contains("organize_pattern"),
-                "{pattern:?} produced: {error}"
-            );
-        }
-    }
-
-    #[test]
     fn allowed_extensions_rejects_entries_that_can_never_match() {
         // The matcher compares against the text after the last dot with no
         // trimming, so a dot anywhere, or any surrounding whitespace, matches
@@ -2902,54 +2872,6 @@ search:
         let mut config = Config::default();
         config.filters.allowed_extensions = vec!["flac".to_string(), "MP3".to_string()];
         assert!(config.validate_non_credential_constraints().is_ok());
-    }
-
-    #[test]
-    fn organize_pattern_is_rejected_when_it_escapes_the_library() {
-        // The pattern is joined onto the library root, so an absolute pattern or
-        // a parent component would write outside it — most damaging on the
-        // discover placement path, whose contract is to write inside the
-        // artist's own folder. `Path::join` discards part or all of the root for
-        // both forms, which is why the check inspects components.
-        for pattern in [
-            "/absolute/%artist%/%track%.%ext%",
-            "%artist%/../%album%/%track%.%ext%",
-        ] {
-            let mut config = Config::default();
-            config.storage.organize_pattern = pattern.to_string();
-            let error = config
-                .validate_non_credential_constraints()
-                .expect_err("an escaping pattern must be rejected");
-            assert!(
-                error.to_string().contains("organize_pattern"),
-                "{pattern:?} produced: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn organize_pattern_is_rejected_when_empty() {
-        let mut config = Config::default();
-        config.storage.organize_pattern = String::new();
-        let error = config
-            .validate_non_credential_constraints()
-            .expect_err("an empty pattern must be rejected");
-        assert!(
-            error.to_string().contains("organize_pattern"),
-            "got: {error}"
-        );
-    }
-
-    #[test]
-    fn organize_pattern_accepts_relative_paths_with_curdir_components() {
-        // Both harmless components are accepted: an ordinary name and a leading
-        // `.`, which `Path::components` normalises but does not reject.
-        let mut config = Config::default();
-        config.storage.organize_pattern = "./%artist%/%album%/%track% - %title%.%ext%".to_string();
-        assert!(
-            config.validate_non_credential_constraints().is_ok(),
-            "a leading ./ must not be treated as an escape"
-        );
     }
 
     #[test]

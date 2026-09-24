@@ -605,7 +605,7 @@ pub(crate) fn album_identity_key(album: &str, artist: &str) -> String {
 /// the album directory immediately above the file. A dedicated disc directory
 /// is folded into its parent album, so all discs of one album remain together.
 /// Results without an identifiable album directory are omitted because their
-/// album cannot be safely named or organized.
+/// album cannot be safely named or placed.
 pub(crate) fn group_artist_results(
     results: &[SearchResult],
     artist: &str,
@@ -882,6 +882,37 @@ pub async fn search_album_with_fallback(
     .await
 }
 
+/// Take one search tier's results: hand them back when they pass the queue-aware
+/// filter, otherwise remember them as the fallback set a later tier or the caller
+/// can fall back on. An empty tier changes nothing.
+fn take_tier_results(
+    results: Vec<SearchResult>,
+    filters: &FilterConfig,
+    library_track_count: Option<usize>,
+    album: Option<&str>,
+    max_queue_length: u32,
+    anchor: crate::filter::TrackOneAnchor,
+    fallback: &mut Option<Vec<SearchResult>>,
+) -> Option<SearchOutcome> {
+    if results.is_empty() {
+        return None;
+    }
+    if tier_has_usable_results(
+        &results,
+        filters,
+        library_track_count,
+        album,
+        max_queue_length,
+        anchor,
+    ) {
+        return Some(SearchOutcome { results });
+    }
+    if fallback.is_none() {
+        *fallback = Some(results);
+    }
+    None
+}
+
 /// Queue-aware variant of [`search_album_with_fallback`]. A tier is usable
 /// when it yields at least one result that passes the queue-aware filter
 /// pipeline, so a zero-slot candidate admitted by a positive queue cap does
@@ -924,18 +955,16 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
     if album.is_some() && !artist.trim().is_empty() {
         retain_artist_files(&mut results, artist);
     }
-    if !results.is_empty() {
-        if tier_has_usable_results(
-            &results,
-            filters,
-            library_track_count,
-            album,
-            max_queue_length,
-            anchor,
-        ) {
-            return Ok(SearchOutcome { results });
-        }
-        fallback = Some(results);
+    if let Some(outcome) = take_tier_results(
+        results,
+        filters,
+        library_track_count,
+        album,
+        max_queue_length,
+        anchor,
+        &mut fallback,
+    ) {
+        return Ok(outcome);
     }
 
     // Tier 1b: lowercase fallback (when original casing was not usable)
@@ -953,22 +982,16 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                     search_fallback_tier(client, &artist_lower, Some(&album_lower), timeout_secs)
                         .await;
                 retain_artist_files(&mut lower_results, artist);
-                if !lower_results.is_empty() {
-                    if tier_has_usable_results(
-                        &lower_results,
-                        filters,
-                        library_track_count,
-                        album,
-                        max_queue_length,
-                        anchor,
-                    ) {
-                        return Ok(SearchOutcome {
-                            results: lower_results,
-                        });
-                    }
-                    if fallback.is_none() {
-                        fallback = Some(lower_results);
-                    }
+                if let Some(outcome) = take_tier_results(
+                    lower_results,
+                    filters,
+                    library_track_count,
+                    album,
+                    max_queue_length,
+                    anchor,
+                    &mut fallback,
+                ) {
+                    return Ok(outcome);
                 }
             }
         }
@@ -995,22 +1018,16 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                     search_fallback_tier(client, &artist_norm, Some(&album_norm), timeout_secs)
                         .await;
                 retain_artist_files(&mut norm_results, artist);
-                if !norm_results.is_empty() {
-                    if tier_has_usable_results(
-                        &norm_results,
-                        filters,
-                        library_track_count,
-                        album,
-                        max_queue_length,
-                        anchor,
-                    ) {
-                        return Ok(SearchOutcome {
-                            results: norm_results,
-                        });
-                    }
-                    if fallback.is_none() {
-                        fallback = Some(norm_results);
-                    }
+                if let Some(outcome) = take_tier_results(
+                    norm_results,
+                    filters,
+                    library_track_count,
+                    album,
+                    max_queue_length,
+                    anchor,
+                    &mut fallback,
+                ) {
+                    return Ok(outcome);
                 }
             }
         }
@@ -1026,22 +1043,16 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                 let mut artist_matches =
                     search_fallback_tier(client, "", Some(album_name), timeout_secs).await;
                 retain_artist_files(&mut artist_matches, artist);
-                if !artist_matches.is_empty() {
-                    if tier_has_usable_results(
-                        &artist_matches,
-                        filters,
-                        library_track_count,
-                        album,
-                        max_queue_length,
-                        anchor,
-                    ) {
-                        return Ok(SearchOutcome {
-                            results: artist_matches,
-                        });
-                    }
-                    if fallback.is_none() {
-                        fallback = Some(artist_matches);
-                    }
+                if let Some(outcome) = take_tier_results(
+                    artist_matches,
+                    filters,
+                    library_track_count,
+                    album,
+                    max_queue_length,
+                    anchor,
+                    &mut fallback,
+                ) {
+                    return Ok(outcome);
                 }
             }
         }

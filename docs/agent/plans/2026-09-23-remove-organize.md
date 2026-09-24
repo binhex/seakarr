@@ -711,11 +711,11 @@ Add to the inline test module in `src/runner.rs`. Use a unique artist name in ea
     }
 
     #[tokio::test]
-    async fn an_album_only_request_warns_instead_of_failing() {
+    async fn an_album_only_request_downloads_into_staging_without_failing() {
         // The old guard returned a Config error before searching, and only when
         // storage.organize was on. Placement needs an artist folder, so an
         // album-only request cannot be filed - but it is still a valid download and
-        // must warn, not abort.
+        // must not abort.
         let client = MockClient::new();
         *client.search_results.lock().unwrap() = vec![album_result("Test Artist", "Album")];
         *client.write_files.lock().unwrap() = true;
@@ -748,7 +748,7 @@ Add to the inline test module in `src/runner.rs`. Use a unique artist name in ea
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test --lib runner`
-Expected: FAIL. `an_album_only_request_warns_instead_of_failing` fails because the guard still returns `Err(Config(..))` before the search, and the other three fail to compile until `automatic_place_target` and the owned `LibraryTarget` exist. Treat the guard failure as the behavioural RED and the compile failures as the structural RED for this task.
+Expected: FAIL. `an_album_only_request_downloads_into_staging_without_failing` fails because the guard still returns `Err(Config(..))` before the search, and the other three fail to compile until `automatic_place_target` and the owned `LibraryTarget` exist. Treat the guard failure as the behavioural RED and the compile failures as the structural RED for this task.
 
 - [ ] **Step 3: Delete the organize step and the second writer**
 
@@ -979,7 +979,7 @@ git commit -m "feat: place automatic and batch downloads through the artist fold
 In `README.md`:
 
 - Delete the `| organize | ... |` and `| organize_pattern | ... |` rows from the storage table.
-- Delete the sentence at `158-159` claiming an album-only line fails before searching when `storage.organize` is enabled; the line now warns and keeps its download in staging.
+- Delete the sentence at `158-159` claiming an album-only line fails before searching when `storage.organize` is enabled; the line keeps its download in staging.
 - At `214`, drop the instruction to use `storage.organize: true`; batch and auto place automatically into an artist folder that already exists.
 - At `463-466`, the completion-line section describes three cases: rewrite it as two — the album was placed into the artist's library folder, or it stayed in staging because the artist has no folder there (`library.paths` empty means staging is the destination, as before).
 - At `483`, the `Organized:` DEBUG example is deleted; placement logs `Keeping existing file ...` and the placement INFO line already used by manual runs.
@@ -1045,8 +1045,17 @@ Each mutation is applied, the named test is run to see it fail, then the mutatio
 | Make `walk_artist_folders` skip entry depth > 1 | `an_artist_folder_five_levels_below_a_root_is_found` |
 | Delete the ambiguity WARN from `find` | `an_ambiguous_artist_folder_picks_the_first_and_warns` |
 | Flip `skip_existing_album` to `true` in `automatic_place_target` | `the_automatic_target_places_into_an_existing_folder_and_stages_without_one` |
-| Restore the album-only early return | `an_album_only_request_warns_instead_of_failing` |
-| Replace the dedupe in the manual explanation with an unconditional call | `an_artist_with_no_folder_is_explained_once` |
+| Restore the album-only early return | `an_album_only_request_downloads_into_staging_without_failing` |
+| Drop the dedupe in `explain_staging_outcome` (`if true` instead of the `BTreeSet::insert`) | `the_staging_explanation_fires_once_per_artist_not_per_album` |
+
+> **Corrected during verification.** This plan's Step 3 prescribed a `warn_when_album_only_cannot_place`
+> helper for auto and batch album-only lines. Review found that situation unreachable: manual mode is
+> the only mode that can express an album-only request (auto and discover reject `--album` on its own,
+> and a batch line is trimmed before parsing, so a line written `" - Album"` reads as an artist-only
+> line), and manual album-only runs must stay silent. The helper and its tests were deleted rather
+> than shipped.
+>
+> **Corrected during verification.** The fifth row originally named `an_artist_with_no_folder_is_explained_once`, which that mutation cannot fail: the manual paths call `log_no_artist_folder` directly and never `explain_staging_outcome`, so the named test kept passing. The dedupe now has its own test, and the corrected row fails it (verified: `FAILED. 0 passed; 1 failed; 914 filtered out`).
 
 - [ ] **Step 4: Confirm the acceptance criteria**
 
@@ -1055,7 +1064,9 @@ rg -n 'storage\.organize|organize_pattern' src/ tests/ README.md
 rg -n 'organize_file|OrganizeInput|expand_pattern|placement_album_dir|ArtistComponent' src/
 ```
 
-Expected: no hits from either command.
+Expected: no hits from the second command; the first command's only hit is the
+`removed_storage_keys_are_dropped_by_reconciliation` fixture, which must contain both keys to prove
+they are dropped.
 
 - [ ] **Step 5: Commit anything the verification changed**
 

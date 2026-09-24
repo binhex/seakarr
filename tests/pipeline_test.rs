@@ -62,7 +62,7 @@ async fn test_full_pipeline_manual_mode() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
-        None, // target: no library write for this direct call
+        None, // target: this direct call writes nothing to the library
     )
     .await;
 
@@ -79,15 +79,14 @@ async fn test_full_pipeline_manual_mode() {
     assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
 }
 
-/// End-to-end regression for the organize step (Finding 1 in the release
-/// review): with `storage.organize = true` and real numbered staging files,
-/// `process_album` must organise each track into the library with a CLEAN
-/// name — zero-padded track number and the leading track token stripped from
-/// the title. It must never produce the duplicated, unpadded "2 - 02 - Track
-/// Two.flac" that shipped when the manual organize path derived metadata
-/// differently from the auto-upgrade copy path.
+/// End-to-end regression for library placement (Finding 1 in the release review):
+/// with a placement target and real numbered staging files, `process_album` must
+/// place each track into the library with a CLEAN name — zero-padded track number
+/// and the leading track token stripped from the title. It must never produce the
+/// duplicated, unpadded "2 - 02 - Track Two.flac" that shipped when the placement
+/// and auto-upgrade paths derived metadata differently.
 #[tokio::test]
-async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
+async fn test_full_pipeline_placement_uses_clean_names() {
     let client = MockClient::new();
     *client.write_files.lock().unwrap() = true; // write real files to staging
     *client.search_results.lock().unwrap() = vec![SearchResult {
@@ -114,13 +113,19 @@ async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
     config.soulseek.username = "test".into();
     config.soulseek.password = "test".into();
     config.storage.staging_dir = staging.path().to_string_lossy().into();
-    config.storage.organize = true;
-    config.storage.organize_pattern = "%artist%/%album%/%track% - %title%.%ext%".into();
     config.library.paths = vec![library.path().to_string_lossy().into()];
     config.download.min_upload_speed_kbps = 0;
     config.download.max_retries = 1;
     config.notifications.urls = vec![];
     config.filters.min_tracks = 0;
+
+    // Placement writes into an artist folder that already exists; it never
+    // creates one, so the fixture provides it.
+    std::fs::create_dir_all(library.path().join("Test Artist")).unwrap();
+    let target = seakarr::runner::automatic_place_target(
+        &seakarr::discover::ArtistFolderIndex::new(&config),
+        "Test Artist",
+    );
 
     let db = Database::open_in_memory().unwrap();
 
@@ -135,7 +140,7 @@ async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
         None,
         None,
         None,
-        None,
+        Some(target),
     )
     .await;
 
@@ -148,7 +153,7 @@ async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
         "the album must complete with its downloaded track count"
     );
 
-    // Organised files carry clean, zero-padded names with the leading track
+    // Placed files carry clean, zero-padded names with the leading track
     // token stripped from the title — never "1 - 01 - Track One.flac".
     let lib_album = library.path().join("Test Artist").join("Test Album");
     assert!(lib_album.join("01 - Track One.flac").exists());
@@ -157,7 +162,7 @@ async fn test_full_pipeline_manual_mode_with_organize_uses_clean_names() {
     assert!(!lib_album.join("2 - 02 - Track Two.flac").exists());
     assert!(!lib_album.join("1 - 01 - Track One.flac").exists());
 
-    // The staging directory was consumed by the organize step.
+    // The staging directory was consumed by the placement.
     let album_staging = staging.path().join("Test Artist--Test Album");
     assert!(!album_staging.exists());
 
@@ -188,7 +193,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         None,
         None,
         None, // library_track_count (not applicable in manual mode)
-        None, // target: no library write for this direct call
+        None, // target: this direct call writes nothing to the library
     )
     .await;
 

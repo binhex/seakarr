@@ -577,7 +577,7 @@ impl DiscoveryFailure {
 
 /// Whether a caller will accept a recorded resolution failure in place of a
 /// provider call. Named rather than a bare `bool` so the two call sites read as
-/// a decision, following `ArtistComponent` in `organizer.rs`.
+/// a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureCacheUse {
     /// Replay a fresh recorded failure for this artist.

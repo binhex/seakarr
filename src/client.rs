@@ -107,7 +107,7 @@ pub struct MockClient {
     /// When true, `download()` writes real file bytes to `dir/<basename>` on
     /// completion. Off by default so existing tests (which assert throughput
     /// from `file.size`, not on-disk metadata) keep their behaviour; on by
-    /// tests that need real files on disk (organize paths, multi-disc
+    /// tests that need real files on disk (placement paths, multi-disc
     /// collision checks).
     pub write_files: Mutex<bool>,
 }
@@ -238,7 +238,7 @@ impl SoulseekClient for MockClient {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             // Write real bytes BEFORE reporting completion so a caller that
-            // proceeds straight to organize/copy sees the file on disk.
+            // proceeds straight to the library copy sees the file on disk.
             if write_files {
                 let _ = std::fs::write(&dest, b"mock audio content");
             }

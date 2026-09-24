@@ -3,11 +3,14 @@
 //! Selection logic and presence data: an index of what the library already
 //! holds, the presence decision, the artist work list, and the per-run download
 //! budget. Two entry points read the filesystem on the caller's behalf -
-//! [`index_from_paths`] walks the library and [`resolve_artist_folder`] lists the
-//! configured roots; the rest is pure.
+//! [`index_from_paths`] walks the library and [`ArtistFolderIndex`] walks the
+//! configured roots for artist folders; the rest is pure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::discography::{normalize_album_key, normalize_catalog_key, AlbumTarget};
@@ -184,76 +187,168 @@ impl LibraryIndex {
     }
 }
 
-/// The library root and on-disk artist folder a manual run should place this
-/// artist's downloads into, or `None` when no configured library path holds a
-/// folder for the artist. The first configured path holding such a folder wins,
-/// so the destination depends on configuration order rather than on walk order.
+/// Every artist folder under the configured library roots, built on first use and
+/// reused for the rest of the run.
 ///
-/// Reads the filesystem rather than [`LibraryIndex`]: the index only lists
-/// artists the walk found audio for, so a failed or stale scan would silently
-/// change where a manual download lands. Both sides are sanitised and compared
-/// through [`normalize_catalog_key`], so the tag spelling agrees with the stored
-/// spelling (`AC/DC` with a folder written as `AC-DC`) and the comparison is
-/// case-insensitive. The returned folder name is the spelling that exists on
-/// disk, so placement lands inside the existing folder instead of beside a
-/// rewritten copy of it.
-///
-/// An artist with no name has no folder: an album-only manual run passes an empty
-/// name, and sanitising it would yield the non-empty placeholder, which would
-/// otherwise match any folder whose own name sanitises away (`_`, `***`, a
-/// whitespace-only directory). Such a folder is not an artist folder, so it is
-/// never a destination - and a name that sanitises away the same way is refused for
-/// the same reason.
-///
-/// A folder whose name is not valid UTF-8 is skipped, because names are compared as
-/// `String`s: matching a lossy spelling could make placement create a second folder
-/// beside the real one.
-///
-/// Cost of refusing names that sanitise away: an artist whose name is only punctuation
-/// cannot reach a folder the organize step created for it under the placeholder name,
-/// so such a manual run keeps its download in staging. Matching the placeholder instead
-/// is what the guard above exists to prevent.
-pub fn resolve_artist_folder(config: &Config, artist: &str) -> Option<(PathBuf, String)> {
+/// The walk reads **directory names only**: no file is opened and no tag is read,
+/// which is what makes a lookup affordable in a deep
+/// `<user>/<type>/<genre>/<subgenre>/<artist>` tree. Building is lazy, so a run
+/// that never places anything never touches the library tree, and it happens at
+/// most once per run.
+pub struct ArtistFolderIndex {
+    roots: Vec<PathBuf>,
+    folders: OnceLock<BTreeMap<String, Vec<(PathBuf, String)>>>,
+    /// Artist keys whose ambiguity has already been reported. Auto mode resolves a
+    /// target once per album, so without this an artist with three albums would
+    /// repeat the same warning three times in one run.
+    warned: Mutex<BTreeSet<String>>,
+}
+
+impl ArtistFolderIndex {
+    /// An unbuilt index over the configured library roots, in configuration order.
+    pub fn new(config: &Config) -> Self {
+        Self {
+            roots: config.library.paths.iter().map(PathBuf::from).collect(),
+            folders: OnceLock::new(),
+            warned: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Whether the walk has run. A run that places nothing never builds the index.
+    pub fn is_built(&self) -> bool {
+        self.folders.get().is_some()
+    }
+
+    /// The parent directory and on-disk name of this artist's folder, or `None`
+    /// when no configured root holds one.
+    ///
+    /// Roots are searched in configuration order, and each root is walked
+    /// depth-first with directory names in alphabetical order, so the choice never
+    /// depends on filesystem order. When more than one folder matched, the first in
+    /// that order wins and a WARN names it alongside the folders it skipped.
+    ///
+    /// A candidate nested inside another candidate is not a second artist folder:
+    /// that shape is a self-titled album (`<artist>/<artist>`), so only the
+    /// shallowest match counts and no warning is emitted for it. The accepted cost is
+    /// that when an artist's name also matches an ancestor folder (`<root>/Rock/Rock`
+    /// with the artist "Rock") the ancestor wins silently, which is what the old
+    /// direct-child lookup chose as well.
+    pub fn find(&self, artist: &str) -> Option<(PathBuf, String)> {
+        let key = artist_folder_key(artist)?;
+        let folders = self
+            .folders
+            .get_or_init(|| walk_artist_folders(&self.roots));
+        let candidates = folders.get(&key)?;
+        // A self-titled album folder carries the artist's own name, so the artist
+        // folder and its album folder share this key. Only the shallowest match is
+        // the artist folder: the deeper one is the album, and reporting it as a
+        // competing artist folder would warn on an ordinary layout.
+        let candidates: Vec<&(PathBuf, String)> = candidates
+            .iter()
+            .filter(|(parent, _)| {
+                !candidates
+                    .iter()
+                    .any(|(other_parent, other_name)| other_parent.join(other_name) == *parent)
+            })
+            .collect();
+        let (parent, name) = (*candidates.first()?).clone();
+        if candidates.len() > 1 {
+            // Once per artist per run: auto mode resolves a target per album, so an
+            // artist with several albums would otherwise repeat this warning.
+            let first_report = self
+                .warned
+                .lock()
+                .map(|mut warned| warned.insert(key.clone()))
+                .unwrap_or(true);
+            if first_report {
+                let skipped = candidates
+                    .get(1..)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|candidate| candidate.0.join(&candidate.1).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    "{name}: more than one library folder matches this artist; placing into {} and skipping {skipped}",
+                    parent.join(&name).display()
+                );
+            }
+        }
+        Some((parent, name))
+    }
+}
+
+/// The comparison key for an artist folder name, or `None` when the name carries
+/// nothing a filesystem can keep: a blank name, or one that sanitises away to the
+/// placeholder (`***`), which must not match a folder whose own name did the same.
+fn artist_folder_key(artist: &str) -> Option<String> {
     if artist.trim().is_empty() {
         return None;
     }
     let sanitized = sanitize_component(artist);
-    // A name that carries nothing the filesystem can keep (only punctuation or
-    // whitespace) sanitises to the placeholder, which must not match a folder whose
-    // own name sanitised away too: neither is an artist folder. Separators are not in
-    // this class, because the sanitiser rewrites them to `-`.
     if sanitized == sanitize_component("") {
         return None;
     }
-    let wanted = normalize_catalog_key(&sanitized);
-    for root in &config.library.paths {
-        // A root that does not exist is simply not configured yet; any other failure
-        // (permissions, I/O) is worth naming, because otherwise the caller reports the
-        // artist as having no folder rather than the root as unreadable.
-        let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
+    let key = normalize_catalog_key(&sanitized);
+    (!key.is_empty()).then_some(key)
+}
+
+/// Walk every root's directories depth-first with sorted names, recording each
+/// directory under the key its own name produces. Album folders land in the map
+/// too and simply never match an artist unless one carries that name.
+fn walk_artist_folders(roots: &[PathBuf]) -> BTreeMap<String, Vec<(PathBuf, String)>> {
+    let mut folders: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
+    for root in roots {
+        // A root that does not exist is not configured yet; any other failure is
+        // worth naming, because otherwise the caller reports the artist as having
+        // no folder rather than the root as unreadable. `Path::exists` would fold
+        // every metadata error (permissions, I/O) into "not configured yet".
+        match std::fs::read_dir(root) {
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                tracing::warn!("library root {root} cannot be listed ({error}); skipping it");
+                tracing::warn!(
+                    "library root {} cannot be listed ({error}); skipping it",
+                    root.display()
+                );
                 continue;
             }
-        };
-        // Sorted so a library holding two spellings of one artist resolves
-        // deterministically rather than following read_dir order.
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-            .collect();
-        names.sort();
-        if let Some(name) = names
-            .into_iter()
-            .find(|name| normalize_catalog_key(&sanitize_component(name)) == wanted)
-        {
-            return Some((PathBuf::from(root), name));
+        }
+        for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // An unreadable subdirectory yields no artist folder, and the
+                    // caller would otherwise report the artist as absent rather than
+                    // the tree as unreadable.
+                    tracing::warn!(
+                        "library walk skipped an entry under {}: {error}",
+                        root.display()
+                    );
+                    continue;
+                }
+            };
+            if entry.depth() == 0 || !entry.file_type().is_dir() {
+                continue;
+            }
+            // A non-UTF-8 folder name cannot be compared with a UTF-8 artist, so it
+            // is skipped rather than matched lossily.
+            let Some(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            let Some(key) = artist_folder_key(name) else {
+                continue;
+            };
+            let Some(parent) = entry.path().parent() else {
+                continue;
+            };
+            folders
+                .entry(key)
+                .or_default()
+                .push((parent.to_path_buf(), name.to_string()));
         }
     }
-    None
+    folders
 }
 
 /// Index scanned albums by normalised artist key and album title.
@@ -643,11 +738,131 @@ mod tests {
     }
 
     #[test]
-    fn resolve_artist_folder_returns_the_on_disk_spelling() {
+    fn an_artist_folder_five_levels_below_a_root_is_found() {
+        // The operator's layout: /media/Music/<user>/<type>/<genre>/<subgenre>/<artist>.
+        // The direct-child lookup cannot see it, which is why manual and automatic
+        // placement never fired on a real library.
+        let library = TempDir::new().unwrap();
+        let artist = library
+            .path()
+            .join("Paul")
+            .join("Albums")
+            .join("Rock")
+            .join("Indie")
+            .join("Radiohead");
+        std::fs::create_dir_all(&artist).unwrap();
+        let config = config_with_roots(&[&library]);
+
+        let found = ArtistFolderIndex::new(&config).find("Radiohead");
+
+        assert_eq!(
+            found,
+            Some((
+                library
+                    .path()
+                    .join("Paul")
+                    .join("Albums")
+                    .join("Rock")
+                    .join("Indie"),
+                "Radiohead".to_string()
+            )),
+            "the lookup must descend past a root's immediate children"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_artist_folder_picks_the_first_and_warns() {
+        // Albums and Singles both holding the artist is legitimate, so the choice
+        // must be deterministic and visible rather than silent.
+        let library = TempDir::new().unwrap();
+        let albums = library.path().join("Albums").join("Radiohead");
+        let singles = library.path().join("Singles").join("Radiohead");
+        std::fs::create_dir_all(&albums).unwrap();
+        std::fs::create_dir_all(&singles).unwrap();
+        let config = config_with_roots(&[&library]);
+        let capture = crate::test_support::LogCapture::start();
+
+        let index = ArtistFolderIndex::new(&config);
+
+        let found = index.find("Radiohead");
+
+        assert_eq!(
+            found,
+            Some((library.path().join("Albums"), "Radiohead".to_string()))
+        );
+        // A second lookup for the same artist must not repeat the warning: auto mode
+        // resolves a target once per album, and one artist normally has several.
+        let _ = index.find("Radiohead");
+        let logs = capture.text();
+        let warnings = logs
+            .lines()
+            .filter(|line| {
+                line.contains("more than one library folder matches this artist")
+                    && line.contains("Radiohead")
+            })
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "the ambiguity warning is reported once per artist per run:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn a_self_titled_album_folder_is_not_a_competing_artist_folder() {
+        // Music/ABBA/ABBA is the ordinary self-titled layout: the album folder shares
+        // the artist's name and must not be read as a second artist folder, which
+        // would warn on every run for that artist.
+        let library = TempDir::new().unwrap();
+        let artist = library.path().join("ABBA");
+        std::fs::create_dir_all(artist.join("ABBA")).unwrap();
+        let config = config_with_roots(&[&library]);
+        let capture = crate::test_support::LogCapture::start();
+
+        let found = ArtistFolderIndex::new(&config).find("ABBA");
+
+        assert_eq!(
+            found,
+            Some((library.path().to_path_buf(), "ABBA".to_string()))
+        );
+        let logs = capture.text();
+        let warnings = logs
+            .lines()
+            .filter(|line| {
+                line.contains("more than one library folder matches this artist")
+                    && line.contains("ABBA")
+            })
+            .count();
+        assert_eq!(
+            warnings, 0,
+            "a self-titled album folder is not an ambiguity:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn the_index_is_not_built_when_nothing_is_looked_up() {
+        // A run that places nothing must not walk the library tree at all.
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library.paths = vec![library
+            .path()
+            .join("missing")
+            .to_string_lossy()
+            .into_owned()];
+
+        let index = ArtistFolderIndex::new(&config);
+
+        assert!(
+            !index.is_built(),
+            "constructing the index must not walk anything"
+        );
+    }
+
+    #[test]
+    fn artist_folder_index_returns_the_on_disk_spelling() {
         let library = library_with_artist_folders(&["the cinematic orchestra"]);
         let config = config_with_roots(&[&library]);
 
-        let found = resolve_artist_folder(&config, "The Cinematic Orchestra");
+        let found = ArtistFolderIndex::new(&config).find("The Cinematic Orchestra");
 
         assert_eq!(
             found,
@@ -659,12 +874,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_artist_folder_folds_the_tag_spelling_onto_the_stored_folder() {
+    fn artist_folder_index_folds_the_tag_spelling_onto_the_stored_folder() {
         // The sanitiser stores "AC/DC" as "AC-DC"; the tag spelling must find it.
         let library = library_with_artist_folders(&["AC-DC"]);
         let config = config_with_roots(&[&library]);
 
-        let found = resolve_artist_folder(&config, "AC/DC");
+        let found = ArtistFolderIndex::new(&config).find("AC/DC");
 
         assert_eq!(
             found,
@@ -673,23 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_artist_folder_is_none_when_the_artist_has_no_folder() {
+    fn artist_folder_index_is_none_when_the_artist_has_no_folder() {
         let library = library_with_artist_folders(&["Someone Else"]);
         let config = config_with_roots(&[&library]);
 
         assert_eq!(
-            resolve_artist_folder(&config, "The Cinematic Orchestra"),
+            ArtistFolderIndex::new(&config).find("The Cinematic Orchestra"),
             None
         );
     }
 
     #[test]
-    fn resolve_artist_folder_prefers_the_first_configured_root() {
+    fn artist_folder_index_prefers_the_first_configured_root() {
         let first = library_with_artist_folders(&["The Artist"]);
         let second = library_with_artist_folders(&["The Artist"]);
         let config = config_with_roots(&[&first, &second]);
 
-        let found = resolve_artist_folder(&config, "The Artist");
+        let found = ArtistFolderIndex::new(&config).find("The Artist");
 
         assert_eq!(
             found,
@@ -699,40 +914,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_artist_folder_ignores_a_file_named_like_the_artist() {
+    fn artist_folder_index_ignores_a_file_named_like_the_artist() {
         let library = TempDir::new().unwrap();
         std::fs::write(library.path().join("The Artist"), b"not a folder").unwrap();
         let config = config_with_roots(&[&library]);
 
-        assert_eq!(resolve_artist_folder(&config, "The Artist"), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find("The Artist"), None);
     }
 
     #[test]
-    fn resolve_artist_folder_is_none_without_library_paths() {
+    fn artist_folder_index_is_none_without_library_paths() {
         let config = Config::default();
 
         assert!(config.library.paths.is_empty());
-        assert_eq!(resolve_artist_folder(&config, "The Artist"), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find("The Artist"), None);
     }
 
     #[test]
-    fn resolve_artist_folder_is_none_for_a_blank_artist() {
+    fn artist_folder_index_is_none_for_a_blank_artist() {
         // An album-only manual run passes an empty artist. Sanitising that yields
         // the non-empty "_" placeholder, which must not match a folder whose own
         // name sanitises away: such a folder is not an artist folder.
         let library = library_with_artist_folders(&["_", "***", "The Artist"]);
         let config = config_with_roots(&[&library]);
 
-        assert_eq!(resolve_artist_folder(&config, ""), None);
-        assert_eq!(resolve_artist_folder(&config, "   "), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find(""), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find("   "), None);
         // A name that carries nothing the filesystem can keep is refused too, so it
         // cannot match the placeholder folder either.
-        assert_eq!(resolve_artist_folder(&config, "***"), None);
-        assert_eq!(resolve_artist_folder(&config, "???"), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find("***"), None);
+        assert_eq!(ArtistFolderIndex::new(&config).find("???"), None);
     }
 
     #[test]
-    fn resolve_artist_folder_skips_a_root_that_is_not_a_directory() {
+    fn artist_folder_index_skips_a_root_that_is_not_a_directory() {
         // A file where a root belongs cannot be listed: the resolver must name it and try
         // the next configured root rather than reporting the artist as missing.
         let holder = TempDir::new().unwrap();
@@ -747,7 +962,7 @@ mod tests {
         let capture = crate::test_support::LogCapture::start();
 
         assert_eq!(
-            resolve_artist_folder(&config, "The Artist"),
+            ArtistFolderIndex::new(&config).find("The Artist"),
             Some((library.path().to_path_buf(), "The Artist".to_string()))
         );
         let logs = capture.text();
@@ -762,7 +977,7 @@ mod tests {
     // syscall, so this fixture only exists here.
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_artist_folder_skips_a_non_utf8_folder() {
+    fn artist_folder_index_skips_a_non_utf8_folder() {
         use std::os::unix::ffi::OsStrExt;
 
         let library = TempDir::new().unwrap();
@@ -772,11 +987,14 @@ mod tests {
 
         // The folder exists on disk, but its name is not valid UTF-8: a lossy match
         // could make placement create a second folder beside the real one.
-        assert_eq!(resolve_artist_folder(&config, "The Art\u{fffd}ist"), None);
+        assert_eq!(
+            ArtistFolderIndex::new(&config).find("The Art\u{fffd}ist"),
+            None
+        );
     }
 
     #[test]
-    fn resolve_artist_folder_skips_an_unusable_root() {
+    fn artist_folder_index_skips_an_unusable_root() {
         // A root that no longer exists (or is unreadable) must not stop the search:
         // the next configured root still supplies the artist folder.
         let missing = TempDir::new().unwrap();
@@ -787,13 +1005,13 @@ mod tests {
         config.library.paths = vec![missing_path, library.path().to_string_lossy().into_owned()];
 
         assert_eq!(
-            resolve_artist_folder(&config, "The Artist"),
+            ArtistFolderIndex::new(&config).find("The Artist"),
             Some((library.path().to_path_buf(), "The Artist".to_string()))
         );
     }
 
     #[test]
-    fn resolve_artist_folder_prefers_the_smallest_spelling_within_a_root() {
+    fn artist_folder_index_prefers_the_smallest_spelling_within_a_root() {
         // Created in reverse order. On a filesystem whose read_dir returns insertion
         // order (tmpfs, a small ext4 directory) an unsorted resolver returns
         // "the artist" and fails here; a hash-ordered directory may still return the
@@ -803,7 +1021,7 @@ mod tests {
         let config = config_with_roots(&[&library]);
 
         assert_eq!(
-            resolve_artist_folder(&config, "The Artist"),
+            ArtistFolderIndex::new(&config).find("The Artist"),
             Some((library.path().to_path_buf(), "The Artist".to_string())),
             "read_dir order must not decide the destination"
         );
@@ -1662,7 +1880,7 @@ mod tests {
     #[test]
     fn a_folder_name_the_write_path_sanitised_does_not_satisfy_the_gate() {
         // Accepted cost of the gate, pinned so it cannot change silently. The
-        // organise pattern sanitises `%artist%` (a slash becomes a hyphen), so
+        // library write sanitises the artist component (a slash becomes a hyphen), so
         // an artist tagged `AC/DC` can own a folder spelled `AC-DC` and still be
         // gated out. Naming it explicitly is the workaround.
         let index = build_index(&[scanned_at("AC/DC", "Back in Black", "/library", "AC-DC")]);

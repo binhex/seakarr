@@ -49,8 +49,8 @@ pub fn quality_score_lossy(bitrate: u32) -> u64 {
 }
 
 /// Strip a leading track-number token (e.g. "02 - " in "02 - Song" or "04_"
-/// in "04_Cure for Me") from a file stem so it can be used as the pattern's
-/// `%title%` placeholder without duplicating the track number. Returns the
+/// in "04_Cure for Me") from a file stem so it can be used as the fixed layout's
+/// title without duplicating the track number. Returns the
 /// stem unchanged when it has no numeric prefix.
 fn strip_leading_track_token(stem: &str) -> &str {
     // Locate the first alphanumeric token.
@@ -76,30 +76,30 @@ fn strip_leading_track_token(stem: &str) -> &str {
         .map(|off| token_end + off)
         .unwrap_or(stem.len());
     // If stripping consumes the entire stem (e.g. "01" -> ""), keep the
-    // original to avoid producing an empty title placeholder.
+    // original to avoid producing an empty title.
     if rest >= stem.len() {
         return stem;
     }
     &stem[rest..]
 }
 
-/// Derive the `%track%` and `%title%` metadata values for a staging file
-/// stem (e.g. `"02 - Track Two"` -> `("02", "Track Two")`). The track
-/// number is zero-padded to two digits and the leading track token is
-/// stripped from the title so a `%track% - %title%` pattern yields clean
-/// names like `"02 - Track Two.flac"`. Files without a parseable track
+/// Derive the track number and title a staging file stem contributes to the fixed
+/// `NN - Title.ext` layout (e.g. `"02 - Track Two"` -> `("02", "Track Two")`). The
+/// track number is zero-padded to two digits and the leading track token is
+/// stripped from the title, so the layout yields clean names like
+/// `"02 - Track Two.flac"`. Files without a parseable track
 /// number fall back to track `"01"` with the stem unchanged as the title.
 ///
-/// This is the single source of truth for organize naming: every path that
-/// derives a library destination (the auto-upgrade copy, the organize step and
-/// the placement check) must produce the same names for the same staging files.
-pub fn organize_name_from_stem(stem: &str) -> (String, String) {
+/// This is the single source of truth for library naming: every path that derives
+/// a library destination (the auto-upgrade copy and the placement check) must
+/// produce the same names for the same staging files.
+pub fn library_name_from_stem(stem: &str) -> (String, String) {
     let track = crate::tracks::track_number_from_filename(stem)
         .map(|n| format!("{n:02}"))
         .unwrap_or_else(|| "01".to_string());
     let title = strip_leading_track_token(stem).to_string();
     // A DISC-TRACK stem ("1-11 - Steel Bars") keeps the track number once the
-    // disc number is stripped, which would duplicate it in `%track% - %title%`.
+    // disc number is stripped, which would duplicate it in `NN - Title.ext`.
     // Only the hyphenated form is treated this way: a title that merely starts
     // with its own track number ("01 - 1 Thing") keeps that word.
     let title = if crate::tracks::has_hyphenated_disc_prefix(stem) {
@@ -110,54 +110,50 @@ pub fn organize_name_from_stem(stem: &str) -> (String, String) {
     (track, title)
 }
 
-/// Expand an organization pattern with metadata placeholders.
-/// Placeholders: %artist%, %album%, %track%, %title%, %ext%, %user%
+/// The library-relative path one staged file is written to.
 ///
-/// Every value is sanitised, so remote metadata cannot inject path segments.
-/// Callers that already hold a filesystem-derived component use the placement
-/// entry point instead, which substitutes it verbatim.
-pub fn expand_pattern(
-    pattern: &str,
-    artist: &str,
+/// The layout is fixed: the artist component, then the sanitised album title,
+/// then `NN - Title.ext`. This is the code form of the default pattern the
+/// configuration used to carry, so every library write produces the paths a
+/// default-configured library already holds. Every metadata value except a
+/// filesystem-derived artist name is sanitised, so remote metadata cannot inject
+/// a path segment.
+fn library_relative_path(
+    artist_dir: &str,
     album: &str,
     track: &str,
     title: &str,
     ext: &str,
-    user: &str,
-) -> String {
-    expand_pattern_inner(
-        pattern,
-        &sanitize_component(artist),
-        album,
-        track,
-        title,
-        ext,
-        user,
-    )
+) -> PathBuf {
+    Path::new(artist_dir)
+        .join(sanitize_component(album))
+        .join(format!(
+            "{} - {}.{}",
+            sanitize_component(track),
+            sanitize_component(title),
+            sanitize_component(ext)
+        ))
 }
 
-/// Expand a pattern whose artist value is already final, such as the on-disk
-/// name of an existing artist folder.
+/// The album folder a placement writes into for this artist folder and album
+/// title, or `None` when the artist folder name is not usable as one path
+/// component.
 ///
-/// `%artist%` is substituted last so a value that itself contains a placeholder
-/// cannot cascade into another field's value. Sanitised callers are unaffected
-/// because [`sanitize_component`] removes `%` before substitution.
-fn expand_pattern_inner(
-    pattern: &str,
-    artist: &str,
-    album: &str,
-    track: &str,
-    title: &str,
-    ext: &str,
-    user: &str,
-) -> String {
-    pattern
-        .replace("%album%", &sanitize_component(album))
-        .replace("%track%", &sanitize_component(track))
-        .replace("%title%", &sanitize_component(title))
-        .replace("%ext%", &sanitize_component(ext))
-        .replace("%user%", &sanitize_component(user))
-        .replace("%artist%", artist)
+/// The single source of truth for the album folder: the writer creates files
+/// whose parent is exactly this path and the existing-album check reads it, so
+/// the two cannot disagree.
+pub fn album_dir_for(artist_parent: &Path, artist_dir: &str, album: &str) -> Option<PathBuf> {
+    let mut components = Path::new(artist_dir).components();
+    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_normal {
+        return None;
+    }
+    Some(
+        artist_parent
+            .join(artist_dir)
+            .join(sanitize_component(album)),
+    )
 }
 
 /// Characters Windows cannot store in a file or directory name, whatever the
@@ -243,9 +239,9 @@ fn neutralise_device_name(value: &str) -> String {
     }
 }
 
-/// Remove path separators, null bytes, percent signs (to prevent cascading
-/// placeholder re-substitution), and directory-traversal patterns from a
-/// metadata value so it cannot inject extra path segments into the
+/// Remove path separators, null bytes, percent signs (kept out so a sanitised name
+/// stays stable when it is stored and sanitised again), and directory-traversal
+/// patterns from a metadata value so it cannot inject extra path segments into the
 /// destination path.
 ///
 /// The same pass also makes the value portable between Linux and Windows,
@@ -260,7 +256,7 @@ pub fn sanitize_component(value: &str) -> String {
     let value = value
         .replace(['/', '\\'], "-")
         .replace('\0', "")
-        .replace('%', "％"); // U+FF05 FULLWIDTH PERCENT SIGN — prevents cascading replace
+        .replace('%', "％"); // U+FF05 FULLWIDTH PERCENT SIGN — keeps sanitising idempotent
     let mut s = strip_unsafe_name_characters(&value);
     // Collapse directory-traversal sequences. Runs after the trailing-dot trim
     // so "Album.." becomes "Album" rather than a fullwidth stop.
@@ -275,25 +271,11 @@ pub fn sanitize_component(value: &str) -> String {
     }
 }
 
-/// Metadata used to expand the organize pattern.
-#[derive(Debug, Clone)]
-pub struct OrganizeInput<'a> {
-    pub src: &'a Path,
-    pub library_root: &'a Path,
-    pub pattern: &'a str,
-    pub artist: &'a str,
-    pub album: &'a str,
-    pub track: &'a str,
-    pub title: &'a str,
-    pub ext: &'a str,
-}
-
 /// Result of a library write: the album folder targeted and the files written.
 ///
 /// `album_dir` is reported to the operator as the album's final destination, so
 /// it must be the album folder a human recognises — never a disc subdirectory,
-/// and never a path recomputed from the organize pattern (which the
-/// sanitisation pass and the verbatim artist component both rewrite).
+/// and never a path recomputed from the sanitised file name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryWriteOutcome {
     /// The album folder the write targeted, with any disc subdirectory removed.
@@ -304,100 +286,7 @@ pub struct LibraryWriteOutcome {
     pub written: Vec<PathBuf>,
 }
 
-/// Move a file from staging to the library using the naming pattern.
-/// Handles directory creation and duplicate filenames (adds (1), (2) suffix).
-pub fn organize_file(input: OrganizeInput<'_>) -> Result<LibraryWriteOutcome> {
-    let relative = expand_pattern(
-        input.pattern,
-        input.artist,
-        input.album,
-        input.track,
-        input.title,
-        input.ext,
-        "unknown",
-    );
-    let mut dest = input.library_root.join(&relative);
-    // The album folder is the destination's parent *before* the disc
-    // subdirectory is inserted below, so a multi-disc album reports the album
-    // folder rather than the disc folder.
-    let album_dir = dest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| input.library_root.to_path_buf());
-    if let Some(disc) = disc_subdir(input.src) {
-        dest = match dest.parent() {
-            Some(parent) => parent.join(disc).join(dest.file_name().unwrap_or_default()),
-            None => PathBuf::from(disc).join(dest.file_name().unwrap_or_default()),
-        };
-    }
-
-    // Create parent directories
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Handle duplicates: append (1), (2), etc.
-    let final_dest = if dest.exists() {
-        let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
-        let ext_str = dest
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-        let parent = dest.parent().unwrap_or(Path::new("."));
-        let mut counter = 1;
-        loop {
-            let candidate = parent.join(format!("{stem} ({counter}){ext_str}"));
-            if !candidate.exists() {
-                break candidate;
-            }
-            counter += 1;
-        }
-    } else {
-        dest
-    };
-
-    match fs::rename(input.src, &final_dest) {
-        Ok(()) => {}
-        // The staging area and the library may live on different mount
-        // points (separate disks, Docker volumes). rename(2) then fails
-        // with EXDEV; fall back to copy-and-delete so the file still lands
-        // in the library (mirroring the library-upgrade copy path).
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            fs::copy(input.src, &final_dest)?;
-            fs::remove_file(input.src)?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-    // The generic organize path is the route into the library for batch runs, and
-    // the fallback for an auto run with no library target of its own: every manual
-    // run passes a target instead, and `StagingOnly` suppresses this block. It
-    // writes one file at a time: without this the README's promise of per-file
-    // destinations at DEBUG holds only for the copy-based paths.
-    tracing::debug!(
-        "Organized: {} -> {}",
-        input.src.display(),
-        final_dest.display()
-    );
-    Ok(LibraryWriteOutcome {
-        album_dir,
-        written: vec![final_dest],
-    })
-}
-
 // ── Library upgrade: copy, quality-aware deletion, and recovery ──
-
-/// How the `%artist%` component of a pattern is produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArtistComponent {
-    /// Tag-derived name: sanitised like every other metadata value.
-    Sanitized,
-    /// An existing on-disk folder name, used verbatim as a single path
-    /// component. Rewriting it (percent signs, double dots, backslashes) would
-    /// place the album beside the real artist folder instead of inside it.
-    /// Callers only pass one component produced by the library walk, so it
-    /// cannot introduce a path separator.
-    Verbatim,
-}
 
 /// What to do when the destination file already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,11 +310,10 @@ enum ExistingFile {
     KeepWhenValid,
 }
 
-/// Copy downloaded files from staging into the library directory, applying
-/// the organize pattern for naming. The staging files are preserved (this is
-/// a copy, not a move). Track numbers are zero-padded to two digits and the
-/// leading track token is stripped from the title, so `%track% - %title%`
-/// produces clean names like "01 - Song.flac".
+/// Copy downloaded files from staging into the library directory. The staging
+/// files are preserved (this is a copy, not a move). Track numbers are zero-padded
+/// to two digits and the leading track token is stripped from the title, so files
+/// land as "01 - Song.flac" under the sanitised artist and album folders.
 ///
 /// A destination that already holds a strictly better file is kept (see the
 /// per-file guard in the shared implementation below); otherwise the copy
@@ -434,17 +322,15 @@ enum ExistingFile {
 pub fn copy_to_library(
     downloaded: &[PathBuf],
     library_root: &Path,
-    pattern: &str,
     artist: &str,
     album: &str,
 ) -> Result<LibraryWriteOutcome> {
+    let artist_dir = sanitize_component(artist);
     copy_into_library(LibraryWrite {
         downloaded,
         library_root,
-        pattern,
-        artist,
+        artist_dir: &artist_dir,
         album,
-        artist_component: ArtistComponent::Sanitized,
         existing_file: ExistingFile::ReplaceUnlessBetter,
     })
 }
@@ -466,11 +352,10 @@ pub fn copy_to_library(
 ///   requires: a failure there would not converge, because the album folder
 ///   presence looks for is still absent.
 ///
-/// `artist_dir` must be a single ordinary path component. It is substituted
-/// into the pattern without sanitisation, so a value carrying a separator or
-/// `..` would write outside the library; the callers pass the on-disk artist
-/// folder name the library walk or [`crate::discover::resolve_artist_folder`]
-/// found, never a raw tag.
+/// `artist_dir` must be a single ordinary path component, and is used verbatim as
+/// the folder name: a value carrying a separator or `..` would write outside the
+/// library, so the callers pass the on-disk artist folder name the library walk
+/// or [`crate::discover::ArtistFolderIndex`] found, never a raw tag.
 ///
 /// # Errors
 ///
@@ -478,55 +363,25 @@ pub fn copy_to_library(
 /// component, and any filesystem error the copy or directory creation returns.
 pub fn place_into_library(
     downloaded: &[PathBuf],
-    library_root: &Path,
-    pattern: &str,
+    artist_parent: &Path,
     artist_dir: &str,
     album: &str,
 ) -> Result<LibraryWriteOutcome> {
-    let mut components = Path::new(artist_dir).components();
-    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none();
-    if !single_normal {
+    // The artist folder name comes from the library walk, which only ever produces
+    // one component, but a caller could pass anything and a second component would
+    // write outside the artist folder.
+    if album_dir_for(artist_parent, artist_dir, album).is_none() {
         return Err(SeakarrError::Config(format!(
             "artist folder {artist_dir:?} must be a single path component"
         )));
     }
     copy_into_library(LibraryWrite {
         downloaded,
-        library_root,
-        pattern,
-        artist: artist_dir,
+        library_root: artist_parent,
+        artist_dir,
         album,
-        artist_component: ArtistComponent::Verbatim,
         existing_file: ExistingFile::KeepWhenValid,
     })
-}
-
-/// The album directory placement would write into for `first_downloaded`.
-///
-/// Derived exactly as [`copy_into_library`] derives it: expand the pattern with
-/// the artist value already final, then take the parent of the file path, which
-/// is recorded before any disc subdirectory is inserted. Used to tell whether the
-/// album's destination already exists before anything is copied.
-///
-/// `None` when the first path has no file stem, or when the expanded path has no
-/// parent directory to return.
-pub fn placement_album_dir(
-    library_root: &Path,
-    pattern: &str,
-    artist_dir: &str,
-    album: &str,
-    first_downloaded: &Path,
-) -> Option<PathBuf> {
-    let stem = first_downloaded.file_stem()?.to_string_lossy();
-    let ext = first_downloaded
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let (track, title) = organize_name_from_stem(&stem);
-    let relative =
-        expand_pattern_inner(pattern, artist_dir, album, &track, &title, &ext, "unknown");
-    library_root.join(relative).parent().map(Path::to_path_buf)
 }
 
 /// Everything one library write needs: the files to copy, where they go, and
@@ -536,10 +391,8 @@ pub fn placement_album_dir(
 struct LibraryWrite<'a> {
     downloaded: &'a [PathBuf],
     library_root: &'a Path,
-    pattern: &'a str,
-    artist: &'a str,
+    artist_dir: &'a str,
     album: &'a str,
-    artist_component: ArtistComponent,
     existing_file: ExistingFile,
 }
 
@@ -547,10 +400,8 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
     let LibraryWrite {
         downloaded,
         library_root,
-        pattern,
-        artist,
+        artist_dir,
         album,
-        artist_component,
         existing_file,
     } = write;
     let mut written = Vec::with_capacity(downloaded.len());
@@ -558,15 +409,8 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
     for src in downloaded {
         let stem = src.file_stem().unwrap_or_default().to_string_lossy();
         let ext = src.extension().unwrap_or_default().to_string_lossy();
-        let (track, title) = organize_name_from_stem(&stem);
-        let relative = match artist_component {
-            ArtistComponent::Sanitized => {
-                expand_pattern(pattern, artist, album, &track, &title, &ext, "unknown")
-            }
-            ArtistComponent::Verbatim => {
-                expand_pattern_inner(pattern, artist, album, &track, &title, &ext, "unknown")
-            }
-        };
+        let (track, title) = library_name_from_stem(&stem);
+        let relative = library_relative_path(artist_dir, album, &track, &title, &ext);
         let mut dest = library_root.join(&relative);
         // Recorded before the disc subdirectory is inserted below, and before
         // the keep/ replace decision, so the album folder is known even when
@@ -634,7 +478,7 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
             }
         }
         fs::copy(src, &dest)?;
-        tracing::debug!("Organized: {} -> {}", src.display(), dest.display());
+        tracing::debug!("Placed: {} -> {}", src.display(), dest.display());
         written.push(dest);
     }
     Ok(LibraryWriteOutcome {
@@ -980,195 +824,78 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn placement_album_dir_matches_the_copy_destination() {
-        let album_dir = placement_album_dir(
-            Path::new("/library"),
-            "%artist%/%album%/%track% - %title%.%ext%",
-            "The Artist",
-            "The Album",
-            Path::new("/staging/Artist--Album/01 - One.flac"),
-        );
+    fn placement_writes_the_fixed_layout_without_a_pattern() {
+        // The default pattern used to produce exactly this layout, so a
+        // default-configured library must receive byte-identical paths after
+        // the pattern is gone. The staged name exercises both naming rules:
+        // the track number is zero-padded and the leading track token is
+        // stripped from the title.
+        let staging = tempfile::TempDir::new().unwrap();
+        let library = tempfile::TempDir::new().unwrap();
+        let staged = staging.path().join("2 - Track Two.flac");
+        fs::write(&staged, b"fake flac data").unwrap();
+        fs::create_dir_all(library.path().join("Artist")).unwrap();
 
-        assert_eq!(
-            album_dir,
-            Some(PathBuf::from("/library/The Artist/The Album"))
-        );
-    }
-
-    #[test]
-    fn placement_album_dir_follows_a_pattern_that_shapes_the_album_folder() {
-        // The album component carries another placeholder, so the destination is
-        // not simply `<root>/<artist>/<album>`: the check has to follow the pattern.
-        let album_dir = placement_album_dir(
-            Path::new("/library"),
-            "%artist%/%album% - %user%/%track% - %title%.%ext%",
-            "The Artist",
-            "The Album",
-            Path::new("/staging/Artist--Album/01 - One.flac"),
-        );
-
-        assert_eq!(
-            album_dir,
-            Some(PathBuf::from("/library/The Artist/The Album - unknown"))
-        );
-    }
-
-    #[test]
-    fn placement_album_dir_ignores_a_disc_subdirectory_in_staging() {
-        // `copy_into_library` records the album directory from the pattern, before
-        // it inserts the disc subdirectory, so a staging layout with a disc folder
-        // must not move the album directory down into it.
-        let album_dir = placement_album_dir(
-            Path::new("/library"),
-            "%artist%/%album%/%track% - %title%.%ext%",
-            "The Artist",
-            "The Album",
-            Path::new("/staging/Artist--Album/CD 01/01 - One.flac"),
-        );
-
-        assert_eq!(
-            album_dir,
-            Some(PathBuf::from("/library/The Artist/The Album"))
-        );
-    }
-
-    #[test]
-    fn test_expand_pattern() {
-        let result = expand_pattern(
-            "%artist%/%album%/%track% - %title%.%ext%",
-            "Pink Floyd",
-            "Dark Side of the Moon",
-            "01",
-            "Speak to Me",
-            "flac",
-            "fastuser",
-        );
-        assert_eq!(
-            result,
-            "Pink Floyd/Dark Side of the Moon/01 - Speak to Me.flac"
-        );
-    }
-
-    #[test]
-    fn test_expand_pattern_with_spaces() {
-        let result = expand_pattern(
-            "%artist% - %album%/%track% %title%.%ext%",
-            "Radiohead",
-            "OK Computer",
-            "03",
-            "Subterranean Homesick Alien",
-            "flac",
-            "someuser",
-        );
-        assert_eq!(
-            result,
-            "Radiohead - OK Computer/03 Subterranean Homesick Alien.flac"
-        );
-    }
-
-    #[test]
-    fn test_organize_moves_files() {
-        let staging = TempDir::new().unwrap();
-        let library = TempDir::new().unwrap();
-
-        // Create a file in staging
-        let src = staging.path().join("01 - Song.flac");
-        fs::write(&src, b"fake flac content").unwrap();
-
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
-        organize_file(OrganizeInput {
-            src: &src,
-            library_root: library.path(),
-            pattern,
-            artist: "Test Artist",
-            album: "Test Album",
-            track: "01",
-            title: "Song",
-            ext: "flac",
-        })
+        let outcome = place_into_library(
+            std::slice::from_ref(&staged),
+            library.path(),
+            "Artist",
+            "Album",
+        )
         .unwrap();
 
-        // File should have been moved to library
-        let expected = library.path().join("Test Artist/Test Album/01 - Song.flac");
-        assert!(expected.exists());
-        // Source should be gone
-        assert!(!src.exists());
-    }
-
-    #[test]
-    fn test_organize_handles_duplicates() {
-        let staging = TempDir::new().unwrap();
-        let library = TempDir::new().unwrap();
-
-        let src = staging.path().join("track.flac");
-        fs::write(&src, b"content").unwrap();
-
-        // First organize
-        organize_file(OrganizeInput {
-            src: &src,
-            library_root: library.path(),
-            pattern: "%artist%/%title%.%ext%",
-            artist: "Artist",
-            album: "Album",
-            track: "01",
-            title: "Title",
-            ext: "flac",
-        })
-        .unwrap();
-        assert!(library.path().join("Artist/Title.flac").exists());
-
-        // Second file with same name
-        let src2 = staging.path().join("track2.flac");
-        fs::write(&src2, b"other content").unwrap();
-
-        organize_file(OrganizeInput {
-            src: &src2,
-            library_root: library.path(),
-            pattern: "%artist%/%title%.%ext%",
-            artist: "Artist",
-            album: "Album",
-            track: "01",
-            title: "Title",
-            ext: "flac",
-        })
-        .unwrap();
-        // Duplicate should get (1) suffix
-        assert!(library.path().join("Artist/Title (1).flac").exists());
-    }
-
-    #[test]
-    fn organize_preserves_brace_marker_disc_subdirectory() {
-        let staging = TempDir::new().unwrap();
-        let library = TempDir::new().unwrap();
-        let disc = staging.path().join("Album {cd1}");
-        fs::create_dir_all(&disc).unwrap();
-        let source = disc.join("01 - Song.flac");
-        fs::write(&source, b"content").unwrap();
-
-        let destination = organize_file(OrganizeInput {
-            src: &source,
-            library_root: library.path(),
-            pattern: "%artist%/%album%/%track% - %title%.%ext%",
-            artist: "Artist",
-            album: "Album",
-            track: "01",
-            title: "Song",
-            ext: "flac",
-        })
-        .unwrap()
-        .written[0]
-            .clone();
-
         assert_eq!(
-            destination,
-            library
+            outcome.album_dir,
+            library.path().join("Artist").join("Album"),
+            "the album folder is the sanitised album title under the artist folder"
+        );
+        assert_eq!(
+            outcome.written,
+            vec![library
                 .path()
-                .join("Artist/Album/Album {cd1}/01 - Song.flac")
+                .join("Artist")
+                .join("Album")
+                .join("02 - Track Two.flac")],
+            "the track number is zero-padded and the leading track token is stripped"
         );
-        assert!(destination.is_file());
     }
 
-    // ── Library upgrade tests ──
+    #[test]
+    fn placement_keeps_a_staging_disc_subdirectory_under_the_album_folder() {
+        // A staging layout with a disc folder must keep that folder under the album
+        // and must not report it as the album folder itself.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("Artist--Album").join("CD 01");
+        fs::create_dir_all(&disc).unwrap();
+        let source = disc.join("01 - One.flac");
+        fs::write(&source, b"fake flac content").unwrap();
+        fs::create_dir_all(library.path().join("The Artist")).unwrap();
+
+        let outcome = place_into_library(
+            std::slice::from_ref(&source),
+            library.path(),
+            "The Artist",
+            "The Album",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.album_dir,
+            library.path().join("The Artist").join("The Album"),
+            "the reported album folder is never the disc folder"
+        );
+        assert_eq!(
+            outcome.written,
+            vec![library
+                .path()
+                .join("The Artist")
+                .join("The Album")
+                .join("CD 01")
+                .join("01 - One.flac")],
+            "the disc subdirectory is preserved under the album folder"
+        );
+    }
 
     #[test]
     fn test_place_into_library_uses_the_artist_folder_name_verbatim() {
@@ -1187,7 +914,6 @@ mod tests {
         let dests = place_into_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "100% Hits..",
             "Test Album",
         )
@@ -1232,7 +958,6 @@ mod tests {
         let dests = place_into_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "Test Artist",
             "Test Album",
         )
@@ -1271,7 +996,6 @@ mod tests {
         let dests = place_into_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "Test Artist",
             "Test Album",
         )
@@ -1284,9 +1008,8 @@ mod tests {
 
     #[test]
     fn test_place_into_library_does_not_cascade_placeholders_from_the_folder_name() {
-        // A folder legitimately named "%album%" must stay a literal component.
-        // %artist% is substituted last for exactly this reason: substituting it
-        // first would let the folder name expand into the album field.
+        // A folder legitimately named "%album%" must stay a literal component: the
+        // on-disk artist folder name is used verbatim and is never re-expanded.
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
         let artist_dir = library.path().join("%album%");
@@ -1298,7 +1021,6 @@ mod tests {
         let dests = place_into_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "%album%",
             "Test Album",
         )
@@ -1325,7 +1047,6 @@ mod tests {
             let error = place_into_library(
                 std::slice::from_ref(&src),
                 library.path(),
-                "%artist%/%album%/%track% - %title%.%ext%",
                 artist_dir,
                 "Test Album",
             )
@@ -1496,7 +1217,6 @@ mod tests {
         let dests = place_into_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "A Guy Called Gerald",
             "Tronic Jazz: The Berlin Sessions",
         )
@@ -1509,37 +1229,6 @@ mod tests {
             library
                 .path()
                 .join("A Guy Called Gerald/Tronic Jazz The Berlin Sessions/01 - Track One.flac")
-        );
-    }
-
-    #[test]
-    fn test_organize_file_strips_unsafe_characters_from_album_and_title() {
-        // The auto path: album and title both come from remote metadata, and
-        // the default pattern puts both into the destination path.
-        let staging = TempDir::new().unwrap();
-        let library = TempDir::new().unwrap();
-        let src = staging.path().join("01 - Song.flac");
-        fs::write(&src, b"fake flac content").unwrap();
-
-        let destination = organize_file(OrganizeInput {
-            src: &src,
-            library_root: library.path(),
-            pattern: "%artist%/%album%/%track% - %title%.%ext%",
-            artist: "Aerosmith",
-            album: "Tough Love: Best of the Ballads",
-            track: "01",
-            title: "Pink: The Song?",
-            ext: "flac",
-        })
-        .unwrap()
-        .written[0]
-            .clone();
-
-        assert_eq!(
-            destination,
-            library
-                .path()
-                .join("Aerosmith/Tough Love Best of the Ballads/01 - Pink The Song.flac")
         );
     }
 
@@ -1558,7 +1247,6 @@ mod tests {
         let dests = copy_to_library(
             std::slice::from_ref(&src),
             library.path(),
-            "%artist%/%album%/%track% - %title%.%ext%",
             "Test Artist",
             "Test Album",
         )
@@ -1577,13 +1265,13 @@ mod tests {
     #[test]
     fn test_resume_library_upgrade_sanitises_staging_file_names() {
         // Staging file names are the peer's own basenames, and the forward copy
-        // runs them through the pattern's sanitiser. The resume walk must apply
-        // the same sanitiser, or recovery creates a name the library's own write
-        // path refuses to create — the SMB short-name defect itself. Only the
-        // character divergence is closed here: the forward name is also
-        // pattern-derived (zero-padded track numbers, a stripped leading track
-        // token), so a peer name such as `1 - Track.flac` still differs from the
-        // forward `01 - Track.flac` and is copied again under its own name.
+        // runs them through the same sanitiser. The resume walk must apply it too,
+        // or recovery creates a name the library's own write path refuses to create
+        // — the SMB short-name defect itself. Only the character divergence is closed
+        // here: the forward name is derived the same way (zero-padded track numbers,
+        // a stripped leading track token), so a peer name such as `1 - Track.flac`
+        // still differs from the forward `01 - Track.flac` and is copied again under
+        // its own name.
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
         fs::write(
@@ -1671,9 +1359,8 @@ mod tests {
         fs::write(&src1, b"flac content 1").unwrap();
         fs::write(&src2, b"flac content 2").unwrap();
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let files = vec![src1.clone(), src2.clone()];
-        copy_to_library(&files, library.path(), pattern, "Test Artist", "Test Album").unwrap();
+        copy_to_library(&files, library.path(), "Test Artist", "Test Album").unwrap();
 
         // Files are copied (not moved) into the library with clean names:
         // zero-padded track number plus the title stripped of its track prefix.
@@ -1716,14 +1403,13 @@ mod tests {
         fs::write(&cd2_t1, b"cd2 track1").unwrap();
         fs::write(&cd2_t2, b"cd2 track2").unwrap();
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let files = vec![
             cd1_t1.clone(),
             cd1_t2.clone(),
             cd2_t1.clone(),
             cd2_t2.clone(),
         ];
-        copy_to_library(&files, library.path(), pattern, "Test Artist", "Test Album").unwrap();
+        copy_to_library(&files, library.path(), "Test Artist", "Test Album").unwrap();
 
         // Each disc's tracks must land in its own subdirectory under the album.
         assert!(library
@@ -1762,11 +1448,9 @@ mod tests {
         fs::write(&cd1_t1, b"cd1 track1").unwrap();
         fs::write(&cd2_t1, b"cd2 track1").unwrap();
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let outcome = copy_to_library(
             &[cd1_t1, cd2_t1],
             library.path(),
-            pattern,
             "Test Artist",
             "Test Album",
         )
@@ -1797,15 +1481,8 @@ mod tests {
         fs::create_dir_all(&existing_dir).unwrap();
         write_minimal_flac(&existing_dir.join("01 - Track.flac"));
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
-        let outcome = place_into_library(
-            &[staged],
-            library.path(),
-            pattern,
-            "On Disk Artist",
-            "Test Album",
-        )
-        .unwrap();
+        let outcome =
+            place_into_library(&[staged], library.path(), "On Disk Artist", "Test Album").unwrap();
 
         assert!(
             outcome.written.is_empty(),
@@ -1836,11 +1513,9 @@ mod tests {
         fs::write(&d1_track, b"disc1").unwrap();
         fs::write(&d2_track, b"disc2").unwrap();
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         copy_to_library(
             &[d1_track.clone(), d2_track.clone()],
             library.path(),
-            pattern,
             "Test Artist",
             "Test Album",
         )
@@ -1875,11 +1550,9 @@ mod tests {
         let src = staging.path().join("01 - Track One.flac");
         write_minimal_flac(&src); // 16-bit — strictly worse
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let dests = copy_to_library(
             std::slice::from_ref(&src),
             library.path(),
-            pattern,
             "Test Artist",
             "Test Album",
         )
@@ -1913,11 +1586,9 @@ mod tests {
         let src = staging.path().join("01 - Track One.flac");
         write_minimal_flac(&src);
 
-        let pattern = "%artist%/%album%/%track% - %title%.%ext%";
         let dests = copy_to_library(
             std::slice::from_ref(&src),
             library.path(),
-            pattern,
             "Test Artist",
             "Test Album",
         )
@@ -1984,10 +1655,10 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_lesser_quality_reports_a_pattern_that_misses_the_album_folder() {
-        // A pattern that does not keep <artist>/<album> copies elsewhere, so the
-        // walk finds no album directory: the caller logs the error and the old
-        // files stay where they are.
+    fn test_delete_lesser_quality_reports_an_album_folder_that_holds_no_files() {
+        // A folder the album no longer occupies holds no files, so the walk finds no
+        // album directory: the caller logs the error and the old files stay where
+        // they are.
         let dir = TempDir::new().unwrap();
         let library_root = dir.path();
         let misplaced = library_root.join("Artist - Album");

@@ -205,7 +205,7 @@ pub(crate) fn filter_results_with_queue_limit(
 /// the library already holds its own track 1, and the upgrade only replaces the
 /// files that failed the quality gate, so a peer delivering just those files is a
 /// legitimate source. This mirrors where the post-download gate applies the anchor
-/// (`library_write_refusal` on the placement and organize paths) and where it does
+/// (`library_write_refusal` on the placement path) and where it does
 /// not (the upgrade path's `expected_tracks`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrackOneAnchor {
