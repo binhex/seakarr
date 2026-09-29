@@ -327,7 +327,7 @@ folder whose name sanitisation rewrote, is no longer swept automatically.
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `max_cycle_downloads` | Download attempts allowed per run. `0` means unlimited. Only work that reached the download stage is charged: albums skipped because they are already present, albums already recorded as processed, and albums whose search produced no admissible candidate all cost nothing. A transfer that fails is charged and retried on a later run, so a cluster of permanently unavailable albums can consume successive runs before later artists are reached. | `5` |
-| `exclude_artists` | Artist names skipped before any MusicBrainz lookup, matched as whole names ignoring case and spacing, which prevents aggregator folders from expanding into hundreds of releases when `compilation` or `live_album` is enabled. An explicit `--artist` overrides this list for that one artist. | `[Various Artists, VA, Unknown Artist]` |
+| `exclude_artists` | Artist names skipped before any MusicBrainz lookup, matched as whole names ignoring case, spacing and apostrophe variants (`Guns N’ Roses` matches `Guns N' Roses`), which prevents aggregator folders from expanding into hundreds of releases when `compilation` or `live_album` is enabled. An explicit `--artist` overrides this list for that one artist. | `[Various Artists, VA, Unknown Artist]` |
 
 An album counts as present when a matching `artist/album` folder holds at least
 one audio file. Both halves are matched under two spellings, because the two
@@ -335,26 +335,53 @@ sides are written by different owners: the album matches on its embedded album
 tag **or** on any album folder the scan found it in, and the artist matches on
 its tag spelling **or** on the artist folder the albums were found in. That is
 what lets a placed album stay present when a peer's tag spells the title
-differently from the MusicBrainz title the folder was named from. Matching is
-exact after case, spacing, and Unicode folding, and
-after the name sanitiser has run on both sides: the folder seakarr writes has
-been through it, so a title such as `Tronic Jazz: The Berlin Sessions` is stored
-as `Tronic Jazz The Berlin Sessions` and still satisfies the MusicBrainz title it
-came from. Punctuation the sanitiser leaves alone stays significant, so an album
-held only under a spelling that differs in both the tag and the folder name — a
-deluxe or remastered edition, for example — does not satisfy the plain album;
-the one exception is a folder that itself carries the plain title, which counts
-even when the files inside are tagged as an edition, because that folder name is
-what the write path took from the MusicBrainz title.
-The sanitised key is lossy, so the reverse can also happen: two release titles
-that differ only by a character it removes share one key, and holding one of them
-makes the other look present, so discover skips it.
-Quality is not considered: replacing lossy files remains `auto` mode's job. The
-match is a whole title, so a folder that also carries a release year, the artist
-name, or a format label (`2006 - Days to Come`, `Days to Come - Bonobo`,
-`Days to Come [FLAC]`) is a different key from the plain title MusicBrainz
-reports, and discover can place one extra copy beside it; keeping folder names
-close to the MusicBrainz title avoids that.
+differently from the MusicBrainz title the folder was named from.
+
+Album presence uses the same album identity the search side groups a peer's
+folders with, so every spelling one release is known by satisfies it: the
+apostrophe variants (`Sgt. Pepper’s`, `Sgt. Pepper's`, `Sgt. Peppers`), a
+separator mark used as a word boundary (`Abbey-Road` is `Abbey Road`), Unicode
+letter folds, and the metadata a peer folder carries — a *leading* or bracketed
+release year (`2006 - Days to Come`, `Days to Come (2006)`; a trailing bare year
+stays significant, see the FAQ below), the artist name, a format label
+(`Days to Come - Bonobo`, `Days to Come [FLAC]`), and any bracketed text whose
+words are not in the edition list below. Two titles that share this identity are
+one album, so holding one of them makes the other look present and discover skips
+it. This is what stops an album being downloaded once per spelling of its title.
+
+Edition markers are the exception and stay significant. The complete list is
+`deluxe`, `remaster`, `remastered`, `edition`, `limited`, `anniversary`,
+`reissue`, `expanded`, `special`, `collector`, `live`, `instrumental`,
+`acoustic`, `demo`, `single`, `version`, `remix`, `remixes`, `session`,
+`sessions`, `tour`, `part`, `mix` and `mixtape`; a title or bracket naming any of
+them is a different album from the plain one, so an edition does not satisfy the
+plain album and the plain album is still downloaded when only an edition is held.
+A folder that itself carries the plain title counts even when the files inside are
+tagged as an edition, because that folder name is what the write path took from
+the MusicBrainz title.
+
+The list is what makes the exception work, so the consequence is worth stating: a
+bracket whose words are *not* in it — `Album (Bonus Tracks)`, `Album (Disc 2)`,
+`Album (B-Sides)` — carries no edition marker and folds into the plain `Album`.
+Holding only such a spelling therefore makes the plain album look present, and the
+plain album is not downloaded; the reverse holds too.
+
+Artist identity is narrower than album identity and keeps punctuation
+significant: it folds case, width and the apostrophe marks — ASCII `'`, the
+typographic `‘`, `’`, `‚`, `‛`, the modifier letters `ʻ`, `ʼ`, `ʾ`, `ʿ`, `ʹ`,
+`՚`, `᾽`, `′`, the fullwidth `＇`, the combining comma above (U+0313) and
+reversed comma above (U+0314), the Hebrew geresh (U+05F3), a backtick and an
+acute accent all fold away — so the library's `Guns 'n' Roses` resolves against
+MusicBrainz's `Guns N’ Roses`, while `AC/DC` and `AC DC` remain distinct names
+*for this key*. It is the key used to match a whole artist name in
+`discover.exclude_artists`, `discography.artist_mbids` and the discography and
+failure caches. Two other artist matchers are deliberately looser: the peer-folder
+gate on a search result (`artist_directory_matches`) and the processed-history
+reconciliation key both fold `&` to `and` and ignore word order, so each
+conflates `AC/DC` with `AC DC` and treats `Roses & Guns` as `Guns and Roses`; the
+processed-history key is the one also used for the stored records.
+
+Quality is not considered: replacing lossy files remains `auto` mode's job.
 
 An artist that MusicBrainz cannot resolve to exactly one candidate is recorded
 for `discography.failure_cache_days`, and a later run skips the lookup for it
@@ -924,7 +951,8 @@ Artist-only manual runs resolve the artist on MusicBrainz and process conceptual
 arbitrary Soulseek folders:
 
 - Automatic resolution accepts only candidates whose canonical MusicBrainz name matches exactly. Matching uses
-  Unicode NFKC normalization, lowercase conversion, trimming, and whitespace collapse, but punctuation stays
+  Unicode NFKC normalization, case folding, apostrophe and width folding, and whitespace collapse, so a library
+  folder spelled `Guns 'n' Roses` resolves against MusicBrainz's `Guns N’ Roses`; other punctuation stays
   significant, so `AC/DC` and `AC DC` are distinct. One exact match is used directly. When several canonical
   exact names match, seakarr selects one only when it is uniquely dominant: a MusicBrainz search score of 100
   with a lead of at least 10 points over the runner-up. Tied top scores, a score below 100, and a margin below
@@ -941,9 +969,10 @@ arbitrary Soulseek folders:
 - Release-group browse requests use MusicBrainz `release-group-status=website-default`, which excludes
   promotional, bootleg, and pseudo-release-only groups while keeping a conceptual album that also has an
   official release.
-- Conceptual albums are deduplicated by normalized title and processed oldest first, so different editions or
-  remasters of the same album produce one targeted `Artist Album` search. Undated albums are processed after
-  dated ones, sorted by title.
+- Conceptual albums are deduplicated by album identity — the same fold the presence check uses — and processed
+  oldest first, so the several ways MusicBrainz spells one album (a leading or bracketed release year, a format
+  label) produce one targeted `Artist Album` search. A name carrying an edition marker from the list in the
+  matching section stays a separate target. Undated albums are processed after dated ones, sorted by title.
 - Each eligible album runs through the existing targeted search cascade sequentially; an album whose run ends in a
   failed download or no usable candidate does not block the remaining albums, and cancellation stops scheduling later
   ones. A search-stage error (a lost session, for example) does abort the rest of the artist's albums, because the

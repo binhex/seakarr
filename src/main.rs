@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use seakarr::client::{RealClient, SoulseekClient};
+use seakarr::client::SoulseekClient;
 use seakarr::config::{CliOverrides, Config};
 use seakarr::db::Database;
 use seakarr::error::{Result, SeakarrError};
@@ -137,7 +137,7 @@ fn main() {
     // spawns. `exit_code_after_run` bypasses the runtime drop (see its doc
     // comment), so the runtime is never waited on after the run finishes.
     let runtime = tokio::runtime::Runtime::new().expect("failed to initialise tokio runtime");
-    std::process::exit(exit_code_after_run(runtime.block_on(run())));
+    std::process::exit(exit_code_after_run(runtime.block_on(run(cli))));
 }
 
 /// Map a run result to a process exit code, printing the error on failure.
@@ -159,9 +159,45 @@ fn exit_code_after_run(result: Result<()>) -> i32 {
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// The client `run` drives during startup: the shared [`SoulseekClient`]
+/// behaviour plus the peer cap, which only the real client can apply. Declared
+/// here rather than added to the library's public trait so the public surface
+/// stays unchanged.
+///
+/// [`SoulseekClient`]: seakarr::client::SoulseekClient
+#[async_trait::async_trait]
+trait StartupClient: seakarr::client::SoulseekClient {
+    async fn apply_max_peers(&self, max_peers: usize) -> Result<()>;
+}
 
+#[async_trait::async_trait]
+impl StartupClient for seakarr::client::RealClient {
+    async fn apply_max_peers(&self, max_peers: usize) -> Result<()> {
+        self.set_max_peers(max_peers).await
+    }
+}
+
+/// Builds the client `run` logs in with.
+///
+/// Production always builds a [`RealClient`](seakarr::client::RealClient) from
+/// the loaded config; a test substitutes a double, which is what makes the
+/// post-login wiring (peer-cap re-apply, the schedule/dispatch branch, PID
+/// release) reachable without a Soulseek server.
+type ClientFactory = Box<dyn Fn(&Config) -> Box<dyn StartupClient>>;
+
+fn real_client_factory(config: &Config) -> Box<dyn StartupClient> {
+    Box::new(seakarr::client::RealClient::from_config(config))
+}
+
+/// Program-internal entry point: run one execution with the production client.
+async fn run(cli: Cli) -> Result<()> {
+    run_with(cli, Box::new(real_client_factory)).await
+}
+
+/// Run one execution: load the config, resolve the mode, install logging, and
+/// dispatch. Takes the parsed `Cli` rather than parsing argv itself, so a test
+/// can drive the startup path without inheriting the test harness's arguments.
+async fn run_with(cli: Cli, client_factory: ClientFactory) -> Result<()> {
     if cli.daemon {
         eprintln!(
             "warning: --daemon is deprecated; use --schedule; \
@@ -207,7 +243,15 @@ async fn run() -> Result<()> {
 
     let (console_filter, console_handle) =
         tracing_subscriber::reload::Layer::new(console_targets(true));
-    tracing_subscriber::registry()
+    // `try_init` rather than `init`: a global subscriber can be installed only
+    // once per process, and `init` panics on a second call. Production installs
+    // it exactly once, but a test that drives `run` directly shares its process
+    // with every other test.
+    //
+    // A failure is reported rather than swallowed: if the subscriber could not
+    // be installed the process would otherwise run with no console output and no
+    // file log, and nothing at all would say so.
+    if let Err(error) = tracing_subscriber::registry()
         .with(env_filter)
         .with(
             fmt::Layer::new()
@@ -219,7 +263,10 @@ async fn run() -> Result<()> {
                 .with_writer(file_appender)
                 .with_ansi(false),
         )
-        .init();
+        .try_init()
+    {
+        eprintln!("seakarr: logging subscriber was not installed: {error}");
+    }
     seakarr::scan_progress::install_console_filter(std::sync::Arc::new(ConsoleFilterFn(
         move |enabled: bool| {
             if let Err(error) = console_handle.modify(|targets| *targets = console_targets(enabled))
@@ -263,7 +310,7 @@ async fn run() -> Result<()> {
         "Connecting to Soulseek server {}...",
         config.soulseek.server
     );
-    let client = RealClient::from_config(&config);
+    let client = client_factory(&config);
     if let Err(e) = client
         .login(
             &config.soulseek.username,
@@ -282,13 +329,17 @@ async fn run() -> Result<()> {
     }
     tracing::info!("Connected to Soulseek.");
 
-    if let Err(e) = client.set_max_peers(config.soulseek.max_peers).await {
+    if let Err(e) = client.apply_max_peers(config.soulseek.max_peers).await {
         // The lock was acquired above; a failure here must not leave it behind.
         if let Err(release_err) = release_pid_lock(&pid_file) {
             tracing::warn!("Failed to release PID file after client setup error: {release_err}");
         }
         return Err(e);
     }
+
+    // The shared trait surface is what scheduling and dispatch need; the peer
+    // cap above is the only startup-specific call.
+    let dispatch_client: &dyn seakarr::client::SoulseekClient = &*client;
 
     if config.schedule.enabled {
         let interval_mins = config.schedule.interval_mins;
@@ -298,11 +349,24 @@ async fn run() -> Result<()> {
         let interval = schedule_interval(interval_mins)?;
         // --ignore-processed + schedule was rejected during mode validation, so
         // the scheduled path always dispatches with false.
-        run_schedule(&client, &config, &db, &pid_file, interval, &execution_plan).await
+        run_schedule(
+            dispatch_client,
+            &config,
+            &db,
+            &pid_file,
+            interval,
+            &execution_plan,
+        )
+        .await
     } else {
-        let result =
-            dispatch_execution_plan(&client, &execution_plan, &config, &db, cli.ignore_processed)
-                .await;
+        let result = dispatch_execution_plan(
+            dispatch_client,
+            &execution_plan,
+            &config,
+            &db,
+            cli.ignore_processed,
+        )
+        .await;
         release_pid_lock(&pid_file)?;
         result
     }
@@ -920,6 +984,20 @@ mod tests {
     }
 
     #[test]
+    fn schedule_interval_rejects_a_span_that_cannot_be_expressed_in_seconds() {
+        // u64::MAX minutes is ~3.5e17 years: the multiply overflows, and the run
+        // must report a named configuration error rather than wrap to a tiny
+        // interval and busy-loop.
+        let error = schedule_interval(u64::MAX).expect_err("an overflowing interval must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("schedule.interval_mins is too large"),
+            "the error must name the setting, got {error}"
+        );
+    }
+
+    #[test]
     fn finish_scheduled_shutdown_removes_pid_file() {
         let temp = TempDir::new().unwrap();
         let pid_file = temp.path().join("seakarr.pid");
@@ -928,6 +1006,61 @@ mod tests {
         finish_scheduled_shutdown(&pid_file, "test signal").unwrap();
 
         assert!(!pid_file.exists());
+    }
+
+    #[test]
+    fn pid_lock_refuses_a_pid_path_that_cannot_be_read() {
+        // A directory at the PID path: POSIX checks O_CREAT|O_EXCL before the
+        // open flags that would otherwise reject a directory, so `create_new`
+        // reports AlreadyExists (measured: EEXIST on Linux), and reading the path
+        // as a PID then fails. Liveness cannot be verified, so the lock must
+        // refuse rather than overwrite a possibly-live lock.
+        let temp = TempDir::new().unwrap();
+        let pid_file = temp.path().join("seakarr.pid");
+        std::fs::create_dir(&pid_file).unwrap();
+
+        let error =
+            acquire_pid_lock(&pid_file).expect_err("an unreadable PID path must be refused");
+        assert!(
+            matches!(error, SeakarrError::PidLock(_)),
+            "expected a PidLock error, got {error:?}"
+        );
+        assert!(
+            pid_file.is_dir(),
+            "refusing the lock must leave the path untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discover_plan_dispatches_to_the_discover_runner() {
+        // Discover refuses a plan it cannot serve. This fixture keeps the
+        // default (enabled) discography and clears the library paths, so the
+        // refusal must be the library one - the discography check runs first and
+        // would otherwise mask it.
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.notifications.urls = vec![];
+        config.library.paths.clear();
+        assert!(
+            config.discography.enabled,
+            "the fixture must exercise the library refusal, not the discography one"
+        );
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Discover { artist: None };
+
+        let error = dispatch_execution_plan(&client, &plan, &config, &db, false)
+            .await
+            .expect_err("discover without a library must be refused");
+        assert!(
+            error.to_string().contains("library.paths is empty"),
+            "the refusal must name the missing library, got {error}"
+        );
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a refused plan must not search before it refuses"
+        );
     }
 
     #[cfg(unix)]
@@ -1415,6 +1548,476 @@ mod tests {
         assert_eq!(exit_code_after_run(Ok(())), 0);
         let err: Result<()> = Err(SeakarrError::Config("bad".into()));
         assert_eq!(exit_code_after_run(err), 1);
+    }
+
+    /// A config that starts a real run but can never reach a Soulseek server:
+    /// the server address cannot be parsed, so `login` fails before any connect
+    /// attempt and the test costs no wall-clock time. Every path the run writes
+    /// to — database, pid, logs and staging — lives under `dir`, so the run
+    /// touches nothing outside it.
+    fn run_config_fixture(dir: &std::path::Path, library_paths: &[std::path::PathBuf]) -> Cli {
+        let library = if library_paths.is_empty() {
+            String::new()
+        } else {
+            let entries: Vec<String> = library_paths
+                .iter()
+                .map(|path| format!("\n    - {}", path.display()))
+                .collect();
+            format!("library:\n  paths:{}", entries.concat())
+        };
+        let yaml = format!(
+            "soulseek:\n  username: test-user\n  password: test-pass\n  server: \"no-port\"\n  \
+             listen_port: 0\n  max_peers: 1\n  login_retries: 1\n  login_retry_delay_secs: 0\n\
+             database:\n  path: {dir}/db\n\
+             pid:\n  path: {dir}/pid\n  file: seakarr.pid\n\
+             storage:\n  staging_dir: {dir}/staging\n\
+             logging:\n  level: INFO\n  path: {dir}/logs\n  file: seakarr.log\n{library}\n",
+            dir = dir.display()
+        );
+        std::fs::write(dir.join("seakarr.yml"), yaml).expect("fixture config must be writable");
+        Cli {
+            config_path: dir.to_path_buf(),
+            log_path: None,
+            log_level: None,
+            db_path: None,
+            pid_path: None,
+            library_path: None,
+            soulseek_user: None,
+            soulseek_password: None,
+            listen_port: None,
+            mode: None,
+            batch_file: None,
+            artist: None,
+            album: None,
+            test: false,
+            schedule: false,
+            daemon: false,
+            ignore_processed: false,
+        }
+    }
+
+    // `main` cannot be driven from a test (it calls `std::process::exit`), and
+    // `run` used to parse argv itself, so the real startup sequence below config
+    // loading was never executed by any test. It takes the parsed CLI now, which
+    // makes that sequence — logging setup, mode resolution, validation, database
+    // open, PID lock, login, lock release — reachable.
+    #[tokio::test]
+    async fn run_in_test_mode_validates_the_configuration_and_exits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A library path that does not exist: `--test` warns rather than fails.
+        let cli = run_config_fixture(dir.path(), &[dir.path().join("absent-library")]);
+
+        run(Cli { test: true, ..cli })
+            .await
+            .expect("--test must return Ok for a structurally valid configuration");
+    }
+
+    /// A startup client double: a [`MockClient`] that records the peer cap the
+    /// run applied and can be told to reject it, so the post-login wiring is
+    /// reachable without a Soulseek server.
+    struct StartupDouble {
+        inner: MockClient,
+        applied: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        searches: std::sync::Arc<std::sync::Mutex<usize>>,
+        reject_cap: bool,
+        fail_search: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SoulseekClient for StartupDouble {
+        async fn login(
+            &self,
+            username: &str,
+            password: &str,
+            server: &str,
+            listen_port: u16,
+        ) -> Result<()> {
+            self.inner
+                .login(username, password, server, listen_port)
+                .await
+        }
+
+        async fn search(
+            &self,
+            query: &str,
+            timeout_secs: u64,
+        ) -> Result<Vec<seakarr::client::SearchResult>> {
+            *self.searches.lock().unwrap() += 1;
+            if self.fail_search {
+                return Err(SeakarrError::Disconnected {
+                    reason: "injected search failure".into(),
+                });
+            }
+            self.inner.search(query, timeout_secs).await
+        }
+
+        async fn download(
+            &self,
+            file: &seakarr::client::FileInfo,
+            username: &str,
+            dir: &Path,
+        ) -> Result<seakarr::client::DownloadHandle> {
+            self.inner.download(file, username, dir).await
+        }
+
+        async fn request_queue_position(&self, username: &str, filename: &str) -> bool {
+            self.inner.request_queue_position(username, filename).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StartupClient for StartupDouble {
+        async fn apply_max_peers(&self, max_peers: usize) -> Result<()> {
+            self.applied.lock().unwrap().push(max_peers);
+            if self.reject_cap {
+                return Err(SeakarrError::Client("peer cap rejected".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A batch plan that dispatches without touching the network or a library.
+    fn batch_fixture(dir: &std::path::Path) -> Cli {
+        let batch_path = dir.join("wantlist.txt");
+        std::fs::write(&batch_path, "Artist - Album\n").expect("batch fixture must be writable");
+        let mut cli = run_config_fixture(dir, &[]);
+        cli.mode = Some("batch".into());
+        cli.batch_file = Some(batch_path);
+        cli
+    }
+
+    fn startup_factory(
+        applied: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        reject_cap: bool,
+        fail_search: bool,
+    ) -> ClientFactory {
+        startup_factory_watching(
+            applied,
+            std::sync::Arc::new(std::sync::Mutex::new(0usize)),
+            reject_cap,
+            fail_search,
+        )
+    }
+
+    /// As [`startup_factory`], but also sharing a counter of the searches the
+    /// double has been asked to run, so a caller can tell when a scheduled cycle
+    /// has started.
+    fn startup_factory_watching(
+        applied: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        searches: std::sync::Arc<std::sync::Mutex<usize>>,
+        reject_cap: bool,
+        fail_search: bool,
+    ) -> ClientFactory {
+        Box::new(move |_config| {
+            Box::new(StartupDouble {
+                inner: MockClient::new(),
+                applied: std::sync::Arc::clone(&applied),
+                searches: std::sync::Arc::clone(&searches),
+                reject_cap,
+                fail_search,
+            })
+        })
+    }
+
+    /// A scheduled run's config: a manual plan over an empty library, a staging
+    /// dir inside `dir`, and a one-minute interval.
+    fn schedule_run_config_fixture(dir: &std::path::Path) -> Cli {
+        let cli = run_config_fixture(dir, &[]);
+        let mut yaml = std::fs::read_to_string(dir.join("seakarr.yml"))
+            .expect("the base fixture config must exist");
+        yaml.push_str(
+            "schedule:\n  enabled: true\n  interval_mins: 1\n\
+             download:\n  concurrent: 2\n  min_upload_speed_kbps: 0\n  \
+             speed_check_wait_secs: 0\n  max_retries: 1\n  retry_delay_secs: 0\n\
+             notifications:\n  urls: []\n\
+             filters:\n  min_tracks: 0\n",
+        );
+        std::fs::write(dir.join("seakarr.yml"), yaml)
+            .expect("the schedule config must be writable");
+        Cli {
+            mode: Some("manual".into()),
+            artist: Some("Michael Bolton".into()),
+            album: Some("The Essential Michael Bolton".into()),
+            ..cli
+        }
+    }
+
+    // The scheduled branch of the startup path — interval construction and the
+    // handover to `run_schedule` — returns only when a signal arrives, so it can
+    // only be reached from a real signalled process. The child signals ITSELF
+    // once the first cycle has started searching, which is deterministic: the
+    // scheduler installs its SIGTERM listener before the first cycle, so the
+    // signal cannot be lost to the default disposition.
+    // Unix-only: it raises a real SIGTERM and uses the `#[cfg(unix)]`
+    // `receive_child_marker` helper and `libc::kill`.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_a_scheduled_plan_releases_the_pid_lock_on_a_real_signal() {
+        if let Ok(marker) = std::env::var("SEAKARR_RUN_SCHEDULE_CHILD") {
+            let dir = std::path::PathBuf::from(
+                std::env::var("SEAKARR_RUN_SCHEDULE_DIR").expect("child needs its directory"),
+            );
+            let cli = schedule_run_config_fixture(&dir);
+            let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let searches = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let factory = startup_factory_watching(
+                    std::sync::Arc::clone(&applied),
+                    std::sync::Arc::clone(&searches),
+                    false,
+                    false,
+                );
+                let scheduled = run_with(cli, factory);
+                tokio::pin!(scheduled);
+                loop {
+                    tokio::select! {
+                        result = scheduled.as_mut() => {
+                            panic!("the schedule ended before it was signalled: {result:?}")
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                            if *searches.lock().unwrap() > 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+
+                scheduled
+                    .await
+                    .expect("a signalled scheduled run must finish cleanly");
+            });
+
+            assert!(
+                !dir.join("pid").join("seakarr.pid").exists(),
+                "{marker} must remove the PID file"
+            );
+            println!("PID_REMOVED");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("tests::run_with_a_scheduled_plan_releases_the_pid_lock_on_a_real_signal")
+            .arg("--nocapture")
+            .env("SEAKARR_RUN_SCHEDULE_CHILD", "SIGTERM")
+            .env("SEAKARR_RUN_SCHEDULE_DIR", dir.path())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn the scheduled child");
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                if sender.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stopped =
+            receive_child_marker(&receiver, "PID_REMOVED", std::time::Duration::from_secs(30));
+        if !stopped {
+            // The child loops until it has issued a search, so a run that stalls
+            // would block this test - and with it the whole bin test binary -
+            // forever. Kill it before reporting, as the sibling signal test does.
+            let _ = child.kill();
+        }
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+
+        assert!(
+            stopped,
+            "the signalled scheduled run must release the PID file"
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "a signalled scheduled run must exit cleanly"
+        );
+    }
+
+    // With this seam the post-login wiring is reachable: the run logs in,
+    // re-applies the configured peer cap, dispatches, and releases the PID lock.
+    #[tokio::test]
+    async fn run_applies_the_peer_cap_and_dispatches_after_a_successful_login() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = batch_fixture(dir.path());
+        let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        run_with(
+            cli,
+            startup_factory(std::sync::Arc::clone(&applied), false, false),
+        )
+        .await
+        .expect("a batch plan over an empty library must dispatch");
+
+        assert_eq!(
+            applied.lock().unwrap().as_slice(),
+            [1],
+            "the configured soulseek.max_peers must be applied to the fresh client"
+        );
+        assert!(
+            !dir.path().join("pid").join("seakarr.pid").exists(),
+            "a completed run must release the PID lock"
+        );
+    }
+
+    // A peer cap the client refuses must abort the run and still release the PID
+    // lock, or a later run would refuse to start against a stale PID file.
+    #[tokio::test]
+    async fn run_releases_the_pid_lock_when_the_peer_cap_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = batch_fixture(dir.path());
+        let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let error = run_with(
+            cli,
+            startup_factory(std::sync::Arc::clone(&applied), true, false),
+        )
+        .await
+        .expect_err("a rejected peer cap must fail the run");
+
+        assert!(
+            matches!(error, SeakarrError::Client(_)),
+            "the rejection reason must surface, got {error:?}"
+        );
+        assert!(
+            !dir.path().join("pid").join("seakarr.pid").exists(),
+            "a failed client setup must not leave an orphaned PID file behind"
+        );
+    }
+
+    // A batch line whose album cannot be processed must be reported and must not
+    // abort the run; the PID lock is still released.
+    #[tokio::test]
+    async fn a_failed_batch_line_does_not_abort_the_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = batch_fixture(dir.path());
+        let applied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        run_with(cli, startup_factory(applied, false, true))
+            .await
+            .expect("a failing album must be reported rather than abort the run");
+
+        assert!(
+            !dir.path().join("pid").join("seakarr.pid").exists(),
+            "a run with a failed album must still release the PID lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_real_startup_client_applies_the_cap_through_the_production_impl() {
+        // The production `StartupClient` impl delegates to `RealClient`. With no
+        // logged-in session it must report that, not silently succeed, so a
+        // mis-wired cap can never look applied.
+        let client = seakarr::client::RealClient::new();
+
+        let error = StartupClient::apply_max_peers(&client, 4)
+            .await
+            .expect_err("applying a cap without a session must fail");
+
+        assert!(
+            error.to_string().contains("not connected"),
+            "the error must say the session is missing, got {error}"
+        );
+    }
+
+    // `run` installs a console filter whose toggle closure reloads the tracing
+    // layer. That filter is process-global and set-once, so which installation
+    // wins depends on test order and the reload handle may already be detached
+    // from the active subscriber. This pins only what is observable either way:
+    // the filter is retrievable after a run and toggling it is panic-free. It is
+    // NOT evidence that the reload is live, and no assertion here would catch a
+    // broken reload.
+    #[tokio::test]
+    async fn the_installed_console_filter_can_be_toggled_after_a_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = run_config_fixture(dir.path(), &[]);
+        run(Cli { test: true, ..cli })
+            .await
+            .expect("--test must install the console filter and exit");
+
+        let filter = seakarr::scan_progress::installed_console_filter()
+            .expect("a run installs the console filter");
+        filter.set_console_heartbeat(false);
+        filter.set_console_heartbeat(true);
+    }
+
+    #[tokio::test]
+    async fn run_releases_the_pid_lock_when_the_login_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = run_config_fixture(dir.path(), &[]);
+
+        let error = run(cli)
+            .await
+            .expect_err("an unusable server must fail the run");
+
+        assert!(
+            matches!(
+                error,
+                SeakarrError::Client(_)
+                    | SeakarrError::Disconnected { .. }
+                    | SeakarrError::Auth { .. }
+            ),
+            "a login failure must surface as a client, disconnected or auth error, got {error:?}"
+        );
+        assert!(
+            dir.path().join("db").join("seakarr.db").is_file(),
+            "the run reached login, which happens after the database is opened"
+        );
+        assert!(
+            !dir.path().join("pid").join("seakarr.pid").exists(),
+            "a failed login must not leave an orphaned PID file behind"
+        );
+    }
+
+    // Ordering evidence the assertion above cannot give: a live PID lock conflict
+    // must be refused, and the database must already exist when it is, proving
+    // the database is opened BEFORE the lock is taken. `run_with` promises that
+    // order so "database errors should not leave a stale pid".
+    #[tokio::test]
+    async fn the_database_is_opened_before_the_pid_lock_is_taken() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cli = run_config_fixture(dir.path(), &[]);
+        // A PID file naming this live process: the lock must refuse it.
+        std::fs::create_dir_all(dir.path().join("pid")).unwrap();
+        std::fs::write(
+            dir.path().join("pid").join("seakarr.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let error = run_with(
+            cli,
+            startup_factory(
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect_err("a live PID lock must be refused");
+
+        assert!(
+            matches!(error, SeakarrError::PidLock(_)),
+            "expected a PidLock error, got {error:?}"
+        );
+        assert!(
+            dir.path().join("db").join("seakarr.db").is_file(),
+            "the database must be open before the lock is refused"
+        );
     }
 
     #[test]

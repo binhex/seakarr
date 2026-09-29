@@ -886,4 +886,79 @@ mod tests {
             "deleting an absent row reports false"
         );
     }
+
+    #[test]
+    fn open_creates_migrates_and_reopens_an_on_disk_database() {
+        // `open` is the only production entry point, and every other test in this
+        // module uses the in-memory variant, so the on-disk path was never
+        // exercised: directory creation, file creation, migration, and the
+        // idempotent re-open that a second run performs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_dir = dir.path().join("appdata").join("data");
+        let config = DatabaseConfig {
+            path: db_dir.to_string_lossy().into_owned(),
+        };
+
+        let db = Database::open(&db_dir, &config).expect("open must create and migrate");
+        assert!(
+            db_dir.join("seakarr.db").is_file(),
+            "open must create the database file"
+        );
+        db.mark_album_processed("Artist", "Album", "success")
+            .unwrap();
+        assert!(db.is_album_processed("artist", "album").unwrap());
+
+        // A second run opens the same directory again; migration is idempotent
+        // and the rows written by the first run are still there.
+        drop(db);
+        let reopened = Database::open(&db_dir, &config).expect("re-open must succeed");
+        assert!(
+            reopened.is_album_processed("artist", "album").unwrap(),
+            "an existing database keeps its rows across a re-open"
+        );
+    }
+
+    #[test]
+    fn open_reports_a_config_error_when_the_directory_cannot_be_created() {
+        // A `database.path` that points at an existing file cannot become a
+        // directory. The failure must be a typed Config error naming the path,
+        // not a panic and not a bare I/O error.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("seakarr.yml");
+        std::fs::write(&file_path, b"not a directory").unwrap();
+        let config = DatabaseConfig {
+            path: file_path.to_string_lossy().into_owned(),
+        };
+
+        let error = Database::open(&file_path, &config)
+            .err()
+            .expect("a path that is a file cannot be a database directory");
+        let SeakarrError::Config(message) = &error else {
+            panic!("expected a Config error, got {error:?}");
+        };
+        assert!(
+            message.contains("cannot create db dir"),
+            "the error must name the failing directory: {message}"
+        );
+    }
+
+    #[test]
+    fn migrate_reports_an_error_when_the_database_is_not_writable() {
+        // A read-only database file (a read-only mount, or a permissions
+        // mistake) must surface a typed error from `migrate` rather than
+        // panicking on the schema batch.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("seakarr.db");
+        std::fs::write(&path, b"").unwrap();
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("a read-only connection to an empty database file opens");
+
+        let error = Database { conn }
+            .migrate()
+            .expect_err("a read-only database cannot be migrated");
+        assert!(
+            matches!(error, SeakarrError::Database(_)),
+            "expected a Database error, got {error:?}"
+        );
+    }
 }

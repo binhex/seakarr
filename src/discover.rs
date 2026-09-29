@@ -13,22 +13,24 @@ use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
 use crate::config::Config;
-use crate::discography::{normalize_album_key, normalize_catalog_key, AlbumTarget};
+use crate::discography::{normalize_catalog_key, AlbumTarget};
 use crate::error::{Result, SeakarrError};
 use crate::organizer::sanitize_component;
 use crate::scanner::ScannedAlbum;
+use crate::search::album_identity_key;
 
-/// One library artist: every spelling seen, and the normalised album titles.
+/// One library artist: every spelling seen, and the album identities held for it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct IndexedArtist {
     /// Original spelling to number of albums seen under it.
     spellings: BTreeMap<String, usize>,
-    /// Normalised album titles, from the embedded tag when one is present.
+    /// Album identity keys, from the embedded tag when one is present.
     albums: BTreeSet<String>,
-    /// Normalised **on-disk album folder names**, the tag spelling included. A
-    /// folder this program placed is named from the MusicBrainz title while the
-    /// audio inside carries the peer's own tag, so presence has to accept
-    /// either spelling or it keeps treating its own placement as missing.
+    /// Album identity keys of the **on-disk album folder names**, the tag
+    /// spelling included. A folder this program placed is named from the
+    /// MusicBrainz title while the audio inside carries the peer's own tag, so
+    /// presence has to accept either spelling or it keeps treating its own
+    /// placement as missing.
     album_folders: BTreeSet<String>,
     /// Normalised on-disk artist folder names this artist's albums were found
     /// under. Presence follows them, scoped to what each folder holds, so an
@@ -45,7 +47,9 @@ struct IndexedArtist {
     destinations: BTreeMap<(PathBuf, String), usize>,
 }
 
-/// What the library already holds, keyed exactly like MusicBrainz catalog keys.
+/// What the library already holds. Artist keys are MusicBrainz catalog keys;
+/// album keys are album identities, so every spelling of one release shares an
+/// entry.
 ///
 /// Built from one `scanner::scan_library` walk, so a nested layout such as
 /// `<root>/Genre/Artist/Album` is indexed as correctly as `<root>/Artist/Album`:
@@ -64,6 +68,24 @@ pub struct LibraryIndex {
 /// either the embedded tag or a folder the album was found in.
 fn holds_album(entry: &IndexedArtist, album_key: &str) -> bool {
     entry.albums.contains(album_key) || entry.album_folders.contains(album_key)
+}
+
+/// The album identity keys an album is present under.
+///
+/// The identity is the primary key. A second, sanitiser-folded key is included
+/// because the folder the write path created has been through
+/// [`sanitize_component`], which can fuse words the identity keeps apart:
+/// `Album:Two` is stored as `AlbumTwo`, and a title made only of removed
+/// characters is stored as the placeholder. Without that second key such an
+/// album looks absent and is selected for download again on every cycle.
+fn presence_keys(album: &str, artist: &str) -> Vec<String> {
+    let identity = album_identity_key(album, artist);
+    let sanitised = album_identity_key(&sanitize_component(album), artist);
+    if sanitised == identity {
+        vec![identity]
+    } else {
+        vec![identity, sanitised]
+    }
 }
 
 impl LibraryIndex {
@@ -89,13 +111,16 @@ impl LibraryIndex {
 
     /// True when this artist/album pair is present in the library.
     ///
-    /// Matching is a whole normalised title match, not an identity match: a
-    /// library folder carrying a release year, the artist name, or a format
-    /// label is a different key, so `2006 - Days to Come` does not satisfy the
-    /// target `Days to Come`. Punctuation stays significant by design (see the
-    /// README), and the search-side `album_identity_key` heuristic is not
-    /// applied here. The README documents the consequence: such a release can be
-    /// downloaded again and placed beside the folder that already holds it.
+    /// Matching is by album identity, the same key the search side groups peer
+    /// folders with (`album_identity_key`), so the spellings one release is
+    /// known by all satisfy it: `Sgt. Pepper’s` (U+2019), `Sgt. Pepper's`
+    /// (ASCII) and `Sgt. Peppers` are one album, and so are a leading release
+    /// year (`2006 - Days to Come`), a trailing artist name, and a format label.
+    ///
+    /// Edition markers are the exception and stay significant: `Album (Deluxe
+    /// Edition)` and `Album (Live)` remain distinct from `Album`, so an edition
+    /// does not satisfy the plain album and the plain album is still downloaded
+    /// when only an edition is held.
     ///
     /// Two spellings of each half are accepted, because the two sides of the
     /// comparison are written by different owners:
@@ -110,12 +135,12 @@ impl LibraryIndex {
     ///   on-disk folder spelling is itself a valid lookup key.
     pub fn contains_album(&self, artist: &str, album: &str) -> bool {
         let artist_key = normalize_catalog_key(artist);
-        let album_key = normalize_album_key(album);
-        if self
-            .artists
-            .get(&artist_key)
-            .is_some_and(|entry| holds_album(entry, &album_key))
-        {
+        let album_keys = presence_keys(album, artist);
+        if self.artists.get(&artist_key).is_some_and(|entry| {
+            album_keys
+                .iter()
+                .any(|album_key| holds_album(entry, album_key))
+        }) {
             return true;
         }
         // Follow the artist folders. An album whose files carry another artist
@@ -130,12 +155,16 @@ impl LibraryIndex {
         // both a folder-only artist (no entry under that spelling) and an artist
         // whose albums live in a folder named after the spelling being queried.
         let in_own_folders = self.artists.get(&artist_key).is_some_and(|entry| {
-            entry
-                .artist_folders
-                .iter()
-                .any(|folder| self.folder_holds(folder, &album_key))
+            entry.artist_folders.iter().any(|folder| {
+                album_keys
+                    .iter()
+                    .any(|album_key| self.folder_holds(folder, album_key))
+            })
         });
-        in_own_folders || self.folder_holds(&artist_key, &album_key)
+        in_own_folders
+            || album_keys
+                .iter()
+                .any(|album_key| self.folder_holds(&artist_key, album_key))
     }
 
     /// True when the folder recorded this album title inside it.
@@ -145,11 +174,11 @@ impl LibraryIndex {
             .is_some_and(|albums| albums.contains(album_key))
     }
 
-    /// Normalised tag-derived album titles for one artist key, in order.
+    /// Album identity keys derived from the tags, for one artist key, in order.
     ///
-    /// Only the tags are listed: the titles an album is also reachable under
-    /// because of the folder it sits in are presence keys, not catalog titles,
-    /// and presence accepts them through [`Self::contains_album`].
+    /// Only the tags are listed: the identities an album is also reachable
+    /// under because of the folder it sits in are presence keys stored
+    /// separately, and presence accepts them through [`Self::contains_album`].
     pub fn albums_for(&self, artist: &str) -> Option<impl Iterator<Item = &str>> {
         self.artists
             .get(&normalize_catalog_key(artist))
@@ -351,19 +380,23 @@ fn walk_artist_folders(roots: &[PathBuf]) -> BTreeMap<String, Vec<(PathBuf, Stri
     folders
 }
 
-/// Index scanned albums by normalised artist key and album title.
+/// Index scanned albums by normalised artist key and album identity.
 pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
     let mut index = LibraryIndex::default();
     for album in albums {
         let artist_key = normalize_catalog_key(&album.artist);
         // A blank title carries no album identity, so it is skipped. The check
-        // is made on the title itself rather than on the album key: the
-        // sanitiser's non-empty placeholder exists so a path component is never
-        // empty, and must not invent an album here.
-        if artist_key.is_empty() || normalize_catalog_key(&album.album).is_empty() {
+        // is made on the title itself rather than on the album key: the sanitiser's
+        // non-empty placeholder exists so a path component is never empty, and
+        // must not invent an album here. Testing the key instead would let a title
+        // that folds to an empty key be skipped while a lookup for that same title
+        // still computed a non-empty key, so the index and the presence check would
+        // disagree about the album. The artist key is checked as a key, because it
+        // is the index map key itself.
+        if artist_key.is_empty() || album.album.trim().is_empty() {
             continue;
         }
-        let album_key = normalize_album_key(&album.album);
+        let album_keys = presence_keys(&album.album, &album.artist);
         let artist_dir_keys: BTreeSet<String> = album
             .artist_dirs
             .iter()
@@ -374,12 +407,12 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
         let album_dir_keys: Vec<String> = album
             .album_dirs
             .iter()
-            .map(|dir| normalize_album_key(dir))
+            .flat_map(|dir| presence_keys(dir, &album.artist))
             .collect();
         {
             let entry = index.artists.entry(artist_key.clone()).or_default();
             *entry.spellings.entry(album.artist.clone()).or_insert(0) += 1;
-            entry.albums.insert(album_key.clone());
+            entry.albums.extend(album_keys.iter().cloned());
             entry.album_folders.extend(album_dir_keys.iter().cloned());
             entry.artist_folders.extend(artist_dir_keys.iter().cloned());
             *entry
@@ -394,7 +427,7 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
         for artist_dir_key in artist_dir_keys {
             let folder = index.folders.entry(artist_dir_key).or_default();
             folder.extend(album_dir_keys.iter().cloned());
-            folder.insert(album_key.clone());
+            folder.extend(album_keys.iter().cloned());
         }
     }
     index
@@ -402,7 +435,7 @@ pub fn build_index(albums: &[ScannedAlbum]) -> LibraryIndex {
 
 /// Remove every target the library already holds, preserving input order.
 ///
-/// Presence is a normalised title match inside the artist's own index entry: an
+/// Presence is an album-identity match inside the artist's own index entry: an
 /// album counts as present when any audio file was scanned under that
 /// artist/album directory. Quality and track count are deliberately ignored, so
 /// a partially populated album counts as present.
@@ -1077,27 +1110,18 @@ mod tests {
     // ── Presence keys survive the portable-name sanitiser ──
 
     #[test]
-    fn an_album_written_through_the_sanitiser_still_matches_its_musicbrainz_title() {
-        // The folder seakarr wrote to disk went through the path sanitiser, so
-        // the library holds "Tronic Jazz The Berlin Sessions" while MusicBrainz
-        // still reports "Tronic Jazz: The Berlin Sessions". The presence check
-        // must compare the sanitised form on both sides, or the album is
-        // downloaded again on every discover cycle.
-        let index = build_index(&[scanned(
-            "A Guy Called Gerald",
-            "Tronic Jazz The Berlin Sessions",
-        )]);
-        assert!(
-            index.contains_album("A Guy Called Gerald", "Tronic Jazz: The Berlin Sessions"),
-            "the sanitised on-disk title must satisfy the MusicBrainz title"
-        );
-    }
-
-    #[test]
     fn the_presence_key_is_symmetric_for_the_stored_and_musicbrainz_spellings() {
         // Coupling guard: whichever function the presence check uses, both the
         // on-disk (sanitised) spelling and the MusicBrainz spelling must resolve
         // to one key, from either direction of the lookup.
+        //
+        // The punctuation case is load-bearing in its own right: the library
+        // holds "Tronic Jazz The Berlin Sessions" while MusicBrainz still reports
+        // "Tronic Jazz: The Berlin Sessions". Album identity treats a separator
+        // mark as a word boundary, so both spellings satisfy one key; a
+        // comparison that kept the colon significant would download the album
+        // again on every discover cycle. This guard subsumes the single-direction
+        // check it replaced.
         let stored = build_index(&[scanned(
             "A Guy Called Gerald",
             "Tronic Jazz The Berlin Sessions",
@@ -1123,10 +1147,10 @@ mod tests {
 
     #[test]
     fn a_fullwidth_spelling_of_a_stripped_character_still_matches() {
-        // NFKC folds a compatibility variant (U+FF1A) to the character the
-        // sanitiser removes. Both sides must be folded BEFORE the sanitiser runs,
-        // or a library tagged with the fullwidth form never matches the
-        // MusicBrainz spelling and discover re-downloads the album every cycle.
+        // NFKC folds a compatibility variant (U+FF1A) to the ASCII colon that
+        // album identity treats as a word boundary, so a library tagged with the
+        // fullwidth form must still match the MusicBrainz spelling rather than
+        // re-downloading the album every cycle.
         let index = build_index(&[scanned(
             "A Guy Called Gerald",
             "Tronic Jazz\u{ff1a} The Berlin Sessions",
@@ -1165,11 +1189,10 @@ mod tests {
         // to the presence check, so the next run searched the network and
         // downloaded the whole album again.
         //
-        // The pair here differs by a curly (U+2019) versus ASCII apostrophe,
-        // which the sanitiser leaves alone (it removes only `< > : " | ? *` and
-        // control characters), so the two really are different keys; the
-        // It-Is/It's test below pins the same seam with a difference no
-        // normalisation can unify.
+        // The pair here differs by a curly (U+2019) versus ASCII apostrophe.
+        // Both spellings now share one identity key, which is what stops the
+        // re-download; the It-Is/It's test below pins the same seam with a
+        // difference no normalisation can unify.
         let library = TempDir::new().unwrap();
         let album_dir = library
             .path()
@@ -1207,11 +1230,58 @@ mod tests {
     }
 
     #[test]
+    fn an_album_held_under_an_apostrophe_less_tag_satisfies_both_musicbrainz_spellings() {
+        // The reported duplication, as the runtime log showed it. The library
+        // held Sgt. Pepper under a tag and folder that carried no apostrophe at
+        // all, while MusicBrainz reported two release groups for it: "Sgt.
+        // Pepper’s Lonely Hearts Club Band" (U+2019, 1967) and "Sgt. Pepper's
+        // Lonely Hearts Club Band" (ASCII, 2009). Neither matched the stored
+        // spelling, so both were judged missing and the album was downloaded
+        // twice, two minutes apart, into two new folders beside the copy
+        // already on disk.
+        let library = TempDir::new().unwrap();
+        let album_dir = library
+            .path()
+            .join("The Beatles")
+            .join("Sgt. Peppers Lonely Hearts Club Band");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        write_minimal_flac_with_tags(
+            &album_dir.join("01 - track.flac"),
+            "The Beatles",
+            "Sgt. Peppers Lonely Hearts Club Band",
+        );
+
+        let scanned = scan_library(
+            &[library.path().to_string_lossy().into_owned()],
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let index = build_index(&scanned);
+
+        for title in [
+            "Sgt. Pepper\u{2019}s Lonely Hearts Club Band",
+            "Sgt. Pepper's Lonely Hearts Club Band",
+        ] {
+            assert!(
+                index.contains_album("The Beatles", title),
+                "the stored spelling must satisfy {title:?}"
+            );
+            let missing = missing_albums(&index, "The Beatles", &[target(title)]);
+            assert!(
+                missing.is_empty(),
+                "an album the library holds must not be downloaded again: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_on_disk_album_folder_name_satisfies_the_title_its_tag_misspells() {
         // The seam a placement creates: the folder takes the MusicBrainz title,
         // the tag keeps the peer's spelling. A fast pin for the same behaviour
-        // the end-to-end discover run covers, including the boundary that the
-        // folder name must not make punctuation insignificant.
+        // the end-to-end discover run covers, including the boundary that a
+        // difference other than an apostrophe stays significant.
         let index = build_index(&[scanned_in(
             "Aesop Rock",
             "I Heard It's A Mess There Too",
@@ -1229,8 +1299,12 @@ mod tests {
             "the tag spelling must keep working"
         );
         assert!(
-            !index.contains_album("Aesop Rock", "I Heard Its a Mess There Too"),
-            "a third spelling must stay absent: punctuation remains significant"
+            index.contains_album("Aesop Rock", "I Heard Its a Mess There Too"),
+            "an apostrophe the spelling omits is the same album, not a second one"
+        );
+        assert!(
+            !index.contains_album("Aesop Rock", "I Heard It Is a Mess There Too"),
+            "a difference that is not an apostrophe stays significant"
         );
     }
 
@@ -1420,7 +1494,34 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_normalised_but_punctuation_stays_significant() {
+    fn an_album_whose_stored_folder_fused_its_title_still_counts_as_present() {
+        // The write path runs the folder name through the sanitiser, which
+        // REMOVES reserved characters rather than replacing them with a space, so
+        // the MusicBrainz title `Album:Two` is stored as the fused `AlbumTwo`.
+        // Presence must recognise the title that produced the folder, or the
+        // album is selected for download again on every cycle.
+        let fused = build_index(&[scanned("Artist", "AlbumTwo")]);
+        assert!(
+            fused.contains_album("Artist", "Album:Two"),
+            "the fused on-disk spelling must satisfy the title it was written from"
+        );
+
+        // A title made only of characters the sanitiser removes is stored as its
+        // non-empty placeholder, which must satisfy that title too.
+        let placeholder = build_index(&[scanned("Artist", "_")]);
+        assert!(
+            placeholder.contains_album("Artist", "???"),
+            "the placeholder folder must satisfy the title it replaced"
+        );
+    }
+
+    #[test]
+    fn keys_are_normalised_and_punctuation_is_a_word_boundary() {
+        // The artist key folds case and whitespace. The album identity folds the
+        // marks a sharer uses as separators, so "Abbey-Road" and "Abbey Road!"
+        // are the one album "Abbey Road" — presence must not treat a spelling
+        // difference as a missing album. Words that are fused rather than
+        // separated stay different titles.
         let index = build_index(&[
             scanned("  The   BEATLES ", "Abbey Road"),
             scanned("the beatles", "Abbey Road!"),
@@ -1428,28 +1529,58 @@ mod tests {
         assert_eq!(index.artist_keys().collect::<Vec<_>>(), ["the beatles"]);
         assert!(index.contains_album("THE BEATLES", "abbey road"));
         assert!(
-            index.contains_album("The Beatles", "Abbey Road!"),
-            "a punctuated title is a distinct index entry"
+            index.contains_album("The Beatles", "Abbey-Road"),
+            "a separator must not make the album look absent"
         );
         assert!(
-            !index.contains_album("The Beatles", "Abbey-Road"),
-            "punctuation must remain significant"
+            !index.contains_album("The Beatles", "Abbeyroad"),
+            "a fused word is a genuinely different title"
         );
     }
 
     #[test]
-    fn a_year_prefixed_folder_does_not_satisfy_the_plain_title() {
-        // Documented limitation (README): presence is a whole normalised title
-        // match, so a folder written as "2006 - Days to Come" is a different
-        // album from the target "Days to Come" and discover may place a second
-        // copy beside it. Folding the search-side identity heuristic in here
-        // would also make punctuation insignificant, which the README rules out.
+    fn a_year_prefixed_folder_satisfies_the_plain_title() {
+        // Presence now uses the same album identity as the search side, so the
+        // sharer-supplied metadata a folder can carry — a leading release year,
+        // a trailing artist name, a format label — no longer makes an album the
+        // library already holds look absent, and therefore downloadable again.
         let index = build_index(&[scanned("Bonobo", "2006 - Days To Come")]);
         assert!(index.contains_album("Bonobo", "2006 - Days To Come"));
         assert!(
-            !index.contains_album("Bonobo", "Days to Come"),
-            "the plain MusicBrainz title is not satisfied by the year-prefixed folder"
+            index.contains_album("Bonobo", "Days to Come"),
+            "the plain MusicBrainz title is satisfied by the year-prefixed folder"
         );
+    }
+
+    #[test]
+    fn a_folder_carrying_sharer_metadata_satisfies_the_plain_title() {
+        // The forms a peer folder arrives in. Every one of them names the same
+        // album as the MusicBrainz title, and the search side has always
+        // treated them as such; presence now agrees.
+        let index = build_index(&[
+            scanned("Bonobo", "Days to Come FLAC"),
+            scanned("Bonobo", "Days to Come - Bonobo"),
+        ]);
+        assert!(index.contains_album("Bonobo", "Days to Come"));
+        assert!(index.contains_album("Bonobo", "Days To Come - Bonobo FLAC"));
+    }
+
+    #[test]
+    fn edition_markers_keep_an_album_distinct_from_the_plain_title() {
+        // The README contract this change must not break: an edition is not the
+        // plain album, so discover still downloads the plain one when only an
+        // edition is held. `album_identity_key` preserves these markers.
+        let index = build_index(&[
+            scanned("Artist", "Album (Deluxe Edition)"),
+            scanned("Artist", "Album (Live)"),
+            scanned("Artist", "Album [Remastered]"),
+        ]);
+        assert!(
+            !index.contains_album("Artist", "Album"),
+            "an edition must not satisfy the plain album"
+        );
+        assert!(index.contains_album("Artist", "Album (Deluxe Edition)"));
+        assert!(index.contains_album("Artist", "Album (Live)"));
     }
 
     #[test]
@@ -1509,8 +1640,11 @@ mod tests {
             "/library/Rock",
             "Guns N Roses",
         )]);
+        // The artist key folds the apostrophe, so the tag spelling and the
+        // on-disk folder spelling are one index entry; the destination it
+        // reports is still the folder name that exists on disk.
         assert_eq!(
-            destination(&index, "guns 'n' roses"),
+            destination(&index, "guns n roses"),
             Some(("/library/Rock".to_string(), "Guns N Roses".to_string())),
             "the folder that exists on disk wins over the tag spelling"
         );
@@ -1582,11 +1716,16 @@ mod tests {
     }
 
     #[test]
-    fn presence_ignores_case_and_whitespace_but_not_punctuation() {
+    fn presence_ignores_case_whitespace_and_separator_punctuation() {
+        // The identity folds the marks a sharer uses as word separators, so a
+        // trailing mark no longer makes an album the library holds look missing.
+        // The last case keeps the test non-vacuous: presence still differs
+        // between distinct titles.
         let index = build_index(&[scanned("Discovery", "  DISCOVERY  ")]);
         assert!(missing_albums(&index, "discovery", &[target("Discovery")]).is_empty());
+        assert!(missing_albums(&index, "Discovery", &[target("Discovery!")]).is_empty());
         assert_eq!(
-            missing_albums(&index, "Discovery", &[target("Discovery!")]).len(),
+            missing_albums(&index, "Discovery", &[target("Discovered")]).len(),
             1
         );
     }

@@ -1086,15 +1086,21 @@ mod real_client_tests {
 
     #[test]
     fn main_builds_the_client_from_configuration() {
-        // The tests above pin `from_config`; this pins the call site, so a revert
-        // to `RealClient::new()` (which hardcoded 3/5 and ignored the configured
-        // policy) cannot pass silently.
+        // The tests above pin `from_config`; this pins the production call site,
+        // so a revert to `RealClient::new()` (which hardcoded 3/5 and ignored the
+        // configured policy) cannot pass silently. Both halves are asserted: the
+        // factory builds from the config, AND `run` reaches it through the
+        // factory instead of constructing a client directly.
         let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
             .expect("src/main.rs must be readable");
 
         assert!(
-            main_rs.contains("RealClient::from_config(&config)"),
-            "main.rs must build the client from the loaded configuration"
+            main_rs.contains("run_with(cli, Box::new(real_client_factory))"),
+            "run must obtain its client through real_client_factory"
+        );
+        assert!(
+            main_rs.contains("RealClient::from_config("),
+            "the factory must build the client from the loaded configuration"
         );
     }
 
@@ -1107,9 +1113,9 @@ mod real_client_tests {
         let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
             .expect("src/main.rs must be readable");
         let after_set_max_peers = main_rs
-            .split("set_max_peers")
+            .split("client.apply_max_peers")
             .nth(1)
-            .expect("main.rs must set max_peers after login");
+            .expect("main.rs must apply max_peers after login");
         // Bound the window to the statements up to the next part of `run()`, so
         // the assertion cannot be satisfied by a later release or by the
         // function definition itself.
@@ -1118,9 +1124,17 @@ mod real_client_tests {
             .next()
             .expect("the schedule block follows the client setup");
 
+        // Order matters, not mere presence: a release placed after the `return`
+        // is unreachable, and a substring-presence check would accept it.
+        let released = window
+            .find("release_pid_lock")
+            .expect("a rejected peer cap must release the PID lock");
+        let returned = window
+            .find("return Err(e);")
+            .expect("the rejected-cap branch must return the error");
         assert!(
-            window.contains("release_pid_lock"),
-            "a failed set_max_peers must release the PID lock before returning: {window}"
+            released < returned,
+            "the lock must be released BEFORE the error is returned: {window}"
         );
     }
 
@@ -1145,6 +1159,53 @@ mod real_client_tests {
         let rc = RealClient::new();
         *rc.inner.lock().await = Some(Arc::new(client));
         rc
+    }
+
+    // A reconnect runs the real login sequence with the credentials captured at
+    // login time. When that sequence fails, the reason must be negative-cached
+    // (so later callers fail fast) and surfaced as Disconnected rather than as a
+    // transport-specific error. The address has no `:`, so `parse_server_address`
+    // fails before any connect attempt, and that is what keeps this test fast: a
+    // well-formed but unreachable address would spend ~45s in vendored timeouts.
+    #[tokio::test]
+    async fn reconnect_against_an_unusable_server_negative_caches_the_reason() {
+        let client = Client::with_settings(ClientSettings::new("test-user", "test-pass"));
+        client.record_session_loss(SessionLoss::Disconnected);
+        // One attempt with no backoff: the login retry loop is exercised without
+        // sleeping through the production policy.
+        let rc = RealClient::with_login_retries(1, 0);
+        *rc.inner.lock().await = Some(Arc::new(client));
+        *rc.reconnect_settings.lock().await = Some(ReconnectSettings {
+            username: "test-user".into(),
+            password: "test-pass".into(),
+            server: "no-port".into(),
+            listen_port: 0,
+        });
+
+        let error = rc
+            .reconnect_if_needed()
+            .await
+            .expect_err("an unreachable server must fail the reconnect");
+        assert!(
+            matches!(error, SeakarrError::Disconnected { .. }),
+            "a transport failure must surface as Disconnected, got {error:?}"
+        );
+
+        let cached = rc
+            .reconnect_failed
+            .lock()
+            .await
+            .clone()
+            .expect("a failed reconnect must be negative-cached");
+        assert!(
+            cached.1.contains("reconnect failed"),
+            "the cache must record why the reconnect failed: {}",
+            cached.1
+        );
+        assert!(
+            cached.0.is_some(),
+            "a transport failure is transient, so it must be retried after the cooldown"
+        );
     }
 
     // A live session must not trigger any reconnect work.
@@ -1820,6 +1881,15 @@ mod real_client_tests {
         assert!(parse_server_address(":2242").is_err());
         assert!(parse_server_address("host:99999").is_err());
     }
+
+    #[test]
+    fn real_client_default_matches_the_documented_retry_policy() {
+        // `Default` and `new` must agree, and both must match the policy
+        // documented on `new` (the SoulseekConfig defaults).
+        let client = RealClient::default();
+        assert_eq!(client.login_retries, 3);
+        assert_eq!(client.login_retry_delay_secs, 5);
+    }
 }
 
 #[cfg(test)]
@@ -1859,6 +1929,47 @@ mod mock_client_tests {
         assert_eq!(
             queries,
             vec!["history".to_string(), "no override".to_string()]
+        );
+    }
+
+    #[test]
+    fn mock_client_default_is_an_empty_configured_double() {
+        let client = MockClient::default();
+        assert!(client.search_results.lock().unwrap().is_empty());
+        assert!(client.search_results_by_query.lock().unwrap().is_empty());
+        assert!(!*client.search_should_fail.lock().unwrap());
+        assert!(!*client.login_should_fail.lock().unwrap());
+        assert!(!*client.download_fails.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn mock_client_login_succeeds_and_reports_an_injected_failure() {
+        let client = MockClient::new();
+        client
+            .login("user", "pass", "server", 2242)
+            .await
+            .expect("the double accepts any credentials by default");
+
+        *client.login_should_fail.lock().unwrap() = true;
+        let error = client
+            .login("user", "pass", "server", 2242)
+            .await
+            .expect_err("an injected login failure must surface");
+        assert!(
+            matches!(error, SeakarrError::Auth { .. }),
+            "expected an Auth error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_client_queue_position_is_always_false() {
+        // The double models no peer actor, so it answers like a peer that was
+        // not found. Production ignores the value.
+        let client = MockClient::new();
+        assert!(
+            !client
+                .request_queue_position("peer", "01 - track.flac")
+                .await
         );
     }
 }

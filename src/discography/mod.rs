@@ -6,44 +6,69 @@ use unicode_normalization::UnicodeNormalization;
 use crate::config::DiscographyConfig;
 use crate::config::DiscographyReleaseType;
 use crate::db::{Database, DiscographyCacheEntry, DiscographyFailureEntry};
+use crate::search::album_identity_key;
 
 mod bundle;
 mod musicbrainz;
 pub use musicbrainz::MusicBrainzProvider;
 
+/// Apostrophe characters that spell the same mark across keyboards, tags and
+/// cover art: the ASCII apostrophe, the typographic pair, the single high
+/// quotation mark, the modifier letter apostrophe, the grave accent and the
+/// acute accent.
+///
+/// They are removed before folding so `Guns N’ Roses` (how MusicBrainz spells
+/// it), `Guns 'n' Roses` (how one library spells it) and `Guns N Roses` share a
+/// single key. Leaving them in made one album look like several: a discover run
+/// reported both MusicBrainz Sgt. Pepper release groups, the library's
+/// apostrophe-less tag did not match either, and the album was downloaded twice
+/// into two new folders beside the copy already on disk.
+const APOSTROPHE_LIKE_CHARACTERS: &[char] = &[
+    '\'',       // ASCII apostrophe
+    '\u{2018}', // left single quotation mark
+    '\u{2019}', // right single quotation mark (MusicBrainz's usual spelling)
+    '\u{201A}', // single low-9 quotation mark
+    '\u{201B}', // single high-reversed-9 quotation mark
+    '\u{02BB}', // modifier letter turned comma (okina)
+    '\u{02BC}', // modifier letter apostrophe
+    '\u{02BE}', // modifier letter right half ring
+    '\u{02BF}', // modifier letter left half ring
+    '\u{02B9}', // modifier letter prime
+    '\u{055A}', // Armenian apostrophe
+    '\u{1FBD}', // Greek koronis (spacing form)
+    '\u{0313}', // combining comma above (the decomposition of U+1FBD)
+    '\u{0314}', // combining reversed comma above (of U+201B)
+    '\u{05F3}', // Hebrew geresh
+    '\u{2032}', // prime
+    '\u{FF07}', // fullwidth apostrophe (NFKC folds it to U+0027; listed anyway)
+    '`',        // grave accent
+    '\u{00B4}', // acute accent
+];
+
 pub(crate) fn normalize_catalog_key(value: &str) -> String {
+    // The filter runs on BOTH sides of the compatibility fold.
+    //
+    // Before it, because a listed mark can decompose into several characters
+    // (U+00B4 becomes a space plus a combining acute) and removing it while it is
+    // still one character is the only way to remove all of it.
+    //
+    // After it, as a safety net for a compatibility variant that is NOT itself
+    // listed but folds INTO a listed mark - the shape U+FF07 (fullwidth
+    // apostrophe) has. U+FF07 is also listed explicitly, so today the first pass
+    // already removes it and this pass is redundant for every input; it exists so
+    // the "both sides of the fold" invariant stays true if a future entry is
+    // added without its compatibility form.
     value
+        .chars()
+        .filter(|character| !APOSTROPHE_LIKE_CHARACTERS.contains(character))
+        .collect::<String>()
         .nfkc()
+        .filter(|character| !APOSTROPHE_LIKE_CHARACTERS.contains(character))
         .flat_map(char::to_lowercase)
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Comparison key for library album presence, built from the name the library
-/// write path would store rather than from the raw title.
-///
-/// The album folder on disk has been through
-/// [`crate::organizer::sanitize_component`], but the album tag the scanner
-/// prefers, and the MusicBrainz title the presence check is made against, have
-/// not. Sanitising both sides keeps a stored album equal to the title it was
-/// written from; comparing raw titles would make an album whose title carried a
-/// character the filesystem cannot hold permanently "missing", and discover
-/// would download it again on every cycle.
-///
-/// Artist identity deliberately does not use this: it keeps
-/// [`normalize_catalog_key`] and its significant-punctuation contract.
-///
-/// The compatibility fold runs BEFORE the sanitiser so that a width variant of a
-/// reserved character reaches it as the reserved character itself. Folding
-/// afterwards would leave a library tagged `Tronic Jazz：` (U+FF1A) keyed on
-/// `tronic jazz:` while the MusicBrainz spelling keys on
-/// `tronic jazz the berlin sessions`, and the album would be re-downloaded every
-/// cycle.
-pub(crate) fn normalize_album_key(value: &str) -> String {
-    let folded: String = value.nfkc().collect();
-    normalize_catalog_key(&crate::organizer::sanitize_component(&folded))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,13 +417,20 @@ fn parse_partial_date(value: &str) -> Option<PartialDate> {
 }
 
 /// Filter allowed release groups with non-empty titles, drop any whose title
-/// bundles other release groups of the same artist, deduplicate by the
-/// normalized title key (prefer dated over undated, then earlier date, then
+/// bundles other release groups of the same artist, deduplicate by album
+/// identity (prefer dated over undated, then earlier date, then
 /// lexicographically smaller MBID), and order dated targets by partial date
 /// before undated targets.
+///
+/// Identity, not the raw title, is what collapses MusicBrainz's several release
+/// groups for one album into a single target — see `album_identity_key`.
+/// `artist` is the artist spelling the run is working from — the library's in
+/// discover mode, the operator's in an artist-only manual run — which the
+/// identity uses to strip an artist prefix a release group title may carry.
 pub fn select_albums(
     groups: &[ReleaseGroup],
     allowed: &[DiscographyReleaseType],
+    artist: &str,
 ) -> Vec<AlbumTarget> {
     #[derive(Clone)]
     struct Candidate {
@@ -432,7 +464,7 @@ pub fn select_albums(
             log_rejected_release(release, "title bundles other release groups");
             continue;
         }
-        let key = normalize_catalog_key(title);
+        let key = album_identity_key(title, artist);
         let candidate = Candidate {
             date: release
                 .first_release_date
@@ -460,6 +492,17 @@ pub fn select_albums(
             Some(existing) => {
                 if better(existing, &candidate) {
                     *existing = candidate;
+                } else {
+                    // The identity key collapsed two release groups into one
+                    // target. Only one can be searched for, so the loser is
+                    // dropped; say which one, because otherwise it vanishes from
+                    // the run output with nothing to explain why.
+                    tracing::debug!(
+                        release_group_id = %candidate.target.release_group_id,
+                        title = %candidate.target.title,
+                        kept_release_group_id = %existing.target.release_group_id,
+                        "excluding MusicBrainz release group: shares its album identity with another"
+                    );
                 }
             }
             None => {
@@ -653,6 +696,7 @@ pub(crate) async fn discover_artist_albums_at(
             return select_outcome(
                 &cached.groups,
                 &config.allowed_types,
+                artist,
                 DiscoveryProvenance::FreshCache,
             );
         }
@@ -726,17 +770,18 @@ pub(crate) async fn discover_artist_albums_at(
                 select_outcome(
                     &groups,
                     &config.allowed_types,
+                    artist,
                     DiscoveryProvenance::Refreshed,
                 )
             }
             // An oversized (or unserializable) payload is a refresh error:
             // fall back to the stale cache or legacy discovery.
-            Err(error) => stale_or_legacy(cached, &config.allowed_types, now, error),
+            Err(error) => stale_or_legacy(cached, &config.allowed_types, artist, now, error),
         },
         Err(error) => {
             let has_success_row = cached.is_some();
             record_resolution_failure(db, &artist_key, config, now, &error, has_success_row);
-            stale_or_legacy(cached, &config.allowed_types, now, error)
+            stale_or_legacy(cached, &config.allowed_types, artist, now, error)
         }
     }
 }
@@ -929,9 +974,10 @@ fn serialize_cache_payload(
 fn select_outcome(
     groups: &[ReleaseGroup],
     allowed: &[DiscographyReleaseType],
+    artist: &str,
     provenance: DiscoveryProvenance,
 ) -> DiscoveryOutcome {
-    let albums = select_albums(groups, allowed);
+    let albums = select_albums(groups, allowed, artist);
     if albums.is_empty() {
         DiscoveryOutcome::AuthoritativeEmpty { provenance }
     } else {
@@ -945,6 +991,7 @@ fn select_outcome(
 fn stale_or_legacy(
     cached: Option<CachedDiscography>,
     allowed: &[DiscographyReleaseType],
+    artist: &str,
     now: i64,
     refresh_error: DiscographyError,
 ) -> DiscoveryOutcome {
@@ -960,7 +1007,7 @@ fn stale_or_legacy(
         kind: DiscoveryFailure::from_error(&refresh_error),
         refresh_error: refresh_error.to_string(),
     };
-    select_outcome(&cached.groups, allowed, provenance)
+    select_outcome(&cached.groups, allowed, artist, provenance)
 }
 
 #[cfg(test)]
@@ -1009,6 +1056,81 @@ mod tests {
             normalize_catalog_key("AC/DC"),
             normalize_catalog_key("AC DC")
         );
+    }
+
+    #[test]
+    fn catalog_keys_fold_apostrophe_variants() {
+        // MusicBrainz stores the typographic apostrophe ("Sgt. Pepper’s",
+        // "Guns N’ Roses") while tags and folder names carry the ASCII one, or
+        // none at all. All three spellings name the same artist and the same
+        // album, so they must share one key.
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{2019} Roses"),
+            normalize_catalog_key("Guns 'n' Roses")
+        );
+        assert_eq!(
+            normalize_catalog_key("Sgt. Pepper\u{2019}s Lonely Hearts Club Band"),
+            normalize_catalog_key("Sgt. Pepper's Lonely Hearts Club Band")
+        );
+        assert_eq!(
+            normalize_catalog_key("Sgt. Pepper's Lonely Hearts Club Band"),
+            normalize_catalog_key("Sgt. Peppers Lonely Hearts Club Band")
+        );
+    }
+
+    #[test]
+    fn catalog_keys_fold_a_compatibility_variant_of_the_apostrophe() {
+        // U+FF07 is the fullwidth apostrophe. NFKC folds it to the ASCII one, so
+        // the filter has to run after the fold as well as before it, or a
+        // fullwidth keyboard tag keeps its own key and one artist or album is
+        // treated as two - the very duplication this fold exists to remove.
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{ff07} Roses"),
+            normalize_catalog_key("Guns N' Roses")
+        );
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{ff07} Roses"),
+            normalize_catalog_key("Guns N\u{2019} Roses")
+        );
+        // Lookalikes with NO compatibility decomposition survive NFKC entirely,
+        // so they have to be listed: U+201A is what a CP1252/SmartQuotes round
+        // trip can leave in place of an apostrophe.
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{201a} Roses"),
+            normalize_catalog_key("Guns N' Roses")
+        );
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{02bb} Roses"),
+            normalize_catalog_key("Guns N' Roses")
+        );
+        // The COMBINING forms are never produced by NFKC - they ARE the
+        // decomposition - so a tag carrying one directly has to be listed too.
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{0313} Roses"),
+            normalize_catalog_key("Guns N' Roses")
+        );
+        assert_eq!(
+            normalize_catalog_key("Guns N\u{05f3} Roses"),
+            normalize_catalog_key("Guns N' Roses")
+        );
+    }
+
+    #[test]
+    fn artist_resolution_folds_apostrophe_variants_of_the_canonical_name() {
+        // The library spells it "Guns 'n' Roses" while MusicBrainz spells it
+        // "Guns N’ Roses" with U+2019. Resolution accepts a candidate only when
+        // it compares equal to the query after folding, so without the fold the
+        // two never meet and the artist is skipped as unresolved on every
+        // discover cycle, even though its folder is sitting in the library.
+        let candidates = vec![scored(
+            "eeb1195b-f213-4ce1-b28c-8565211f8e43",
+            "Guns N\u{2019} Roses",
+            Some(100),
+        )];
+        let resolved = resolve_artist("Guns 'n' Roses", &candidates)
+            .expect("the library spelling must resolve against the canonical name");
+        assert_eq!(resolved.candidate.name, "Guns N\u{2019} Roses");
+        assert_eq!(resolved.resolution, ArtistResolution::UniqueExactName);
     }
 
     #[test]
@@ -1295,9 +1417,12 @@ mod tests {
             ),
             &allowed,
         ));
-        assert!(
-            select_albums(&[group("4", "   ", None, Some("Album"), &[])], &allowed,).is_empty()
-        );
+        assert!(select_albums(
+            &[group("4", "   ", None, Some("Album"), &[])],
+            &allowed,
+            "Artist"
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1319,6 +1444,7 @@ mod tests {
                 DiscographyReleaseType::StudioAlbum,
                 DiscographyReleaseType::LiveAlbum,
             ],
+            "Artist",
         )
         .is_empty());
 
@@ -1363,6 +1489,7 @@ mod tests {
         let albums = select_albums(
             &archive_bundle_groups(),
             &[DiscographyReleaseType::StudioAlbum],
+            "Archive",
         );
         let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
         assert_eq!(
@@ -1394,7 +1521,7 @@ mod tests {
             ),
             group("m2", "Metallica", Some("1991-08-12"), Some("Album"), &[]),
         ];
-        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum]);
+        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum], "Metallica");
         let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
         assert_eq!(
             titles,
@@ -1418,9 +1545,56 @@ mod tests {
             group("b2", "First Album", Some("2001"), Some("EP"), &[]),
             group("b3", "Second Album", Some("2002"), Some("Album"), &[]),
         ];
-        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum]);
+        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum], "Artist");
         let titles: Vec<&str> = albums.iter().map(|album| album.title.as_str()).collect();
         assert_eq!(titles, vec!["Second Album"]);
+    }
+
+    #[test]
+    fn release_groups_of_one_album_are_deduplicated_by_identity() {
+        // MusicBrainz carries more than one release group for the same album.
+        // This Sgt. Pepper pair is real: `9f7a4c28-…` is the 1967 album spelled
+        // with U+2019, `e2efefb2-…` the 2009 album spelled with ASCII. Keying the
+        // dedupe on the raw title made each a separate target, so a discover run
+        // searched and downloaded the same album once per spelling, two minutes
+        // apart, into two new folders beside the copy already on disk.
+        let groups = vec![
+            group(
+                "9f7a4c28-8fa2-3113-929c-c47a9f7982c3",
+                "Sgt. Pepper\u{2019}s Lonely Hearts Club Band",
+                Some("1967-05-26"),
+                Some("Album"),
+                &[],
+            ),
+            group(
+                "e2efefb2-0e9d-47c1-9e62-bb7e093d401b",
+                "Sgt. Pepper's Lonely Hearts Club Band",
+                Some("2009"),
+                Some("Album"),
+                &[],
+            ),
+            group(
+                "aaaabbbb-0000-0000-0000-000000000001",
+                "1998 Sgt. Peppers Lonely Hearts Club Band",
+                None,
+                Some("Album"),
+                &[],
+            ),
+        ];
+        let albums = select_albums(
+            &groups,
+            &[DiscographyReleaseType::StudioAlbum],
+            "The Beatles",
+        );
+        assert_eq!(
+            albums.len(),
+            1,
+            "one album must yield one target: {albums:?}"
+        );
+        assert_eq!(
+            albums[0].release_group_id, "9f7a4c28-8fa2-3113-929c-c47a9f7982c3",
+            "the dated original wins over the undated re-spelling"
+        );
     }
 
     /// The same shape as `archive_bundle_groups`, with a bundle MBID that no
@@ -1438,6 +1612,7 @@ mod tests {
         let albums = select_albums(
             &bundle_log_fixture(),
             &[DiscographyReleaseType::StudioAlbum],
+            "Archive",
         );
         assert_eq!(albums.len(), 2);
         let logs = capture.text();
@@ -1462,7 +1637,7 @@ mod tests {
             group("c", "Later", Some("2005-01-02"), Some("Album"), &[]),
             group("d", "Undated", Some("not-a-date"), Some("Album"), &[]),
         ];
-        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum]);
+        let albums = select_albums(&groups, &[DiscographyReleaseType::StudioAlbum], "Artist");
         assert_eq!(
             albums
                 .iter()
