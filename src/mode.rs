@@ -4,7 +4,7 @@ use crate::error::{Result, SeakarrError};
 /// The search modes that seakarr can execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
-    Auto,
+    Upgrade,
     Manual,
     Batch,
     Discover,
@@ -13,7 +13,7 @@ pub enum SearchMode {
 /// Validated mode and the criteria needed by that mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionPlan {
-    Auto,
+    Upgrade,
     Manual {
         artist: Option<String>,
         album: Option<String>,
@@ -31,7 +31,7 @@ impl ExecutionPlan {
     /// Return the mode represented by this validated plan.
     pub fn mode(&self) -> SearchMode {
         match self {
-            Self::Auto => SearchMode::Auto,
+            Self::Upgrade => SearchMode::Upgrade,
             Self::Manual { .. } => SearchMode::Manual,
             Self::Batch { .. } => SearchMode::Batch,
             Self::Discover { .. } => SearchMode::Discover,
@@ -61,10 +61,11 @@ fn non_empty_path(value: Option<&str>) -> Option<String> {
     non_empty(value).map(|value| value.trim().to_owned())
 }
 
-/// Format an auto-mode conflict error. When the mode came from the YAML config
-/// (not `--mode`) and that config knows its on-disk source, point the user at
-/// the exact `search.default_mode` line that caused the conflict. Otherwise
-/// keep the concise legacy message (explicit `--mode` or in-memory config).
+/// Format an upgrade-mode conflict error. When the mode came from the YAML
+/// config (not `--mode`) and that config knows its on-disk source, point the
+/// user at the exact `search.default_mode` line that caused the conflict.
+/// Otherwise keep the concise legacy message (explicit `--mode` or in-memory
+/// config).
 fn configured_mode_conflict(
     config: &Config,
     mode_from_cli: bool,
@@ -76,7 +77,7 @@ fn configured_mode_conflict(
     } else {
         ("are", selectors)
     };
-    let base = format!("{selectors} {verb} incompatible with auto mode");
+    let base = format!("{selectors} {verb} incompatible with upgrade mode");
     match (mode_from_cli, config.source()) {
         (false, Some(source)) => {
             // Omit the `:line` suffix when the line could not be located
@@ -113,13 +114,18 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
         .as_deref()
         .unwrap_or(config.search.default_mode.as_str());
     let mode = match raw_mode.trim() {
-        "auto" => SearchMode::Auto,
+        "upgrade" => SearchMode::Upgrade,
         "manual" => SearchMode::Manual,
         "batch" => SearchMode::Batch,
         "discover" => SearchMode::Discover,
+        "auto" => {
+            return Err(SeakarrError::Config(
+                "invalid search mode 'auto'; this mode is now called 'upgrade'".into(),
+            ));
+        }
         value => {
             return Err(SeakarrError::Config(format!(
-                "invalid search mode '{value}' (must be auto, manual, batch, or discover)"
+                "invalid search mode '{value}' (must be upgrade, manual, batch, or discover)"
             )));
         }
     };
@@ -145,15 +151,16 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
     }
 
     match mode {
-        SearchMode::Auto => {
+        SearchMode::Upgrade => {
             if has_blank_batch_cli_selector {
                 return Err(SeakarrError::Config(
-                    "--batch-file must not be blank in auto mode; use --mode batch".into(),
+                    "--batch-file must not be blank in upgrade mode; use --mode batch".into(),
                 ));
             }
             if has_blank_manual_cli_selector {
                 return Err(SeakarrError::Config(
-                    "blank CLI selector is incompatible with auto mode; use --mode manual".into(),
+                    "blank CLI selector is incompatible with upgrade mode; use --mode manual"
+                        .into(),
                 ));
             }
             if has_manual_cli_selector {
@@ -172,7 +179,7 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                     "use --mode batch",
                 )));
             }
-            Ok(ExecutionPlan::Auto)
+            Ok(ExecutionPlan::Upgrade)
         }
         SearchMode::Manual => {
             if has_batch_cli_selector {
@@ -222,7 +229,7 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
             // Mode resolution runs before CliOverrides are merged into the
             // Config, so the effective value must be computed here: a
             // --library-path override has to satisfy discover exactly as it
-            // satisfies auto mode, whose equivalent check runs after the merge.
+            // satisfies upgrade mode, whose equivalent check runs after the merge.
             let library_paths_empty = cli
                 .library_path
                 .as_deref()
@@ -300,19 +307,32 @@ mod tests {
     }
 
     #[test]
-    fn configured_auto_without_selectors_returns_auto() {
-        let config = config_with_mode("auto");
+    fn configured_upgrade_without_selectors_returns_upgrade() {
+        let config = config_with_mode("upgrade");
         let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
-        assert_eq!(plan, ExecutionPlan::Auto);
-        assert_eq!(plan.mode(), SearchMode::Auto);
+        assert_eq!(plan, ExecutionPlan::Upgrade);
+        assert_eq!(plan.mode(), SearchMode::Upgrade);
     }
 
     #[test]
-    fn configured_auto_manual_selector_error_identifies_yaml_source() {
+    fn explicit_cli_upgrade_without_selectors_returns_upgrade_plan() {
+        // The spec requires the positive path from the CLI as well as from the
+        // config. The configured mode is a different one, so this also proves the
+        // CLI value wins; without it the CLI spelling is covered only by the
+        // conflict cases that expect an error.
+        let config = config_with_mode("manual");
+        let plan =
+            resolve_execution_plan(&config, &cli(Some("upgrade"), None, None, None)).unwrap();
+        assert_eq!(plan, ExecutionPlan::Upgrade);
+        assert_eq!(plan.mode(), SearchMode::Upgrade);
+    }
+
+    #[test]
+    fn configured_upgrade_manual_selector_error_identifies_yaml_source() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("seakarr.yml"),
-            "search:\n  default_mode: auto\n",
+            "search:\n  default_mode: upgrade\n",
         )
         .unwrap();
         let config = Config::load(dir.path()).unwrap();
@@ -320,7 +340,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         let source = config.source().unwrap();
-        assert!(error.contains("search.default_mode: auto"), "got: {error}");
+        assert!(
+            error.contains("search.default_mode: upgrade"),
+            "got: {error}"
+        );
         assert!(
             error.contains(&source.path.to_string_lossy().to_string()),
             "got: {error}"
@@ -333,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn configured_auto_batch_selector_error_identifies_yaml_source() {
+    fn configured_upgrade_batch_selector_error_identifies_yaml_source() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("seakarr.yml"),
-            "search:\n  default_mode: auto\n",
+            "search:\n  default_mode: upgrade\n",
         )
         .unwrap();
         let config = Config::load(dir.path()).unwrap();
@@ -345,7 +368,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         let source = config.source().unwrap();
-        assert!(error.contains("search.default_mode: auto"), "got: {error}");
+        assert!(
+            error.contains("search.default_mode: upgrade"),
+            "got: {error}"
+        );
         assert!(
             error.contains(&source.path.to_string_lossy().to_string()),
             "got: {error}"
@@ -358,8 +384,18 @@ mod tests {
     }
 
     #[test]
-    fn configured_auto_rejects_manual_cli_selectors() {
-        let config = config_with_mode("auto");
+    fn the_upgrade_conflict_message_names_upgrade_mode() {
+        let config = config_with_mode("upgrade");
+        assert_config_error(
+            &config,
+            &cli(None, Some("Artist"), None, None),
+            "are incompatible with upgrade mode",
+        );
+    }
+
+    #[test]
+    fn configured_upgrade_rejects_manual_cli_selectors() {
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(None, None, Some("Album"), None),
@@ -368,8 +404,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_auto_rejects_batch_cli_selector() {
-        let config = config_with_mode("auto");
+    fn configured_upgrade_rejects_batch_cli_selector() {
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(None, None, None, Some("wantlist.txt")),
@@ -378,8 +414,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_rejects_blank_cli_selectors() {
-        let config = config_with_mode("auto");
+    fn upgrade_mode_rejects_blank_cli_selectors() {
+        let config = config_with_mode("upgrade");
         for (artist, album) in [(Some("  "), None), (None, Some("\t"))] {
             assert_config_error(
                 &config,
@@ -390,14 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_reports_blank_batch_file_specifically() {
-        let config = config_with_mode("auto");
+    fn upgrade_mode_reports_blank_batch_file_specifically() {
+        let config = config_with_mode("upgrade");
         assert_config_error(&config, &cli(None, None, None, Some("  ")), "--batch-file");
     }
 
     #[test]
-    fn explicit_manual_mode_overrides_configured_auto() {
-        let config = config_with_mode("auto");
+    fn explicit_manual_mode_overrides_configured_upgrade() {
+        let config = config_with_mode("upgrade");
         let plan = resolve_execution_plan(
             &config,
             &cli(Some("manual"), Some("Artist"), Some("Album"), None),
@@ -544,28 +580,28 @@ mod tests {
     }
 
     #[test]
-    fn explicit_auto_rejects_manual_selector() {
+    fn explicit_upgrade_rejects_manual_selector() {
         let config = config_with_mode("manual");
         assert_config_error(
             &config,
-            &cli(Some("auto"), Some("Artist"), None, None),
+            &cli(Some("upgrade"), Some("Artist"), None, None),
             "--mode manual",
         );
     }
 
     #[test]
-    fn explicit_auto_rejects_batch_selector() {
+    fn explicit_upgrade_rejects_batch_selector() {
         let config = config_with_mode("manual");
         assert_config_error(
             &config,
-            &cli(Some("auto"), None, None, Some("wantlist.txt")),
+            &cli(Some("upgrade"), None, None, Some("wantlist.txt")),
             "--mode batch",
         );
     }
 
     #[test]
     fn explicit_manual_rejects_batch_selector() {
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(Some("manual"), None, None, Some("wantlist.txt")),
@@ -575,7 +611,7 @@ mod tests {
 
     #[test]
     fn explicit_batch_rejects_manual_selector() {
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(Some("batch"), Some("Artist"), None, None),
@@ -628,7 +664,7 @@ mod tests {
 
     #[test]
     fn manual_and_batch_cli_selectors_conflict() {
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(None, Some("Artist"), None, Some("wantlist.txt")),
@@ -638,11 +674,11 @@ mod tests {
 
     #[test]
     fn inactive_config_values_do_not_infer_mode() {
-        let mut auto = config_with_mode("auto");
-        auto.search.manual.artist = "Stale Artist".into();
-        auto.search.batch.file_path = "stale.txt".into();
-        let plan = resolve_execution_plan(&auto, &cli(None, None, None, None)).unwrap();
-        assert_eq!(plan, ExecutionPlan::Auto);
+        let mut upgrade = config_with_mode("upgrade");
+        upgrade.search.manual.artist = "Stale Artist".into();
+        upgrade.search.batch.file_path = "stale.txt".into();
+        let plan = resolve_execution_plan(&upgrade, &cli(None, None, None, None)).unwrap();
+        assert_eq!(plan, ExecutionPlan::Upgrade);
 
         let mut manual = config_with_mode("manual");
         manual.search.manual.artist = "Artist".into();
@@ -690,27 +726,54 @@ mod tests {
         assert_config_error(
             &config,
             &cli(None, None, None, None),
-            "must be auto, manual, batch, or discover",
+            "must be upgrade, manual, batch, or discover",
         );
+    }
+
+    #[test]
+    fn the_retired_auto_value_is_rejected_with_a_pointer_to_upgrade() {
+        let config = config_with_mode("upgrade");
+        assert_config_error(
+            &config,
+            &cli(Some("auto"), None, None, None),
+            "invalid search mode 'auto'; this mode is now called 'upgrade'",
+        );
+    }
+
+    #[test]
+    fn a_migrated_config_resolves_to_the_upgrade_plan() {
+        // The retired value is rewritten during reconciliation, so the resolver
+        // sees `upgrade` and never the retired spelling.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("seakarr.yml"),
+            "search:\n  default_mode: auto\n",
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
+
+        assert_eq!(plan, ExecutionPlan::Upgrade);
     }
 
     #[test]
     fn empty_cli_mode_is_rejected() {
         // `--mode ""` trims to the empty string and must hit the invalid-mode
         // branch rather than being treated as "unset".
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(Some(""), None, None, None),
-            "must be auto, manual, batch, or discover",
+            "must be upgrade, manual, batch, or discover",
         );
     }
 
     #[test]
-    fn auto_mode_both_blank_selectors_report_blank_specific_message() {
+    fn upgrade_mode_both_blank_selectors_report_blank_specific_message() {
         // Both selectors present-but-blank must report the blank-selector
         // message, not the generic manual/batch conflict.
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         assert_config_error(
             &config,
             &cli(None, Some("  "), Some("\t"), None),
@@ -738,7 +801,7 @@ mod tests {
 
     #[test]
     fn configured_mode_conflict_omits_zero_line_suffix() {
-        let mut config = config_with_mode("auto");
+        let mut config = config_with_mode("upgrade");
         config.source = Some(ConfigSource {
             path: PathBuf::from("/tmp/seakarr.yml"),
             default_mode_line: 0,
@@ -766,7 +829,7 @@ mod tests {
     fn ignore_processed_is_rejected_for_scheduled_cli_mode() {
         // --ignore-processed must never combine with scheduled mode: it would
         // force a reprocess on every scheduled cycle.
-        let config = config_with_mode("auto");
+        let config = config_with_mode("upgrade");
         let mut overrides = cli(None, None, None, None);
         overrides.schedule = true;
         overrides.ignore_processed = true;
@@ -778,7 +841,7 @@ mod tests {
     fn ignore_processed_is_rejected_for_configured_schedule() {
         // The schedule flag can come from the YAML config as well; both forms
         // must be rejected before any processing.
-        let mut config = config_with_mode("auto");
+        let mut config = config_with_mode("upgrade");
         config.schedule.enabled = true;
         let mut overrides = cli(None, None, None, None);
         overrides.ignore_processed = true;
@@ -787,12 +850,12 @@ mod tests {
     }
 
     #[test]
-    fn ignore_processed_is_allowed_for_one_shot_auto() {
-        let config = config_with_mode("auto");
+    fn ignore_processed_is_allowed_for_one_shot_upgrade() {
+        let config = config_with_mode("upgrade");
         let mut overrides = cli(None, None, None, None);
         overrides.ignore_processed = true;
         let plan = resolve_execution_plan(&config, &overrides).unwrap();
-        assert_eq!(plan, ExecutionPlan::Auto);
+        assert_eq!(plan, ExecutionPlan::Upgrade);
     }
 
     #[test]
@@ -892,7 +955,7 @@ mod tests {
 
     #[test]
     fn discover_mode_is_reachable_from_the_cli() {
-        let mut config = config_with_mode("auto");
+        let mut config = config_with_mode("upgrade");
         config.library.paths = vec!["/library".to_string()];
         let plan =
             resolve_execution_plan(&config, &cli(Some("discover"), None, None, None)).unwrap();

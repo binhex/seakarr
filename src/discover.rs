@@ -227,7 +227,7 @@ impl LibraryIndex {
 pub struct ArtistFolderIndex {
     roots: Vec<PathBuf>,
     folders: OnceLock<BTreeMap<String, Vec<(PathBuf, String)>>>,
-    /// Artist keys whose ambiguity has already been reported. Auto mode resolves a
+    /// Artist keys whose ambiguity has already been reported. Upgrade mode resolves a
     /// target once per album, so without this an artist with three albums would
     /// repeat the same warning three times in one run.
     warned: Mutex<BTreeSet<String>>,
@@ -282,7 +282,7 @@ impl ArtistFolderIndex {
             .collect();
         let (parent, name) = (*candidates.first()?).clone();
         if candidates.len() > 1 {
-            // Once per artist per run: auto mode resolves a target per album, so an
+            // Once per artist per run: upgrade mode resolves a target per album, so an
             // artist with several albums would otherwise repeat this warning.
             let first_report = self
                 .warned
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn an_artist_folder_five_levels_below_a_root_is_found() {
         // The operator's layout: /media/Music/<user>/<type>/<genre>/<subgenre>/<artist>.
-        // The direct-child lookup cannot see it, which is why manual and automatic
+        // The direct-child lookup cannot see it, which is why manual and upgrade
         // placement never fired on a real library.
         let library = TempDir::new().unwrap();
         let artist = library
@@ -823,7 +823,7 @@ mod tests {
             found,
             Some((library.path().join("Albums"), "Radiohead".to_string()))
         );
-        // A second lookup for the same artist must not repeat the warning: auto mode
+        // A second lookup for the same artist must not repeat the warning: upgrade mode
         // resolves a target once per album, and one artist normally has several.
         let _ = index.find("Radiohead");
         let logs = capture.text();

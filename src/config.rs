@@ -356,7 +356,7 @@ fn default_staging_dir() -> String {
     "downloads/staging".into()
 }
 fn default_search_mode() -> String {
-    "auto".into()
+    "upgrade".into()
 }
 fn default_search_timeout() -> u64 {
     15
@@ -384,7 +384,7 @@ fn default_extensions() -> Vec<String> {
     vec!["flac".into()]
 }
 fn default_concurrent() -> usize {
-    // 1: auto mode searches albums concurrently, and each search makes the
+    // 1: upgrade mode searches albums concurrently, and each search makes the
     // Soulseek server push ConnectToPeer for every result peer (the crate
     // spawns a peer-actor thread per connection). The peer registry is sized
     // from the configured `soulseek.max_peers` (default 64), which bounds the
@@ -515,7 +515,7 @@ impl Default for ScheduleConfig {
 /// the on-disk YAML contents. Only the `search:` top-level section is
 /// inspected so a same-named key elsewhere cannot be misreported. Both block
 /// style (`search:` followed by indented keys) and flow style
-/// (`search: {default_mode: auto, ...}`) are handled. Quoted keys, spacing
+/// (`search: {default_mode: upgrade, ...}`) are handled. Quoted keys, spacing
 /// before colons, and inline comments are also accepted. Returns `None` when
 /// the entry is absent.
 fn find_default_mode_line(contents: &str) -> Option<usize> {
@@ -715,13 +715,14 @@ impl Config {
         let mut file_value: serde_yaml::Value = serde_yaml::from_str(contents)
             .map_err(|e| SeakarrError::Config(format!("failed to parse {config_file:?}: {e}")))?;
 
-        // Migration: rename config keys that changed between versions.
-        // Preserves existing values (e.g., min_bitrate: 320 becomes
+        // Migration: rename config keys and mode values that changed between
+        // versions. Preserves existing values (e.g., min_bitrate: 320 becomes
         // min_bit_rate: 320). Null legacy values are dropped so
         // merge_with_defaults restores the schema default (0 for the u32
         // quality keys, true for peer_reputation). The legacy `daemon` section
         // is folded into the canonical `schedule` section first, with explicit
-        // `schedule` values winning.
+        // `schedule` values winning. A retired mode value is rewritten in place
+        // (see `migrate_search_mode_value` below).
         // Bitwise OR is intentional: every migration mutates file_value and
         // must run even when an earlier migration already returned true.
         let renamed = migrate_schedule_section(&mut file_value, config_file)?
@@ -732,7 +733,8 @@ impl Config {
                 "search",
                 "prefer_reliable_peer",
                 "peer_reputation",
-            );
+            )
+            | migrate_search_mode_value(&mut file_value);
 
         let merged = merge_with_defaults(&default_value, &file_value);
         if merged == file_value && !renamed {
@@ -1054,6 +1056,36 @@ fn migrate_schedule_section(config: &mut serde_yaml::Value, config_file: &Path) 
     })
 }
 
+/// Rewrite the retired `search.default_mode: auto` to `upgrade`.
+///
+/// The comparison is deliberately the same one the resolver makes - the raw
+/// value, `trim()`ed - so the migration can never rewrite a value the resolver
+/// would accept, and never leaves the retired spelling behind for the resolver
+/// to reject. Any other value is left in place for the resolver to reject,
+/// which keeps typos visible instead of silently coercing them into a valid
+/// mode.
+///
+/// Returns `true` when the value was rewritten.
+fn migrate_search_mode_value(config: &mut serde_yaml::Value) -> bool {
+    let serde_yaml::Value::Mapping(root) = config else {
+        return false;
+    };
+    let Some(serde_yaml::Value::Mapping(search)) =
+        root.get_mut(serde_yaml::Value::String("search".into()))
+    else {
+        return false;
+    };
+    let mode_key = serde_yaml::Value::String("default_mode".into());
+    let Some(serde_yaml::Value::String(value)) = search.get_mut(&mode_key) else {
+        return false;
+    };
+    if value.trim() != "auto" {
+        return false;
+    }
+    *value = "upgrade".to_string();
+    true
+}
+
 /// Rename a key within a YAML section, preserving the value.
 /// If the old key exists and is not null, its value is copied to the new key
 /// (unless the new key is already present with a non-null value — the explicit
@@ -1247,7 +1279,7 @@ storage:
   staging_dir: "downloads/staging"
 
 search:
-  default_mode: "auto"
+  default_mode: "upgrade"
   timeout_secs: 15
   response_limit: 1000
   type: "any"
@@ -1380,7 +1412,7 @@ schedule:
     }
 
     // Regression guard for the thread-explosion bug: with the default
-    // concurrency, auto mode fires N concurrent album searches, each of which
+    // concurrency, upgrade mode fires N concurrent album searches, each of which
     // makes the Soulseek server push ConnectToPeer for every result peer;
     // soulseek-rs-lib spawns a peer-actor thread per connection. At
     // concurrent=5 this blew past the container's pids limit (~1200-1600
@@ -1482,12 +1514,13 @@ schedule:
         // only matches the input would send them to the wrong place.
         let dir = TempDir::new().unwrap();
         let config_file = dir.path().join("seakarr.yml");
-        let yaml = "soulseek:\n  username: user\n  password: pass\nsearch: {default_mode: auto}\n";
+        let yaml =
+            "soulseek:\n  username: user\n  password: pass\nsearch: {default_mode: upgrade}\n";
         fs::write(&config_file, yaml).unwrap();
 
         let config = Config::load(dir.path()).unwrap();
 
-        assert_eq!(config.search.default_mode, "auto");
+        assert_eq!(config.search.default_mode, "upgrade");
         let source = config.source().expect("loaded config has source");
         let final_contents = fs::read_to_string(&config_file).unwrap();
         let expected = final_contents
@@ -1531,7 +1564,8 @@ soulseek:\n  username: user\n  password: pass\nstorage:\n  staging_dir: download
     fn load_records_absolute_path_and_default_mode_line() {
         let dir = TempDir::new().unwrap();
         let config_file = dir.path().join("seakarr.yml");
-        let yaml = "soulseek:\n  username: user\n  password: pass\nsearch:\n  default_mode: auto\n";
+        let yaml =
+            "soulseek:\n  username: user\n  password: pass\nsearch:\n  default_mode: upgrade\n";
         fs::write(&config_file, yaml).unwrap();
 
         let config = Config::load(dir.path()).unwrap();
@@ -1545,6 +1579,11 @@ soulseek:\n  username: user\n  password: pass\nstorage:\n  staging_dir: download
         let expected_line = find_default_mode_line(&final_contents).expect("default_mode present");
         assert_eq!(source.default_mode_line, expected_line);
         assert!(expected_line > 0);
+    }
+
+    #[test]
+    fn default_search_mode_is_upgrade() {
+        assert_eq!(Config::default().search.default_mode, "upgrade");
     }
 
     #[test]
@@ -1787,6 +1826,60 @@ library:
     }
 
     #[test]
+    fn test_load_migrates_retired_auto_mode_to_upgrade() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("seakarr.yml");
+        fs::write(&file, "search:\n  default_mode: auto\n").unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        // The in-memory config reflects the migrated file: Config::load
+        // re-reads after reconciliation.
+        assert_eq!(config.search.default_mode, "upgrade");
+        let written = fs::read_to_string(&file).unwrap();
+        assert!(written.contains("default_mode: upgrade"), "got:\n{written}");
+        assert!(!written.contains("default_mode: auto"), "got:\n{written}");
+        assert!(
+            dir.path().join("seakarr.yml.bak").exists(),
+            "the pre-migration file must be preserved as seakarr.yml.bak"
+        );
+    }
+
+    #[test]
+    fn test_load_does_not_back_up_an_already_canonical_config() {
+        let dir = TempDir::new().unwrap();
+        // The first load creates the default file; no reconciliation is needed.
+        assert_eq!(
+            Config::load(dir.path()).unwrap().search.default_mode,
+            "upgrade"
+        );
+        let file = dir.path().join("seakarr.yml");
+        let before = fs::read_to_string(&file).unwrap();
+
+        // The second load must be a no-op: no rewrite, no backup.
+        Config::load(dir.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+        assert!(!dir.path().join("seakarr.yml.bak").exists());
+    }
+
+    #[test]
+    fn test_migrate_search_mode_value_matches_the_resolver_trim() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("search:\n  default_mode: \" auto \"\n").unwrap();
+        assert!(migrate_search_mode_value(&mut value));
+        assert_eq!(value["search"]["default_mode"], "upgrade");
+    }
+
+    #[test]
+    fn test_migrate_search_mode_value_leaves_an_unknown_value_alone() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("search:\n  default_mode: upgrde\n").unwrap();
+        assert!(!migrate_search_mode_value(&mut value));
+        assert_eq!(value["search"]["default_mode"], "upgrde");
+    }
+
+    #[test]
     fn test_load_migrates_only_once_no_duplicate_backup() {
         let dir = TempDir::new().unwrap();
         let minimal = r#"
@@ -1895,6 +1988,14 @@ notifications:
         assert_eq!(
             config.filters.min_bit_depth, 24,
             "Config::load must return migrated min_bit_depth from old min_bitdepth key"
+        );
+        // The migration chain is joined with `|`, not `||`: this fixture fires an
+        // earlier migration (the filter-key renames) AND carries the retired mode
+        // value, so this assertion is what proves a later migration still runs
+        // after an earlier one has already reported a change.
+        assert_eq!(
+            config.search.default_mode, "upgrade",
+            "a later migration must still run when an earlier one already changed the file"
         );
 
         // Verify the on-disk file was migrated

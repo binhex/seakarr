@@ -9,7 +9,7 @@ Automated Soulseek music downloader with library quality upgrading.
   OGG, Opus, WAV, WMA, and more via [lofty](https://crates.io/crates/lofty)), and identifies albums
   whose tracks are in a format outside `filters.allowed_extensions` or fall below the
   configurable bitrate threshold.
-- **Automatic mode** — for each album needing an upgrade, searches the Soulseek network, ranks
+- **Upgrade mode** — for each album needing an upgrade, searches the Soulseek network, ranks
   candidates by advertised speed (adjusted by measured-throughput reputation), free-slot bonus, bitrate bonus,
   album-name match and peer reliability, and downloads the best match. The result is written into your
   library when the artist already has a folder under a configured `library.paths` entry, and stays in
@@ -34,10 +34,10 @@ Automated Soulseek music downloader with library quality upgrading.
   A run places each completed album into the artist's existing library folder when one exists
   anywhere under a configured `library.paths` entry; when the artist has no folder there, or the
   album's destination folder already exists, a manual run keeps the download in
-  `storage.staging_dir` (batch and automatic runs merge into the existing folder instead, keeping
+  `storage.staging_dir` (batch and upgrade runs merge into the existing folder instead, keeping
   any file that already parses as audio). An
   album-only request names no artist, so it always stays in staging and says nothing: only manual
-  mode can express one, because auto mode rejects `--album` on its own and a batch line is trimmed
+  mode can express one, because upgrade mode rejects `--album` on its own and a batch line is trimmed
   before it is parsed, so a line written as `" - Album"` is read as an artist-only line. An artist-naming run with a configured library path explains a
   staging-only download once it has one.
 - **Authoritative artist discography** — artist-only manual runs resolve conceptual albums from MusicBrainz
@@ -73,7 +73,7 @@ Automated Soulseek music downloader with library quality upgrading.
   folder.
 - **SQLite persistence** — tracks processed albums, peer reputation, and search history
   across restarts and schedule cycles.
-- **Scheduled mode** — run the selected auto, manual, batch, or discover operation immediately, then repeat
+- **Scheduled mode** — run the selected upgrade, manual, batch, or discover operation immediately, then repeat
   it after a configurable interval. SIGTERM stops after the active cycle; Ctrl+C requests active-cycle
   cancellation or stops the scheduler while it is waiting between cycles. A Ctrl+C received during the
   library scan aborts the scan and the run before any work item. While a run is active, a second Ctrl+C
@@ -121,7 +121,7 @@ Soulseek username, password, and library paths, then run `seakarr --test` to val
 # Validate configuration
 seakarr --test
 
-# One-shot automatic upgrade scan
+# One-shot upgrade scan
 seakarr
 
 # Scheduled foreground loop (run immediately, then wait 60 min after each cycle)
@@ -143,13 +143,13 @@ seakarr --mode batch --batch-file wantlist.txt
 
 Mode selection is explicit. `--artist` and `--album` are manual selectors, and
 `--batch-file` is a batch selector; these options do not silently override the
-configured `search.default_mode`. When the configured mode is `auto`, add
+configured `search.default_mode`. When the configured mode is `upgrade`, add
 `--mode manual` for a manual target or `--mode batch` for a batch file. An
 artist-only manual search resolves MusicBrainz conceptual albums first and then
 performs one sequential targeted Soulseek search per eligible album, oldest
 first. Explicit artist-plus-album manual searches now place their downloads into the artist's
 existing library folder; album-only manual searches keep theirs in staging, because an album has
-no artist folder; batch and automatic runs place the same way, and the library-upgrade copy-back
+no artist folder; batch and upgrade runs place the same way, and the library-upgrade copy-back
 is unchanged. If
 authoritative discovery cannot be established, the previous
 single-query folder heuristic remains available as a visible fallback; set
@@ -194,14 +194,14 @@ All options are optional overrides. When an option is omitted, the value from `s
 
 | Option | Description | Default |
 | ------ | ----------- | ------- |
-| `--mode <mode>` | Select `auto`, `manual`, `batch`, or `discover`. | *(from config)* |
+| `--mode <mode>` | Select `upgrade`, `manual`, `batch`, or `discover`. The retired value `auto` was renamed to `upgrade` and is rejected with an error naming the replacement. | *(from config)* |
 | `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library, and that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
-| `--schedule` | Run immediately, then repeat the same validated auto, manual, batch, or discover operation after each interval. | `false` |
+| `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
 
-`--ignore-processed` applies to one-shot auto, manual, batch, and discover modes.
+`--ignore-processed` applies to one-shot upgrade, manual, batch, and discover modes.
 In `discover` mode, and in artist-only manual runs (`--artist` without
 `--album`), it is honoured for processed-record checks but it never bypasses the
 library-presence check, so it cannot re-download an album you already own. To
@@ -216,12 +216,12 @@ placed into the artist's existing library folder unless the album's destination 
 exists, in which case it stays in staging (there
 may be a different edition there, and
 placement never replaces a readable file); when the artist has no folder under a configured
-library path it stays in staging too, because placement never creates one. Batch and automatic
+library path it stays in staging too, because placement never creates one. Batch and upgrade
 runs merge into an album folder that already exists instead, and a replacement they leave in
-staging is one whose artist has no folder; it stays there until a later auto run with
+staging is one whose artist has no folder; it stays there until a later upgrade run with
 `library_upgrade.enabled: true` runs its recovery scan, which adopts a staging
 leftover with a matching successful record into `library.paths[0]` and deletes a
-leftover with no record. In auto mode, only albums
+leftover with no record. In upgrade mode, only albums
 selected by the existing upgrade scanner are eligible. The flag cannot be
 combined with `--schedule` (or configured scheduled mode), so a forced reprocess
 is never repeated automatically on every cycle. If a forced search fails before
@@ -250,7 +250,7 @@ A default config is created automatically on first run. The file is divided into
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `paths` | Root directories to scan for music files, in priority order. Artist folders are looked up anywhere below each root, so a nested `<root>/<user>/<type>/<genre>/<subgenre>/<artist>/<album>` layout works as well as `<root>/Artist/Album`; when more than one folder matches an artist, the run warns naming the folder it chose and the ones it skipped; the winner is the first matching root in configuration order, and within one root the first in the walk's alphabetical, depth-first order (a deeper folder can win, and the warning names the choice). A folder nested inside another match is a self-titled album (`<artist>/<artist>`), not a second artist folder, so it is not treated as an ambiguity - and an artist whose name also matches an ancestor folder (`<root>/Rock/Rock` with the artist "Rock") resolves to that ancestor, as the direct-child lookup did before. When the same album is found under more than one root, the earliest listed entry supplies the location an upgrade writes back to, while the track counts from all copies are summed (so keep the entries non-overlapping: overlapping roots inflate the count the peer-completeness gate compares against). Discover placement is artist-level instead: it uses the root holding most of that artist's albums, with ties broken alphabetically, and manual placement uses the first configured entry that holds a folder for the artist, checking the album's destination folder under that same entry. Overridden by `--library-path`. | `[]` |
-| `scan_on_startup` | Rescan the library on startup (auto mode). *(Reserved for future use — not yet enforced.)* | `true` |
+| `scan_on_startup` | Rescan the library on startup (upgrade mode). *(Reserved for future use — not yet enforced.)* | `true` |
 
 ### `storage`
 
@@ -267,7 +267,7 @@ mode are ignored. CLI values take precedence over values in the selected section
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `default_mode` | Default search mode. Choices: `auto`, `manual`, `batch`, `discover`. | `auto` |
+| `default_mode` | Default search mode. Choices: `upgrade`, `manual`, `batch`, `discover`. A config still carrying the retired value `auto` keeps loading: it is migrated to `upgrade` the next time the file is reconciled, with a `seakarr.yml.bak` backup, so the config directory must be writable. | `upgrade` |
 | `timeout_secs` | How long to wait for Soulseek search responses. | `15` |
 | `response_limit` | Maximum search results to collect. *(Reserved for future use — not yet enforced.)* | `1000` |
 | `type` | Filter results by track count. `any` (no restriction), `album` (5+ tracks), `single` (1–4 tracks). *(Reserved for future use — not yet enforced.)* | `any` |
@@ -286,7 +286,7 @@ Controls authoritative MusicBrainz discovery. Artist-only manual runs resolve
 the artist's conceptual release groups before any Soulseek search, and
 `discover` mode applies the same resolution to every eligible artist derived
 from your library. Explicit artist-plus-album manual searches now place their downloads as
-described above; album-only manual searches keep theirs in staging; batch and automatic runs
+described above; album-only manual searches keep theirs in staging; batch and upgrade runs
 place the same way, and only the library-upgrade copy-back is unchanged. The
 MusicBrainz API needs no account or API
 key.
@@ -381,7 +381,7 @@ reconciliation key both fold `&` to `and` and ignore word order, so each
 conflates `AC/DC` with `AC DC` and treats `Roses & Guns` as `Guns and Roses`; the
 processed-history key is the one also used for the stored records.
 
-Quality is not considered: replacing lossy files remains `auto` mode's job.
+Quality is not considered: replacing lossy files remains `upgrade` mode's job.
 
 An artist that MusicBrainz cannot resolve to exactly one candidate is recorded
 for `discography.failure_cache_days`, and a later run skips the lookup for it
@@ -403,12 +403,12 @@ Controls which Soulseek search results pass the quality gate.
 | --- | ----------- | ------- |
 | `allowed_extensions` | Only consider files with these extensions. Entries must be bare extensions of ASCII letters and digits (so `flac`, `mp3`, `m4a`); an empty list, or an entry such as `.flac` or `flac, mp3` that could never match, aborts startup. | `[flac]` |
 | `min_bit_rate` | Minimum bitrate in kbps. At candidate selection, any file whose advertised bitrate is below this value is rejected, lossless included; the post-download verification is what applies to lossy files only, and it also runs when the peer omitted the bitrate attribute. `0` disables. | `0` |
-| `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. Auto mode's upgrade scan does not read bit depth, so a library of 16-bit files is never flagged for upgrade because of this setting; it only rejects candidates whose advertised or measured depth is lower. | `0` |
+| `min_bit_depth` | Minimum bit depth in bits (e.g. `16` or `24`). Lossless files whose actual bit depth is below this value are rejected (verified after download when the peer omits the attribute). `0` disables. Upgrade mode's upgrade scan does not read bit depth, so a library of 16-bit files is never flagged for upgrade because of this setting; it only rejects candidates whose advertised or measured depth is lower. | `0` |
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. This toggle governs the gap check only; the track-1 half of the completeness rule is part of `min_tracks` and is disabled only by `min_tracks: 0`. | `true` |
-| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule has two halves and is measured on the largest album group — the set that will actually be downloaded — so a result cannot pass on files from directories that will not be fetched: the group must reach `min_tracks`, and (for a new album) its numbered files, when every name parses with at least two distinct values, must include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement path as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later auto run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
-| `peer_track_count` | In auto mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that auto mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
+| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule has two halves and is measured on the largest album group — the set that will actually be downloaded — so a result cannot pass on files from directories that will not be fetched: the group must reach `min_tracks`, and (for a new album) its numbered files, when every name parses with at least two distinct values, must include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement path as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later upgrade run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
+| `peer_track_count` | In upgrade mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that upgrade mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
 
@@ -429,7 +429,7 @@ Controls which Soulseek search results pass the quality gate.
 
 ### `library_upgrade`
 
-Auto-mode workflow that finds library albums failing the quality gate and re-downloads them from a
+Upgrade-mode workflow that finds library albums failing the quality gate and re-downloads them from a
 better source, replacing the existing files.
 
 The destination is derived from the album's tags, not from the folder the album was found in, so a tag
@@ -444,7 +444,7 @@ places under the on-disk artist folder.
 
 | Key | Description | Default |
 | --- | ----------- | ------- |
-| `enabled` | Enable the library-upgrade workflow (auto mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. Requires at least one `library.paths` entry. | `false` |
+| `enabled` | Enable the library-upgrade workflow (upgrade mode only). When enabled, albums whose formats or bitrate fall below the `filters` targets are re-downloaded and their files copied into the library. Requires at least one `library.paths` entry. | `false` |
 | `delete_lesser_quality` | After a successful upgrade, delete existing files in the album that are lower quality than the newly written copies (non-audio files are never deleted). The pass walks `<artist>/<album>` under the directory the album was found in (the library root itself only for a flat `<root>/Artist/Album` layout) and compares against the best written file, so two cases behave differently from the name: the folder the pass walks is the one on disk, so a spelling the sanitiser would rewrite still leaves the old files judged against replacements stored in the sanitised folder, and a file kept because it scored higher than its own incoming copy can still be deleted when another track of the album scored higher. | `false` |
 
 ### `database`
@@ -636,7 +636,7 @@ starting at track 1, just as the hyphenated `1-01` form does.
 
 Note that the count half also applies to genuine EPs and singles: an album shorter than
 `min_tracks` is refused in the filter, before any download, in every mode — the target is not
-consulted first. Auto mode with `library_upgrade.enabled: false` (the shipped default) needs
+consulted first. Upgrade mode with `library_upgrade.enabled: false` (the shipped default) needs
 `min_tracks: 0` or `1` to replace a short album rather than refusing it every cycle. With
 `library_upgrade.enabled: true` and `min_tracks` low enough to admit the album, the library-upgrade
 path's own `needs_upgrade` reference decides the copy after the download, and that path may be
@@ -681,7 +681,7 @@ seakarr saves the original as `seakarr.yml.bak`. Explicit values already under
 
 Seakarr has four operating modes:
 
-### Automatic mode (default)
+### Upgrade mode (default)
 
 1. **Scan** — walks every path in `library.paths`, reads audio tags via `lofty`, and groups tracks by
    artist and album. Prefers tag metadata over directory names. Folder-derived artist and album names
@@ -743,7 +743,7 @@ under a configured library path, or the album folder that a placement would writ
 already exists, the download stays in `storage.staging_dir`.
 
 Explicit artist-plus-album manual searches now place their downloads as described above;
-album-only manual searches keep theirs in staging; batch mode, automatic mode, and the
+album-only manual searches keep theirs in staging; batch mode, upgrade mode, and the
 library-upgrade workflow place the same way and never consult
 MusicBrainz. The legacy single-query folder heuristic is retained as the
 `discography.enabled: false` opt-out and as an automatic fallback when
@@ -799,7 +799,7 @@ stays in `staging_dir`.
 
 ### Scheduled mode
 
-When `--schedule` or `schedule.enabled` is set, the same validated auto, manual, batch, or discover
+When `--schedule` or `schedule.enabled` is set, the same validated upgrade, manual, batch, or discover
 plan runs immediately in a foreground loop. After each cycle completes, seakarr waits for
 `schedule.interval_mins` before dispatching that unchanged plan again. SIGTERM received at
 any time stops the scheduler after the active cycle and removes the PID file. Ctrl+C during
@@ -871,7 +871,7 @@ is read by the first-number rule instead. (2) A gap inside any one disc
 is rejected, because each disc's tracks are validated independently, but a share that omits an entire
 disc is not detected by this heuristic — a peer advertising only `CD 01` forms one contiguous group,
 so a multi-disc album can be completed from it and recorded as present. Turning the gate off does not
-help there: it is a false acceptance, so disabling the check only accepts more shares. In auto mode,
+help there: it is a false acceptance, so disabling the check only accepts more shares. In upgrade mode,
 and in manual mode when the album is already in the library, the peer track-count gate is what rejects
 a peer that supplies fewer tracks than the album needs; discover and batch runs have no such baseline,
 because neither derives a library track count for the album.
@@ -1137,16 +1137,16 @@ the album on later runs. Note that
 `--artist` narrowing still keys on the tag spelling, and the artist work list now also requires the
 artist to own a folder of its own, so a name spelled
 differently on disk than in its tags is skipped by the sweep and has to be named with `--artist`.
-Case, spacing and width differences fold, so only a genuinely different spelling is skipped. Note that a later auto run with
+Case, spacing and width differences fold, so only a genuinely different spelling is skipped. Note that a later upgrade run with
 `library_upgrade.enabled` removes every leftover staging
 directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a
 permanent one.
 
-**Q: Can I run auto mode and discover mode on a schedule at the same time?**
+**Q: Can I run upgrade mode and discover mode on a schedule at the same time?**
 
 No. seakarr holds a single PID lock and a single Soulseek session, and a second
 login with the same username displaces the running instance. A scheduled
-instance performs one job: either upgrading what you have (`--mode auto`) or
+instance performs one job: either upgrading what you have (`--mode upgrade`) or
 filling gaps (`--mode discover`). Alternating between them across separate runs
 is the supported approach.
 

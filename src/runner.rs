@@ -234,18 +234,18 @@ fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::Sear
 
 /// Where a completed download is written, and what its write is allowed to do.
 ///
-/// `Upgrade` is auto mode's replacement of an album that already exists but
+/// `Upgrade` is upgrade mode's replacement of an album that already exists but
 /// fails the quality gate: it is gated by the caller on
 /// `library_upgrade.enabled`, compares the download against the library's own
 /// track count, and may delete lesser-quality files. `Place` is the placement of
 /// a newly downloaded album beside the artist's existing albums, used by discover,
-/// manual, automatic and batch runs: it carries no completeness baseline and never deletes
+/// manual, upgrade and batch runs: it carries no completeness baseline and never deletes
 /// anything. `skip_existing_album` is manual mode's rule that an album folder
 /// which already exists keeps the download in staging instead of being written
-/// into; discover, auto and batch pass `false`. `StagingOnly` is a run with no
+/// into; discover, upgrade and batch pass `false`. `StagingOnly` is a run with no
 /// artist folder to place into.
 ///
-/// Paths are owned: automatic runs compute a target before entering the future
+/// Paths are owned: upgrade runs compute a target before entering the future
 /// that processes the album, so a borrowed target cannot outlive the lookup that
 /// produced it.
 #[derive(Debug, Clone)]
@@ -296,7 +296,7 @@ fn existing_album_destination(
 /// grouping), so no run reaches it today: the filter refuses such a set before
 /// anything is fetched. It is kept as a defensive backstop for a future change to
 /// the download layer, and the paths that call it (the `Place` arm, used by
-/// discover, manual and automatic runs) are backstops in the same
+/// discover, manual, upgrade and batch runs) are backstops in the same
 /// sense. The library-upgrade path does not
 /// call it: its own gate compares the
 /// download against `needs_upgrade`, the number of files that failed the quality
@@ -650,7 +650,7 @@ async fn process_album_internal(
         DownloadStage::Failed { outcome } => return Ok(outcome),
     };
 
-    // Library write: auto mode's gated upgrade, or placement for every other mode.
+    // Library write: upgrade mode's gated upgrade, or placement for every other mode.
     let album_write = AlbumWrite {
         config,
         db,
@@ -1399,8 +1399,8 @@ async fn download_ranked_candidates(
     }
 }
 
-/// Run in automatic mode: scan library, find upgrades, process each album concurrently.
-pub async fn run_auto_mode(
+/// Run in upgrade mode: scan library, find upgrades, process each album concurrently.
+pub async fn run_upgrade_mode(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
@@ -1486,7 +1486,7 @@ pub async fn run_auto_mode(
         let artist = artist.clone();
         let album = album.clone();
         let library_track_count = *track_count;
-        // Auto mode's copy-back is the upgrade path: it replaces an album that
+        // Upgrade mode's copy-back is the upgrade path: it replaces an album that
         // exists but fails the quality gate, so it is gated on
         // `library_upgrade.enabled` and carries the library's own track count
         // as the completeness reference. With the flag off the album is placed
@@ -2248,7 +2248,7 @@ const DISCOVER_PROVIDER_FAILURE_LIMIT: u32 = 3;
 /// Run discover mode: derive artists from the library, ask MusicBrainz what
 /// each one is missing, and download only those albums.
 ///
-/// Auto mode's upgrade pass is untouched: this mode never replaces an album it
+/// Upgrade mode's upgrade pass is untouched: this mode never replaces an album it
 /// considers present.
 pub async fn run_discover_mode(
     client: &dyn SoulseekClient,
@@ -2366,7 +2366,7 @@ async fn fill_artist_gap(
                 report.record(&artist.name, &target.title, outcome);
             }
             Err(error) => {
-                // Matches auto mode: an environment error is recorded and the run
+                // Matches upgrade mode: an environment error is recorded and the run
                 // continues to the next album.
                 tracing::error!(
                     "Album processing failed: {} - {}: {error}",
@@ -5123,8 +5123,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_automatic_target_places_into_an_existing_folder_and_stages_without_one() {
-        // Auto mode and batch mode both route through this helper, so this is the
+    async fn the_automatic_place_target_places_into_an_existing_folder_and_stages_without_one() {
+        // Upgrade mode and batch mode both route through this helper, so this is the
         // placement contract for both of them.
         let (mut config, _db, _staging) = artist_only_fixture();
         let library = TempDir::new().unwrap();
@@ -5202,7 +5202,7 @@ mod tests {
 
     #[test]
     fn the_staging_explanation_fires_once_per_artist_not_per_album() {
-        // Auto mode and batch mode call this once per album result, so the dedupe is
+        // Upgrade mode and batch mode call this once per album result, so the dedupe is
         // what stops an artist with several staged albums from repeating the same
         // line. The artist name is unique because LogCapture is process-wide.
         let (mut config, _db, _staging) = artist_only_fixture();
@@ -5814,7 +5814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_and_automatic_modes_keep_query_contracts() {
+    async fn explicit_and_upgrade_modes_keep_query_contracts() {
         // Explicit album fixture: an artist+album manual run must issue exactly
         // the primary "Artist Album" query, unchanged by the artist-only
         // authoritative refactor.
@@ -6630,7 +6630,7 @@ mod tests {
         // the completeness rule belongs to the library-write gate, which the
         // upgrade path does not use (it compares against `expected_tracks`).
         // Applying the anchor here would refuse the set before the download and
-        // cost auto mode its partial-repair source.
+        // cost upgrade mode its partial-repair source.
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "peer".into(),
@@ -6956,7 +6956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_with_library_upgrade_disabled_places_into_the_artist_folder() {
+    async fn upgrade_mode_with_library_upgrade_disabled_places_into_the_artist_folder() {
         // With the upgrade flag off there is no copy-back, so the album is placed
         // beside the artist's existing albums instead. Placement never creates an
         // artist folder, so the fixture provides one.
@@ -8495,7 +8495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_auto_mode_processes_album_and_marks_success() {
+    async fn test_run_upgrade_mode_processes_album_and_marks_success() {
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "user1".into(),
@@ -8525,7 +8525,7 @@ mod tests {
         db.mark_album_processed("Test Artist", "Test Album", "success")
             .unwrap();
 
-        let result = run_auto_mode(
+        let result = run_upgrade_mode(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
@@ -8539,7 +8539,7 @@ mod tests {
         // the fresh flac unwritten and this assertion would fail.
         assert!(
             artist_dir.join("01 - track.flac").exists(),
-            "auto mode with library_upgrade disabled must place the downloaded album"
+            "upgrade mode with library_upgrade disabled must place the downloaded album"
         );
 
         // Album processed successfully through the outcome-collection path.
@@ -8551,7 +8551,7 @@ mod tests {
             queries
                 .iter()
                 .any(|query| query == "Test Artist Test Album"),
-            "ignore_processed must let auto mode search the pre-processed target"
+            "ignore_processed must let upgrade mode search the pre-processed target"
         );
     }
 
@@ -8566,7 +8566,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
 
         // No targets — should not panic or error
-        let result = run_auto_mode(
+        let result = run_upgrade_mode(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
@@ -8809,7 +8809,7 @@ mod tests {
     // the Alesha Dixon album was copied to .../Albums/Pop/Alesha Dixon/...
     // instead of .../Albums/Pop/Pop/Alesha Dixon/...
     #[tokio::test]
-    async fn test_auto_mode_upgrade_preserves_nested_library_location() {
+    async fn test_upgrade_mode_upgrade_preserves_nested_library_location() {
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "user1".into(),
@@ -8847,7 +8847,7 @@ mod tests {
         *client.write_files.lock().unwrap() = true;
 
         let db = Database::open_in_memory().unwrap();
-        let result = run_auto_mode(
+        let result = run_upgrade_mode(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,
@@ -8900,7 +8900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auto_mode_upgrade_of_a_disc_nested_album_lands_in_the_album_folder() {
+    async fn test_upgrade_mode_upgrade_of_a_disc_nested_album_lands_in_the_album_folder() {
         let client = Arc::new(MockClient::new());
         *client.search_results.lock().unwrap() = vec![SearchResult {
             username: "user1".into(),
@@ -8935,7 +8935,7 @@ mod tests {
         *client.write_files.lock().unwrap() = true;
 
         let db = Database::open_in_memory().unwrap();
-        let result = run_auto_mode(
+        let result = run_upgrade_mode(
             client.as_ref() as &dyn crate::client::SoulseekClient,
             &config,
             &db,

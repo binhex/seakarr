@@ -82,7 +82,7 @@ fn test_mode_manual_without_target_fails_validation() {
 }
 
 #[test]
-fn artist_and_album_do_not_enter_configured_auto_mode() {
+fn artist_and_album_do_not_enter_configured_upgrade_mode() {
     let temp = TempDir::new().unwrap();
     let config_dir = temp.path().join("config");
     let log_dir = temp.path().join("logs");
@@ -124,17 +124,21 @@ fn artist_and_album_do_not_enter_configured_auto_mode() {
     );
     assert!(
         !combined.contains("Scanning library"),
-        "manual selectors must never enter the auto scanner:\n{combined}"
+        "manual selectors must never enter the upgrade scanner:\n{combined}"
     );
 }
 
 #[test]
-fn configured_auto_conflict_reports_absolute_config_path_and_line() {
+fn configured_upgrade_conflict_reports_absolute_config_path_and_line() {
     let cwd = std::env::current_dir().unwrap();
     let config_dir = cwd.join("target").join("provenance-conflict-test");
     let _ = std::fs::remove_dir_all(&config_dir);
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_file = config_dir.join("seakarr.yml");
+    // The fixture carries the retired value on purpose: reconciliation rewrites
+    // it to `upgrade` before mode resolution, so the conflict below is reported
+    // against the migrated value and the migrated line. This doubles as the
+    // regression test that the retired value never reaches the resolver.
     let yaml = concat!(
         "# provenance test\n",
         "soulseek:\n",
@@ -178,7 +182,7 @@ fn configured_auto_conflict_reports_absolute_config_path_and_line() {
     );
     assert_eq!(output.status.code(), Some(1), "got:\n{combined}");
     assert!(
-        combined.contains("search.default_mode: auto"),
+        combined.contains("search.default_mode: upgrade"),
         "got:\n{combined}"
     );
     assert!(
@@ -349,7 +353,7 @@ fn ignore_processed_with_configured_schedule_fails_before_login() {
         config_dir.join("seakarr.yml"),
         r#"
 search:
-  default_mode: auto
+  default_mode: upgrade
 schedule:
   enabled: true
   interval_mins: 60
@@ -497,5 +501,44 @@ fn test_discover_mode_rejects_album_selector() {
     assert!(
         combined.contains("--album is incompatible with discover mode"),
         "got:\n{combined}"
+    );
+}
+
+#[test]
+fn test_retired_auto_mode_is_rejected_before_login() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--mode",
+            "auto",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the retired mode value must fail, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("invalid search mode 'auto'; this mode is now called 'upgrade'"),
+        "the error must name the replacement, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Connecting to Soulseek"),
+        "the mode error must occur before login:\n{combined}"
     );
 }

@@ -408,7 +408,7 @@ fn scan_library_with_heartbeat(
             // folders into one album is a presence and identity concern, not a
             // path concern.
             //
-            // Note that the auto-mode upgrade destination comes from the album
+            // Note that the upgrade-mode destination comes from the album
             // TAG (`final_album` below), not from this name, so a tag that
             // differs from the folder already sent that write to a sibling
             // folder before the portable-name sanitiser existed. The current
@@ -456,7 +456,7 @@ fn scan_library_with_heartbeat(
             // The same artist/album key can appear under several roots, and under
             // one root in several folders. The earliest listed root wins, and
             // inside one root the lexicographically smallest folder wins, so the
-            // recorded pair (used by placement and by the auto-mode upgrade root)
+            // recorded pair (used by placement and by the upgrade-mode root)
             // never depends on filesystem walk order.
             let take_location = match albums.get(&key) {
                 None => true,
@@ -580,7 +580,7 @@ fn unreadable(error: impl std::fmt::Display) -> AudioTags {
 /// NOT the album's total track count. The library location (the directory the
 /// album was found in; for a standard <root>/Artist/Album layout this is the
 /// library root, for nested layouts it is the directory above the artist
-/// folder) is threaded to the runner so auto-mode copies upgrades back into
+/// folder) is threaded to the runner so upgrade mode copies upgrades back into
 /// the album's real location.
 pub fn find_albums_to_upgrade(
     albums: &[ScannedAlbum],
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[test]
     fn test_find_albums_to_upgrade_ignores_bit_depth() {
-        // Auto mode's upgrade scan reads formats and bitrate only, so a library of
+        // Upgrade mode's upgrade scan reads formats and bitrate only, so a library of
         // 16-bit FLAC must not be flagged by `min_bit_depth: 24`; the setting only
         // rejects candidates at filter/verify time.
         let dir = TempDir::new().unwrap();
@@ -1536,7 +1536,7 @@ mod tests {
         // The album component is the folder that holds the file (one dedicated
         // disc folder is stepped over), so a format or extra sub-folder inside
         // the album folder shifts the reading: the sub-folder becomes the album
-        // and its parent becomes the artist. Pinned because untagged auto-mode
+        // and its parent becomes the artist. Pinned because untagged upgrade-mode
         // queries and the discover destination pair both derive from this.
         let dir = TempDir::new().unwrap();
         let album_dir = dir.path().join("Artist").join("Album").join("FLAC");
@@ -1601,7 +1601,7 @@ mod tests {
 
     #[test]
     fn test_scan_keeps_an_embedded_marker_in_the_album_folder_name() {
-        // Regression: the album name is the identity the auto-mode upgrade
+        // Regression: the album name is the identity the upgrade mode
         // copies into and the root the quality-deletion pass walks. Stripping
         // the marker here moves the copy into a new folder while the replaced
         // files stay in the old one, so the album was re-upgraded every run.

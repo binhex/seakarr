@@ -84,7 +84,7 @@ async fn test_full_pipeline_manual_mode() {
 /// place each track into the library with a CLEAN name — zero-padded track number
 /// and the leading track token stripped from the title. It must never produce the
 /// duplicated, unpadded "2 - 02 - Track Two.flac" that shipped when the placement
-/// and auto-upgrade paths derived metadata differently.
+/// and upgrade paths derived metadata differently.
 #[tokio::test]
 async fn test_full_pipeline_placement_uses_clean_names() {
     let client = MockClient::new();
@@ -170,7 +170,7 @@ async fn test_full_pipeline_placement_uses_clean_names() {
 }
 
 #[tokio::test]
-async fn test_full_pipeline_auto_mode_no_results() {
+async fn test_full_pipeline_no_results() {
     let client = MockClient::new();
     // No search results added — should handle gracefully
 
@@ -192,7 +192,7 @@ async fn test_full_pipeline_auto_mode_no_results() {
         staging.path(),
         None,
         None,
-        None, // library_track_count (not applicable in manual mode)
+        None, // library_track_count: this direct call has no library baseline
         None, // target: this direct call writes nothing to the library
     )
     .await;

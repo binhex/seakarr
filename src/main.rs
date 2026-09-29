@@ -80,7 +80,7 @@ struct Cli {
     #[arg(long)]
     listen_port: Option<u16>,
 
-    /// Override search mode (auto|manual|batch|discover)
+    /// Override search mode (upgrade|manual|batch|discover)
     #[arg(long)]
     mode: Option<String>,
 
@@ -559,7 +559,9 @@ async fn dispatch_execution_plan(
     ignore_processed: bool,
 ) -> Result<()> {
     match plan {
-        ExecutionPlan::Auto => runner::run_auto_mode(client, config, db, ignore_processed).await,
+        ExecutionPlan::Upgrade => {
+            runner::run_upgrade_mode(client, config, db, ignore_processed).await
+        }
         ExecutionPlan::Manual { artist, album } => {
             runner::run_manual_mode(
                 client,
@@ -616,7 +618,7 @@ async fn run_schedule(
 /// Run one scheduled cycle with the same validated plan used by one-shot execution.
 ///
 /// Keeping dispatch centralized ensures CLI criteria are not reinterpreted and
-/// an explicit manual or batch plan cannot fall through to auto mode.
+/// an explicit manual or batch plan cannot fall through to upgrade mode.
 async fn run_schedule_cycle(
     client: &dyn SoulseekClient,
     config: &Config,
@@ -781,6 +783,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn the_mode_flag_help_advertises_upgrade() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("upgrade|manual|batch|discover"),
+            "the --mode help must advertise upgrade, got:\n{help}"
+        );
+    }
+
+    #[test]
     fn the_console_filter_hides_and_restores_the_scan_heartbeat() {
         use seakarr::scan_progress::ConsoleFilter;
         use std::sync::{Arc, Mutex};
@@ -857,7 +869,7 @@ mod tests {
         config.search.manual.artist = "Michael Bolton".into();
         config.search.manual.album = "The Essential Michael Bolton".into();
         config.schedule.enabled = true;
-        // Empty library paths: auto mode would fail with
+        // Empty library paths: upgrade mode would fail with
         // "library.paths is empty", proving manual mode ran instead.
         config.library.paths = vec![];
         let staging = TempDir::new().unwrap();
@@ -1182,7 +1194,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn schedule_reuses_an_auto_plan_after_each_interval() {
+    async fn schedule_reuses_an_upgrade_plan_after_each_interval() {
         let client = MockClient::new();
         let mut config = Config::default();
         config.download.min_upload_speed_kbps = 0;
@@ -1200,7 +1212,7 @@ mod tests {
         let database = Database::open_in_memory().unwrap();
         let pid_file = temp.path().join("seakarr.pid");
         let interval = tokio::time::Duration::from_secs(60);
-        let plan = ExecutionPlan::Auto;
+        let plan = ExecutionPlan::Upgrade;
         let schedule = run_schedule(&client, &config, &database, &pid_file, interval, &plan);
         tokio::pin!(schedule);
 
@@ -1211,12 +1223,12 @@ mod tests {
         let queries = client.search_queries.lock().unwrap();
         assert!(
             queries.len() >= 6,
-            "expected two three-tier auto cycles: {queries:?}"
+            "expected two three-tier upgrade cycles: {queries:?}"
         );
         let first_cycle = &queries[..3];
         assert!(
             queries.chunks_exact(3).all(|cycle| cycle == first_cycle),
-            "every cycle must reuse the auto plan: {queries:?}"
+            "every cycle must reuse the upgrade plan: {queries:?}"
         );
     }
 
@@ -1248,7 +1260,7 @@ mod tests {
 
     // A validated manual plan must dispatch to the manual runner even with
     // an empty library — the plan's own criteria drive the run, never the
-    // auto scanner.
+    // upgrade scanner.
     #[tokio::test]
     async fn dispatches_manual_plan_without_scanning_library() {
         let client = MockClient::new();

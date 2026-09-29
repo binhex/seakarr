@@ -91,7 +91,7 @@ fn strip_leading_track_token(stem: &str) -> &str {
 /// number fall back to track `"01"` with the stem unchanged as the title.
 ///
 /// This is the single source of truth for library naming: every path that derives
-/// a library destination (the auto-upgrade copy and the placement check) must
+/// a library destination (the upgrade copy and the placement check) must
 /// produce the same names for the same staging files.
 pub fn library_name_from_stem(stem: &str) -> (String, String) {
     let track = crate::tracks::track_number_from_filename(stem)

@@ -4,7 +4,7 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Filter search results by extension, bitrate, excluded words, free slots,
 /// the download-completeness rule, contiguous track numbers (when
-/// `contiguous_tracks` is enabled), and — in auto mode — the library track
+/// `contiguous_tracks` is enabled), and — in upgrade mode — the library track
 /// count (`peer_track_count`): results whose usable track count is below the
 /// library's existing track count are rejected.
 ///
@@ -103,7 +103,7 @@ pub(crate) fn filter_results_with_queue_limit(
                 if passing.is_empty() {
                     return false;
                 }
-                // Library track count check (auto mode only).
+                // Library track count check (upgrade mode only).
                 // Note: the count mirrors what download_album will actually
                 // download — a peer's SearchResult can span multiple album
                 // directories (original edition + anniversary edition both
@@ -162,7 +162,7 @@ pub(crate) fn filter_results_with_queue_limit(
                 );
                 return false;
             }
-            // Library track count check (auto mode only).
+            // Library track count check (upgrade mode only).
             // The count mirrors download_album: a peer's SearchResult can
             // span multiple album directories, and only the LARGEST single
             // directory group is ever downloaded. Comparing the total
@@ -2109,7 +2109,7 @@ pub(crate) fn summarize_rejections_with_queue_limit(
             continue;
         }
 
-        // Library track count check (auto mode only)
+        // Library track count check (upgrade mode only)
         // Must mirror filter_results: use the largest album group's
         // length, not the flat file count, so multi-folder shares and
         // multi-disc albums are scored consistently.

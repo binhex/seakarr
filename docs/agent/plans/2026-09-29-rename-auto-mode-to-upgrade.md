@@ -799,10 +799,10 @@ rg -n 'SearchMode::Auto|ExecutionPlan::Auto|run_auto_mode|--mode auto|auto mode|
 Expected: no matches (`exit=1` from ripgrep means no matches found). Then confirm the untouched wording is intact:
 
 ```bash
-rg -c 'auto-retried' src/client.rs
+rg -c 'auto-retr' src/client.rs
 ```
 
-Expected: `4`
+Expected: `4` (the wording appears as `auto-retried` on three lines and `auto-retry` on one, so a count of the exact token `auto-retried` would read 3)
 
 - [ ] **Step 4: Acceptance criterion 5 - formatter and linter**
 
