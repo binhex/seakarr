@@ -563,6 +563,11 @@ cancellation guard for their downloads, so no listener outlives a run. Only the
   `has_artist` and `artist_keys` deliberately do not consult the folder alias,
   so an artist whose on-disk folder is spelled differently from its tags cannot
   be named with `--artist` even though presence would find its albums.
+  **Superseded on 2026-10-05:** such a spelling can now be named with `--artist`
+  when a library folder of that name exists; the folder becomes the destination
+  and the on-disk spelling is what MusicBrainz is asked about, so an album-less
+  artist folder is filled in. `has_artist` and `artist_keys` are themselves
+  unchanged, and the automatic sweep still keys on the tag spelling.
 - **A marker-shaped subfolder under an album folder reads as the artist folder.**
   For `<root>/Artist/Gold/Gold (Disc 1)/track.flac` the album component is the
   marker folder, so the artist folder resolves to `Gold` and the destination

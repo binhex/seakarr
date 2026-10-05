@@ -25,6 +25,10 @@ Automated Soulseek music downloader with library quality upgrading.
   and downloads only those. An artist the library only knows as a guest inside
   another artist's folder is skipped, and the run summary reports how many were
   skipped that way; name one explicitly with `--artist` to process it anyway.
+  Naming an artist explicitly does not require the library to hold an album for
+  it: when a folder named after the artist exists, the artist is processed and
+  its albums are placed into that folder, and when there is neither an album nor
+  a folder the run warns and keeps the downloads in staging.
   Albums already present are never
   searched or re-downloaded, and each run stops after
   `discover.max_cycle_downloads` download attempts so a large library fills in
@@ -195,7 +199,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `upgrade`, `manual`, `batch`, or `discover`. The retired value `auto` was renamed to `upgrade` and is rejected with an error naming the replacement. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that must name an artist already in the library, and that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead). Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
@@ -311,15 +315,24 @@ is unaffected, and so is a venue-and-date title such as
 
 ### `discover`
 
-Controls `discover` mode, which fills gaps in your library for artists you
-already have.
+Controls `discover` mode, which fills gaps in your library for the artists it
+derives from `library.paths`.
 
 Gap filling follows folders, not tags. An artist is only swept when at least one
 of its albums was found in a folder named after the artist itself, so an album
 tagged `ARTIST=Apashe` that sits inside the `Bassnectar` folder does not make
 Apashe an artist discover fills: it is skipped, counted in the run summary as
 `discover: N artist(s) skipped: no folder of their own`, and named in the debug
-log. Name such an artist with `--artist` to process it anyway. The accepted cost
+log. Name such an artist with `--artist` to process it anyway. Naming an artist
+explicitly does not require the library to hold an album for it: a folder named
+after it becomes the destination for its downloads, and naming an artist with
+neither an album nor a folder warns and keeps the downloads in staging; an album
+that really was kept there is counted in the summary as
+`discover: N album(s) kept in staging: the named artist is not in the library`. A
+title identity-equal to a requested one counts as already present when it sits in
+the named folder, whatever tag it carries, so an occupying album with the same
+title is treated as the artist's own. The
+accepted cost
 is that an artist whose albums live in a folder with a different name — beyond
 case, spacing, or width folding, which the gate tolerates — or in a
 folder whose name sanitisation rewrote, is no longer swept automatically.
@@ -767,13 +780,16 @@ download, placement, and notification pipeline as the other modes, oldest album 
 `discover.exclude_artists` skips aggregator names before any lookup, the
 folder-ownership gate keeps an artist the library knows only as a guest inside
 another artist's folder out of the sweep, `--artist` optionally
-names one artist already in the library to process on its own (overriding both
-the exclusion list and the gate), and the run stops after
+names one artist to process on its own (overriding both
+the exclusion list and the gate), whether or not the library holds an album for
+it — a folder named after it is the destination, and with neither album nor
+folder the downloads stay in staging — and the run stops after
 `discover.max_cycle_downloads` download attempts so a large library fills in over successive
 runs.
 
 Each completed album is placed in the artist's own library folder — the directory that artist's
-existing albums were scanned from — as `<artist folder>/<album title>/NN - Title.ext`, with the artist
+existing albums were scanned from, or, for an explicitly named artist the library holds no album
+for, the folder a name lookup found — as `<artist folder>/<album title>/NN - Title.ext`, with the artist
 folder named exactly as it is on disk and the album folder named from the MusicBrainz title. Placement
 is unconditional in discover mode: it does not depend on
 `library_upgrade.enabled`, and `library_upgrade.delete_lesser_quality` never applies to it. Once the
@@ -1099,16 +1115,20 @@ library.
 
 **Q: How do I fill in missing albums for one artist only?**
 
-Run `--mode discover --artist "Artist Name"`. The name must already exist in
-your library; discover derives the artist list from your library and never adds
-an artist you do not have. Naming one explicitly also bypasses the
+Run `--mode discover --artist "Artist Name"`. Naming an artist the library holds
+an album for narrows the sweep to that artist and also bypasses the
 folder-ownership gate, which is how you reach an artist whose albums sit in a
-folder named after somebody else. To fetch a specific album instead, use
+folder named after somebody else. The name need not exist in the library yet:
+when a folder named after the artist exists, the artist is processed and its
+albums are placed into that folder, and when there is neither an album nor a
+folder the run warns and keeps the downloads in staging. To fetch a specific
+album instead, use
 `--mode manual --artist "Artist Name" --album "Album Title"`.
 
 **Q: Where do discover downloads end up?**
 
-In the artist's own library folder, beside the albums that artist already has. Manual runs
+In the artist's own library folder, beside the albums that artist already has — or, for an
+explicitly named artist the library holds no album for, in the folder that lookup found. Manual runs
 (`--artist` with or without `--album`) place the same way, except that they require the artist
 folder to exist already: no run creates one, and an album folder that already exists keeps the
 download in staging. The artist folder is looked up anywhere below each configured root, so a nested
@@ -1118,7 +1138,7 @@ the first in configuration order wins and the run warns naming the folder it cho
 skipped. The lookup reads directory names only, so it never opens a file or a tag. Every placement
 writes the fixed layout `<artist folder>/<album title>/NN - Title.ext`, with the artist folder name
 exactly as it is on disk. Discover derives its destination from the same scan that produces its artist
-list. The staging copy is deleted once the album is placed. Placement never replaces a file
+list when the library holds albums for the artist, and from a directory-name lookup when it holds none. The staging copy is deleted once the album is placed. Placement never replaces a file
 that already parses as audio, because the album folder may belong to a different edition of the album — only a file
 that cannot be opened at all (junk bytes, an empty file, an unrelated format) is replaced. The check reads the metadata
 header, so a copy interrupted after that header still parses: it is kept as it stands and the incoming file for that
@@ -1133,10 +1153,13 @@ embedded album tag, and accepts the artist folder name as well as the tag spelli
 tag is spelled differently from the MusicBrainz title therefore cannot make a later run re-download an album seakarr
 placed itself, and the `--ignore-processed` override cannot reach it either: both sides of the lookup cover both
 spellings. Every placement writes an album folder, so the presence check always has a folder name to match. The processed-album record still suppresses
-the album on later runs. Note that
-`--artist` narrowing still keys on the tag spelling, and the artist work list now also requires the
+the album on later runs. The automatic sweep still keys on the tag spelling, and the artist work list still requires the
 artist to own a folder of its own, so a name spelled
-differently on disk than in its tags is skipped by the sweep and has to be named with `--artist`.
+differently on disk than in its tags is skipped by the sweep. Naming it with `--artist` resolves
+the name against the library's folders as well, so such an artist can be processed without
+renaming anything, and the on-disk spelling is then what MusicBrainz is asked about: a
+`discography.artist_mbids` pin must be keyed to the spelling you type, and naming the tag spelling
+is the way to query that spelling instead.
 Case, spacing and width differences fold, so only a genuinely different spelling is skipped. Note that a later upgrade run with
 `library_upgrade.enabled` removes every leftover staging
 directory whose album is not recorded as successful, so a retained copy is a short-lived safeguard rather than a

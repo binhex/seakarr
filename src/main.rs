@@ -89,7 +89,10 @@ struct Cli {
     batch_file: Option<PathBuf>,
 
     /// Artist for manual mode; in discover mode a narrowing filter that also
-    /// overrides discover.exclude_artists and the folder-ownership gate
+    /// overrides discover.exclude_artists and the folder-ownership gate. The
+    /// name need not be an artist the library holds an album for: a library
+    /// folder named after it becomes the destination, and with neither an album
+    /// nor a folder the downloads stay in staging
     #[arg(long)]
     artist: Option<String>,
 
@@ -1188,7 +1191,11 @@ mod tests {
         );
         let first_cycle = &queries[..3];
         assert!(
-            queries.chunks_exact(3).all(|cycle| cycle == first_cycle),
+            queries
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|cycle| cycle.as_slice() == first_cycle),
             "every cycle must reuse the same manual plan: {queries:?}"
         );
     }
@@ -1227,7 +1234,11 @@ mod tests {
         );
         let first_cycle = &queries[..3];
         assert!(
-            queries.chunks_exact(3).all(|cycle| cycle == first_cycle),
+            queries
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|cycle| cycle.as_slice() == first_cycle),
             "every cycle must reuse the upgrade plan: {queries:?}"
         );
     }

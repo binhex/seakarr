@@ -2363,6 +2363,19 @@ async fn fill_artist_gap(
                 if charges_download_budget(&outcome) {
                     budget.charge();
                 }
+                // Counted from the outcome, not from the selection: "kept in
+                // staging" is only true once an album really was downloaded and
+                // left there. A staging destination is produced only by the
+                // explicit-name fallback, so this is that fallback's count.
+                if matches!(
+                    &outcome,
+                    AlbumOutcome::Downloaded {
+                        destination: DownloadDestination::Staging(_),
+                        ..
+                    }
+                ) {
+                    counters.staged_albums += 1;
+                }
                 report.record(&artist.name, &target.title, outcome);
             }
             Err(error) => {
@@ -2440,8 +2453,27 @@ async fn run_discover_mode_with_provider(
         return Ok(());
     };
     let index = discover::build_index(&scanned);
-    let selection =
-        discover::select_artists(&index, &config.discover.exclude_artists, artist_filter)?;
+    // An explicitly named artist the library holds no album for is resolved
+    // against the library's folders. The folder is the operator's own statement
+    // that they collect the artist under that name, and the destination for its
+    // downloads, so `--artist` is not confined to the album-derived list. The
+    // walk reads directory names only and is lazy, and it is reached only for a
+    // name the index does not already hold, so a run that never names an absent
+    // artist never touches the library tree.
+    let filter_folder = match artist_filter {
+        Some(name) if !index.has_artist(name) => {
+            discover::ArtistFolderIndex::new(config).find(name)
+        }
+        _ => None,
+    };
+    let selection = discover::select_artists(
+        &index,
+        &config.discover.exclude_artists,
+        artist_filter,
+        filter_folder
+            .as_ref()
+            .map(|(root, artist_dir)| (root.as_path(), artist_dir.as_str())),
+    )?;
 
     // An explicit --artist is a deliberate one-off request, so it bypasses a
     // recorded failure; the scheduled sweep honours it. This matches the
@@ -2478,14 +2510,21 @@ async fn run_discover_mode_with_provider(
             // interrupted.
             break;
         }
-        // Where this artist's completed albums belong: the directory the
-        // artist's existing albums were scanned from, with the folder name that
-        // is actually on disk. Placement is unconditional in discover mode, so
-        // it does not consult `library_upgrade.enabled`.
-        let placement = LibraryTarget::Place {
-            root: artist.library_root.clone(),
-            artist_dir: artist.artist_dir.clone(),
-            skip_existing_album: false,
+        // Where this artist's completed albums belong: the artist folder the
+        // library holds for it, with the folder name that is actually on disk,
+        // or staging when the library holds neither an album nor a folder for
+        // it. Placement is unconditional in discover mode, so it does not
+        // consult `library_upgrade.enabled`.
+        let placement = match &artist.destination {
+            discover::ArtistDestination::Folder {
+                library_root,
+                artist_dir,
+            } => LibraryTarget::Place {
+                root: library_root.clone(),
+                artist_dir: artist_dir.clone(),
+                skip_existing_album: false,
+            },
+            discover::ArtistDestination::Staging => LibraryTarget::StagingOnly,
         };
         counters.artists_examined += 1;
         match discover_artist_albums(
@@ -7458,12 +7497,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_rejects_a_filter_artist_absent_from_the_library() {
+    async fn discover_fills_an_artist_that_owns_a_folder_with_no_albums() {
+        // The reported bug, end to end: the operator creates <artist>/ before any
+        // album of that artist is in it, then names the artist explicitly. The
+        // folder is evidence they collect the artist under that name and is the
+        // destination, so the album is placed there. "Shy Fx" is spelled
+        // differently from the typed "shy fx" on purpose: the on-disk spelling is
+        // what MusicBrainz is asked about, because there is no artist tag to
+        // prefer.
         let soulseek = MockClient::new();
-        let (config, db, staging, _library) = discover_fixture(&[("Alpha Artist", "Present")]);
-        let provider = FakeDiscographyProvider::with_groups(vec![]);
+        search_index(&soulseek, "Shy Fx", &[("Shy Fx Missing", "Missing")]);
+        *soulseek.write_files.lock().unwrap() = true;
 
-        let error = run_discover_mode_with_provider(
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = library_with(&[("Other Artist", "Their Album")]);
+        std::fs::create_dir_all(library.path().join("Shy Fx")).unwrap();
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("shy fx"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Shy Fx")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must be placed inside the artist folder the operator created"
+        );
+        assert!(
+            !staging.path().join("Shy Fx--Missing").exists(),
+            "a placed album must not be left in staging as well"
+        );
+        assert!(
+            soulseek
+                .search_queries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query.contains("Shy Fx")),
+            "the on-disk folder spelling is what the search and MusicBrainz use"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_places_into_a_named_folder_that_holds_another_artists_albums() {
+        // The wiring between the folder walk and `select_artists`: the named
+        // folder is occupied by a different artist's album, so the album-derived
+        // index holds no entry under the named spelling and the folder walk is the
+        // only source of a destination. Pins that the walk is consulted, and that
+        // the destination is the named folder rather than the occupied one.
+        //
+        // It does NOT pin presence: the folder-scoped presence rule counts a title
+        // identity-equal to the requested one as already present whatever tag
+        // carries it (see `an_identity_equal_title_in_the_named_folder_counts_as_present`),
+        // so an occupying album with a *different* title is used here on purpose.
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Blockhead", &[("Blockhead Missing", "Missing")]);
+        *soulseek.write_files.lock().unwrap() = true;
+
+        let (mut config, db, staging) = artist_only_fixture();
+        let library = TempDir::new().unwrap();
+        let occupied = library.path().join("Blockhead").join("Appetite");
+        std::fs::create_dir_all(&occupied).unwrap();
+        write_minimal_flac_with_tags(&occupied.join("01 - track.flac"), "Aesop Rock", "Appetite");
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Blockhead"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Blockhead")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "the named folder is the destination even though another artist's album occupies it"
+        );
+        assert!(
+            occupied.join("01 - track.flac").exists(),
+            "the album already in the folder must be left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_stages_an_artist_with_no_library_evidence_and_warns() {
+        // No album and no folder: the run proceeds rather than refusing to start,
+        // warns, and keeps the download in staging, because placement never
+        // creates a library folder.
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Nobody", &[("Nobody Missing", "Missing")]);
+        *soulseek.write_files.lock().unwrap() = true;
+        let (config, db, staging, library) = discover_fixture(&[("Alpha Artist", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+        let capture = crate::test_support::LogCapture::start();
+
+        run_discover_mode_with_provider(
             &soulseek,
             &config,
             &db,
@@ -7473,10 +7627,21 @@ mod tests {
             &provider,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
-        assert!(error.to_string().contains("not found in the library"));
+        assert!(
+            staging.path().join("Nobody--Missing").exists(),
+            "the download must stay in staging when the library holds no folder"
+        );
+        assert!(
+            !library.path().join("Nobody").exists(),
+            "placement must never create a library folder"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.contains("discover: Nobody has no album and no folder"),
+            "the run must warn and say where the downloads are kept, got:\n{logs}"
+        );
     }
 
     #[tokio::test]

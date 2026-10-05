@@ -49,6 +49,7 @@ In scope:
 - a library artist and album index built from one recursive walk;
 - presence filtering of discovered albums, shared with artist-only manual mode;
 - an optional `--artist` filter limited to artists present in the library;
+  *(superseded 2026-10-05 - see the note under Artist source)*
 - aggregator exclusions and a per-run download budget;
 - aggregate run reporting;
 - deterministic tests for the new pure logic and for runner integration;
@@ -284,14 +285,37 @@ also reported for that artist, because it was not applied.
 `--mode discover --artist "Name"` narrows the run to that one artist. The name
 must exist in the library index, otherwise the run fails with a configuration
 error naming the artist; a typo can never silently do nothing.
+*(Superseded on 2026-10-05 - see the note below.)*
 
 The selector can only narrow the library-derived list, never add to it; fetching
 a discography for an artist who is not in the library remains artist-only manual
-mode's job. It can, however, reach an artist the automatic sweep skips, because
+mode's job. *(Superseded on 2026-10-05: the selector does add such an artist, with
+staging as the destination - see the note below.)* It can, however, reach an
+artist the automatic sweep skips, because
 naming an artist explicitly overrides the folder-ownership gate (and
 `exclude_artists`). `search.manual.artist` is not consulted by discover,
 consistent with
 mode resolution already ignoring inactive configuration values.
+
+**Superseded on 2026-10-05: the selector is no longer limited to artists the
+index holds, and an absent name is no longer a configuration error.** The
+reported failure was an operator who had created `<artist>/` before any album of
+that artist existed in it; discover refused to run, because the artist list is
+album-derived. `--mode discover --artist "Name"` now resolves the name against
+the library's folders when the album-derived index does not hold it: a folder
+named after the artist makes it a work item, with that folder as the destination
+and its on-disk spelling as the MusicBrainz query. That spelling is what the
+operator asked for, and it is also the only correct choice: the folder spelling
+also names the folder when the index holds the artist under a different tag
+spelling (`AC/DC` tagged, `AC-DC` on disk), and preferring the tag spelling there
+would query a different artist's discography when the folder holds another
+artist's albums. The consequences are that `discography.artist_mbids` must be
+keyed to the spelling the operator types, and that naming the tag spelling is
+the way to query with it. A name the library holds neither an album nor a
+folder for warns and keeps its downloads in staging rather than ending the
+run. A blank name remains a configuration error. The automatic sweep is
+unchanged: folder evidence is consulted only for an explicitly named artist,
+so a folder the operator never named is never gap-filled.
 
 `--album` and `--batch-file` remain incompatible with discover and are rejected
 with discover-specific messages.
@@ -342,7 +366,7 @@ Validation, evaluated during mode resolution before startup side effects:
    auto mode.
 3. `discover` with `--album` or `--batch-file` is a configuration error.
 4. `--artist` naming an artist absent from the library index is a configuration
-   error.
+   error. *(superseded 2026-10-05)*
 
 ## Architecture
 
@@ -368,7 +392,10 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
 - `select_artists(&index, excludes: &[String], filter: Option<&str>)` -
   normalised-order artist list with exclusions, the folder-ownership gate and
   the optional filter applied; returns a configuration error when the filter
-  names an artist the index does not contain. Exclusions are decided before the
+  names an artist the index does not contain. *(Superseded on 2026-10-05: the
+  signature gained a `filter_folder: Option<(&Path, &str)>` argument, and a
+  filter naming an artist the index does not contain is no longer an error -
+  see the note under Artist source.)* Exclusions are decided before the
   gate, so an artist that is both excluded and folder-less is reported as
   excluded; the filter is decided before both, so an explicitly named artist is
   neither excluded nor gated. Gated spellings are returned in
@@ -444,6 +471,9 @@ Notices emitted by a discover run, in this order when present:
 - `discover: <N> album(s) already present; skipped`
 - `discover: excluded <N> artist(s) by discover.exclude_artists`
 - `discover: <N> artist(s) skipped: no folder of their own`
+- `discover: <N> artist(s) not in the library; their downloads stay in staging`
+  *(added 2026-10-05, for an explicitly named artist with neither an album nor a
+  folder)*
 - `discover: <N> artist(s) skipped from cached resolution failures`
 - `discover: <N> artist(s) unresolved on MusicBrainz: <name>, ...` (first ten
   names, then `and N more`)
@@ -480,8 +510,11 @@ Per-album outcome sections and per-album downloads are unchanged.
   charged and the run continues.
 - **`discography.enabled: false`** - configuration error at mode resolution.
 - **Empty `library.paths`** - configuration error at mode resolution.
-- **`--artist` not found in the library** - configuration error naming the
-  artist.
+- **`--artist` not found in the library** - *(superseded 2026-10-05)* no longer
+  a configuration error: a folder named after the artist becomes the
+  destination, and with neither an album nor a folder the downloads stay in
+  staging with a warning.
+- **Blank `--artist`** - configuration error naming the artist.
 - **`--album` or `--batch-file` with discover** - configuration error with a
   discover-specific message.
 - **Cancellation (SIGINT)** - existing behaviour: stop before the next album and
@@ -574,7 +607,7 @@ Per-album outcome sections and per-album downloads are unchanged.
   order preserved.
 - Artist selection: exclusions matched exactly, not as substrings; ordering by
   normalised key; the optional filter selects exactly one artist; an unknown
-  filter artist is an error.
+  filter artist is an error. *(superseded 2026-10-05)*
 - Budget: `0` never exhausts; charging decrements; exhaustion is reported;
   charging stops further work; `NoCandidates` never charges.
 

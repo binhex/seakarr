@@ -221,9 +221,9 @@ impl LibraryIndex {
 ///
 /// The walk reads **directory names only**: no file is opened and no tag is read,
 /// which is what makes a lookup affordable in a deep
-/// `<user>/<type>/<genre>/<subgenre>/<artist>` tree. Building is lazy, so a run
-/// that never places anything never touches the library tree, and it happens at
-/// most once per run.
+/// `<user>/<type>/<genre>/<subgenre>/<artist>` tree. Building is lazy: the walk
+/// runs on the first lookup, at most once per run, so a run that never looks an
+/// artist up never touches the library tree.
 pub struct ArtistFolderIndex {
     roots: Vec<PathBuf>,
     folders: OnceLock<BTreeMap<String, Vec<(PathBuf, String)>>>,
@@ -451,23 +451,36 @@ pub fn missing_albums(
         .collect()
 }
 
+/// Where a selected artist's completed albums are written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtistDestination {
+    /// The artist's own library folder, beside any albums the library already
+    /// holds there.
+    Folder {
+        library_root: PathBuf,
+        artist_dir: String,
+    },
+    /// The library holds no album and no folder for this artist, so the
+    /// downloads stay in staging. Only reachable for an explicitly named
+    /// artist: the sweep is library-derived and never selects one.
+    Staging,
+}
+
 /// One artist selected for gap filling: what to ask MusicBrainz, and where the
 /// completed downloads belong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedArtist {
     /// Spelling to query MusicBrainz.
     pub name: String,
-    /// Parent directory of the artist's existing library folder.
-    pub library_root: PathBuf,
-    /// On-disk name of the artist's existing library folder.
-    pub artist_dir: String,
+    /// Where this artist's completed albums are written.
+    pub destination: ArtistDestination,
 }
 
 /// The artists selected for gap filling, plus the exclusions that were applied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArtistSelection {
-    /// Library spellings to query, in normalised-key order, each with the
-    /// destination its downloads belong under.
+    /// Spellings to query, in normalised-key order, each with the destination
+    /// its downloads belong under.
     pub artists: Vec<SelectedArtist>,
     /// Library spellings skipped because an exclusion matched their key.
     pub excluded: Vec<String>,
@@ -480,13 +493,26 @@ pub struct ArtistSelection {
 ///
 /// Exclusions are compared as whole normalised keys, never as substrings, so an
 /// entry such as `live` cannot silently drop an unrelated artist whose name
-/// happens to contain it. A filter may only narrow the library-derived list;
-/// naming an artist the library does not hold is a configuration error rather
-/// than a silent no-op.
+/// happens to contain it.
+///
+/// A filter narrows the run to the artist it names, and naming an artist the
+/// library holds no album for is no longer a refusal to start: the name is a
+/// deliberate request, so the artist becomes a work item either way.
+/// `filter_folder` carries the `(parent, on-disk name)` of a library folder named
+/// after that artist — the operator's own statement that they collect the artist
+/// under that name — and its downloads are placed there. Without it there is no
+/// destination to place into, so the downloads stay in
+/// [`ArtistDestination::Staging`] and the run warns. A blank filter is still a
+/// configuration error, because it names nothing at all rather than naming an
+/// artist the library lacks.
+///
+/// `filter_folder` is consulted only for an explicit `filter`: the sweep stays
+/// album-derived, so a folder the operator never named is never gap-filled.
 pub fn select_artists(
     index: &LibraryIndex,
     excludes: &[String],
     filter: Option<&str>,
+    filter_folder: Option<(&Path, &str)>,
 ) -> Result<ArtistSelection> {
     let excluded_keys: BTreeSet<String> = excludes
         .iter()
@@ -498,10 +524,68 @@ pub fn select_artists(
         .map(normalize_catalog_key)
         .filter(|key| !key.is_empty());
     if let Some(name) = filter {
-        if filter_key.is_none() || !index.has_artist(name) {
+        if filter_key.is_none() {
+            // A blank name names nothing at all, so it is unusable rather than
+            // merely absent from the library: the mode accepts an artist it has
+            // no album for, and only a name with something in it can identify
+            // one.
             return Err(SeakarrError::Config(format!(
-                "artist {name:?} was not found in the library; discover mode can only narrow to artists already present"
+                "artist {name:?} is blank; discover mode needs a non-empty artist name to narrow the run"
             )));
+        }
+        // An artist the library knows only as a folder: the operator created it
+        // before any album of that artist existed there, so the album-derived
+        // index has no entry. The folder is their own statement that they
+        // collect the artist under that name, so an explicit name selects it and
+        // its downloads are placed into that folder. The on-disk spelling is
+        // what MusicBrainz is asked about, because it is the only spelling that
+        // exists: no album means no artist tag.
+        //
+        // Only an explicit name reaches this: the sweep stays album-derived, so
+        // a folder the operator never named is not gap-filled.
+        if !index.has_artist(name) {
+            return match filter_folder {
+                Some((library_root, artist_dir)) => Ok(ArtistSelection {
+                    artists: vec![SelectedArtist {
+                        name: artist_dir.to_string(),
+                        destination: ArtistDestination::Folder {
+                            library_root: library_root.to_path_buf(),
+                            artist_dir: artist_dir.to_string(),
+                        },
+                    }],
+                    ..ArtistSelection::default()
+                }),
+                None => {
+                    // The library holds nothing for this artist. Refusing to run
+                    // made `--artist` useless for filling in an artist before
+                    // anything of theirs exists locally, so the run proceeds and
+                    // the downloads stay in staging: placement never creates a
+                    // library folder, and a folder the operator wanted already
+                    // took the branch above.
+                    //
+                    // The name is trimmed because it reaches the MusicBrainz
+                    // query, the staging directory name and the processed-album
+                    // key: `" Shy Fx "` and `"Shy Fx"` would otherwise be two
+                    // artists, stage the same album twice, and differ by one space
+                    // for the rest of the run.
+                    //
+                    // The message states intent, not outcome: it is emitted before
+                    // any download, so a run whose albums all fail, or that skips
+                    // them all as already processed, must not read as though
+                    // something is sitting in staging now.
+                    let name = name.trim();
+                    tracing::warn!(
+                        "discover: {name} has no album and no folder in the library; its downloads will stay in staging"
+                    );
+                    Ok(ArtistSelection {
+                        artists: vec![SelectedArtist {
+                            name: name.to_string(),
+                            destination: ArtistDestination::Staging,
+                        }],
+                        ..ArtistSelection::default()
+                    })
+                }
+            };
         }
     }
 
@@ -550,8 +634,10 @@ pub fn select_artists(
         };
         selection.artists.push(SelectedArtist {
             name: name.to_string(),
-            library_root: library_root.to_path_buf(),
-            artist_dir: artist_dir.to_string(),
+            destination: ArtistDestination::Folder {
+                library_root: library_root.to_path_buf(),
+                artist_dir: artist_dir.to_string(),
+            },
         });
     }
     Ok(selection)
@@ -609,6 +695,15 @@ pub struct DiscoverCounters {
     /// Artists skipped because they have no folder of their own, so the library
     /// only knows them as guests inside another artist's folder.
     pub no_folder: usize,
+    /// Artists named explicitly that the library holds neither an album nor a
+    /// folder for, so their downloads stay in staging. Counted apart from
+    /// `no_folder`: a gated sweep artist is skipped, while a named one is
+    /// processed with staging as its destination.
+    ///
+    /// Counted from outcomes, not from the work list: an artist whose request
+    /// resolved to nothing, was skipped as already processed, or failed must not
+    /// be reported as sitting in staging.
+    pub staged_albums: usize,
     /// Artists MusicBrainz could not resolve, in encounter order.
     pub unresolved: Vec<String>,
     /// Artists skipped because a previous run recorded a resolution failure,
@@ -659,6 +754,15 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
         notices.push(format!(
             "discover: {} artist(s) skipped: no folder of their own",
             counters.no_folder
+        ));
+    }
+    if counters.staged_albums > 0 {
+        // Outcome-based, like the manual-mode explanation: the count comes from
+        // albums that really were downloaded and kept in staging, so a run whose
+        // albums all failed, were skipped, or never resolved stays silent here.
+        notices.push(format!(
+            "discover: {} album(s) kept in staging: the named artist is not in the library",
+            counters.staged_albums
         ));
     }
     if !counters.cached_failures.is_empty() {
@@ -747,7 +851,6 @@ mod tests {
     use super::*;
     use crate::config::FilterConfig;
     use crate::discography::AlbumTarget;
-    use crate::error::SeakarrError;
     use crate::scanner::scan_library;
     use crate::test_support::write_minimal_flac_with_tags;
     use std::path::PathBuf;
@@ -1438,11 +1541,12 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_only_spelling_cannot_be_selected_with_a_filter() {
-        // `--artist` narrows the work list, which is keyed on the artist tag
-        // spelling; a name that exists only as an on-disk folder spelling must
-        // still be rejected rather than silently selecting nothing or the wrong
-        // artist.
+    fn a_folder_only_spelling_is_not_mapped_onto_the_artist_that_uses_that_folder() {
+        // Typing a folder name with no folder evidence on disk must never select
+        // the artist whose albums happen to live in a folder of that name: the
+        // work list is keyed on the artist tag spelling, so mapping one onto the
+        // other would gap-fill the wrong discography. With no folder on disk the
+        // typed name is simply an artist the library does not hold.
         let index = build_index(&[scanned_at(
             "Aesop Rock",
             "Appetite",
@@ -1450,14 +1554,17 @@ mod tests {
             "Blockhead",
         )]);
 
-        let error = select_artists(&index, &[], Some("Blockhead"))
-            .expect_err("a folder-only spelling is not an artist the library holds");
-        assert!(
-            error.to_string().contains("Blockhead"),
-            "the error must name the rejected spelling: {error}"
+        let selection = select_artists(&index, &[], Some("Blockhead"), None).unwrap();
+        assert_eq!(
+            selection.artists,
+            vec![SelectedArtist {
+                name: "Blockhead".to_string(),
+                destination: ArtistDestination::Staging,
+            }],
+            "a folder name must never select Aesop Rock's albums"
         );
         assert_eq!(
-            selected_names(&select_artists(&index, &[], Some("Aesop Rock")).unwrap()),
+            selected_names(&select_artists(&index, &[], Some("Aesop Rock"), None).unwrap()),
             ["Aesop Rock"],
             "the tag spelling still selects the artist"
         );
@@ -1776,7 +1883,7 @@ mod tests {
 
     #[test]
     fn artists_come_back_in_normalised_key_order() {
-        let selection = select_artists(&library_fixture(), &[], None).unwrap();
+        let selection = select_artists(&library_fixture(), &[], None, None).unwrap();
         assert_eq!(
             selected_names(&selection),
             ["Alpha Artist", "Beta Band", "Live", "Live Band"]
@@ -1786,7 +1893,8 @@ mod tests {
 
     #[test]
     fn exclusions_match_the_whole_key_not_a_substring() {
-        let selection = select_artists(&library_fixture(), &["live".to_string()], None).unwrap();
+        let selection =
+            select_artists(&library_fixture(), &["live".to_string()], None, None).unwrap();
         // "Live Band" survives: only the whole key "live" is excluded.
         assert_eq!(
             selected_names(&selection),
@@ -1797,8 +1905,13 @@ mod tests {
 
     #[test]
     fn exclusion_matching_ignores_case_and_whitespace() {
-        let selection =
-            select_artists(&library_fixture(), &["  BETA   BAND ".to_string()], None).unwrap();
+        let selection = select_artists(
+            &library_fixture(),
+            &["  BETA   BAND ".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             selected_names(&selection),
             ["Alpha Artist", "Live", "Live Band"]
@@ -1808,7 +1921,91 @@ mod tests {
 
     #[test]
     fn a_filter_narrows_the_run_to_one_artist() {
-        let selection = select_artists(&library_fixture(), &[], Some("beta band")).unwrap();
+        let selection = select_artists(&library_fixture(), &[], Some("beta band"), None).unwrap();
+        assert_eq!(selected_names(&selection), ["Beta Band"]);
+    }
+
+    #[test]
+    fn an_explicitly_named_folder_is_selected_even_when_it_holds_another_artists_albums() {
+        // The reported failure: the operator creates the artist's folder before
+        // any album of that artist exists there, and discover refused to run at
+        // all because its artist list is album-derived. The folder is the
+        // operator's own statement that they collect the artist under that
+        // name, so `--artist` selects it and the downloads are placed into it.
+        //
+        // The on-disk spelling is what the MusicBrainz query uses, because it
+        // is the only spelling that exists: no album means no artist tag.
+        let index = build_index(&[scanned_at(
+            "Aesop Rock",
+            "Appetite",
+            "/library",
+            "Blockhead",
+        )]);
+
+        let selection = select_artists(
+            &index,
+            &[],
+            Some("blockhead"),
+            Some((Path::new("/library"), "Blockhead")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.artists,
+            vec![SelectedArtist {
+                name: "Blockhead".to_string(),
+                destination: ArtistDestination::Folder {
+                    library_root: PathBuf::from("/library"),
+                    artist_dir: "Blockhead".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn an_identity_equal_title_in_the_named_folder_counts_as_present() {
+        // The folder-scoped presence rule, recorded rather than implied. A named
+        // artist with no album of its own has the folder as its only evidence, and
+        // a title identity-equal to a requested one counts as present whatever tag
+        // carries it: MusicBrainz reporting a `Blockhead` album named `Appetite`
+        // would not be searched for while an Aesop Rock album of that name sits in
+        // the `Blockhead` folder. The alternative needs per-artist tag evidence a
+        // folder-only artist does not have, and would break the third-spelling case
+        // the folder alias exists for (`AC-DC` on disk, `AC/DC` tagged).
+        let index = build_index(&[scanned_at(
+            "Aesop Rock",
+            "Appetite",
+            "/library",
+            "Blockhead",
+        )]);
+
+        assert!(
+            index.contains_album("Blockhead", "Appetite"),
+            "an identity-equal title in the named folder counts as present"
+        );
+        assert!(
+            !index.contains_album("Blockhead", "Missing"),
+            "a different title in the named folder does not"
+        );
+    }
+
+    #[test]
+    fn the_sweep_does_not_select_an_artist_that_only_owns_a_folder() {
+        // Folder evidence is an explicit-name mechanism only. Sweeping them
+        // automatically would make every directory under a configured root a
+        // candidate artist, which is the phantom-artist problem the
+        // folder-ownership gate exists to avoid, so an album-less folder is
+        // filled in only when the operator names it.
+        let index = build_index(&[scanned_at(
+            "Beta Band",
+            "Album One",
+            "/library",
+            "Beta Band",
+        )]);
+
+        let selection =
+            select_artists(&index, &[], None, Some((Path::new("/library"), "Ghost"))).unwrap();
+
         assert_eq!(selected_names(&selection), ["Beta Band"]);
     }
 
@@ -1820,13 +2017,15 @@ mod tests {
             "/library/Indie",
             "Beta Band",
         )]);
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
         assert_eq!(
             selection.artists,
             vec![SelectedArtist {
                 name: "Beta Band".to_string(),
-                library_root: PathBuf::from("/library/Indie"),
-                artist_dir: "Beta Band".to_string(),
+                destination: ArtistDestination::Folder {
+                    library_root: PathBuf::from("/library/Indie"),
+                    artist_dir: "Beta Band".to_string(),
+                },
             }]
         );
     }
@@ -1845,7 +2044,7 @@ mod tests {
             "Bassnectar",
         )]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert!(
             selection.artists.is_empty(),
@@ -1868,10 +2067,48 @@ mod tests {
             scanned_at("Bassnectar", "All Colors", "/library", "Bassnectar"),
         ]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert_eq!(selected_names(&selection), ["Bassnectar"]);
         assert_eq!(selection.no_folder, ["Apashe"]);
+    }
+
+    #[test]
+    fn a_tag_spelled_artist_named_by_its_folder_spelling_queries_the_folder_spelling() {
+        // `AC/DC` in the tags, `AC-DC` on disk. Naming the folder spelling makes
+        // that spelling the MusicBrainz query, because the folder is the only
+        // evidence for the name the operator typed. Preferring the tag spelling
+        // here is not available: the same reading would query Aesop Rock's
+        // discography for `--artist Blockhead` in the fixture above, where the
+        // folder holds a different artist's albums. The consequence is that a
+        // `discography.artist_mbids` pin must be keyed to the spelling the
+        // operator types, and naming the tag spelling remains the way to query it.
+        let index = build_index(&[scanned_at("AC/DC", "Back in Black", "/library", "AC-DC")]);
+
+        let selection = select_artists(
+            &index,
+            &[],
+            Some("AC-DC"),
+            Some((Path::new("/library"), "AC-DC")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.artists,
+            vec![SelectedArtist {
+                name: "AC-DC".to_string(),
+                destination: ArtistDestination::Folder {
+                    library_root: PathBuf::from("/library"),
+                    artist_dir: "AC-DC".to_string(),
+                },
+            }],
+            "the typed folder spelling is the MusicBrainz query spelling"
+        );
+        assert_eq!(
+            selected_names(&select_artists(&index, &[], Some("AC/DC"), None).unwrap()),
+            ["AC/DC"],
+            "naming the tag spelling still queries the tag spelling"
+        );
     }
 
     #[test]
@@ -1885,7 +2122,7 @@ mod tests {
             "Bassnectar",
         )]);
 
-        let selection = select_artists(&index, &[], Some("Apashe")).unwrap();
+        let selection = select_artists(&index, &[], Some("Apashe"), None).unwrap();
 
         assert_eq!(selected_names(&selection), ["Apashe"]);
         assert!(
@@ -1911,6 +2148,41 @@ mod tests {
     }
 
     #[test]
+    fn the_staging_fallback_is_reported_in_the_run_summary() {
+        let counters = DiscoverCounters {
+            staged_albums: 1,
+            artists_total: 1,
+            ..DiscoverCounters::default()
+        };
+        assert!(
+            discover_notices(&counters).contains(
+                &"discover: 1 album(s) kept in staging: the named artist is not in the library"
+                    .to_string()
+            ),
+            "an album kept in staging must say why in the summary: {:?}",
+            discover_notices(&counters)
+        );
+    }
+
+    #[test]
+    fn a_selected_staging_artist_without_a_staged_album_emits_no_staging_notice() {
+        // The count comes from outcomes, not from the work list: a named artist
+        // whose request resolved to nothing, or whose album was already processed,
+        // must not be reported as keeping a download in staging.
+        let counters = DiscoverCounters {
+            artists_total: 1,
+            ..DiscoverCounters::default()
+        };
+        assert!(
+            !discover_notices(&counters)
+                .iter()
+                .any(|notice| notice.contains("kept in staging")),
+            "nothing reached staging, so nothing may claim to be there: {:?}",
+            discover_notices(&counters)
+        );
+    }
+
+    #[test]
     fn an_artist_owns_a_folder_however_the_merged_album_chose_its_location() {
         // A merged album (same tag artist and album in two folders) keeps one
         // folder as its recorded location, but the artist still owns the other
@@ -1922,7 +2194,7 @@ mod tests {
             .collect();
         let index = build_index(&[merged]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert_eq!(selected_names(&selection), ["Zed"]);
         assert!(selection.no_folder.is_empty());
@@ -1935,7 +2207,7 @@ mod tests {
         // not satisfy the gate for the artist whose entry it belongs to.
         let index = build_index(&[scanned_in("Ghost", "Album", "Album", "/library", "")]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert!(
             selection.artists.is_empty(),
@@ -1956,7 +2228,7 @@ mod tests {
             "Sigur Ros",
         )]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert_eq!(selected_names(&selection), ["SIGUR ROS"]);
         assert!(selection.no_folder.is_empty());
@@ -1969,7 +2241,7 @@ mod tests {
             ("SIGUR ROS", "Sigur\u{3000}Ros"),
         ] {
             let index = build_index(&[scanned_at(tag, "Agaetis Byrjun", "/library", folder)]);
-            let selection = select_artists(&index, &[], None).unwrap();
+            let selection = select_artists(&index, &[], None, None).unwrap();
             assert_eq!(
                 selected_names(&selection),
                 [tag],
@@ -1988,7 +2260,7 @@ mod tests {
             scanned_at("Apashe", "Renaissance", "/library", "Apashe"),
         ]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
 
         assert_eq!(selected_names(&selection), ["Apashe"]);
         assert!(selection.no_folder.is_empty());
@@ -2005,8 +2277,13 @@ mod tests {
             scanned_at("Burial", "Untrue", "/library", "Nobody"),
         ]);
 
-        let selection =
-            select_artists(&index, &["Apashe".to_string(), "Burial".to_string()], None).unwrap();
+        let selection = select_artists(
+            &index,
+            &["Apashe".to_string(), "Burial".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(selected_names(&selection), ["Bassnectar"]);
         assert_eq!(selection.excluded, ["Apashe", "Burial"]);
@@ -2024,42 +2301,65 @@ mod tests {
         // gated out. Naming it explicitly is the workaround.
         let index = build_index(&[scanned_at("AC/DC", "Back in Black", "/library", "AC-DC")]);
 
-        let selection = select_artists(&index, &[], None).unwrap();
+        let selection = select_artists(&index, &[], None, None).unwrap();
         assert!(selection.artists.is_empty());
         assert_eq!(selection.no_folder, ["AC/DC"]);
 
-        let named = select_artists(&index, &[], Some("AC/DC")).unwrap();
+        let named = select_artists(&index, &[], Some("AC/DC"), None).unwrap();
         assert_eq!(selected_names(&named), ["AC/DC"]);
     }
 
     #[test]
-    fn an_unknown_filter_artist_is_a_configuration_error() {
-        let error = select_artists(&library_fixture(), &[], Some("Nobody")).unwrap_err();
+    fn a_blank_filter_artist_is_a_configuration_error() {
+        let error = select_artists(&library_fixture(), &[], Some("   "), None).unwrap_err();
         assert!(
-            matches!(error, SeakarrError::Config(_)),
-            "expected a configuration error, got {error:?}"
+            error.to_string().contains("needs a non-empty artist name"),
+            "a blank name is unusable rather than absent from the library: {error}"
         );
-        assert!(error.to_string().contains("not found in the library"));
     }
 
     #[test]
-    fn a_blank_filter_artist_is_a_configuration_error() {
-        let error = select_artists(&library_fixture(), &[], Some("   ")).unwrap_err();
-        assert!(error.to_string().contains("not found in the library"));
+    fn a_padded_staging_artist_name_is_trimmed_before_it_is_used() {
+        // The staged name becomes the MusicBrainz query, the staging directory
+        // name and the processed-album key, so "  Padded Ghost  " and
+        // "Padded Ghost" must not be two artists that each download the same
+        // album. The spelling is unique to this test on purpose: `LogCapture`
+        // holds one process-wide window, so a name shared with the runner test
+        // could satisfy that test's log assertion without its own run emitting
+        // anything.
+        let selection =
+            select_artists(&library_fixture(), &[], Some("  Padded Ghost  "), None).unwrap();
+        assert_eq!(
+            selection.artists,
+            vec![SelectedArtist {
+                name: "Padded Ghost".to_string(),
+                destination: ArtistDestination::Staging,
+            }]
+        );
     }
 
     #[test]
     fn an_exclusion_that_matches_nothing_excludes_nothing() {
-        let selection =
-            select_artists(&library_fixture(), &["Various Artists".to_string()], None).unwrap();
+        let selection = select_artists(
+            &library_fixture(),
+            &["Various Artists".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(selection.artists.len(), 4);
         assert!(selection.excluded.is_empty());
     }
 
     #[test]
     fn an_explicit_filter_overrides_the_exclusion_list() {
-        let selection =
-            select_artists(&library_fixture(), &["live".to_string()], Some("Live")).unwrap();
+        let selection = select_artists(
+            &library_fixture(),
+            &["live".to_string()],
+            Some("Live"),
+            None,
+        )
+        .unwrap();
         assert_eq!(selected_names(&selection), ["Live"]);
         assert!(
             selection.excluded.is_empty(),
@@ -2146,6 +2446,7 @@ mod tests {
             present: 12,
             excluded: 2,
             no_folder: 3,
+            staged_albums: 1,
             unresolved: vec!["Mystery Artist".to_string()],
             cached_failures: vec!["Cached Artist".to_string()],
             no_eligible_albums: 1,
@@ -2161,6 +2462,8 @@ mod tests {
                 "discover: 12 album(s) already present; skipped".to_string(),
                 "discover: excluded 2 artist(s) by discover.exclude_artists".to_string(),
                 "discover: 3 artist(s) skipped: no folder of their own".to_string(),
+                "discover: 1 album(s) kept in staging: the named artist is not in the library"
+                    .to_string(),
                 "discover: 1 artist(s) skipped from cached resolution failures".to_string(),
                 "discover: 1 artist(s) unresolved on MusicBrainz: Mystery Artist".to_string(),
                 "discover: 1 artist(s) had no albums matching discography.allowed_types"
