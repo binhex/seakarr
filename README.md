@@ -199,7 +199,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `upgrade`, `manual`, `batch`, or `discover`. The retired value `auto` was renamed to `upgrade` and is rejected with an error naming the replacement. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead). Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead), and it is verified on MusicBrainz before the library is walked, so a name MusicBrainz cannot resolve fails the run without scanning. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
@@ -787,6 +787,15 @@ folder the downloads stay in staging — and the run stops after
 `discover.max_cycle_downloads` download attempts so a large library fills in over successive
 runs.
 
+An explicitly named artist is verified on MusicBrainz **before** `library.paths` is walked: its
+conceptual albums are resolved first and then reused for the scan's present-album check, so one
+name still costs exactly one MusicBrainz dialog. A name MusicBrainz cannot resolve is a
+configuration error and the run stops without scanning, and a MusicBrainz outage for a named
+artist warns and also stops before the walk, unless a compatible discography cache exists (fresh or
+stale), in which case the run proceeds on the cached albums instead. Only the automatic sweep keeps
+the scan-first order, because its artist list *is* the scan's output; there an unresolved artist is
+warned about and skipped, and the run continues.
+
 Each completed album is placed in the artist's own library folder — the directory that artist's
 existing albums were scanned from, or, for an explicitly named artist the library holds no album
 for, the folder a name lookup found — as `<artist folder>/<album title>/NN - Title.ext`, with the artist
@@ -998,9 +1007,12 @@ arbitrary Soulseek folders:
 
 Fallback precedence is fresh cache, a freshly recorded resolution failure (unless `--artist` or a pinned MBID
 bypasses it), successful refresh, stale cache, then the legacy heuristic. The last
-step applies to artist-only manual mode; discover mode instead reports the artist as skipped and aborts the
-run after repeated provider failures (see the discover answer below), and `discography.enabled: false` is a
-configuration error for discover.
+step applies to artist-only manual mode; discover mode never uses the heuristic and instead records the
+artist as skipped or provider-failed, aborting after repeated provider failures (see the discover answer
+below). An artist named with `--artist` is resolved before the library is walked, so a name MusicBrainz
+cannot resolve is a configuration error and the run stops without scanning, and an outage stops it before
+the walk rather than after it (a compatible discography cache, fresh or stale, is used instead of stopping).
+`discography.enabled: false` is a configuration error for discover.
 
 - A cached discography is fresh for `discography.cache_days` complete 24-hour periods (30 by default). `0`
   attempts a refresh on every run but still keeps the cached copy as a stale fallback. Boundary equality is
@@ -1021,7 +1033,10 @@ configuration error for discover.
   reason, and uses the legacy single-query folder heuristic; the notice states that album names were discovered
   heuristically from Soulseek folders. This is the artist-only manual behaviour: discover never falls back to the
   heuristic, it warns, records the artist as skipped or provider-failed, and stops the run after
-  `DISCOVER_PROVIDER_FAILURE_LIMIT` consecutive provider failures.
+  `DISCOVER_PROVIDER_FAILURE_LIMIT` consecutive provider failures. For an artist named with `--artist` the
+  resolution happens before `library.paths` is walked, so an unresolvable name is a configuration error and an
+  outage stops the run before the walk instead of after it, unless a compatible discography cache exists: a
+  fresh one answers without any request, and a stale one is used with a warning.
 - A valid authoritative empty result — zero release groups, or zero albums left after `allowed_types`
   filtering — is not an error: no Soulseek search runs, there is no heuristic fallback, and the run summary
   shows a neutral notice instead of a failed or skipped album.
@@ -1105,10 +1120,12 @@ The integration deliberately favors safe fallback over guessing:
 
 **Q: What happens when MusicBrainz cannot resolve an artist from my library?**
 
-In `discover` mode the artist is skipped for that run and reported in the run
+In `discover` mode a swept artist is skipped for that run and reported in the run
 summary: no broad Soulseek artist search is issued and no folder-derived
 discovery is attempted, so albums are never downloaded from an unverified
-identity. `discography.artist_mbids` is the supported fix for a name MusicBrainz
+identity. An artist named with `--artist` is resolved before the library is walked
+instead, so a name MusicBrainz cannot resolve stops the run with a configuration
+error naming the artist and no summary. `discography.artist_mbids` is the supported fix for a name MusicBrainz
 cannot resolve on its own. Three consecutive MusicBrainz request failures abort
 the run instead, so a provider outage cannot grind through the rest of the
 library.
@@ -1157,7 +1174,8 @@ the album on later runs. The automatic sweep still keys on the tag spelling, and
 artist to own a folder of its own, so a name spelled
 differently on disk than in its tags is skipped by the sweep. Naming it with `--artist` resolves
 the name against the library's folders as well, so such an artist can be processed without
-renaming anything, and the on-disk spelling is then what MusicBrainz is asked about: a
+renaming anything: the name you type is what MusicBrainz is asked about, and the on-disk spelling
+supplies the Soulseek search and the placement destination. A
 `discography.artist_mbids` pin must be keyed to the spelling you type, and naming the tag spelling
 is the way to query that spelling instead.
 Case, spacing and width differences fold, so only a genuinely different spelling is skipped. Note that a later upgrade run with

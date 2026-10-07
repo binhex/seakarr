@@ -2223,13 +2223,17 @@ fn charges_after_error(error: &SeakarrError) -> bool {
     matches!(error, SeakarrError::Database(_))
 }
 
-/// Report a discover run that the provider circuit breaker aborted, and build
-/// the error to return.
-fn abort_discover_run(
+/// Add a finished discover run's aggregate notices, release the scan indicator
+/// and print the summary.
+///
+/// One owner for the run's exit reporting, so a run that stops before the walk
+/// (an explicitly named artist MusicBrainz could not be asked about) reports
+/// through the same path as one that ran to the end.
+fn finish_discover_run(
     report: &mut RunReport,
     counters: &discover::DiscoverCounters,
     progress: Option<&ProgressDisplay>,
-) -> SeakarrError {
+) {
     for notice in discover::discover_notices(counters) {
         report.add_notice(notice);
     }
@@ -2237,16 +2241,93 @@ fn abort_discover_run(
         display.clear();
     }
     report.print_summary();
+}
+
+/// Report a discover run that the provider circuit breaker aborted, and build
+/// the error to return.
+fn abort_discover_run(
+    report: &mut RunReport,
+    counters: &discover::DiscoverCounters,
+    progress: Option<&ProgressDisplay>,
+    artist: &str,
+) -> SeakarrError {
+    finish_discover_run(report, counters, progress);
     SeakarrError::MusicBrainz(format!(
-        "{DISCOVER_PROVIDER_FAILURE_LIMIT} consecutive MusicBrainz failures; aborting discover run"
+        "{artist}: {DISCOVER_PROVIDER_FAILURE_LIMIT} consecutive MusicBrainz failures; aborting discover run"
     ))
 }
 
 /// Consecutive provider failures tolerated before a discover run aborts.
 const DISCOVER_PROVIDER_FAILURE_LIMIT: u32 = 3;
 
+/// What an explicitly named discover artist's pre-walk verification left the run.
+#[derive(Debug)]
+enum NamedArtistVerification {
+    /// Work to do: the artist's authoritative outcome - the album list, or the
+    /// authoritative "no eligible albums" verdict - reused as its work list.
+    WorkList(DiscoveryOutcome),
+    /// No work list, so the run stops before the walk; the outage was reported.
+    Stop,
+}
+
+/// Verify an explicitly named discover artist against MusicBrainz before the
+/// library is walked, and report what that verification left the run: the
+/// artist's work list, or `Stop` when the run must end before the walk.
+///
+/// `Stop` is the provider-outage case: nothing is claimed about the artist,
+/// but the run has no work list, so the walk would be paid for nothing. An
+/// unresolvable name is fatal instead - there is no work list to build, and the
+/// operator asked for that name by hand. Both verdicts are reached before the
+/// walk, which is the point of asking first; the recorded resolution-failure
+/// cache is bypassed, matching the rule that naming an artist means the lookup
+/// runs.
+#[allow(clippy::too_many_arguments)] // the run's report, counters and breaker
+                                     // are updated together, as in the main loop
+async fn verify_named_artist(
+    provider: &dyn DiscographyProvider,
+    db: &Database,
+    config: &Config,
+    name: &str,
+    progress: Option<&ProgressDisplay>,
+    report: &mut RunReport,
+    counters: &mut discover::DiscoverCounters,
+    consecutive_provider_failures: &mut u32,
+) -> Result<NamedArtistVerification> {
+    let outcome = discover_artist_albums(
+        provider,
+        db,
+        name,
+        &config.discography,
+        FailureCacheUse::Bypass,
+    )
+    .await;
+    let DiscoveryOutcome::LegacyFallback { reason, kind, .. } = &outcome else {
+        return Ok(NamedArtistVerification::WorkList(outcome));
+    };
+    match kind {
+        DiscoveryFailure::Unresolved => Err(SeakarrError::Config(format!(
+            "artist {name:?} could not be resolved on MusicBrainz ({reason}); \
+             discover mode needs a verified artist to build its work list"
+        ))),
+        DiscoveryFailure::Provider => {
+            if note_provider_failure(name, reason, counters, consecutive_provider_failures) {
+                return Err(abort_discover_run(report, counters, progress, name));
+            }
+            finish_discover_run(report, counters, progress);
+            Ok(NamedArtistVerification::Stop)
+        }
+    }
+}
+
 /// Run discover mode: derive artists from the library, ask MusicBrainz what
 /// each one is missing, and download only those albums.
+///
+/// An explicitly named artist inverts that order: it is resolved through
+/// MusicBrainz before the library is walked and that answer is reused. A name
+/// MusicBrainz cannot resolve fails fast, and a provider outage ends the run
+/// before the walk as a reported skip, so neither is paid for after the run's
+/// longest phase. The automatic sweep keeps the derive-from-the-library order,
+/// because its artist list is the walk's own output.
 ///
 /// Upgrade mode's upgrade pass is untouched: this mode never replaces an album it
 /// considers present.
@@ -2310,6 +2391,27 @@ fn note_stale_cache(
     }
     *consecutive = 0;
     false
+}
+
+/// Record one provider outage for the circuit breaker: warn, count the artist
+/// and advance the consecutive-failure count the caller compares.
+///
+/// Returns true when the limit is reached, so the caller can abort. Shared by
+/// the pre-walk verification and the sweep so the two cannot drift: an outage
+/// observed before the walk counts towards the same breaker as one observed
+/// inside the loop.
+fn note_provider_failure(
+    artist: &str,
+    reason: &str,
+    counters: &mut discover::DiscoverCounters,
+    consecutive: &mut u32,
+) -> bool {
+    *consecutive += 1;
+    tracing::warn!("{artist}: MusicBrainz unavailable ({reason}); artist skipped");
+    counters
+        .provider_failed
+        .push((artist.to_string(), reason.to_string()));
+    *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
 }
 
 /// Fill the gaps in one artist's library: process every album the library is
@@ -2435,10 +2537,13 @@ async fn run_discover_mode_with_provider(
         ));
     }
 
-    // Discover reads the whole library before it can pick a single work item, so
-    // cancellation is armed first: interrupting a slow scan must be possible
-    // without killing the process and stranding the PID lock. The guard aborts
-    // the listener on every return path.
+    // The sweep reads the whole library before it can pick a single work item, so
+    // cancellation is armed first: interrupting the slow scan must be possible
+    // without killing the process and stranding the PID lock. That walk, the
+    // downloads and the loop between artists all poll the flag; the extra
+    // MusicBrainz request an explicitly named artist makes first is one bounded
+    // request and is not polled. The guard aborts the listener on every return
+    // path.
     let (cancel, _guard) = arm_cancellation();
 
     // Created before the scan so the scan's indicator and the later downloads
@@ -2447,6 +2552,53 @@ async fn run_discover_mode_with_provider(
         Some(ProgressDisplay::new())
     } else {
         None
+    };
+
+    // The name is validated before anything else is paid for: a filter that names
+    // nothing is rejected here, so neither the walk nor a MusicBrainz lookup can
+    // happen for it. `select_artists` applies the same rule through the same
+    // helper, so the two cannot disagree about what a usable name is.
+    let validated_filter = artist_filter
+        .map(discover::validate_artist_filter)
+        .transpose()?;
+
+    // Created before an explicitly named artist is verified, so a run that stops
+    // there because the provider could not be asked reports through the same
+    // counters and summary as one that walked the library. An unresolvable name
+    // returns its own configuration error and prints no summary: nothing was
+    // examined, so there is nothing to summarise.
+    let mut counters = discover::DiscoverCounters {
+        budget_limit: config.discover.max_cycle_downloads,
+        ..discover::DiscoverCounters::default()
+    };
+    let mut report = RunReport::new();
+    let mut consecutive_provider_failures: u32 = 0;
+
+    // An explicitly named artist is verified against MusicBrainz before the
+    // library is walked. Every other artist in a run comes from the walk itself,
+    // so this is the only place a MusicBrainz verdict can be reached first - and
+    // the walk is the longest phase of a run, which is what makes the order
+    // worth having. The verdict is reused as this artist's work list, so an
+    // explicit name still costs exactly one provider dialog.
+    let mut pre_resolved = match validated_filter {
+        Some(name) => match verify_named_artist(
+            provider,
+            db,
+            config,
+            name,
+            progress.as_ref(),
+            &mut report,
+            &mut counters,
+            &mut consecutive_provider_failures,
+        )
+        .await?
+        {
+            NamedArtistVerification::WorkList(outcome) => Some(outcome),
+            // The outage was warned about and summarised before the walk: there
+            // is no work list for an artist MusicBrainz could not be asked about.
+            NamedArtistVerification::Stop => return Ok(()),
+        },
+        None => None,
     };
 
     let Some(scanned) = scan_library_cancellable(config, &cancel, progress.as_ref())? else {
@@ -2477,23 +2629,21 @@ async fn run_discover_mode_with_provider(
 
     // An explicit --artist is a deliberate one-off request, so it bypasses a
     // recorded failure; the scheduled sweep honours it. This matches the
-    // existing rule that --artist overrides discover.exclude_artists.
+    // existing rule that --artist overrides discover.exclude_artists. A named
+    // artist's lookup has already happened in `verify_named_artist`, so only the
+    // sweep reaches a lookup with this value today; it is still expressed for a
+    // named artist because the rule belongs to naming an artist, not to where
+    // the lookup happens to be made.
     let failure_cache = if artist_filter.is_some() {
         FailureCacheUse::Bypass
     } else {
         FailureCacheUse::Honour
     };
 
-    let mut counters = discover::DiscoverCounters {
-        excluded: selection.excluded.len(),
-        no_folder: selection.no_folder.len(),
-        budget_limit: config.discover.max_cycle_downloads,
-        artists_total: selection.artists.len(),
-        ..discover::DiscoverCounters::default()
-    };
+    counters.excluded = selection.excluded.len();
+    counters.no_folder = selection.no_folder.len();
+    counters.artists_total = selection.artists.len();
     let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
-    let mut report = RunReport::new();
-    let mut consecutive_provider_failures: u32 = 0;
 
     for artist in &selection.artists {
         if budget.exhausted() {
@@ -2527,15 +2677,27 @@ async fn run_discover_mode_with_provider(
             discover::ArtistDestination::Staging => LibraryTarget::StagingOnly,
         };
         counters.artists_examined += 1;
-        match discover_artist_albums(
-            provider,
-            db,
-            &artist.name,
-            &config.discography,
-            failure_cache,
-        )
-        .await
-        {
+        // The abort message names the name the operator typed when there is one: a
+        // work item's spelling can be the on-disk folder name, and the operator
+        // matches an error against their own command line.
+        let abort_artist = validated_filter.unwrap_or(artist.name.as_str());
+        // A run narrowed by `--artist` selects exactly one artist, and that
+        // artist's work list was resolved before the walk: reuse it rather than
+        // asking MusicBrainz twice for one name.
+        let outcome = match pre_resolved.take() {
+            Some(outcome) => outcome,
+            None => {
+                discover_artist_albums(
+                    provider,
+                    db,
+                    &artist.name,
+                    &config.discography,
+                    failure_cache,
+                )
+                .await
+            }
+        };
+        match outcome {
             DiscoveryOutcome::Authoritative { albums, provenance } => {
                 if note_stale_cache(
                     &artist.name,
@@ -2547,6 +2709,7 @@ async fn run_discover_mode_with_provider(
                         &mut report,
                         &counters,
                         progress.as_ref(),
+                        abort_artist,
                     ));
                 }
                 let missing = discover::missing_albums(&index, &artist.name, &albums);
@@ -2579,6 +2742,7 @@ async fn run_discover_mode_with_provider(
                         &mut report,
                         &counters,
                         progress.as_ref(),
+                        abort_artist,
                     ));
                 }
                 counters.no_eligible_albums += 1;
@@ -2611,17 +2775,17 @@ async fn run_discover_mode_with_provider(
                     }
                 }
                 DiscoveryFailure::Provider => {
-                    consecutive_provider_failures += 1;
-                    tracing::warn!(
-                        "{}: MusicBrainz unavailable ({reason}); artist skipped",
-                        artist.name
-                    );
-                    counters.provider_failed.push((artist.name.clone(), reason));
-                    if consecutive_provider_failures >= DISCOVER_PROVIDER_FAILURE_LIMIT {
+                    if note_provider_failure(
+                        &artist.name,
+                        &reason,
+                        &mut counters,
+                        &mut consecutive_provider_failures,
+                    ) {
                         return Err(abort_discover_run(
                             &mut report,
                             &counters,
                             progress.as_ref(),
+                            abort_artist,
                         ));
                     }
                 }
@@ -2629,13 +2793,7 @@ async fn run_discover_mode_with_provider(
         }
     }
 
-    for notice in discover::discover_notices(&counters) {
-        report.add_notice(notice);
-    }
-    if let Some(ref display) = progress {
-        display.clear();
-    }
-    report.print_summary();
+    finish_discover_run(&mut report, &counters, progress.as_ref());
     // `_guard` aborts the listener as it drops; a scheduled cycle must not leak.
     Ok(())
 }
@@ -5011,6 +5169,9 @@ mod tests {
         /// `None` echoes the requested artist back as the only candidate.
         candidate_names: Option<Vec<String>>,
         artist_calls: Arc<AtomicUsize>,
+        /// Every artist name the provider was asked about, in order, so a test can
+        /// pin *which* spelling reached MusicBrainz rather than only how often.
+        requested_artists: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeDiscographyProvider {
@@ -5020,6 +5181,7 @@ mod tests {
                 failure: None,
                 candidate_names: None,
                 artist_calls: Arc::new(AtomicUsize::new(0)),
+                requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -5029,6 +5191,7 @@ mod tests {
                 failure: Some(reason.to_string()),
                 candidate_names: None,
                 artist_calls: Arc::new(AtomicUsize::new(0)),
+                requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -5040,11 +5203,19 @@ mod tests {
                 failure: None,
                 candidate_names: Some(vec!["Somebody Else".to_string()]),
                 artist_calls: Arc::new(AtomicUsize::new(0)),
+                requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn calls(&self) -> usize {
             self.artist_calls.load(Ordering::SeqCst)
+        }
+
+        fn requested(&self) -> Vec<String> {
+            self.requested_artists
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -5055,6 +5226,9 @@ mod tests {
             artist: &str,
         ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
             self.artist_calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut requested) = self.requested_artists.lock() {
+                requested.push(artist.to_string());
+            }
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -5815,6 +5989,47 @@ mod tests {
         assert!(
             notice.contains("service unavailable") && notice.contains("heuristically"),
             "the notice must name the transport reason and the heuristic origin, got: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_mode_does_not_hard_error_on_an_unresolvable_artist() {
+        // Manual mode keeps its legacy fallback. It can name an album and never
+        // needs the provider at all, so an artist MusicBrainz cannot resolve is
+        // searched heuristically instead of failing the run.
+        let soulseek = MockClient::new();
+        soulseek.search_results_by_query.lock().unwrap().insert(
+            "Manual Ghost Artist".into(),
+            vec![album_result("Manual Ghost Artist", "Ghost Album")],
+        );
+        let provider = FakeDiscographyProvider::unresolvable();
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Manual Ghost Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Manual Ghost Artist"],
+            "an unresolvable artist must fall back to the heuristic artist query"
+        );
+        let notice = run
+            .notice
+            .expect("the heuristic fallback must attach a run notice");
+        assert!(
+            notice.contains("heuristically"),
+            "the notice must state the heuristic origin, got: {notice}"
         );
     }
 
@@ -6633,6 +6848,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_explicit_artist_bypasses_a_recorded_failure() {
+        // The lookup runs instead of replaying the recorded row. For an explicit
+        // name the artist's MusicBrainz verdict is fatal, which is what tells a
+        // bypassed lookup apart from a replayed skip: a replayed failure warns
+        // and exits quietly without ever asking the provider.
         let soulseek = MockClient::new();
         let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
         db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
@@ -6644,7 +6863,7 @@ mod tests {
         .unwrap();
         let provider = FakeDiscographyProvider::unresolvable();
 
-        run_discover_mode_with_provider(
+        let error = run_discover_mode_with_provider(
             &soulseek,
             &config,
             &db,
@@ -6654,11 +6873,16 @@ mod tests {
             &provider,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
         assert!(
-            provider.calls() > 0,
-            "asking for an artist by name must reach MusicBrainz"
+            matches!(error, SeakarrError::Config(_)),
+            "a bypassed lookup must reach the fatal artist verdict, got {error:?}"
+        );
+        assert_eq!(
+            provider.calls(),
+            1,
+            "asking for an artist by name must reach MusicBrainz instead of replaying the recorded failure"
         );
     }
 
@@ -7174,6 +7398,10 @@ mod tests {
             matches!(error, SeakarrError::MusicBrainz(_)),
             "expected a MusicBrainz error, got {error:?}"
         );
+        assert!(
+            error.to_string().contains("Gamma Artist"),
+            "the abort must name the artist that tripped the breaker, got {error}"
+        );
     }
 
     #[tokio::test]
@@ -7218,6 +7446,10 @@ mod tests {
         assert!(
             matches!(error, SeakarrError::MusicBrainz(_)),
             "an outage hidden behind a stale cache must still trip the breaker, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Gamma Artist"),
+            "the abort must name the artist that tripped the breaker, got {error}"
         );
     }
 
@@ -7496,15 +7728,423 @@ mod tests {
         );
     }
 
+    /// A library root that does not exist, so any test that walks the library
+    /// fails with a `Scanner` error instead of silently scanning nothing.
+    fn undiscoverable_library(config: &mut Config, staging: &TempDir) {
+        config.library.paths = vec![staging
+            .path()
+            .join("no-such-library")
+            .to_string_lossy()
+            .into_owned()];
+    }
+
+    #[tokio::test]
+    async fn discover_hard_errors_on_an_unresolvable_named_artist_before_scanning_the_library() {
+        // The library root does not exist, so a run that walked it first would
+        // fail with a Scanner error and the operator would learn about the
+        // library instead of about the artist. For an explicitly named artist
+        // the MusicBrainz verdict has to arrive first, and it has to be fatal:
+        // there is no work list to build for a name MusicBrainz cannot confirm.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider = FakeDiscographyProvider::unresolvable();
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Ghost Named Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::Config(_)),
+            "an unresolvable named artist must be a hard error before the walk, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Ghost Named Artist") && message.contains("MusicBrainz"),
+            "the error must name the artist and MusicBrainz, got: {message}"
+        );
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the named artist must be asked about exactly once"
+        );
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "an unverifiable artist must not be searched for"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_verifies_a_named_artist_before_it_scans_the_library() {
+        // The library root does not exist, but the provider resolves. The run
+        // must therefore reach the walk, and the walk is what fails. That the
+        // provider has already answered (calls() == 1) while no album was ever
+        // scanned is the ordering this pins.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Verified Named Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::Scanner(_)),
+            "the walk is the step that must fail, got {error:?}"
+        );
+        assert_eq!(
+            provider.calls(),
+            1,
+            "MusicBrainz must answer for the artist before the walk starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_stops_before_the_scan_when_musicbrainz_is_unavailable() {
+        // An outage is not a verdict about the artist, so the run must not claim
+        // the artist is unresolvable; but it still has no work list, so the walk
+        // must not be paid for either.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider = FakeDiscographyProvider::failing("connection reset");
+        let capture = crate::test_support::LogCapture::start();
+
+        let result = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Outage Named Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a provider outage must not be a hard error for a named artist, got {result:?}"
+        );
+        assert_eq!(provider.calls(), 1, "the outage must be observed once");
+        let logs = capture.text();
+        assert!(
+            logs.contains("Outage Named Artist") && logs.contains("MusicBrainz unavailable"),
+            "the run must warn about the outage, got:\n{logs}"
+        );
+        // The outage still has to report through the run summary, keyed to a name
+        // only this test produces because the capture window is process-wide.
+        assert!(
+            logs.contains("discover: provider failed for Outage Named Artist"),
+            "the outage must reach the run summary, got:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_resolves_a_named_artist_once_and_fills_its_gap() {
+        // Hoisting the lookup must not pay for it twice: the pre-scan answer is
+        // the run's work list. Caching is disabled so that a dropped reuse cannot
+        // hide behind the row the pre-walk itself wrote - the loop's repeat call
+        // would otherwise be served from that fresh row and still report one
+        // provider call.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Once Named Artist",
+            &[("Once Named Artist Missing", "Missing")],
+        );
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Once Named Artist", "Present")]);
+        config.discography.cache_days = 0;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Once Named Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "one named artist must cost exactly one provider lookup"
+        );
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Once Named Artist Missing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_fills_a_named_artist_gap_from_a_fresh_discography_cache() {
+        // The discography cache is the better answer than a second lookup, even
+        // for a name the operator typed: the pre-walk verification is served from
+        // the cache, so the run reaches the walk with no provider request at all
+        // while still using the cached work list to find the gap.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Cached Named Artist",
+            &[("Cached Named Artist Missing", "Missing")],
+        );
+        let (config, db, staging, _library) =
+            discover_fixture(&[("Cached Named Artist", "Present")]);
+        let warming =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Cached Named Artist"),
+            false,
+            staging.path(),
+            &warming,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            warming.calls(),
+            1,
+            "the first run must populate the discography cache"
+        );
+
+        soulseek.search_queries.lock().unwrap().clear();
+        let cold = FakeDiscographyProvider::with_groups(Vec::new());
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Cached Named Artist"),
+            false,
+            staging.path(),
+            &cold,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cold.calls(),
+            0,
+            "a fresh discography cache must serve the named artist without a provider request"
+        );
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Cached Named Artist Missing"],
+            "the cached work list must still drive the gap search"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_uses_a_stale_cache_for_a_named_artist_instead_of_stopping() {
+        // A compatible cache answers even when the refresh fails, so a named
+        // artist is not stopped before the walk on every failure: the stale albums
+        // are the work list, the run warns, and the gap search still happens. Only
+        // a named artist with no usable cache stops there.
+        let soulseek = MockClient::new();
+        search_index(
+            &soulseek,
+            "Stale Named Artist",
+            &[("Stale Named Artist Missing", "Missing")],
+        );
+        let (config, db, staging, _library) =
+            discover_fixture(&[("Stale Named Artist", "Present")]);
+        db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+            artist_key: crate::discography::normalize_catalog_key("Stale Named Artist"),
+            artist_mbid: "11111111-1111-1111-1111-111111111111".to_string(),
+            canonical_artist: "Stale Named Artist".to_string(),
+            fetched_at: 1,
+            release_groups_json: serde_json::to_string(&vec![release_group(
+                "missing", "Missing", "1999",
+            )])
+            .unwrap(),
+        })
+        .unwrap();
+        let provider = FakeDiscographyProvider::failing("offline");
+        let capture = crate::test_support::LogCapture::start();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("Stale Named Artist"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the stale cache is reached through exactly one provider attempt"
+        );
+        let logs = capture.text();
+        assert!(
+            logs.contains("discography cache is") && logs.contains("Stale Named Artist"),
+            "the run must warn that the cache is stale, got:\n{logs}"
+        );
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Stale Named Artist Missing"],
+            "the stale albums must still drive the gap search"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_a_named_artist_that_names_nothing_before_scanning_the_library() {
+        // Two shapes of "names nothing": blank once trimmed, and made only of
+        // characters the catalogue key folds away. Neither may cost the walk or a
+        // MusicBrainz lookup - the walk is the longest phase of a run, and a name
+        // that cannot identify an artist cannot be verified either. The library
+        // root does not exist, so a run that walked would fail with a Scanner
+        // error instead of the configuration error asserted here.
+        for typed in ["   ", "'"] {
+            let soulseek = MockClient::new();
+            let (mut config, db, staging, _library) =
+                discover_fixture(&[("Present Artist", "Present")]);
+            undiscoverable_library(&mut config, &staging);
+            let provider = FakeDiscographyProvider::with_groups(vec![release_group(
+                "missing", "Missing", "1999",
+            )]);
+
+            let error = run_discover_mode_with_provider(
+                &soulseek,
+                &config,
+                &db,
+                Some(typed),
+                false,
+                staging.path(),
+                &provider,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(error, SeakarrError::Config(_)),
+                "a name that names nothing must be a configuration error, got {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("is blank or carries nothing to match on"),
+                "the error must explain that the name carries nothing to match on, got {error}"
+            );
+            assert_eq!(
+                provider.calls(),
+                0,
+                "a name that names nothing must not reach MusicBrainz"
+            );
+            assert!(
+                soulseek.search_queries.lock().unwrap().is_empty(),
+                "a name that names nothing must not search"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_named_artist_honours_the_provider_failure_limit() {
+        // The pre-walk verification shares the sweep's failure bookkeeping. A
+        // fresh run's first failure cannot reach the limit on its own, so the
+        // limit is seeded here to pin the shared contract: an outage observed
+        // before the walk must abort exactly as an in-loop one does, rather than
+        // stopping quietly because a single artist can only fail once.
+        let (config, db, _staging) = artist_only_fixture();
+        let provider = FakeDiscographyProvider::failing("connection reset");
+        let capture = crate::test_support::LogCapture::start();
+        let mut report = RunReport::new();
+        let mut counters = discover::DiscoverCounters {
+            budget_limit: config.discover.max_cycle_downloads,
+            ..discover::DiscoverCounters::default()
+        };
+        let mut consecutive_provider_failures = DISCOVER_PROVIDER_FAILURE_LIMIT - 1;
+
+        let error = verify_named_artist(
+            &provider,
+            &db,
+            &config,
+            "Breaker Named Artist",
+            None,
+            &mut report,
+            &mut counters,
+            &mut consecutive_provider_failures,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::MusicBrainz(_)),
+            "a pre-walk outage at the limit must abort the run, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Breaker Named Artist"),
+            "the abort must name the artist that tripped the breaker, got {error}"
+        );
+        assert_eq!(
+            consecutive_provider_failures, DISCOVER_PROVIDER_FAILURE_LIMIT,
+            "the failure must be counted before the abort is decided"
+        );
+        // The abort must still report like every other discover exit: the warning
+        // names the artist, and the summary carries the provider-failed notice
+        // rather than a bare error. Both assertions are keyed to a name only this
+        // test produces, because the capture window is process-wide.
+        let logs = capture.text();
+        assert!(
+            logs.contains("Breaker Named Artist: MusicBrainz unavailable"),
+            "the breaker abort must warn about the outage, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("discover: provider failed for Breaker Named Artist"),
+            "the breaker abort must still print the run summary, got:\n{logs}"
+        );
+        assert_eq!(
+            counters.provider_failed.as_slice(),
+            [(
+                "Breaker Named Artist".to_string(),
+                "MusicBrainz transport error: connection reset".to_string()
+            )],
+            "the artist and reason must reach the summary"
+        );
+    }
+
     #[tokio::test]
     async fn discover_fills_an_artist_that_owns_a_folder_with_no_albums() {
         // The reported bug, end to end: the operator creates <artist>/ before any
         // album of that artist is in it, then names the artist explicitly. The
         // folder is evidence they collect the artist under that name and is the
         // destination, so the album is placed there. "Shy Fx" is spelled
-        // differently from the typed "shy fx" on purpose: the on-disk spelling is
-        // what MusicBrainz is asked about, because there is no artist tag to
-        // prefer.
+        // differently from the typed "shy fx" on purpose: MusicBrainz is asked
+        // under the typed name, because the folder name is not knowable before the
+        // library is walked, while the on-disk spelling drives the Soulseek search
+        // and the placement destination.
         let soulseek = MockClient::new();
         search_index(&soulseek, "Shy Fx", &[("Shy Fx Missing", "Missing")]);
         *soulseek.write_files.lock().unwrap() = true;
@@ -7537,6 +8177,11 @@ mod tests {
                 .exists(),
             "the album must be placed inside the artist folder the operator created"
         );
+        assert_eq!(
+            provider.requested(),
+            ["shy fx"],
+            "MusicBrainz is asked under the name the operator typed, not the on-disk spelling"
+        );
         assert!(
             !staging.path().join("Shy Fx--Missing").exists(),
             "a placed album must not be left in staging as well"
@@ -7548,7 +8193,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|query| query.contains("Shy Fx")),
-            "the on-disk folder spelling is what the search and MusicBrainz use"
+            "the on-disk folder spelling is what the search uses"
         );
     }
 

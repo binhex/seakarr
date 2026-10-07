@@ -91,7 +91,9 @@ spellings differ in real libraries (`Guns 'n' Roses` in tags, `Guns N Roses` on
 disk); expanding the pattern with the tag spelling would create a second artist
 directory beside the existing one. MusicBrainz queries and processed-album
 records keep using the tag-preferred query spelling, which is unchanged
-behaviour.
+behaviour. *(Superseded on 2026-10-07: a swept artist is still queried under the
+tag-preferred spelling, while an artist named with `--artist` is queried under the
+name the operator typed, before the library is walked.)*
 
 Where one artist's albums were found under more than one root, the destination
 with the most albums wins, ties broken alphabetically. This mirrors the rule the
@@ -566,7 +568,11 @@ cancellation guard for their downloads, so no listener outlives a run. Only the
   **Superseded on 2026-10-05:** such a spelling can now be named with `--artist`
   when a library folder of that name exists; the folder becomes the destination
   and the on-disk spelling is what MusicBrainz is asked about, so an album-less
-  artist folder is filled in. `has_artist` and `artist_keys` are themselves
+  artist folder is filled in. *(Further superseded on 2026-10-07: MusicBrainz is
+  asked under the name the operator typed, because the folder name is not
+  knowable before the library is walked; the on-disk spelling drives the
+  Soulseek search and the placement destination.)*
+  `has_artist` and `artist_keys` are themselves
   unchanged, and the automatic sweep still keys on the tag spelling.
 - **A marker-shaped subfolder under an album folder reads as the artist folder.**
   For `<root>/Artist/Gold/Gold (Disc 1)/track.flac` the album component is the
@@ -637,8 +643,9 @@ cancellation guard for their downloads, so no listener outlives a run. Only the
   layouts.
 - `artist_destination` picks the majority pair and breaks ties alphabetically,
   independent of insert order.
-- `select_artists` returns `SelectedArtist` entries carrying the query spelling
-  and the destination, with exclusions and the optional filter unchanged. (The
+- `select_artists` returns `SelectedArtist` entries carrying the spelling their
+  Soulseek search and placement use, plus the destination, with exclusions and
+  the optional filter unchanged. (The
   folder-ownership gate was added on 2026-09-18; see the gap-filling design's
   artist-source section.)
 - Presence, ordering, and budget tests are adapted for the selection type and

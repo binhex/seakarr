@@ -304,8 +304,11 @@ that artist existed in it; discover refused to run, because the artist list is
 album-derived. `--mode discover --artist "Name"` now resolves the name against
 the library's folders when the album-derived index does not hold it: a folder
 named after the artist makes it a work item, with that folder as the destination
-and its on-disk spelling as the MusicBrainz query. That spelling is what the
-operator asked for, and it is also the only correct choice: the folder spelling
+and its on-disk spelling as the MusicBrainz query. *(Superseded on 2026-10-07:
+the MusicBrainz query is the name the operator typed, because the folder name is
+not knowable before the library is walked; the on-disk spelling still drives the
+Soulseek search and the placement destination. The folder spelling is the only
+correct choice there, and it is what the work item carries.)* The folder spelling
 also names the folder when the index holds the artist under a different tag
 spelling (`AC/DC` tagged, `AC-DC` on disk), and preferring the tag spelling there
 would query a different artist's discography when the folder holds another
@@ -413,6 +416,13 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
   and per missing album the existing `process_album` path with
   `target_library_path: None` (no upgrade copy) and `library_track_count: None`
   (no library baseline exists for an album that is not present).
+  *(Superseded on 2026-10-07: an explicitly named artist is resolved through
+  `discover_artist_albums` before the walk, and that outcome is reused for the
+  artist's work list. A name MusicBrainz cannot resolve is a `Config` error
+  raised without scanning, and a provider outage for a named artist warns and
+  stops before the walk, unless a compatible discography cache answers instead
+  (fresh, or stale with a failed refresh), in which case the walk proceeds on it.
+  The automatic sweep keeps the scan-first order above.)*
   Cancellation is no longer entirely the existing machinery, and it no longer
   leaves the scan untouched: the walk takes the run's cancellation flag and
   aborts with `Cancelled`, so Ctrl+C during the scan ends the run before any
@@ -441,6 +451,11 @@ Pure, synchronous logic only; no I/O beyond the scan it is handed.
   the default YAML template, and the merge-with-defaults path.
 
 ## Data flow
+
+*(Superseded on 2026-10-07: for the sweeps described by steps 1-4 the flow below
+still holds. A run narrowed by `--artist` additionally performs step 4a for that
+one name before step 1, and stops at steps 1-5 entirely when that name cannot be
+resolved - see the `run_discover_mode` note above.)*
 
 1. `scan_library(library.paths, filters, cancel)` walks the library once,
    returning `Cancelled` if the cancellation flag is set, and reporting its
@@ -498,11 +513,20 @@ Per-album outcome sections and per-album downloads are unchanged.
 ## Error handling
 
 - **Artist unresolved by MusicBrainz** - skip and report; no broad Soulseek
-  search and no legacy fallback.
+  search and no legacy fallback. *(Superseded on 2026-10-07 for an explicitly
+  named discover artist: the run stops before the library walk with a `Config`
+  error naming the artist, because there is no work list to build. The automatic
+  sweep still skips and reports, as above.)*
 - **Provider error, cached discography available** - use the stale cache and
-  warn, as today.
-- **Provider error, no cache** - skip and report the artist.
+  warn, as today. *(Superseded on 2026-10-07 for an explicitly named discover
+  artist: the same rule applies, and because the verification happens before the
+  library walk the cached albums are what the walk is filtered by.)*
+- **Provider error, no cache** - skip and report the artist. *(Superseded on
+  2026-10-07 for an explicitly named discover artist: the run warns, prints the
+  summary and ends before the library walk, with no artist processed.)*
 - **Three consecutive provider errors** - abort the run with the failure.
+  *(Superseded on 2026-10-07: the abort message also names the artist that
+  tripped the breaker.)*
 - **Artist resolved, no eligible albums** - not an error; counted.
 - **Album present in the library** - not an error; counted and skipped without
   searching.

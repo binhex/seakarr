@@ -185,9 +185,11 @@ impl LibraryIndex {
             .map(|entry| entry.albums.iter().map(String::as_str))
     }
 
-    /// The spelling to send to MusicBrainz: the one covering the most albums,
-    /// with ties broken alphabetically so the query never depends on walk
-    /// order.
+    /// The spelling this artist's work item carries: the library spelling
+    /// covering the most albums, with ties broken alphabetically so the choice
+    /// never depends on walk order. A swept artist is queried on MusicBrainz
+    /// under it; an artist named with `--artist` was already queried under the
+    /// name the operator typed, before the library was walked.
     pub fn artist_name(&self, artist_key: &str) -> Option<&str> {
         let entry = self.artists.get(artist_key)?;
         entry
@@ -470,7 +472,10 @@ pub enum ArtistDestination {
 /// completed downloads belong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedArtist {
-    /// Spelling to query MusicBrainz.
+    /// The spelling this work item carries: what the Soulseek search and the
+    /// placement destination use. For a swept artist that is also the spelling
+    /// MusicBrainz was queried under; for `--artist` the query used the name the
+    /// operator typed.
     pub name: String,
     /// Where this artist's completed albums are written.
     pub destination: ArtistDestination,
@@ -479,14 +484,34 @@ pub struct SelectedArtist {
 /// The artists selected for gap filling, plus the exclusions that were applied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArtistSelection {
-    /// Spellings to query, in normalised-key order, each with the destination
-    /// its downloads belong under.
+    /// Work items, in normalised-key order, each with the spelling it carries
+    /// and the destination its downloads belong under.
     pub artists: Vec<SelectedArtist>,
     /// Library spellings skipped because an exclusion matched their key.
     pub excluded: Vec<String>,
     /// Library spellings skipped because the artist has no folder of its own,
     /// so the library only knows it as a guest inside another artist's folder.
     pub no_folder: Vec<String>,
+}
+
+/// Validate an explicit artist filter and return the spelling to work with.
+///
+/// A name that carries nothing to match on - blank, or made only of characters
+/// the catalogue key folds away - is unusable rather than merely absent from the
+/// library: the mode accepts an artist it has no album for, so only a name with
+/// something in it can identify one. The check lives here so the selection and
+/// discover mode's pre-walk verification agree on what a name is: a disagreement
+/// would mean paying for the library walk, or for a MusicBrainz lookup, before
+/// rejecting the name the operator typed.
+pub fn validate_artist_filter(filter: &str) -> Result<&str> {
+    let name = filter.trim();
+    if normalize_catalog_key(name).is_empty() {
+        return Err(SeakarrError::Config(format!(
+            "artist {filter:?} is blank or carries nothing to match on; \
+             discover mode needs a non-empty artist name to narrow the run"
+        )));
+    }
+    Ok(name)
 }
 
 /// Build the deterministic artist work list.
@@ -521,25 +546,19 @@ pub fn select_artists(
         .collect();
 
     let filter_key = filter
-        .map(normalize_catalog_key)
-        .filter(|key| !key.is_empty());
+        .map(validate_artist_filter)
+        .transpose()?
+        .map(normalize_catalog_key);
     if let Some(name) = filter {
-        if filter_key.is_none() {
-            // A blank name names nothing at all, so it is unusable rather than
-            // merely absent from the library: the mode accepts an artist it has
-            // no album for, and only a name with something in it can identify
-            // one.
-            return Err(SeakarrError::Config(format!(
-                "artist {name:?} is blank; discover mode needs a non-empty artist name to narrow the run"
-            )));
-        }
         // An artist the library knows only as a folder: the operator created it
         // before any album of that artist existed there, so the album-derived
         // index has no entry. The folder is their own statement that they
         // collect the artist under that name, so an explicit name selects it and
-        // its downloads are placed into that folder. The on-disk spelling is
-        // what MusicBrainz is asked about, because it is the only spelling that
-        // exists: no album means no artist tag.
+        // its downloads are placed into that folder. The work item carries the
+        // on-disk spelling because that is what the Soulseek search and the
+        // placement destination need; MusicBrainz was already asked under the
+        // name the operator typed, because the folder name is not knowable
+        // before the library is walked.
         //
         // Only an explicit name reaches this: the sweep stays album-derived, so
         // a folder the operator never named is not gap-filled.
@@ -732,10 +751,17 @@ const MAX_LISTED_UNRESOLVED: usize = 10;
 /// Pure: the caller records the returned strings on its `RunReport`.
 pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
     let mut notices = Vec::new();
-    if counters.artists_total == 0 {
-        // Without this a run over an unusable library exits silently: an empty
-        // report prints nothing at all, which is indistinguishable from a
-        // crash-free no-op.
+    // A run that examined no artist at all would be silent otherwise, which is
+    // indistinguishable from a crash-free no-op. A run that recorded an artist it
+    // could not resolve, could not ask about, or replayed a failure for is not
+    // silent, and "nothing to do" would contradict the notice beside it: an
+    // explicitly named artist is resolved before the library walk, so a run that
+    // stops there never fills `artists_total`.
+    let nothing_examined = counters.artists_total == 0
+        && counters.unresolved.is_empty()
+        && counters.cached_failures.is_empty()
+        && counters.provider_failed.is_empty();
+    if nothing_examined {
         notices.push("discover: no eligible library artists found; nothing to do".to_string());
     }
     if counters.present > 0 {
@@ -1933,8 +1959,9 @@ mod tests {
         // operator's own statement that they collect the artist under that
         // name, so `--artist` selects it and the downloads are placed into it.
         //
-        // The on-disk spelling is what the MusicBrainz query uses, because it
-        // is the only spelling that exists: no album means no artist tag.
+        // The work item carries the on-disk spelling because that is what the
+        // Soulseek search and the placement destination use; MusicBrainz is asked
+        // under the name the operator typed, before the library is walked.
         let index = build_index(&[scanned_at(
             "Aesop Rock",
             "Appetite",
@@ -2074,13 +2101,15 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_spelled_artist_named_by_its_folder_spelling_queries_the_folder_spelling() {
+    fn a_tag_spelled_artist_named_by_its_folder_spelling_carries_the_folder_spelling() {
         // `AC/DC` in the tags, `AC-DC` on disk. Naming the folder spelling makes
-        // that spelling the MusicBrainz query, because the folder is the only
-        // evidence for the name the operator typed. Preferring the tag spelling
-        // here is not available: the same reading would query Aesop Rock's
-        // discography for `--artist Blockhead` in the fixture above, where the
-        // folder holds a different artist's albums. The consequence is that a
+        // that spelling the work item's: the folder is the only evidence for the
+        // name the operator typed, and the work item's spelling is what the
+        // Soulseek search and the placement destination use. MusicBrainz is asked
+        // under the name the operator typed. Preferring the tag spelling for the
+        // work item is not available: the same reading would place Aesop Rock's
+        // albums in the `Blockhead` folder in the fixture above, where the folder
+        // holds a different artist's albums. The consequence is that a
         // `discography.artist_mbids` pin must be keyed to the spelling the
         // operator types, and naming the tag spelling remains the way to query it.
         let index = build_index(&[scanned_at("AC/DC", "Back in Black", "/library", "AC-DC")]);
@@ -2102,7 +2131,7 @@ mod tests {
                     artist_dir: "AC-DC".to_string(),
                 },
             }],
-            "the typed folder spelling is the MusicBrainz query spelling"
+            "the work item carries the on-disk folder spelling"
         );
         assert_eq!(
             selected_names(&select_artists(&index, &[], Some("AC/DC"), None).unwrap()),
@@ -2313,15 +2342,17 @@ mod tests {
     fn a_blank_filter_artist_is_a_configuration_error() {
         let error = select_artists(&library_fixture(), &[], Some("   "), None).unwrap_err();
         assert!(
-            error.to_string().contains("needs a non-empty artist name"),
-            "a blank name is unusable rather than absent from the library: {error}"
+            error
+                .to_string()
+                .contains("is blank or carries nothing to match on"),
+            "a name with nothing to match on is unusable rather than absent from the library: {error}"
         );
     }
 
     #[test]
     fn a_padded_staging_artist_name_is_trimmed_before_it_is_used() {
-        // The staged name becomes the MusicBrainz query, the staging directory
-        // name and the processed-album key, so "  Padded Ghost  " and
+        // The staged name becomes the work item's spelling for the search, the
+        // staging directory name and the processed-album key, so "  Padded Ghost  " and
         // "Padded Ghost" must not be two artists that each download the same
         // album. The spelling is unique to this test on purpose: `LogCapture`
         // holds one process-wide window, so a name shared with the runner test
@@ -2403,6 +2434,26 @@ mod tests {
         assert_eq!(
             discover_notices(&counters),
             vec!["discover: no eligible library artists found; nothing to do".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_outage_before_the_selection_is_not_reported_as_nothing_to_do() {
+        // A named artist is verified before the library walk, so a run that stops
+        // there has no selection and therefore no `artists_total`. The failure is
+        // the report; a "nothing to do" line beside it would be false.
+        let counters = DiscoverCounters {
+            provider_failed: vec![(
+                "Outage Artist".to_string(),
+                "MusicBrainz transport error: connection reset".to_string(),
+            )],
+            ..DiscoverCounters::default()
+        };
+        assert_eq!(
+            discover_notices(&counters),
+            vec!["discover: provider failed for Outage Artist \
+                 (MusicBrainz transport error: connection reset); artist skipped"
+                .to_string()]
         );
     }
 
