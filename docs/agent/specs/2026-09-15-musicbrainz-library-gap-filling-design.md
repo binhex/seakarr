@@ -114,6 +114,13 @@ artist whose albums live in a differently named folder (Aesop Rock in a
 `Blockhead` folder) or in a folder the write path sanitised (`AC/DC` stored as
 `AC-DC`) is no longer swept automatically.
 
+*(Superseded on 2026-10-07: an explicitly named artist may now supply an
+identity rather than a name — an ISNI, an IPI or a MusicBrainz artist ID. The
+work item is named after the resolved canonical MusicBrainz name, and a code or
+ID matching no single MusicBrainz artist fails before the library walk instead
+of reaching a fallback. See
+`2026-10-07-artist-identifier-resolution-design.md`.)*
+
 ### Presence: a matching folder with any audio file
 
 An album counts as present when the index contains a normalised title match for
@@ -319,6 +326,15 @@ folder for warns and keeps its downloads in staging rather than ending the
 run. A blank name remains a configuration error. The automatic sweep is
 unchanged: folder evidence is consulted only for an explicitly named artist,
 so a folder the operator never named is never gap-filled.
+
+*(Superseded on 2026-10-07: the selector may now be an ISNI such as
+`0000 0004 6659 7022`, an IPI such as `00581977202`, or a MusicBrainz artist ID
+instead of a name. An explicit value is classified by shape: a code is resolved
+against exactly one carrying MusicBrainz artist before the library is walked,
+and a UUID by exact entity lookup. Its cache key is prefixed (`isni:<digits>`,
+`ipi:<digits>` or `mbid:<uuid>`) so it cannot collide with a name key. The work
+item is named after the resolved canonical MusicBrainz name. See
+`2026-10-07-artist-identifier-resolution-design.md`.)*
 
 `--album` and `--batch-file` remain incompatible with discover and are rejected
 with discover-specific messages.

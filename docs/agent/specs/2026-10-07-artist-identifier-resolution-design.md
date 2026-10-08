@@ -206,10 +206,10 @@ For a code input:
 - The discography cache row keeps its existing shape; only the key can now be an
   identifier key. Rows still record `artist_mbid` and `canonical_artist`, and the
   compatibility check against a configured pin is unchanged.
-- The failure cache records an identifier-keyed resolution failure under the same
-  rules as a name-keyed one, so a repeated code run replays the recorded failure
-  cheaply. An explicit `--artist` run bypasses the recorded failure, so a code run
-  always asks once, matching the rule established for names.
+- Only a name resolution failure is recorded: an explicit code or ID always
+  bypasses the recorded failure, so a row keyed by a code could never be replayed
+  and would only accumulate. A code run therefore always asks once, matching the
+  rule established for names.
 - Consequence: a name run and a code run for the same artist keep separate cache
   rows and cost one extra release-group fetch the first time. This is accepted
   rather than solved, because keying by MBID would require a second cache lookup
@@ -233,9 +233,10 @@ session, for example) keeps its existing behaviour.
 
 ## Observability
 
-One log line and one summary notice per identifier resolution, carrying the input
-code, the resolved canonical name, the MBID and the disambiguation comment when
-present. This is what lets an operator confirm that a shared IPI or ISNI picked
+One log line per identifier resolution, carrying the input code, the resolved
+canonical name, the MBID and the disambiguation comment when the live response
+carried one, plus a run-summary notice carrying the code, the canonical name and
+the MBID. This is what lets an operator confirm that a shared IPI or ISNI picked
 the artist they meant, and it is the only place the canonical-name decision
 becomes visible.
 
@@ -293,7 +294,9 @@ becomes visible.
 ## Accepted consequences
 
 - A band named exactly like a code shape is read as a code; the config pin is the
-  way out, and the parser is the single place to revisit that trade.
+  way out in every mode that asks MusicBrainz, while a run that never does
+  (`--album`, a batch line, `discography.enabled: false`) rejects the shape
+  instead, so such a band cannot be processed there., and the parser is the single place to revisit that trade.
 - Name runs and code runs for one artist keep separate cache rows.
 - An IPI typo is not detected by validation, only by the empty result.
 - Placement for a code run depends on the canonical name matching a library

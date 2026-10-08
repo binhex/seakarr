@@ -199,7 +199,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | Option | Description | Default |
 | ------ | ----------- | ------- |
 | `--mode <mode>` | Select `upgrade`, `manual`, `batch`, or `discover`. The retired value `auto` was renamed to `upgrade` and is rejected with an error naming the replacement. | *(from config)* |
-| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead), and it is verified on MusicBrainz before the library is walked, so a name MusicBrainz cannot resolve fails the run without scanning. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. | *(from config)* |
+| `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead), and it is verified on MusicBrainz before the library is walked, so a name MusicBrainz cannot resolve fails the run without scanning. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. The value is read by shape: an artist name (the default), an ISNI such as `0000 0004 6659 7022`, an IPI such as `00581977202`, or a MusicBrainz artist ID (a hyphenated UUID); spaces and hyphens in an ISNI are ignored and its check character is validated, so a malformed code is a configuration error rather than a name to search. A code or ID identifies the artist exactly, is resolved against MusicBrainz before the library is walked and never falls back to the folder heuristic: exactly one MusicBrainz artist carrying the code resolves, while a code matching none or several is a configuration error naming the code — a shared one also names its carriers and the fix, `discography.artist_mbids` keyed `isni:<digits>`, `ipi:<digits>` or `mbid:<uuid>`. A code is rejected when combined with `--album` and in a batch line, because neither path asks MusicBrainz and a code names no library folder. The `isni:`, `ipi:` or `mbid:` prefixed form is `discography.artist_mbids` key syntax, not an accepted `--artist` value. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
@@ -309,9 +309,9 @@ is unaffected, and so is a venue-and-date title such as
 | --- | ----------- | ------- |
 | `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
 | `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
-| `failure_cache_days` | How long an artist that MusicBrainz could not resolve is remembered, so a later run skips the lookup instead of asking again. `0` disables the failure cache: nothing is recorded and nothing is skipped. Only resolution failures are remembered — a MusicBrainz outage is always retried. | `7` |
+| `failure_cache_days` | How long an artist that MusicBrainz could not resolve is remembered, so a later run skips the lookup instead of asking again. An explicitly named or identified artist always asks instead, and a code or ID is never remembered at all, because a row keyed by one could never be replayed. `0` disables the failure cache: nothing is recorded and nothing is skipped. Only resolution failures are remembered — a MusicBrainz outage is always retried. | `7` |
 | `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. Must not be empty while `enabled` is true. | `[studio_album]` |
-| `artist_mbids` | Optional artist-name to MusicBrainz UUID map for ambiguous names. Keys must be unique after normalization, so `Nirvana` and ` nirvana ` cannot both appear. | `{}` |
+| `artist_mbids` | Optional artist-identity to MusicBrainz UUID map for ambiguous names and shared codes. Keys may be an artist name (normalized before matching, so `Nirvana` and ` nirvana ` cannot both appear), `isni:<digits>`, `ipi:<digits>` or `mbid:<uuid>`; an ISNI or IPI key may be written with its usual spaces or hyphens, which are ignored. The value is always a hyphenated MusicBrainz UUID. | `{}` |
 
 ### `discover`
 
@@ -796,6 +796,14 @@ stale), in which case the run proceeds on the cached albums instead. Only the au
 the scan-first order, because its artist list *is* the scan's output; there an unresolved artist is
 warned about and skipped, and the run continues.
 
+A code-shaped `--artist` value — an ISNI, an IPI or a MusicBrainz artist ID — is resolved the same
+way, and the work item is then named after the resolved canonical MusicBrainz name rather than the
+code, so placement follows the existing folder-spelling rules: the on-disk spelling wins when the
+library holds a folder for that artist, and with no such folder the existing staging fallback and
+warning apply. The run logs the code, the canonical name, the MusicBrainz ID and the disambiguation
+comment when MusicBrainz supplies one, so a code that resolved to an artist you did not expect is
+visible.
+
 Each completed album is placed in the artist's own library folder — the directory that artist's
 existing albums were scanned from, or, for an explicitly named artist the library holds no album
 for, the folder a name lookup found — as `<artist folder>/<album title>/NN - Title.ext`, with the artist
@@ -1041,7 +1049,9 @@ the walk rather than after it (a compatible discography cache, fresh or stale, i
   filtering — is not an error: no Soulseek search runs, there is no heuristic fallback, and the run summary
   shows a neutral notice instead of a failed or skipped album.
 - Set `discography.enabled: false` to select the legacy heuristic deliberately in artist-only manual mode. That
-  choice is logged as an explicit configuration choice without an outage warning. Discover mode requires a
+  choice is logged as an explicit configuration choice without an outage warning. An artist named by an ISNI,
+  IPI or MusicBrainz ID is a configuration error in that mode instead, because the run never asks MusicBrainz
+  and would otherwise search Soulseek for the raw code. Discover mode requires a
   configured discography and refuses to start without it.
 
 The legacy heuristic normalizes common folder-name variations so one release is
@@ -1125,8 +1135,19 @@ summary: no broad Soulseek artist search is issued and no folder-derived
 discovery is attempted, so albums are never downloaded from an unverified
 identity. An artist named with `--artist` is resolved before the library is walked
 instead, so a name MusicBrainz cannot resolve stops the run with a configuration
-error naming the artist and no summary. `discography.artist_mbids` is the supported fix for a name MusicBrainz
-cannot resolve on its own. Three consecutive MusicBrainz request failures abort
+error naming the artist and no summary. A name MusicBrainz cannot resolve has two
+fixes. The first is to name the artist by a code instead: an ISNI such as
+`0000 0004 6659 7022`, an IPI such as `00581977202`, or the MusicBrainz artist
+ID. An ISNI or IPI is resolved against exactly one MusicBrainz artist that
+carries it, and a MusicBrainz ID by exact entity lookup; neither falls back to
+the folder heuristic, so neither can fail the way an ambiguous name does. The
+precise fix is a pinned `discography.artist_mbids` entry — keyed by the artist
+name, `isni:<digits>`, `ipi:<digits>` or `mbid:<uuid>` and holding the MusicBrainz
+UUID —
+which also selects a single artist when a shared IPI or ISNI has several
+carriers. A code that resolved is logged with the canonical name, the MBID and
+any disambiguation comment, so the identity it picked is visible. Three
+consecutive MusicBrainz request failures abort
 the run instead, so a provider outage cannot grind through the rest of the
 library.
 

@@ -89,10 +89,14 @@ struct Cli {
     batch_file: Option<PathBuf>,
 
     /// Artist for manual mode; in discover mode a narrowing filter that also
-    /// overrides discover.exclude_artists and the folder-ownership gate. The
-    /// name need not be an artist the library holds an album for: a library
-    /// folder named after it becomes the destination, and with neither an album
-    /// nor a folder the downloads stay in staging
+    /// overrides discover.exclude_artists and the folder-ownership gate. Accepts
+    /// an artist name, an ISNI (0000 0004 6659 7022), an IPI (00581977202) or a
+    /// hyphenated MusicBrainz ID; a code or ID identifies the artist exactly, with
+    /// no name search, but only where a discography is fetched: it is rejected
+    /// together with --album, in a batch line, and in an artist-only manual run
+    /// with discography.enabled: false. The name need not be an artist the library holds an
+    /// album for: a library folder named after it becomes the destination, and
+    /// with neither an album nor a folder the downloads stay in staging
     #[arg(long)]
     artist: Option<String>,
 
@@ -664,6 +668,53 @@ async fn wait_for_sigterm(_signal: &mut Option<TerminateSignal>) {
     std::future::pending::<()>().await;
 }
 
+/// Parse one batch line into an artist and an optional album.
+///
+/// An identifier cannot be used here: a batch line never asks MusicBrainz, and a
+/// code names no library folder.
+fn parse_batch_line(line: &str) -> std::result::Result<(String, Option<String>), String> {
+    let (artist, album) = match line.split_once(" - ") {
+        Some((artist, album)) => {
+            let album = album.trim();
+            (
+                artist.trim().to_string(),
+                if album.is_empty() {
+                    None
+                } else {
+                    Some(album.to_string())
+                },
+            )
+        }
+        None => (line.trim().to_string(), None),
+    };
+    let input = seakarr::discography::ArtistInput::parse(&artist);
+    if let Some(reason) = input.malformed_reason() {
+        return Err(reason.to_string());
+    }
+    if input.is_identity() {
+        // A malformed code is reported as such rather than as a missing folder: the
+        // canonical error text for a bad check character is more useful.
+        input.validate()?;
+        return Err(format!(
+            "{} {artist:?} names a MusicBrainz artist and names no library folder; \
+             a batch line needs an artist name",
+            input.label()
+        ));
+    }
+    Ok((artist, album))
+}
+
+/// Validate every batch line before any of them runs.
+///
+/// An identifier on a later line must not let the earlier lines download first, so
+/// the whole file is checked up front.
+fn validate_batch_lines(lines: &[&str]) -> std::result::Result<(), String> {
+    for line in lines {
+        parse_batch_line(line)?;
+    }
+    Ok(())
+}
+
 /// Batch mode: process a newline-separated list of `artist - album` lines.
 async fn run_batch_mode(
     client: &dyn SoulseekClient,
@@ -678,6 +729,8 @@ async fn run_batch_mode(
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
+
+    validate_batch_lines(&lines).map_err(SeakarrError::Config)?;
 
     let line_word = if lines.len() == 1 { "line" } else { "lines" };
     tracing::info!("Batch mode: {} {line_word} to process", lines.len());
@@ -711,27 +764,25 @@ async fn run_batch_mode(
             break;
         }
 
-        let parts: Vec<&str> = line.splitn(2, " - ").collect();
-        let artist = parts[0].trim();
-        let album = parts.get(1).map(|a| a.trim()).filter(|a| !a.is_empty());
+        let (artist, album) = parse_batch_line(line).map_err(SeakarrError::Config)?;
         if artist.is_empty() && album.is_none() {
             tracing::warn!("Batch: skipping line with no artist or album");
             continue;
         }
-        let album_display = album.unwrap_or("(all)");
+        let album_display = album.as_deref().unwrap_or("(all)");
 
         // Batch files its own downloads: an artist the library already holds is
         // placed into, and one it does not hold keeps the download in staging.
         // An artist-only line names no album, so there is nothing to file into the
         // artist folder; only a line naming both is placed.
         let target = match album {
-            Some(_) => seakarr::runner::automatic_place_target(&artist_folders, artist),
+            Some(_) => seakarr::runner::automatic_place_target(&artist_folders, &artist),
             None => seakarr::runner::LibraryTarget::StagingOnly,
         };
         match seakarr::runner::process_album(
             client,
-            artist,
-            album,
+            &artist,
+            album.as_deref(),
             ignore_processed,
             config,
             db,
@@ -748,18 +799,18 @@ async fn run_batch_mode(
                 // missing, so the "no library folder found" explanation would be false.
                 if album.is_some() {
                     seakarr::runner::explain_staging_outcome(
-                        artist,
+                        &artist,
                         config,
                         &outcome,
                         &mut explained,
                     );
                 }
-                report.record(artist, album_display, outcome)
+                report.record(&artist, album_display, outcome)
             }
             Err(e) => {
                 tracing::error!("Batch: failed {artist} — {album_display}: {e}");
                 report.record(
-                    artist,
+                    &artist,
                     album_display,
                     seakarr::report::AlbumOutcome::Failed {
                         reason: e.to_string(),
@@ -792,6 +843,55 @@ mod tests {
         assert!(
             help.contains("upgrade|manual|batch|discover"),
             "the --mode help must advertise upgrade, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn the_artist_help_lists_every_accepted_shape() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+
+        for expected in ["ISNI", "IPI", "MusicBrainz ID"] {
+            assert!(
+                help.contains(expected),
+                "help must mention {expected}:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_line_naming_a_musicbrainz_id_is_a_configuration_error() {
+        let error =
+            parse_batch_line("c02a5966-b5c4-483a-8326-483edcf3680e - Half Light").unwrap_err();
+        assert!(error.contains("MusicBrainz ID"), "got {error}");
+    }
+
+    #[test]
+    fn a_batch_line_with_a_malformed_code_is_a_configuration_error() {
+        let error = parse_batch_line("000000046659702 - Half Light").unwrap_err();
+        assert!(error.contains("15 digits"), "got {error}");
+    }
+
+    #[test]
+    fn a_malformed_later_batch_line_is_caught_before_any_line_runs() {
+        let error = validate_batch_lines(&["Grafix - Half Light", "000000046659702 - Half Light"])
+            .unwrap_err();
+        assert!(error.contains("15 digits"), "got {error}");
+        assert!(validate_batch_lines(&["Grafix - Half Light"]).is_ok());
+    }
+
+    #[test]
+    fn a_batch_line_naming_an_identifier_is_a_configuration_error() {
+        let error = parse_batch_line("0000 0004 6659 7022 - Half Light").unwrap_err();
+        assert!(error.contains("ISNI"), "got {error}");
+        assert!(error.contains("names no library folder"), "got {error}");
+    }
+
+    #[test]
+    fn a_batch_line_with_a_name_is_still_accepted() {
+        assert_eq!(
+            parse_batch_line("Grafix - Half Light").unwrap(),
+            ("Grafix".to_string(), Some("Half Light".to_string()))
         );
     }
 

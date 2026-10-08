@@ -10,8 +10,8 @@ use crate::client::SoulseekClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::discography::{
-    discover_artist_albums, DiscographyProvider, DiscoveryFailure, DiscoveryOutcome,
-    DiscoveryProvenance, FailureCacheUse, MusicBrainzProvider,
+    discover_artist_albums, ArtistInput, DiscographyProvider, Discovery, DiscoveryFailure,
+    DiscoveryOutcome, DiscoveryProvenance, FailureCacheUse, MusicBrainzProvider,
 };
 use crate::error::{Result, SeakarrError};
 use crate::progress::{is_interactive, ProgressDisplay};
@@ -1614,6 +1614,7 @@ fn canonical_processed_target(
 
 /// Outcome of an artist-only manual run: per-album outcomes plus an optional
 /// run-level notice (e.g. a visible automatic legacy fallback).
+#[derive(Debug)]
 struct ArtistOnlyRun {
     outcomes: Vec<(String, AlbumOutcome)>,
     notice: Option<String>,
@@ -1947,7 +1948,8 @@ async fn run_legacy_artist_only_mode(
 /// provider. Authoritative targets become one sequential targeted Soulseek
 /// search per conceptual album; empty outcomes search nothing; stale caches
 /// warn; an unavailable provider falls back to the legacy folder heuristic
-/// with a visible run notice.
+/// with a visible run notice - unless the artist was named by identifier, whose
+/// failed or unavailable lookup is refused instead of searched for as a code.
 #[allow(clippy::too_many_arguments)]
 async fn run_artist_only_mode_with_provider(
     client: &dyn SoulseekClient,
@@ -1960,16 +1962,36 @@ async fn run_artist_only_mode_with_provider(
     cancel: &Arc<AtomicBool>,
     provider: &dyn DiscographyProvider,
 ) -> Result<ArtistOnlyRun> {
-    match discover_artist_albums(
+    let input = ArtistInput::parse(artist);
+    // A malformed code shape is rejected before any request, exactly as in
+    // discover mode: it claims to be a code, so it is not searched as a name
+    // either, and the provider is never asked about it.
+    input.validate().map_err(SeakarrError::Config)?;
+    let Discovery {
+        outcome,
+        canonical_name,
+        ..
+    } = discover_artist_albums(
         provider,
         db,
-        artist,
+        &input,
         &config.discography,
         FailureCacheUse::Bypass,
     )
-    .await
-    {
-        DiscoveryOutcome::Authoritative { albums, provenance } => {
+    .await;
+    match outcome {
+        DiscoveryOutcome::Authoritative {
+            albums, provenance, ..
+        } => {
+            // An identity resolves to the canonical MusicBrainz spelling: the
+            // work item, its Soulseek searches and its placement follow that
+            // name. A name keeps its own spelling, which is what a name-only run
+            // has always searched and placed under.
+            let artist = if input.is_identity() {
+                canonical_name.as_deref().unwrap_or(artist)
+            } else {
+                artist
+            };
             if let DiscoveryProvenance::StaleCache {
                 age_days,
                 refresh_error,
@@ -2057,7 +2079,7 @@ async fn run_artist_only_mode_with_provider(
             }
             Ok(ArtistOnlyRun { outcomes, notice })
         }
-        DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
+        DiscoveryOutcome::AuthoritativeEmpty { provenance, .. } => {
             if let DiscoveryProvenance::StaleCache {
                 age_days,
                 refresh_error,
@@ -2075,7 +2097,24 @@ async fn run_artist_only_mode_with_provider(
                 )),
             })
         }
-        DiscoveryOutcome::LegacyFallback { reason, .. } => {
+        DiscoveryOutcome::LegacyFallback { reason, kind, .. } => {
+            if input.is_identity() {
+                // A code that resolved to nothing, or could not be asked
+                // about, is refused: the heuristic's input would be the raw
+                // code, and a Soulseek search for "00581977202" is never what
+                // the operator meant.
+                return Err(match kind {
+                    DiscoveryFailure::Unresolved => SeakarrError::Config(format!(
+                        "{} {artist:?} could not be resolved on MusicBrainz ({reason}); \
+                         manual mode cannot guess album names for an identifier",
+                        input.label()
+                    )),
+                    DiscoveryFailure::Provider => SeakarrError::MusicBrainz(format!(
+                        "{} {artist:?} could not be looked up ({reason})",
+                        input.label()
+                    )),
+                });
+            }
             tracing::warn!(
                 "{artist}: authoritative discography unavailable ({reason}); falling back to heuristic folder-based album discovery"
             );
@@ -2108,6 +2147,52 @@ async fn run_artist_only_mode_with_provider(
     }
 }
 
+/// Refuse to hand a code or an ID to the legacy folder heuristic.
+///
+/// The heuristic's only input is the raw artist string, so for an identifier it
+/// would search Soulseek for the code itself. `None` for a name, which is what the
+/// heuristic exists for.
+fn identity_without_provider_refusal(artist: &str) -> Option<SeakarrError> {
+    let input = ArtistInput::parse(artist);
+    if !input.is_identity() {
+        return None;
+    }
+    Some(SeakarrError::MusicBrainz(format!(
+        "{} {artist:?} can only be resolved through MusicBrainz, and no authoritative provider is \
+         available; artist-only manual mode does not fall back to the folder heuristic for an \
+         identifier",
+        input.label()
+    )))
+}
+
+/// The artist name a manual run's rows are reported under, and the identity notice
+/// when the run named a code or an ID.
+///
+/// An identity resolved to a canonical MusicBrainz name, which is also the name its
+/// downloads were searched and placed under, so the summary agrees with the library
+/// and with the log. A name keeps the operator's own spelling.
+fn manual_report_identity(db: &Database, artist_name: &str) -> (String, Option<String>) {
+    let input = ArtistInput::parse(artist_name);
+    if !input.is_identity() {
+        return (artist_name.to_string(), None);
+    }
+    match db.get_discography_cache(&input.cache_key()).ok().flatten() {
+        Some(row) => (
+            row.canonical_artist.clone(),
+            Some(format!(
+                "resolved {} {} to {} ({})",
+                input.label(),
+                artist_name,
+                row.canonical_artist,
+                row.artist_mbid
+            )),
+        ),
+        // No cache row: the resolution failed or was never written, so the run's own
+        // value is the only name there is.
+        None => (artist_name.to_string(), None),
+    }
+}
+
 /// Complete an artist-only manual run. With `discography.enabled` (the
 /// default) the authoritative MusicBrainz provider takes over; an explicit
 /// disable keeps the legacy folder heuristic silently, while a provider
@@ -2124,6 +2209,9 @@ async fn run_artist_only_mode(
     cancel: &Arc<AtomicBool>,
 ) -> Result<ArtistOnlyRun> {
     if !config.discography.enabled {
+        if let Some(error) = identity_without_provider_refusal(artist) {
+            return Err(error);
+        }
         tracing::info!(
             "{artist}: authoritative discography is disabled in config — using legacy folder-based album discovery"
         );
@@ -2142,6 +2230,9 @@ async fn run_artist_only_mode(
     let provider = match MusicBrainzProvider::new() {
         Ok(provider) => provider,
         Err(error) => {
+            if let Some(refusal) = identity_without_provider_refusal(artist) {
+                return Err(refusal);
+            }
             tracing::warn!(
                 "{artist}: failed to construct the MusicBrainz provider ({error}); using legacy folder-based album discovery"
             );
@@ -2227,7 +2318,7 @@ fn charges_after_error(error: &SeakarrError) -> bool {
 /// and print the summary.
 ///
 /// One owner for the run's exit reporting, so a run that stops before the walk
-/// (an explicitly named artist MusicBrainz could not be asked about) reports
+/// (an explicitly targeted artist MusicBrainz could not be asked about) reports
 /// through the same path as one that ran to the end.
 fn finish_discover_run(
     report: &mut RunReport,
@@ -2260,58 +2351,97 @@ fn abort_discover_run(
 /// Consecutive provider failures tolerated before a discover run aborts.
 const DISCOVER_PROVIDER_FAILURE_LIMIT: u32 = 3;
 
-/// What an explicitly named discover artist's pre-walk verification left the run.
+/// What an explicitly targeted discover artist's pre-walk verification left the run.
 #[derive(Debug)]
 enum NamedArtistVerification {
     /// Work to do: the artist's authoritative outcome - the album list, or the
-    /// authoritative "no eligible albums" verdict - reused as its work list.
-    WorkList(DiscoveryOutcome),
+    /// authoritative "no eligible albums" verdict - reused as its work list,
+    /// and the name the selection and the folder lookup must use: the typed
+    /// name for a name input, the resolved canonical name for an identity.
+    WorkList {
+        outcome: DiscoveryOutcome,
+        filter_name: String,
+    },
     /// No work list, so the run stops before the walk; the outage was reported.
     Stop,
 }
 
-/// Verify an explicitly named discover artist against MusicBrainz before the
+/// Verify an explicitly targeted discover artist against MusicBrainz before the
 /// library is walked, and report what that verification left the run: the
-/// artist's work list, or `Stop` when the run must end before the walk.
+/// artist's work list and the name to work under, or `Stop` when the run must
+/// end before the walk.
 ///
 /// `Stop` is the provider-outage case: nothing is claimed about the artist,
 /// but the run has no work list, so the walk would be paid for nothing. An
-/// unresolvable name is fatal instead - there is no work list to build, and the
-/// operator asked for that name by hand. Both verdicts are reached before the
-/// walk, which is the point of asking first; the recorded resolution-failure
-/// cache is bypassed, matching the rule that naming an artist means the lookup
-/// runs.
+/// unresolvable artist is fatal instead - there is no work list to build, and
+/// the operator asked for that artist by hand. Both verdicts are reached before
+/// the walk, which is the point of asking first; the recorded resolution-failure
+/// cache is bypassed: an explicitly named or identified artist always means the
+/// lookup runs.
 #[allow(clippy::too_many_arguments)] // the run's report, counters and breaker
                                      // are updated together, as in the main loop
 async fn verify_named_artist(
     provider: &dyn DiscographyProvider,
     db: &Database,
     config: &Config,
-    name: &str,
+    input: &ArtistInput,
     progress: Option<&ProgressDisplay>,
     report: &mut RunReport,
     counters: &mut discover::DiscoverCounters,
     consecutive_provider_failures: &mut u32,
 ) -> Result<NamedArtistVerification> {
-    let outcome = discover_artist_albums(
+    let discovery = discover_artist_albums(
         provider,
         db,
-        name,
+        input,
         &config.discography,
         FailureCacheUse::Bypass,
     )
     .await;
-    let DiscoveryOutcome::LegacyFallback { reason, kind, .. } = &outcome else {
-        return Ok(NamedArtistVerification::WorkList(outcome));
+    let label = input.display();
+    let DiscoveryOutcome::LegacyFallback { reason, kind, .. } = &discovery.outcome else {
+        // An identity works under the canonical MusicBrainz spelling, because it
+        // has no operator spelling of its own; a name keeps the operator's own
+        // trimmed spelling, which is what the selection and the folder lookup
+        // have always used for a name.
+        let filter_name = match input {
+            ArtistInput::Name(name) => name.trim().to_string(),
+            _ => discovery
+                .canonical_name
+                .clone()
+                .unwrap_or_else(|| label.to_string()),
+        };
+        // An identity request reports what it resolved to, so the operator can see
+        // which artist the code picked.
+        if input.is_identity() {
+            report.add_notice(format!(
+                "discover: resolved {} {} to {filter_name} ({}){}",
+                input.label(),
+                label,
+                discovery
+                    .mbid
+                    .as_deref()
+                    .unwrap_or("unknown MusicBrainz ID"),
+                discovery
+                    .disambiguation
+                    .as_deref()
+                    .map(|comment| format!(", {comment:?}"))
+                    .unwrap_or_default(),
+            ));
+        }
+        return Ok(NamedArtistVerification::WorkList {
+            outcome: discovery.outcome,
+            filter_name,
+        });
     };
     match kind {
         DiscoveryFailure::Unresolved => Err(SeakarrError::Config(format!(
-            "artist {name:?} could not be resolved on MusicBrainz ({reason}); \
+            "artist {label:?} could not be resolved on MusicBrainz ({reason}); \
              discover mode needs a verified artist to build its work list"
         ))),
         DiscoveryFailure::Provider => {
-            if note_provider_failure(name, reason, counters, consecutive_provider_failures) {
-                return Err(abort_discover_run(report, counters, progress, name));
+            if note_provider_failure(label, reason, counters, consecutive_provider_failures) {
+                return Err(abort_discover_run(report, counters, progress, label));
             }
             finish_discover_run(report, counters, progress);
             Ok(NamedArtistVerification::Stop)
@@ -2322,9 +2452,10 @@ async fn verify_named_artist(
 /// Run discover mode: derive artists from the library, ask MusicBrainz what
 /// each one is missing, and download only those albums.
 ///
-/// An explicitly named artist inverts that order: it is resolved through
-/// MusicBrainz before the library is walked and that answer is reused. A name
-/// MusicBrainz cannot resolve fails fast, and a provider outage ends the run
+/// An explicitly targeted artist - a name, an ISNI, an IPI or a MusicBrainz
+/// ID - inverts that order: it is resolved through MusicBrainz before the
+/// library is walked and that answer is reused. A name or a code MusicBrainz
+/// cannot resolve fails fast, and a provider outage ends the run
 /// before the walk as a reported skip, so neither is paid for after the run's
 /// longest phase. The automatic sweep keeps the derive-from-the-library order,
 /// because its artist list is the walk's own output.
@@ -2554,13 +2685,30 @@ async fn run_discover_mode_with_provider(
         None
     };
 
-    // The name is validated before anything else is paid for: a filter that names
-    // nothing is rejected here, so neither the walk nor a MusicBrainz lookup can
-    // happen for it. `select_artists` applies the same rule through the same
-    // helper, so the two cannot disagree about what a usable name is.
-    let validated_filter = artist_filter
-        .map(discover::validate_artist_filter)
-        .transpose()?;
+    // An explicit target is classified once: a name, an exact MusicBrainz identity
+    // (ISNI, IPI or MBID), or a malformed code shape. A name is trimmed here because
+    // it reaches the MusicBrainz query; an identity was normalised by the
+    // classification itself. A malformed shape is rejected below, before any request
+    // or walk.
+    let explicit: Option<ArtistInput> = artist_filter.map(|raw| match ArtistInput::parse(raw) {
+        ArtistInput::Name(name) => ArtistInput::name(name.trim()),
+        other => other,
+    });
+    if let Some(input) = explicit
+        .as_ref()
+        .filter(|input| !matches!(input, ArtistInput::Name(_)))
+    {
+        input.validate().map_err(SeakarrError::Config)?;
+    }
+    // Names keep the name-shaped rule `select_artists` also applies; an identity
+    // is already exact, so it neither needs nor can use that rule. Validating
+    // here is what keeps the walk and the MusicBrainz lookup from being paid for
+    // first, and `select_artists` applies the same helper, so the two cannot
+    // disagree about what a usable name is.
+    let named_filter = match &explicit {
+        Some(ArtistInput::Name(name)) => Some(discover::validate_artist_filter(name)?),
+        _ => None,
+    };
 
     // Created before an explicitly named artist is verified, so a run that stops
     // there because the provider could not be asked reports through the same
@@ -2574,18 +2722,21 @@ async fn run_discover_mode_with_provider(
     let mut report = RunReport::new();
     let mut consecutive_provider_failures: u32 = 0;
 
-    // An explicitly named artist is verified against MusicBrainz before the
+    // An explicitly targeted artist is verified against MusicBrainz before the
     // library is walked. Every other artist in a run comes from the walk itself,
     // so this is the only place a MusicBrainz verdict can be reached first - and
     // the walk is the longest phase of a run, which is what makes the order
     // worth having. The verdict is reused as this artist's work list, so an
-    // explicit name still costs exactly one provider dialog.
-    let mut pre_resolved = match validated_filter {
-        Some(name) => match verify_named_artist(
+    // explicit target still costs exactly one provider dialog. The name it
+    // resolved to drives the selection and the folder lookup: a code run works
+    // under the canonical name, exactly as a run naming that name would.
+    let mut filter_name: Option<String> = named_filter.map(str::to_string);
+    let mut pre_resolved = match &explicit {
+        Some(input) => match verify_named_artist(
             provider,
             db,
             config,
-            name,
+            input,
             progress.as_ref(),
             &mut report,
             &mut counters,
@@ -2593,7 +2744,13 @@ async fn run_discover_mode_with_provider(
         )
         .await?
         {
-            NamedArtistVerification::WorkList(outcome) => Some(outcome),
+            NamedArtistVerification::WorkList {
+                outcome,
+                filter_name: resolved,
+            } => {
+                filter_name = Some(resolved);
+                Some(outcome)
+            }
             // The outage was warned about and summarised before the walk: there
             // is no work list for an artist MusicBrainz could not be asked about.
             NamedArtistVerification::Stop => return Ok(()),
@@ -2612,7 +2769,7 @@ async fn run_discover_mode_with_provider(
     // walk reads directory names only and is lazy, and it is reached only for a
     // name the index does not already hold, so a run that never names an absent
     // artist never touches the library tree.
-    let filter_folder = match artist_filter {
+    let filter_folder = match filter_name.as_deref() {
         Some(name) if !index.has_artist(name) => {
             discover::ArtistFolderIndex::new(config).find(name)
         }
@@ -2621,7 +2778,7 @@ async fn run_discover_mode_with_provider(
     let selection = discover::select_artists(
         &index,
         &config.discover.exclude_artists,
-        artist_filter,
+        filter_name.as_deref(),
         filter_folder
             .as_ref()
             .map(|(root, artist_dir)| (root.as_path(), artist_dir.as_str())),
@@ -2629,12 +2786,12 @@ async fn run_discover_mode_with_provider(
 
     // An explicit --artist is a deliberate one-off request, so it bypasses a
     // recorded failure; the scheduled sweep honours it. This matches the
-    // existing rule that --artist overrides discover.exclude_artists. A named
-    // artist's lookup has already happened in `verify_named_artist`, so only the
-    // sweep reaches a lookup with this value today; it is still expressed for a
-    // named artist because the rule belongs to naming an artist, not to where
-    // the lookup happens to be made.
-    let failure_cache = if artist_filter.is_some() {
+    // existing rule that --artist overrides discover.exclude_artists. A named or
+    // identified artist's lookup has already happened in `verify_named_artist`,
+    // so only the sweep reaches a lookup with this value today; it is still
+    // expressed for an explicit target because the rule belongs to targeting an
+    // artist, not to where the lookup happens to be made.
+    let failure_cache = if explicit.is_some() {
         FailureCacheUse::Bypass
     } else {
         FailureCacheUse::Honour
@@ -2677,28 +2834,35 @@ async fn run_discover_mode_with_provider(
             discover::ArtistDestination::Staging => LibraryTarget::StagingOnly,
         };
         counters.artists_examined += 1;
-        // The abort message names the name the operator typed when there is one: a
-        // work item's spelling can be the on-disk folder name, and the operator
-        // matches an error against their own command line.
-        let abort_artist = validated_filter.unwrap_or(artist.name.as_str());
+        // The abort message names the resolved artist for an explicit target - the
+        // canonical MusicBrainz name for a code or an ID, not the value typed - and
+        // the work item's spelling in the sweep, which is what the operator can
+        // match against the run.
+        let abort_artist = filter_name.as_deref().unwrap_or(artist.name.as_str());
         // A run narrowed by `--artist` selects exactly one artist, and that
         // artist's work list was resolved before the walk: reuse it rather than
         // asking MusicBrainz twice for one name.
         let outcome = match pre_resolved.take() {
             Some(outcome) => outcome,
             None => {
+                // The sweep's artist list is library-derived, so its spelling is
+                // always a name: a library artist spelled like a code must not be
+                // searched for by code.
                 discover_artist_albums(
                     provider,
                     db,
-                    &artist.name,
+                    &ArtistInput::name(artist.name.clone()),
                     &config.discography,
                     failure_cache,
                 )
                 .await
+                .outcome
             }
         };
         match outcome {
-            DiscoveryOutcome::Authoritative { albums, provenance } => {
+            DiscoveryOutcome::Authoritative {
+                albums, provenance, ..
+            } => {
                 if note_stale_cache(
                     &artist.name,
                     &provenance,
@@ -2731,7 +2895,7 @@ async fn run_discover_mode_with_provider(
                 )
                 .await?;
             }
-            DiscoveryOutcome::AuthoritativeEmpty { provenance } => {
+            DiscoveryOutcome::AuthoritativeEmpty { provenance, .. } => {
                 if note_stale_cache(
                     &artist.name,
                     &provenance,
@@ -2856,8 +3020,12 @@ pub async fn run_manual_mode(
         .await
         {
             Ok(run) => {
+                let (report_artist, resolution) = manual_report_identity(db, artist_name);
+                if let Some(notice) = resolution {
+                    report.add_notice(notice);
+                }
                 for (album_name, outcome) in run.outcomes {
-                    report.record(artist_name, &album_name, outcome);
+                    report.record(&report_artist, &album_name, outcome);
                 }
                 if let Some(notice) = run.notice {
                     report.add_notice(notice);
@@ -5158,7 +5326,7 @@ mod tests {
 
     use crate::client::DownloadHandle;
     use crate::discography::{
-        ArtistCandidate, DiscographyError, DiscographyProvider, ReleaseGroup,
+        ArtistCandidate, CodeIdentifier, DiscographyError, DiscographyProvider, ReleaseGroup,
     };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5168,10 +5336,14 @@ mod tests {
         failure: Option<String>,
         /// `None` echoes the requested artist back as the only candidate.
         candidate_names: Option<Vec<String>>,
+        /// Candidates returned for any code search; `None` means no carrier.
+        code_candidates: Option<Vec<ArtistCandidate>>,
         artist_calls: Arc<AtomicUsize>,
         /// Every artist name the provider was asked about, in order, so a test can
         /// pin *which* spelling reached MusicBrainz rather than only how often.
         requested_artists: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Every code the provider was asked about, in order, as `KIND:value`.
+        requested_codes: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeDiscographyProvider {
@@ -5180,8 +5352,10 @@ mod tests {
                 groups,
                 failure: None,
                 candidate_names: None,
+                code_candidates: None,
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
+                requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -5190,8 +5364,10 @@ mod tests {
                 groups: Vec::new(),
                 failure: Some(reason.to_string()),
                 candidate_names: None,
+                code_candidates: None,
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
+                requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -5202,9 +5378,17 @@ mod tests {
                 groups: Vec::new(),
                 failure: None,
                 candidate_names: Some(vec!["Somebody Else".to_string()]),
+                code_candidates: None,
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
+                requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        /// Answer every code search with this one carrier list.
+        fn with_code_candidates(mut self, candidates: Vec<ArtistCandidate>) -> Self {
+            self.code_candidates = Some(candidates);
+            self
         }
 
         fn calls(&self) -> usize {
@@ -5215,6 +5399,13 @@ mod tests {
             self.requested_artists
                 .lock()
                 .map(|names| names.clone())
+                .unwrap_or_default()
+        }
+
+        fn requested_codes(&self) -> Vec<String> {
+            self.requested_codes
+                .lock()
+                .map(|codes| codes.clone())
                 .unwrap_or_default()
         }
     }
@@ -5243,8 +5434,25 @@ mod tests {
                     id: format!("1111111{position}-1111-1111-1111-111111111111"),
                     name,
                     score: None,
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
                 })
                 .collect())
+        }
+
+        async fn search_artists_by_code(
+            &self,
+            code: CodeIdentifier<'_>,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            self.artist_calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut requested) = self.requested_codes.lock() {
+                requested.push(format!("{}:{}", code.kind(), code.value()));
+            }
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(self.code_candidates.clone().unwrap_or_default())
         }
 
         async fn artist_by_id(
@@ -5258,6 +5466,9 @@ mod tests {
                 id: artist_mbid.to_string(),
                 name: "Test Artist".to_string(),
                 score: None,
+                ipis: Vec::new(),
+                isnis: Vec::new(),
+                disambiguation: None,
             })
         }
 
@@ -6031,6 +6242,169 @@ mod tests {
             notice.contains("heuristically"),
             "the notice must state the heuristic origin, got: {notice}"
         );
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_rejects_a_malformed_isni_before_any_request() {
+        // The design's error table gives a malformed code the same treatment in
+        // artist-only manual mode as in discover mode: a configuration error,
+        // raised before any request.
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::with_groups(Vec::new());
+        let (config, db, staging) = artist_only_fixture();
+
+        let error = run_artist_only_mode_with_provider(
+            &soulseek,
+            "0000000466597023",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
+        assert!(
+            error.to_string().contains("invalid check character"),
+            "got {error}"
+        );
+        assert_eq!(
+            provider.calls(),
+            0,
+            "a bad check character must not reach MusicBrainz"
+        );
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_refuses_an_unresolved_code_instead_of_falling_back() {
+        // The heuristic would search Soulseek for "00581977202". A code is an
+        // exact request, so a miss is reported.
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::unresolvable();
+        let (config, db, staging) = artist_only_fixture();
+
+        let error = run_artist_only_mode_with_provider(
+            &soulseek,
+            "00581977202",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
+        assert!(
+            soulseek.search_queries.lock().unwrap().is_empty(),
+            "no Soulseek search may be issued for a code that resolved to nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_refuses_a_code_when_the_provider_is_offline() {
+        let soulseek = MockClient::new();
+        let provider = FakeDiscographyProvider::failing("offline");
+        let (config, db, staging) = artist_only_fixture();
+
+        let error = run_artist_only_mode_with_provider(
+            &soulseek,
+            "0000 0004 6659 7022",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SeakarrError::MusicBrainz(_)),
+            "an outage for a code is a MusicBrainz error, not a heuristic fallback, got {error:?}"
+        );
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_still_falls_back_for_a_name() {
+        // The existing behaviour, pinned so the code path above cannot leak into it.
+        let soulseek = MockClient::new();
+        soulseek
+            .search_results_by_query
+            .lock()
+            .unwrap()
+            .insert("Grafix".into(), vec![album_result("Grafix", "Half Light")]);
+        let provider = FakeDiscographyProvider::unresolvable();
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "Grafix",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Grafix"]
+        );
+        assert!(run.notice.unwrap().contains("heuristically"));
+    }
+
+    #[tokio::test]
+    async fn manual_artist_only_searches_under_the_canonical_name_for_a_code() {
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Grafix", &[("Grafix Half Light", "Half Light")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("rg-1", "Half Light", "2019")])
+                .with_code_candidates(vec![ArtistCandidate {
+                    id: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+                    name: "Grafix".to_string(),
+                    score: Some(100),
+                    ipis: Vec::new(),
+                    isnis: vec!["0000000466597022".to_string()],
+                    disambiguation: None,
+                }]);
+        let (config, db, staging) = artist_only_fixture();
+
+        let run = run_artist_only_mode_with_provider(
+            &soulseek,
+            "0000 0004 6659 7022",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Grafix Half Light"],
+            "the album search uses the canonical name, not the code"
+        );
+        assert_eq!(run.outcomes.len(), 1, "the album was attempted");
     }
 
     #[tokio::test]
@@ -7861,6 +8235,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_verifies_an_isni_before_scanning_the_library() {
+        // The non-existent library root is the ordering proof: a run that walked
+        // first would fail with Scanner instead of reaching the walk's failure
+        // after the code was verified.
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")])
+                .with_code_candidates(vec![ArtistCandidate {
+                    id: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+                    name: "Grafix".to_string(),
+                    score: Some(100),
+                    ipis: Vec::new(),
+                    isnis: vec!["0000000466597022".to_string()],
+                    disambiguation: None,
+                }]);
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("0000 0004 6659 7022"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            provider.requested_codes(),
+            vec!["ISNI:0000000466597022".to_string()],
+            "the code must be what MusicBrainz was asked about"
+        );
+        assert!(
+            matches!(error, SeakarrError::Scanner(_)),
+            "the code was verified first, so the walk is what fails, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_hard_errors_when_no_artist_carries_the_code() {
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider =
+            FakeDiscographyProvider::with_groups(Vec::new()).with_code_candidates(Vec::new());
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("00581977202"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
+        assert!(
+            message.contains("no MusicBrainz artist carries IPI 00581977202"),
+            "got {message}"
+        );
+        assert!(soulseek.search_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_a_malformed_isni_before_any_request() {
+        let soulseek = MockClient::new();
+        let (mut config, db, staging, _library) =
+            discover_fixture(&[("Present Artist", "Present")]);
+        undiscoverable_library(&mut config, &staging);
+        let provider = FakeDiscographyProvider::with_groups(Vec::new());
+
+        let error = run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("0000000466597023"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            provider.calls(),
+            0,
+            "a bad check character must not reach MusicBrainz"
+        );
+        assert!(
+            error.to_string().contains("invalid check character"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_places_a_code_run_under_the_canonical_name() {
+        // The library folder is spelled the way the operator spells the artist;
+        // the code resolves to the canonical MusicBrainz spelling, which is what
+        // the search and the placement use.
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Grafix", &[("Grafix Missing", "Missing")]);
+        *soulseek.write_files.lock().unwrap() = true;
+        let (config, db, staging, library) = discover_fixture(&[("Grafix", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")])
+                .with_code_candidates(vec![ArtistCandidate {
+                    id: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+                    name: "Grafix".to_string(),
+                    score: Some(100),
+                    ipis: Vec::new(),
+                    isnis: vec!["0000000466597022".to_string()],
+                    disambiguation: None,
+                }]);
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("0000 0004 6659 7022"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            soulseek.search_queries.lock().unwrap().as_slice(),
+            ["Grafix Missing"],
+            "the Soulseek search uses the resolved canonical name"
+        );
+        assert!(
+            library
+                .path()
+                .join("Grafix")
+                .join("Missing")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must be placed in the artist folder the canonical name resolved to"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_keeps_the_sweep_name_only() {
+        // A library artist spelled like an IPI is still a name for the sweep: it
+        // must not be searched for by code.
+        let soulseek = MockClient::new();
+        let (config, db, staging, _library) = discover_fixture(&[("12345678901", "Present")]);
+        let provider = FakeDiscographyProvider::with_groups(Vec::new());
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            provider.requested_codes().is_empty(),
+            "the sweep must never search by code, got {:?}",
+            provider.requested_codes()
+        );
+        assert_eq!(provider.requested(), vec!["12345678901".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_code_run_announces_the_identity_it_resolved() {
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Grafix", &[("Grafix Missing", "Missing")]);
+        let (config, db, staging, _library) = discover_fixture(&[("Present Artist", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")])
+                .with_code_candidates(vec![ArtistCandidate {
+                    id: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+                    name: "Grafix".to_string(),
+                    score: Some(100),
+                    ipis: vec!["00581977202".to_string()],
+                    isnis: Vec::new(),
+                    disambiguation: Some("DnB producer Josh Jackson".to_string()),
+                }]);
+        let capture = crate::test_support::LogCapture::start();
+
+        run_discover_mode_with_provider(
+            &soulseek,
+            &config,
+            &db,
+            Some("00581977202"),
+            false,
+            staging.path(),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let logs = capture.text();
+        assert!(
+            logs.contains("IPI 00581977202")
+                && logs.contains("Grafix")
+                && logs.contains("c02a5966-b5c4-483a-8326-483edcf3680e"),
+            "the run must say which artist the code resolved to, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("discover: resolved"),
+            "the run summary must carry the resolution notice, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn an_identity_without_a_provider_is_refused_but_a_name_is_not() {
+        assert!(identity_without_provider_refusal("Test Artist").is_none());
+        for value in [
+            "00581977202",
+            "0000 0004 6659 7022",
+            "c02a5966-b5c4-483a-8326-483edcf3680e",
+        ] {
+            let error =
+                identity_without_provider_refusal(value).expect("an identity must be refused");
+            assert!(
+                matches!(error, SeakarrError::MusicBrainz(_)),
+                "got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manual_identity_run_reports_the_cached_canonical_name() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(
+            manual_report_identity(&db, "Grafix"),
+            ("Grafix".to_string(), None),
+            "a name keeps its own spelling and announces nothing"
+        );
+
+        db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+            artist_key: ArtistInput::parse("0000 0004 6659 7022").cache_key(),
+            artist_mbid: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+            canonical_artist: "Grafix".to_string(),
+            fetched_at: 1,
+            release_groups_json: "[]".to_string(),
+        })
+        .unwrap();
+
+        let (name, notice) = manual_report_identity(&db, "0000 0004 6659 7022");
+        assert_eq!(
+            name, "Grafix",
+            "the row must be reported under the resolved name"
+        );
+        let notice = notice.expect("an identity run must announce what it resolved");
+        assert!(
+            notice.contains("ISNI") && notice.contains("Grafix"),
+            "got {notice}"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_resolves_a_named_artist_once_and_fills_its_gap() {
         // Hoisting the lookup must not pay for it twice: the pre-scan answer is
         // the run's work list. Caching is disabled so that a dropped reuse cannot
@@ -8091,7 +8734,7 @@ mod tests {
             &provider,
             &db,
             &config,
-            "Breaker Named Artist",
+            &ArtistInput::name("Breaker Named Artist"),
             None,
             &mut report,
             &mut counters,

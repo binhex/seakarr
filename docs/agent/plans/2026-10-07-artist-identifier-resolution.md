@@ -380,9 +380,10 @@ fn is_isni_shape(value: &str) -> bool {
 
 /// ISO 7064 MOD 11-2, the ISNI check-character algorithm.
 ///
-/// The body is processed from the left with a running remainder of 0; each
-/// character is worth its digit, or 10 for a leading `X`. The check character is
-/// valid when the final remainder is 1.
+/// The first 15 characters must be digits, and the remainder runs from 0 as
+/// `(remainder + digit) * 2 % 11`. The check character is valid when it equals
+/// `(12 - remainder) % 11`, with 10 written as `X`. The wrap matters: a body
+/// leaving remainder 0 takes the digit 1.
 fn isni_check_character_is_valid(value: &str) -> bool {
     let mut characters = value.chars();
     let mut remainder: u32 = 0;
@@ -395,8 +396,7 @@ fn isni_check_character_is_valid(value: &str) -> bool {
     let Some(check) = characters.next() else {
         return false;
     };
-    let expected = 12 - remainder;
-    let expected = if expected == 11 { 0 } else { expected };
+    let expected = (12 - remainder) % 11;
     match check {
         'X' | 'x' => expected == 10,
         other => other.to_digit(10) == Some(expected),

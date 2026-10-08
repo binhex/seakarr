@@ -9,7 +9,9 @@ use crate::db::{Database, DiscographyCacheEntry, DiscographyFailureEntry};
 use crate::search::album_identity_key;
 
 mod bundle;
+pub mod identifier;
 mod musicbrainz;
+pub use identifier::{resolve_code, ArtistInput, CodeIdentifier};
 pub use musicbrainz::MusicBrainzProvider;
 
 /// Apostrophe characters that spell the same mark across keyboards, tags and
@@ -79,6 +81,12 @@ pub struct ArtistCandidate {
     /// range. `None` when the response omitted a score, which is normal for
     /// lookups by MBID and for a single unambiguous search result.
     pub score: Option<u8>,
+    /// IPI codes the artist's own MusicBrainz record claims.
+    pub ipis: Vec<String>,
+    /// ISNI codes the artist's own MusicBrainz record claims.
+    pub isnis: Vec<String>,
+    /// MusicBrainz disambiguation comment, when present.
+    pub disambiguation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +146,15 @@ pub trait DiscographyProvider: Send + Sync {
         artist: &str,
     ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError>;
 
+    /// Search the MusicBrainz artist index for the artist claiming a code.
+    ///
+    /// Required rather than defaulted: a provider that quietly returned nothing
+    /// would make a missing implementation look like a code no artist carries.
+    async fn search_artists_by_code(
+        &self,
+        code: CodeIdentifier<'_>,
+    ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError>;
+
     async fn artist_by_id(
         &self,
         artist_mbid: &str,
@@ -173,6 +190,8 @@ pub enum ArtistResolution {
     UniqueExactName,
     /// Duplicate exact names resolved by a dominant search score.
     ScoreDominance(DominanceEvidence),
+    /// Exactly one candidate carried the requested IPI or ISNI.
+    Identity,
 }
 
 /// A resolved artist and the reason it was accepted.
@@ -211,6 +230,47 @@ pub fn resolve_artist(
             resolution: ArtistResolution::UniqueExactName,
         }),
         many => resolve_dominant_artist(artist_key, many),
+    }
+}
+
+/// Resolve the artist that claims an IPI or an ISNI.
+///
+/// Exactly one carrier resolves. None and several are both
+/// [`DiscographyError::ArtistUnresolved`], because the caller cannot act on
+/// either: MusicBrainz scores identifier hits at or near 100 whatever artist they
+/// belong to, so the name path's dominance rule cannot choose between them.
+pub fn resolve_artist_by_code(
+    code: CodeIdentifier<'_>,
+    candidates: &[ArtistCandidate],
+) -> std::result::Result<ResolvedArtist, DiscographyError> {
+    let carriers: Vec<&ArtistCandidate> = candidates
+        .iter()
+        .filter(|candidate| code.matches(candidate))
+        .collect();
+    match carriers.as_slice() {
+        [] => Err(DiscographyError::ArtistUnresolved(format!(
+            "no MusicBrainz artist carries {} {}",
+            code.kind(),
+            code.value()
+        ))),
+        [only] => Ok(ResolvedArtist {
+            candidate: (*only).clone(),
+            resolution: ArtistResolution::Identity,
+        }),
+        many => Err(DiscographyError::ArtistUnresolved(format!(
+            "{} artists carry {} {} ({}); pin one with discography.artist_mbids key \"{}:{}\", \
+             or name the artist by its MusicBrainz ID instead",
+            many.len(),
+            code.kind(),
+            code.value(),
+            many.iter()
+                .map(|candidate| format!("{} ({})", candidate.name, candidate.id))
+                .collect::<Vec<_>>()
+                .join(", "),
+            // Lower-cased, this is exactly the key `ArtistInput::cache_key` produces.
+            code.kind().to_ascii_lowercase(),
+            code.value()
+        ))),
     }
 }
 
@@ -424,9 +484,10 @@ fn parse_partial_date(value: &str) -> Option<PartialDate> {
 ///
 /// Identity, not the raw title, is what collapses MusicBrainz's several release
 /// groups for one album into a single target — see `album_identity_key`.
-/// `artist` is the artist spelling the run is working from — the library's in
-/// discover mode, the operator's in an artist-only manual run — which the
-/// identity uses to strip an artist prefix a release group title may carry.
+/// `artist` is what the run is working from - the library's artist name in a
+/// sweep, the operator's value for a name, and the resolved canonical name for an
+/// ISNI, an IPI or an MBID request, which is what lets the identity strip an
+/// `<artist> - ` prefix from a release group title.
 pub fn select_albums(
     groups: &[ReleaseGroup],
     allowed: &[DiscographyReleaseType],
@@ -577,9 +638,10 @@ pub enum DiscoveryFailure {
 }
 
 impl DiscographyError {
-    /// True when this failure means the artist name could not be matched or
-    /// disambiguated, as opposed to a transport, HTTP, decode, pagination or
-    /// unusable-data failure, and is therefore worth remembering across runs.
+    /// True when this failure means the artist could not be matched or
+    /// disambiguated - by canonical name, or by the IPI or ISNI the caller named -
+    /// as opposed to a transport, HTTP, decode, pagination or unusable-data
+    /// failure, and is therefore worth remembering across runs.
     ///
     /// Only [`DiscographyError::ArtistUnresolved`] qualifies. Its sibling
     /// [`DiscographyError::ArtistSearchInconsistent`] is deliberately classified
@@ -593,8 +655,10 @@ impl DiscographyError {
     /// scores — a tied top score, a top score below the required threshold, and a
     /// leading margin below the required margin — so a later re-ranking could make
     /// a cached name resolvable while the row still suppresses the lookup until it
-    /// expires. That is accepted deliberately: the alternative is to remember
-    /// nothing and pay the per-run cost this cache exists to remove.
+    /// expires. The predicate is shared with the name path, but only a name failure
+    /// is recorded: the two producers an identifier request adds - no carrier and
+    /// several carriers - are facts about the code itself, and an explicit code
+    /// always asks again, so remembering one would only accumulate dead rows.
     pub(crate) fn is_stable_artist_resolution_failure(&self) -> bool {
         matches!(self, Self::ArtistUnresolved(_))
     }
@@ -625,8 +689,8 @@ impl DiscoveryFailure {
 pub enum FailureCacheUse {
     /// Replay a fresh recorded failure for this artist.
     Honour,
-    /// Ignore any recorded failure: the user asked for this artist by name, or
-    /// pinned its MBID, so the lookup runs.
+    /// Ignore any recorded failure: the user named this artist explicitly - a
+    /// name, an ISNI or an IPI code, or an MBID - so the lookup runs.
     Bypass,
 }
 
@@ -635,9 +699,13 @@ pub enum DiscoveryOutcome {
     Authoritative {
         albums: Vec<AlbumTarget>,
         provenance: DiscoveryProvenance,
+        /// The canonical MusicBrainz spelling of the resolved artist, carried so the
+        /// variant is self-describing. Callers read `Discovery::canonical_name`.
+        canonical_name: Option<String>,
     },
     AuthoritativeEmpty {
         provenance: DiscoveryProvenance,
+        canonical_name: Option<String>,
     },
     LegacyFallback {
         reason: String,
@@ -646,6 +714,25 @@ pub enum DiscoveryOutcome {
         /// than observed live, so the caller can report the two separately.
         from_cache: bool,
     },
+}
+
+/// The outcome of resolving one artist, with the identity it resolved to.
+///
+/// The canonical name is repeated at the top level so a caller can read it
+/// without matching the variant; both authoritative variants carry it as well,
+/// and a legacy fallback resolved nothing so it has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub outcome: DiscoveryOutcome,
+    pub canonical_name: Option<String>,
+    /// The resolved MusicBrainz artist ID, when one was resolved. An explicit code
+    /// or ID run reports it in the run summary, so the operator can see which
+    /// artist was chosen.
+    pub mbid: Option<String>,
+    /// MusicBrainz's disambiguation comment for the resolved artist, when the live
+    /// response carried one. Absent for a cache-served answer, which stores the
+    /// canonical name and the ID only.
+    pub disambiguation: Option<String>,
 }
 
 /// Resolve an artist's conceptual albums, preferring a fresh discography
@@ -659,14 +746,14 @@ pub enum DiscoveryOutcome {
 pub async fn discover_artist_albums(
     provider: &dyn DiscographyProvider,
     db: &Database,
-    artist: &str,
+    input: &ArtistInput,
     config: &DiscographyConfig,
     failure_cache: FailureCacheUse,
-) -> DiscoveryOutcome {
+) -> Discovery {
     discover_artist_albums_at(
         provider,
         db,
-        artist,
+        input,
         config,
         chrono::Utc::now().timestamp(),
         failure_cache,
@@ -678,27 +765,35 @@ pub async fn discover_artist_albums(
 pub(crate) async fn discover_artist_albums_at(
     provider: &dyn DiscographyProvider,
     db: &Database,
-    artist: &str,
+    input: &ArtistInput,
     config: &DiscographyConfig,
     now: i64,
     failure_cache: FailureCacheUse,
-) -> DiscoveryOutcome {
-    let artist_key = normalize_catalog_key(artist);
+) -> Discovery {
+    let artist = input.display();
+    let artist_key = input.cache_key();
     let configured_mbid = config
         .artist_mbids
         .iter()
-        .find(|(name, _)| normalize_catalog_key(name) == artist_key)
+        .find(|(name, _)| identifier::pin_key(name) == artist_key)
         .map(|(_, mbid)| mbid.as_str());
 
     let cached = load_compatible_cache(db, &artist_key, configured_mbid);
     if let Some(cached) = &cached {
         if cache_is_fresh(cached.entry.fetched_at, config.cache_days, now) {
-            return select_outcome(
-                &cached.groups,
-                &config.allowed_types,
-                artist,
-                DiscoveryProvenance::FreshCache,
-            );
+            let canonical_name = cached.entry.canonical_artist.clone();
+            return Discovery {
+                outcome: select_outcome(
+                    &cached.groups,
+                    &config.allowed_types,
+                    strip_artist(input, artist, &canonical_name),
+                    DiscoveryProvenance::FreshCache,
+                    Some(&canonical_name),
+                ),
+                canonical_name: Some(canonical_name),
+                mbid: Some(cached.entry.artist_mbid.clone()),
+                disambiguation: None,
+            };
         }
     }
 
@@ -715,10 +810,26 @@ pub(crate) async fn discover_artist_albums_at(
     }
 
     let refresh = async {
-        let resolved = match configured_mbid {
-            Some(mbid) => provider.artist_by_id(mbid).await?,
-            None => {
-                let candidates = provider.search_artists(artist).await?;
+        let resolved = match (input.mbid(), input.code(), configured_mbid) {
+            // A pinned UUID wins over every shape, exactly as it does for a name.
+            (_, _, Some(mbid)) => provider.artist_by_id(mbid).await?,
+            (Some(mbid), _, None) => provider.artist_by_id(mbid).await?,
+            (None, Some(code), None) => {
+                let candidates = provider.search_artists_by_code(code).await?;
+                resolve_artist_by_code(code, &candidates)?.candidate
+            }
+            (None, None, None) => {
+                let name = match input {
+                    ArtistInput::Name(name) => name.as_str(),
+                    // Defensive: every caller validates first, so this is unreachable
+                    // from the binary. A public entry point must still not panic, and
+                    // a malformed value could never resolve.
+                    ArtistInput::Malformed { reason, .. } => {
+                        return Err(DiscographyError::ArtistUnresolved(reason.clone()))
+                    }
+                    _ => unreachable!("every other non-name input is an MBID or a code"),
+                };
+                let candidates = provider.search_artists(name).await?;
                 let resolved = resolve_artist(&artist_key, &candidates)?;
                 if let ArtistResolution::ScoreDominance(evidence) = &resolved.resolution {
                     // Debug, not info: this fires for every artist MusicBrainz
@@ -741,6 +852,27 @@ pub(crate) async fn discover_artist_albums_at(
                 resolved.candidate
             }
         };
+        if let Some(code) = input.code() {
+            tracing::info!(
+                "{} {} resolved to {} ({}){}",
+                code.kind(),
+                code.value(),
+                resolved.name,
+                resolved.id,
+                resolved
+                    .disambiguation
+                    .as_deref()
+                    .map(|comment| format!(", {comment:?}"))
+                    .unwrap_or_default()
+            );
+        }
+        if let Some(mbid) = input.mbid() {
+            tracing::info!(
+                "MusicBrainz ID {mbid} resolved to {} ({})",
+                resolved.name,
+                resolved.id
+            );
+        }
         // The row records a failure to RESOLVE this name, so a successful
         // resolution makes it obsolete whatever happens to the release-group
         // fetch that follows. Clearing it here rather than on the fully
@@ -767,21 +899,33 @@ pub(crate) async fn discover_artist_albums_at(
                 if let Err(error) = db.upsert_discography_cache(&entry) {
                     tracing::warn!("failed to write discography cache for {artist:?}: {error}");
                 }
-                select_outcome(
-                    &groups,
-                    &config.allowed_types,
-                    artist,
-                    DiscoveryProvenance::Refreshed,
-                )
+                let canonical_name = resolved.name;
+                Discovery {
+                    outcome: select_outcome(
+                        &groups,
+                        &config.allowed_types,
+                        strip_artist(input, artist, &canonical_name),
+                        DiscoveryProvenance::Refreshed,
+                        Some(&canonical_name),
+                    ),
+                    canonical_name: Some(canonical_name),
+                    mbid: Some(resolved.id),
+                    disambiguation: resolved.disambiguation,
+                }
             }
             // An oversized (or unserializable) payload is a refresh error:
             // fall back to the stale cache or legacy discovery.
-            Err(error) => stale_or_legacy(cached, &config.allowed_types, artist, now, error),
+            Err(error) => stale_or_legacy(cached, &config.allowed_types, input, artist, now, error),
         },
         Err(error) => {
             let has_success_row = cached.is_some();
-            record_resolution_failure(db, &artist_key, config, now, &error, has_success_row);
-            stale_or_legacy(cached, &config.allowed_types, artist, now, error)
+            // Only a name is worth remembering: an explicit code or ID always
+            // bypasses the recorded failure, so a row for one could never be
+            // replayed and would only accumulate.
+            if matches!(input, ArtistInput::Name(_)) {
+                record_resolution_failure(db, &artist_key, config, now, &error, has_success_row);
+            }
+            stale_or_legacy(cached, &config.allowed_types, input, artist, now, error)
         }
     }
 }
@@ -807,7 +951,10 @@ fn load_compatible_cache(
             return None;
         }
     };
-    if normalize_catalog_key(&entry.artist_key) != artist_key {
+    // `pin_key` folds a stored key exactly as the run built it, so an ISNI whose
+    // check character is `X` still matches; `normalize_catalog_key` would lower-case
+    // that `X` and never match.
+    if identifier::pin_key(&entry.artist_key) != artist_key {
         return None;
     }
     if let Some(mbid) = configured_mbid {
@@ -863,7 +1010,7 @@ fn replay_recorded_failure(
     use_cache: FailureCacheUse,
     configured_mbid: Option<&str>,
     has_success_row: bool,
-) -> Option<DiscoveryOutcome> {
+) -> Option<Discovery> {
     if configured_mbid.is_some() {
         // A pinned MBID makes resolution deterministic, so any recorded failure
         // is obsolete. Drop it and let the lookup run.
@@ -907,17 +1054,24 @@ fn replay_recorded_failure(
         recorded_at = entry.recorded_at,
         "skipping a recorded resolution failure"
     );
-    Some(DiscoveryOutcome::LegacyFallback {
-        reason,
-        kind: DiscoveryFailure::Unresolved,
-        from_cache: true,
+    Some(Discovery {
+        outcome: DiscoveryOutcome::LegacyFallback {
+            reason,
+            kind: DiscoveryFailure::Unresolved,
+            from_cache: true,
+        },
+        canonical_name: None,
+        mbid: None,
+        disambiguation: None,
     })
 }
 
 /// Record an artist-resolution failure so a later run can skip the lookup.
 ///
-/// Only a failure to match the artist name is recorded, which
-/// [`DiscographyError::is_stable_artist_resolution_failure`] decides. That
+/// Only a failure to match a name is recorded: an explicit code or ID always
+/// bypasses the recorded failure, so a row for one could never be replayed. Which
+/// errors qualify is [`DiscographyError::is_stable_artist_resolution_failure`]'s
+/// decision. That
 /// excludes a `Provider` failure, because an outage would otherwise keep
 /// suppressing a healthy MusicBrainz for the whole expiry, and it excludes
 /// [`DiscographyError::ArtistSearchInconsistent`], which is classified as an
@@ -976,12 +1130,21 @@ fn select_outcome(
     allowed: &[DiscographyReleaseType],
     artist: &str,
     provenance: DiscoveryProvenance,
+    canonical_name: Option<&str>,
 ) -> DiscoveryOutcome {
     let albums = select_albums(groups, allowed, artist);
+    let canonical_name = canonical_name.map(str::to_string);
     if albums.is_empty() {
-        DiscoveryOutcome::AuthoritativeEmpty { provenance }
+        DiscoveryOutcome::AuthoritativeEmpty {
+            provenance,
+            canonical_name,
+        }
     } else {
-        DiscoveryOutcome::Authoritative { albums, provenance }
+        DiscoveryOutcome::Authoritative {
+            albums,
+            provenance,
+            canonical_name,
+        }
     }
 }
 
@@ -991,15 +1154,21 @@ fn select_outcome(
 fn stale_or_legacy(
     cached: Option<CachedDiscography>,
     allowed: &[DiscographyReleaseType],
+    input: &ArtistInput,
     artist: &str,
     now: i64,
     refresh_error: DiscographyError,
-) -> DiscoveryOutcome {
+) -> Discovery {
     let Some(cached) = cached else {
-        return DiscoveryOutcome::LegacyFallback {
-            kind: DiscoveryFailure::from_error(&refresh_error),
-            reason: refresh_error.to_string(),
-            from_cache: false,
+        return Discovery {
+            outcome: DiscoveryOutcome::LegacyFallback {
+                kind: DiscoveryFailure::from_error(&refresh_error),
+                reason: refresh_error.to_string(),
+                from_cache: false,
+            },
+            canonical_name: None,
+            mbid: None,
+            disambiguation: None,
         };
     };
     let provenance = DiscoveryProvenance::StaleCache {
@@ -1007,7 +1176,33 @@ fn stale_or_legacy(
         kind: DiscoveryFailure::from_error(&refresh_error),
         refresh_error: refresh_error.to_string(),
     };
-    select_outcome(&cached.groups, allowed, artist, provenance)
+    let canonical_name = cached.entry.canonical_artist.clone();
+    Discovery {
+        outcome: select_outcome(
+            &cached.groups,
+            allowed,
+            strip_artist(input, artist, &canonical_name),
+            provenance,
+            Some(&canonical_name),
+        ),
+        canonical_name: Some(canonical_name),
+        mbid: Some(cached.entry.artist_mbid.clone()),
+        disambiguation: None,
+    }
+}
+
+/// The spelling MusicBrainz release-group titles are matched against.
+///
+/// An identity request has no spelling of the operator's own, so it uses the
+/// resolved canonical name: that is what lets `album_identity_key` strip an
+/// `<artist> - ` prefix from a release-group title, so the work item carries the
+/// album title alone. A name request keeps the value the operator gave.
+fn strip_artist<'a>(input: &ArtistInput, artist: &'a str, canonical_name: &'a str) -> &'a str {
+    if input.is_identity() {
+        canonical_name
+    } else {
+        artist
+    }
 }
 
 #[cfg(test)]
@@ -1035,6 +1230,9 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             score,
+            ipis: Vec::new(),
+            isnis: Vec::new(),
+            disambiguation: None,
         }
     }
 
@@ -1047,6 +1245,133 @@ mod tests {
             scored("cc54a811-a221-49f1-b93d-ed42f1affbb0", "ILS", Some(83)),
             scored("5323e64e-008f-4b5c-affc-f410b3746908", "ILS", Some(83)),
         ]
+    }
+
+    fn carrier(id: &str, name: &str, ipis: &[&str], isnis: &[&str]) -> ArtistCandidate {
+        ArtistCandidate {
+            id: id.to_string(),
+            name: name.to_string(),
+            score: Some(100),
+            ipis: ipis.iter().map(|value| value.to_string()).collect(),
+            isnis: isnis.iter().map(|value| value.to_string()).collect(),
+            disambiguation: None,
+        }
+    }
+
+    #[test]
+    fn a_code_with_exactly_one_carrier_resolves() {
+        let candidates = vec![
+            carrier(
+                "11111111-1111-1111-1111-111111111111",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            ),
+            carrier("22222222-2222-2222-2222-222222222222", "Other", &[], &[]),
+        ];
+
+        let resolved = resolve_code(CodeIdentifier::Isni("0000000466597022"), &candidates).unwrap();
+
+        assert_eq!(resolved.candidate.name, "Grafix");
+        assert_eq!(resolved.resolution, ArtistResolution::Identity);
+    }
+
+    #[test]
+    fn a_search_hit_that_does_not_claim_the_code_is_discarded() {
+        // The search index is fuzzy: a hit that does not carry the code is not a
+        // carrier, however it scored.
+        let candidates = vec![carrier(
+            "11111111-1111-1111-1111-111111111111",
+            "Grafix",
+            &["99999999999"],
+            &["0000000000000000"],
+        )];
+
+        let error =
+            resolve_code(CodeIdentifier::Isni("0000000466597022"), &candidates).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no MusicBrainz artist carries ISNI 0000000466597022"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn a_code_with_no_carrier_names_the_code() {
+        let error = resolve_code(CodeIdentifier::Ipi("00581977202"), &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no MusicBrainz artist carries IPI 00581977202"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn a_shared_code_names_the_count_and_every_carrier() {
+        let candidates = vec![
+            carrier(
+                "11111111-1111-1111-1111-111111111111",
+                "Grafix",
+                &["00581977202"],
+                &[],
+            ),
+            carrier(
+                "22222222-2222-2222-2222-222222222222",
+                "Grafix Band",
+                &["00581977202"],
+                &[],
+            ),
+        ];
+
+        let error = resolve_code(CodeIdentifier::Ipi("00581977202"), &candidates).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("2 artists carry IPI 00581977202"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("Grafix (11111111-1111-1111-1111-111111111111)"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("Grafix Band (22222222-2222-2222-2222-222222222222)"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("discography.artist_mbids"),
+            "the message must point at the fix: {message}"
+        );
+    }
+
+    #[test]
+    fn carrier_comparison_ignores_spacing_and_isni_letter_case() {
+        let candidates = vec![carrier(
+            "11111111-1111-1111-1111-111111111111",
+            "Grafix",
+            &[],
+            &["0000 0004 6659 7022"],
+        )];
+
+        assert!(resolve_code(CodeIdentifier::Isni("0000000466597022"), &candidates).is_ok());
+    }
+
+    #[test]
+    fn no_carrier_is_an_artist_problem_not_an_outage() {
+        // The circuit breaker ignores it, and nothing is recorded for a code: an
+        // explicit code always asks again.
+        let error = resolve_code(CodeIdentifier::Isni("0000000466597022"), &[]).unwrap_err();
+        assert!(
+            matches!(error, DiscographyError::ArtistUnresolved(_)),
+            "got {error:?}"
+        );
+        assert_eq!(
+            DiscoveryFailure::from_error(&error),
+            DiscoveryFailure::Unresolved
+        );
     }
 
     #[test]
@@ -1140,11 +1465,17 @@ mod tests {
                 id: "1".into(),
                 name: "ＡC/DC".into(),
                 score: None,
+                ipis: Vec::new(),
+                isnis: Vec::new(),
+                disambiguation: None,
             },
             ArtistCandidate {
                 id: "2".into(),
                 name: "AC DC".into(),
                 score: None,
+                ipis: Vec::new(),
+                isnis: Vec::new(),
+                disambiguation: None,
             },
         ];
         let resolved = resolve_artist("ac/dc", &candidates).unwrap();
@@ -1159,11 +1490,17 @@ mod tests {
                     id: "2".into(),
                     name: "AC DC".into(),
                     score: Some(100),
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
                 },
                 ArtistCandidate {
                     id: "3".into(),
                     name: " ac dc ".into(),
                     score: Some(100),
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
                 },
             ]
         )
@@ -1728,15 +2065,23 @@ mod tests {
     struct FakeProvider {
         artist_responses:
             Mutex<VecDeque<std::result::Result<Vec<ArtistCandidate>, DiscographyError>>>,
+        code_responses:
+            Mutex<VecDeque<std::result::Result<Vec<ArtistCandidate>, DiscographyError>>>,
         group_responses: Mutex<VecDeque<std::result::Result<Vec<ReleaseGroup>, DiscographyError>>>,
         requested_group_mbids: Mutex<Vec<String>>,
         artist_calls: AtomicUsize,
+        code_calls: AtomicUsize,
         lookup_calls: AtomicUsize,
         group_calls: AtomicUsize,
         failure: Option<String>,
         /// Answer the artist search with a page whose reported total disagrees
         /// with the candidates it carried.
         inconsistent: bool,
+        /// The candidate a lookup-by-MBID answers with; `None` keeps the default
+        /// `Artist` naming the existing tests rely on.
+        id_response: Option<ArtistCandidate>,
+        requested_codes: Mutex<Vec<String>>,
+        requested_artists: Mutex<Vec<String>>,
     }
 
     impl FakeProvider {
@@ -1753,8 +2098,43 @@ mod tests {
                     id: "11111111-1111-1111-1111-111111111111".to_string(),
                     name: "Artist".to_string(),
                     score: None,
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
                 }])])),
                 group_responses: Mutex::new(VecDeque::from([Ok(groups)])),
+                ..Self::default()
+            }
+        }
+
+        /// A code search that answers with `candidates`, then the release groups.
+        fn with_code(candidates: Vec<ArtistCandidate>, groups: Vec<ReleaseGroup>) -> Self {
+            Self {
+                code_responses: Mutex::new(VecDeque::from([Ok(candidates)])),
+                group_responses: Mutex::new(VecDeque::from([Ok(groups)])),
+                ..Self::default()
+            }
+        }
+
+        /// An entity lookup that answers with the named artist.
+        fn with_id(mbid: &str, name: &str) -> Self {
+            Self {
+                id_response: Some(ArtistCandidate {
+                    id: mbid.to_string(),
+                    name: name.to_string(),
+                    score: None,
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
+                }),
+                ..Self::default()
+            }
+        }
+
+        /// A name search that answers with `candidates`.
+        fn with_search(candidates: Vec<ArtistCandidate>) -> Self {
+            Self {
+                artist_responses: Mutex::new(VecDeque::from([Ok(candidates)])),
                 ..Self::default()
             }
         }
@@ -1774,6 +2154,9 @@ mod tests {
                     id: "22222222-2222-2222-2222-222222222222".to_string(),
                     name: "Somebody Else".to_string(),
                     score: None,
+                    ipis: Vec::new(),
+                    isnis: Vec::new(),
+                    disambiguation: None,
                 }])])),
                 ..Self::default()
             }
@@ -1794,15 +2177,39 @@ mod tests {
                 + self.lookup_calls.load(Ordering::SeqCst)
                 + self.group_calls.load(Ordering::SeqCst)
         }
+
+        /// Every artist-index search, by name or by code.
+        fn search_calls(&self) -> usize {
+            self.artist_calls.load(Ordering::SeqCst) + self.code_calls.load(Ordering::SeqCst)
+        }
+
+        /// The codes asked about, as `KIND:value`.
+        fn requested_codes(&self) -> Vec<String> {
+            self.requested_codes
+                .lock()
+                .map(|codes| codes.clone())
+                .unwrap_or_default()
+        }
+
+        /// The names asked about.
+        fn requested_artists(&self) -> Vec<String> {
+            self.requested_artists
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default()
+        }
     }
 
     #[async_trait]
     impl DiscographyProvider for FakeProvider {
         async fn search_artists(
             &self,
-            _artist: &str,
+            artist: &str,
         ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
             self.artist_calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut requested) = self.requested_artists.lock() {
+                requested.push(artist.to_string());
+            }
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -1818,6 +2225,24 @@ mod tests {
                 .unwrap_or_else(|| Ok(Vec::new()))
         }
 
+        async fn search_artists_by_code(
+            &self,
+            code: CodeIdentifier<'_>,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            self.code_calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut requested) = self.requested_codes.lock() {
+                requested.push(format!("{}:{}", code.kind(), code.value()));
+            }
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            self.code_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
         async fn artist_by_id(
             &self,
             artist_mbid: &str,
@@ -1826,10 +2251,16 @@ mod tests {
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
+            if let Some(candidate) = &self.id_response {
+                return Ok(candidate.clone());
+            }
             Ok(ArtistCandidate {
                 id: artist_mbid.to_string(),
                 name: "Artist".to_string(),
                 score: None,
+                ipis: Vec::new(),
+                isnis: Vec::new(),
+                disambiguation: None,
             })
         }
 
@@ -1881,6 +2312,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_isni_input_is_searched_by_code_and_reports_the_canonical_name() {
+        let provider = FakeProvider::with_code(
+            vec![carrier(
+                "c02a5966-b5c4-483a-8326-483edcf3680e",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            )],
+            vec![group(
+                "rg-1",
+                "Half Light",
+                Some("2019"),
+                Some("Album"),
+                &[],
+            )],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("0000 0004 6659 7022"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert_eq!(
+            provider.requested_codes(),
+            vec!["ISNI:0000000466597022".to_string()]
+        );
+        assert_eq!(
+            discovery.canonical_name.as_deref(),
+            Some("Grafix"),
+            "the runner needs the canonical name to search and place"
+        );
+        assert!(matches!(
+            discovery.outcome,
+            DiscoveryOutcome::Authoritative { .. }
+        ));
+        assert_eq!(
+            db.get_discography_cache("isni:0000000466597022")
+                .unwrap()
+                .map(|row| row.canonical_artist),
+            Some("Grafix".to_string()),
+            "the cache row is keyed by the code"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mbid_input_is_looked_up_by_id_without_a_search() {
+        let provider = FakeProvider::with_id("c02a5966-b5c4-483a-8326-483edcf3680e", "Grafix");
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("c02a5966-b5c4-483a-8326-483edcf3680e"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert_eq!(
+            provider.search_calls(),
+            0,
+            "an ID must not go through the search index"
+        );
+        assert_eq!(discovery.canonical_name.as_deref(), Some("Grafix"));
+    }
+
+    #[tokio::test]
+    async fn a_code_pinned_in_config_is_looked_up_by_id_instead() {
+        let provider = FakeProvider::with_id("c02a5966-b5c4-483a-8326-483edcf3680e", "Grafix");
+        let db = Database::open_in_memory().unwrap();
+        let mut config = DiscographyConfig::default();
+        config.artist_mbids.insert(
+            "isni:0000000466597022".to_string(),
+            "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+        );
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("0000 0004 6659 7022"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert_eq!(provider.search_calls(), 0, "a pinned code skips the search");
+    }
+
+    #[tokio::test]
+    async fn a_name_input_keeps_the_name_path_and_cache_key() {
+        let provider = FakeProvider::with_search(vec![scored(
+            "11111111-1111-1111-1111-111111111111",
+            "Grafix",
+            Some(100),
+        )]);
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("Grafix"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert_eq!(provider.requested_artists(), vec!["Grafix".to_string()]);
+        assert_eq!(
+            db.get_discography_cache("grafix")
+                .unwrap()
+                .map(|row| row.canonical_artist),
+            Some("Grafix".to_string())
+        );
+        assert_eq!(discovery.canonical_name.as_deref(), Some("Grafix"));
+    }
+
+    #[tokio::test]
     async fn an_unresolved_artist_is_recorded() {
         let db = Database::open_in_memory().unwrap();
         let provider = FakeProvider::unresolvable_recording();
@@ -1888,7 +2448,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -1909,7 +2469,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -1934,7 +2494,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &config,
             1_000,
             FailureCacheUse::Honour,
@@ -1962,7 +2522,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             31 * 86_400,
             FailureCacheUse::Honour,
@@ -1986,7 +2546,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             1_000 + (config.failure_cache_days * 86_400) as i64,
             FailureCacheUse::Honour,
@@ -2008,7 +2568,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_100,
             FailureCacheUse::Honour,
@@ -2016,7 +2576,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 ref reason,
                 kind: DiscoveryFailure::Unresolved,
@@ -2041,7 +2601,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &config,
             1_000 + ttl as i64,
             FailureCacheUse::Honour,
@@ -2049,7 +2609,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 from_cache: false,
                 ..
@@ -2071,7 +2631,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &config,
             1_000 + ttl as i64 + 1,
             FailureCacheUse::Honour,
@@ -2079,7 +2639,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 from_cache: false,
                 ..
@@ -2104,7 +2664,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &config,
             1_100,
             FailureCacheUse::Honour,
@@ -2112,7 +2672,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 from_cache: false,
                 ..
@@ -2138,7 +2698,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_100,
             FailureCacheUse::Bypass,
@@ -2146,7 +2706,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 from_cache: false,
                 ..
@@ -2173,7 +2733,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             1_100,
             FailureCacheUse::Honour,
@@ -2203,6 +2763,9 @@ mod tests {
                 id: "11111111-1111-1111-1111-111111111111".to_string(),
                 name: "Artist".to_string(),
                 score: None,
+                ipis: Vec::new(),
+                isnis: Vec::new(),
+                disambiguation: None,
             }])])),
             group_responses: Mutex::new(VecDeque::from([Err(DiscographyError::Transport(
                 "service unavailable".to_string(),
@@ -2215,7 +2778,7 @@ mod tests {
         discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_100,
             FailureCacheUse::Bypass,
@@ -2241,7 +2804,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -2249,7 +2812,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 kind: DiscoveryFailure::Unresolved,
                 from_cache: false,
@@ -2291,7 +2854,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             1_000_100,
             FailureCacheUse::Honour,
@@ -2300,7 +2863,7 @@ mod tests {
 
         assert!(
             matches!(
-                outcome,
+                outcome.outcome,
                 DiscoveryOutcome::Authoritative {
                     provenance: DiscoveryProvenance::StaleCache { .. },
                     ..
@@ -2325,7 +2888,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_100,
             FailureCacheUse::Honour,
@@ -2333,7 +2896,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 from_cache: false,
                 ..
@@ -2365,16 +2928,17 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             1_100,
             FailureCacheUse::Honour,
         )
         .await;
 
-        assert!(matches!(outcome, DiscoveryOutcome::Authoritative {
+        assert!(matches!(outcome.outcome, DiscoveryOutcome::Authoritative {
             provenance: DiscoveryProvenance::FreshCache,
             ref albums,
+            ..
         } if albums.iter().map(|album| album.title.as_str()).collect::<Vec<_>>() == ["Live"]));
         assert_eq!(provider.total_calls(), 0);
     }
@@ -2396,7 +2960,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             31 * 86_400,
             FailureCacheUse::Honour,
@@ -2404,7 +2968,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::StaleCache { .. },
                 ..
@@ -2419,7 +2983,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -2427,7 +2991,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 reason,
                 kind,
@@ -2457,7 +3021,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             5_000,
             FailureCacheUse::Honour,
@@ -2465,7 +3029,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2491,7 +3055,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             now,
             FailureCacheUse::Honour,
@@ -2500,7 +3064,7 @@ mod tests {
 
         assert!(
             matches!(
-                outcome,
+                outcome.outcome,
                 DiscoveryOutcome::Authoritative {
                     provenance: DiscoveryProvenance::Refreshed,
                     ..
@@ -2527,7 +3091,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             10_000,
             FailureCacheUse::Honour,
@@ -2536,7 +3100,7 @@ mod tests {
 
         assert!(
             matches!(
-                outcome,
+                outcome.outcome,
                 DiscoveryOutcome::Authoritative {
                     provenance: DiscoveryProvenance::StaleCache { age_days: 0, .. },
                     ..
@@ -2545,7 +3109,7 @@ mod tests {
             "a future timestamp must never be FreshCache; its age must saturate at zero"
         );
         assert!(!matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::FreshCache,
                 ..
@@ -2573,7 +3137,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &failing,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             6_000,
             FailureCacheUse::Honour,
@@ -2581,7 +3145,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome, DiscoveryOutcome::LegacyFallback { .. }),
+            matches!(outcome.outcome, DiscoveryOutcome::LegacyFallback { .. }),
             "a cache row for another MBID must never serve as a stale fallback"
         );
         assert_eq!(
@@ -2600,14 +3164,14 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &config,
             6_000,
             FailureCacheUse::Honour,
         )
         .await;
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2637,7 +3201,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             5_000,
             FailureCacheUse::Honour,
@@ -2645,7 +3209,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2666,7 +3230,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -2675,9 +3239,10 @@ mod tests {
 
         assert!(
             matches!(
-                outcome,
+                outcome.outcome,
                 DiscoveryOutcome::AuthoritativeEmpty {
                     provenance: DiscoveryProvenance::Refreshed,
+                    ..
                 }
             ),
             "a resolved artist with zero release groups is authoritative, never legacy"
@@ -2696,7 +3261,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -2704,7 +3269,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2736,7 +3301,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             31 * 86_400,
             FailureCacheUse::Honour,
@@ -2744,9 +3309,10 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome, DiscoveryOutcome::Authoritative {
+            matches!(outcome.outcome, DiscoveryOutcome::Authoritative {
             provenance: DiscoveryProvenance::StaleCache { .. },
             ref albums,
+            ..
         } if albums.iter().map(|album| album.title.as_str()).collect::<Vec<_>>() == ["Studio"]),
             "an oversized refresh payload must fall back to the compatible stale cache"
         );
@@ -2756,14 +3322,14 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             31 * 86_400,
             FailureCacheUse::Honour,
         )
         .await;
         assert!(
-            matches!(outcome, DiscoveryOutcome::LegacyFallback { .. }),
+            matches!(outcome.outcome, DiscoveryOutcome::LegacyFallback { .. }),
             "an oversized payload without a cache must fall back to legacy"
         );
     }
@@ -2807,14 +3373,14 @@ mod tests {
             .block_on(discover_artist_albums_at(
                 &provider,
                 &db,
-                "dominance probe",
+                &ArtistInput::name("dominance probe"),
                 &DiscographyConfig::default(),
                 1_000,
                 FailureCacheUse::Honour,
             ));
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2865,14 +3431,14 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Ils",
+            &ArtistInput::name("Ils"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
         )
         .await;
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -2911,7 +3477,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Ils",
+            &ArtistInput::name("Ils"),
             &DiscographyConfig::default(),
             31 * 86_400,
             FailureCacheUse::Honour,
@@ -2919,7 +3485,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::StaleCache { .. },
                 ..
@@ -2941,7 +3507,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Ils",
+            &ArtistInput::name("Ils"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -2949,7 +3515,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 reason,
                 kind,
@@ -2982,7 +3548,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Ils",
+            &ArtistInput::name("Ils"),
             &config,
             1_000,
             FailureCacheUse::Honour,
@@ -2990,7 +3556,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::Refreshed,
                 ..
@@ -3019,7 +3585,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Ils",
+            &ArtistInput::name("Ils"),
             &DiscographyConfig::default(),
             1_100,
             FailureCacheUse::Honour,
@@ -3027,7 +3593,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::Authoritative {
                 provenance: DiscoveryProvenance::FreshCache,
                 ..
@@ -3066,7 +3632,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Unknown",
+            &ArtistInput::name("Unknown"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -3074,7 +3640,7 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 kind: DiscoveryFailure::Unresolved,
                 ..
@@ -3089,7 +3655,7 @@ mod tests {
         let outcome = discover_artist_albums_at(
             &provider,
             &db,
-            "Artist",
+            &ArtistInput::name("Artist"),
             &DiscographyConfig::default(),
             1_000,
             FailureCacheUse::Honour,
@@ -3097,11 +3663,404 @@ mod tests {
         .await;
 
         assert!(matches!(
-            outcome,
+            outcome.outcome,
             DiscoveryOutcome::LegacyFallback {
                 kind: DiscoveryFailure::Provider,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_album_identity_is_folded_with_the_resolved_name_not_the_code() {
+        // `album_identity_key` strips an `<artist> - ` prefix, so the spelling passed
+        // as the artist decides whether a prefixed release group and a bare one are
+        // one album. The identifier text folds nothing; the canonical name folds both.
+        let groups = vec![
+            group(
+                "rg-prefixed",
+                "Grafix - Half Light",
+                Some("2018"),
+                Some("Album"),
+                &[],
+            ),
+            group("rg-bare", "Half Light", Some("2019"), Some("Album"), &[]),
+        ];
+        let allowed = [DiscographyReleaseType::StudioAlbum];
+
+        assert_eq!(
+            select_albums(&groups, &allowed, "00581977202").len(),
+            2,
+            "a code is not a spelling, so nothing folds"
+        );
+        assert_eq!(
+            select_albums(&groups, &allowed, "Grafix").len(),
+            1,
+            "the canonical name folds the prefixed title onto the bare one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_run_folds_album_identities_with_the_resolved_name() {
+        // End to end: the run must fold the two release groups into one work item,
+        // and report the identity it resolved so the summary can name it.
+        let provider = FakeProvider::with_code(
+            vec![carrier(
+                "c02a5966-b5c4-483a-8326-483edcf3680e",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            )],
+            vec![
+                group(
+                    "rg-prefixed",
+                    "Grafix - Half Light",
+                    Some("2018"),
+                    Some("Album"),
+                    &[],
+                ),
+                group("rg-bare", "Half Light", Some("2019"), Some("Album"), &[]),
+            ],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("0000 0004 6659 7022"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        match &discovery.outcome {
+            DiscoveryOutcome::Authoritative { albums, .. } => {
+                assert_eq!(
+                    albums.len(),
+                    1,
+                    "the prefixed and the bare title are one album under the canonical name"
+                );
+            }
+            other => panic!("expected authoritative albums, got {other:?}"),
+        }
+        assert_eq!(discovery.canonical_name.as_deref(), Some("Grafix"));
+        assert_eq!(
+            discovery.mbid.as_deref(),
+            Some("c02a5966-b5c4-483a-8326-483edcf3680e"),
+            "the run summary needs the resolved ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_failure_is_not_recorded_because_it_could_never_be_replayed() {
+        let provider = FakeProvider::with_code(Vec::new(), Vec::new());
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("0000 0004 6659 7022"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(matches!(
+            discovery.outcome,
+            DiscoveryOutcome::LegacyFallback { .. }
+        ));
+        assert!(
+            db.get_discography_failure("isni:0000000466597022")
+                .unwrap()
+                .is_none(),
+            "an explicit code always asks again, so a failure row for one is dead weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_run_bypasses_a_recorded_failure() {
+        let provider = FakeProvider::with_code(
+            vec![carrier(
+                "c02a5966-b5c4-483a-8326-483edcf3680e",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            )],
+            vec![group(
+                "rg-1",
+                "Half Light",
+                Some("2019"),
+                Some("Album"),
+                &[],
+            )],
+        );
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "isni:0000000466597022".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "no candidate matches".to_string(),
+            // Fresh relative to the injected `now` below: a row recorded at the real
+            // clock is already stale there, so the test would pass without the bypass.
+            recorded_at: 1_700_000_000 - 60,
+        })
+        .unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("0000 0004 6659 7022"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert_eq!(
+            provider.requested_codes().len(),
+            1,
+            "a recorded failure must not stop an explicitly requested code"
+        );
+        assert!(matches!(
+            discovery.outcome,
+            DiscoveryOutcome::Authoritative { .. }
+        ));
+    }
+
+    #[test]
+    fn carrier_comparison_is_case_insensitive_for_an_isni_check_character() {
+        let candidates = vec![carrier(
+            "11111111-1111-1111-1111-111111111111",
+            "X Carrier",
+            &[],
+            &["0000 0002 1694 233x"],
+        )];
+
+        assert!(
+            resolve_code(CodeIdentifier::Isni("000000021694233X"), &candidates).is_ok(),
+            "a lower-case x in the candidate's own record must still match"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_input_is_reported_rather_than_panicking() {
+        // The binary rejects a malformed shape before any request; a direct library
+        // call must not crash either.
+        let provider = FakeProvider::with_code(Vec::new(), Vec::new());
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+
+        let discovery = discover_artist_albums_at(
+            &provider,
+            &db,
+            &ArtistInput::parse("000000046659702"),
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        match discovery.outcome {
+            DiscoveryOutcome::LegacyFallback { kind, reason, .. } => {
+                assert_eq!(kind, DiscoveryFailure::Unresolved);
+                assert!(
+                    reason.contains("15 digits"),
+                    "a malformed shape must be reported as such, never searched for: {reason}"
+                );
+            }
+            other => panic!("expected an unresolved fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identity_run_from_a_fresh_cache_keeps_the_canonical_name() {
+        // A cache-served identity run must name the work item and carry the ID
+        // exactly as the refresh path does.
+        let provider = FakeProvider::with_code(
+            vec![carrier(
+                "c02a5966-b5c4-483a-8326-483edcf3680e",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            )],
+            vec![
+                group(
+                    "rg-prefixed",
+                    "Grafix - Half Light",
+                    Some("2018"),
+                    Some("Album"),
+                    &[],
+                ),
+                group("rg-bare", "Half Light", Some("2019"), Some("Album"), &[]),
+            ],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        let input = ArtistInput::parse("0000 0004 6659 7022");
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            &input,
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        let cold = FakeProvider::with_code(Vec::new(), Vec::new());
+        let discovery = discover_artist_albums_at(
+            &cold,
+            &db,
+            &input,
+            &config,
+            1_700_000_010,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(
+            cold.requested_codes().is_empty(),
+            "the fresh cache must answer without a provider request"
+        );
+        assert_eq!(discovery.canonical_name.as_deref(), Some("Grafix"));
+        assert_eq!(
+            discovery.mbid.as_deref(),
+            Some("c02a5966-b5c4-483a-8326-483edcf3680e")
+        );
+        match &discovery.outcome {
+            DiscoveryOutcome::Authoritative { albums, .. } => assert_eq!(
+                albums.len(),
+                1,
+                "a cache-served identity run must fold identities with the canonical name"
+            ),
+            other => panic!("expected authoritative albums, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_isni_ending_in_x_round_trips_through_its_cache_row() {
+        // The cache key keeps the check character upper-cased, so a row written for
+        // an `X` ISNI must still be found on the next run.
+        let candidates = vec![carrier(
+            "c02a5966-b5c4-483a-8326-483edcf3680e",
+            "X Artist",
+            &[],
+            &["000000021694233X"],
+        )];
+        let provider = FakeProvider::with_code(
+            candidates.clone(),
+            vec![group(
+                "rg-1",
+                "Half Light",
+                Some("2019"),
+                Some("Album"),
+                &[],
+            )],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        let input = ArtistInput::parse("0000 0002 1694 233X");
+
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            &input,
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        let cold = FakeProvider::with_code(candidates, Vec::new());
+        let discovery = discover_artist_albums_at(
+            &cold,
+            &db,
+            &input,
+            &config,
+            1_700_000_010,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(
+            cold.requested_codes().is_empty(),
+            "the row written for an X ISNI must be found again"
+        );
+        assert_eq!(discovery.canonical_name.as_deref(), Some("X Artist"));
+    }
+
+    #[tokio::test]
+    async fn an_identity_run_from_a_stale_cache_keeps_the_canonical_name() {
+        // A failed refresh falls back to the stale row, which must still name the work
+        // item and carry the ID rather than the code.
+        let provider = FakeProvider::with_code(
+            vec![carrier(
+                "c02a5966-b5c4-483a-8326-483edcf3680e",
+                "Grafix",
+                &[],
+                &["0000000466597022"],
+            )],
+            vec![group(
+                "rg-bare",
+                "Half Light",
+                Some("2019"),
+                Some("Album"),
+                &[],
+            )],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let config = DiscographyConfig::default();
+        let input = ArtistInput::parse("0000 0004 6659 7022");
+        discover_artist_albums_at(
+            &provider,
+            &db,
+            &input,
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        // Re-seed the same row as stale, then let the refresh fail.
+        db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+            artist_key: input.cache_key(),
+            artist_mbid: "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+            canonical_artist: "Grafix".to_string(),
+            fetched_at: 1,
+            release_groups_json: serde_json::to_string(&vec![group(
+                "rg-bare",
+                "Half Light",
+                Some("2019"),
+                Some("Album"),
+                &[],
+            )])
+            .unwrap(),
+        })
+        .unwrap();
+        let offline = FakeProvider::with_code(Vec::new(), Vec::new());
+        let discovery = discover_artist_albums_at(
+            &offline,
+            &db,
+            &input,
+            &config,
+            1_700_000_000,
+            FailureCacheUse::Bypass,
+        )
+        .await;
+
+        assert!(
+            matches!(discovery.outcome, DiscoveryOutcome::Authoritative { .. }),
+            "the stale cache must answer"
+        );
+        assert_eq!(discovery.canonical_name.as_deref(), Some("Grafix"));
+        assert_eq!(
+            discovery.mbid.as_deref(),
+            Some("c02a5966-b5c4-483a-8326-483edcf3680e")
+        );
     }
 }

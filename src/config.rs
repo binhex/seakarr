@@ -632,15 +632,6 @@ fn flow_value_contains_key(value: &str, key: &str) -> bool {
     yaml_key_value_start(value[segment_start..].trim(), key).is_some()
 }
 
-fn valid_mbid(value: &str) -> bool {
-    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
-    let parts: Vec<&str> = value.split('-').collect();
-    parts.len() == GROUPS.len()
-        && parts.iter().zip(GROUPS).all(|(part, length)| {
-            part.len() == length && part.chars().all(|c| c.is_ascii_hexdigit())
-        })
-}
-
 impl Config {
     /// Load config from a directory containing `seakarr.yml`.
     /// Creates a default file if none exists.
@@ -877,13 +868,13 @@ impl Config {
         }
         let mut normalized = HashSet::new();
         for (artist, mbid) in &self.discography.artist_mbids {
-            let key = crate::discography::normalize_catalog_key(artist);
+            let key = crate::discography::identifier::pin_key(artist);
             if key.is_empty() || !normalized.insert(key) {
                 return Err(SeakarrError::Config(format!(
                     "discography.artist_mbids contains an empty or duplicate normalized artist key: {artist:?}"
                 )));
             }
-            if !valid_mbid(mbid) {
+            if !crate::discography::identifier::valid_mbid(mbid) {
                 return Err(SeakarrError::Config(format!(
                     "discography.artist_mbids contains an invalid MusicBrainz ID for {artist:?}"
                 )));
@@ -2892,6 +2883,53 @@ search:
             .unwrap_err()
             .to_string()
             .contains("duplicate normalized artist"));
+    }
+
+    #[test]
+    fn an_artist_mbids_key_may_be_a_code() {
+        let mut config = Config::default();
+        config.discography.artist_mbids.insert(
+            "isni:0000000466597022".to_string(),
+            "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+        );
+
+        assert!(
+            config.validate_non_credential_constraints().is_ok(),
+            "a code-keyed pin must be accepted"
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_pin_key_are_a_duplicate() {
+        // The lookup normalises a prefixed key with `pin_key`, so the validation has
+        // to use the same normalisation or one entry would silently win.
+        let mut config = Config::default();
+        config.discography.artist_mbids.insert(
+            "isni:0000 0004 6659 7022".to_string(),
+            "c02a5966-b5c4-483a-8326-483edcf3680e".to_string(),
+        );
+        config.discography.artist_mbids.insert(
+            "isni:0000000466597022".to_string(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        );
+
+        let error = config.validate_non_credential_constraints().unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "got {error}");
+    }
+
+    #[test]
+    fn an_artist_mbids_value_still_has_to_be_a_uuid() {
+        let mut config = Config::default();
+        config
+            .discography
+            .artist_mbids
+            .insert("Grafix".to_string(), "not-a-uuid".to_string());
+
+        let error = config.validate_non_credential_constraints().unwrap_err();
+        assert!(
+            error.to_string().contains("invalid MusicBrainz ID"),
+            "got {error}"
+        );
     }
 
     #[test]

@@ -201,6 +201,33 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                         + "--album (or search.manual values)",
                 ));
             }
+            // A code identifies an artist for MusicBrainz, not a folder on disk:
+            // an album-only run never asks MusicBrainz, so it cannot use one.
+            if let Some(artist) = artist.as_deref() {
+                let input = crate::discography::ArtistInput::parse(artist);
+                if let Some(reason) = input.malformed_reason() {
+                    return Err(SeakarrError::Config(reason.to_string()));
+                }
+                if input.is_identity() {
+                    if album.is_some() {
+                        return Err(SeakarrError::Config(format!(
+                            "{} {artist:?} names a MusicBrainz artist and names no library folder; \
+                             an album-only manual run needs an artist name",
+                            input.label()
+                        )));
+                    }
+                    // The same reasoning without an album: an artist-only manual
+                    // run with the discography disabled uses the legacy folder
+                    // heuristic and would search Soulseek for the raw code.
+                    if !config.discography.enabled {
+                        return Err(SeakarrError::Config(format!(
+                            "{} {artist:?} names a MusicBrainz artist and this run never asks MusicBrainz; \
+                             artist-only manual mode needs discography.enabled: true to use an identifier",
+                            input.label()
+                        )));
+                    }
+                }
+            }
             Ok(ExecutionPlan::Manual { artist, album })
         }
         SearchMode::Batch => {
@@ -248,6 +275,13 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                 return Err(SeakarrError::Config(
                     "--batch-file is incompatible with discover mode; use --mode batch".into(),
                 ));
+            }
+            if let Some(reason) = cli.artist.as_deref().and_then(|value| {
+                crate::discography::ArtistInput::parse(value)
+                    .malformed_reason()
+                    .map(str::to_string)
+            }) {
+                return Err(SeakarrError::Config(reason));
             }
             if cli
                 .artist
@@ -472,6 +506,100 @@ mod tests {
                 album: Some("Album".into()),
             }
         );
+    }
+
+    #[test]
+    fn an_identifier_with_an_album_is_a_configuration_error() {
+        let config = config_with_mode("manual");
+        let error = resolve_execution_plan(
+            &config,
+            &cli(
+                Some("manual"),
+                Some("0000 0004 6659 7022"),
+                Some("Half Light"),
+                None,
+            ),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("ISNI"), "got {message}");
+        assert!(
+            message.contains("names no library folder"),
+            "the reason must be stated: {message}"
+        );
+    }
+
+    #[test]
+    fn an_identifier_without_an_album_is_accepted_for_manual_mode() {
+        let config = config_with_mode("manual");
+        let plan = resolve_execution_plan(
+            &config,
+            &cli(Some("manual"), Some("00581977202"), None, None),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            plan,
+            ExecutionPlan::Manual {
+                artist: Some(_),
+                album: None
+            }
+        ));
+    }
+
+    #[test]
+    fn an_identifier_without_a_discography_is_a_configuration_error() {
+        let mut config = config_with_mode("manual");
+        config.discography.enabled = false;
+        let error = resolve_execution_plan(
+            &config,
+            &cli(Some("manual"), Some("00581977202"), None, None),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("IPI"), "got {message}");
+        assert!(
+            message.contains("discography.enabled: true"),
+            "the fix must be stated: {message}"
+        );
+    }
+
+    #[test]
+    fn a_musicbrainz_id_with_an_album_is_a_configuration_error() {
+        // A UUID is an identity as well, so the album-only refusal must cover it.
+        let config = config_with_mode("manual");
+        let error = resolve_execution_plan(
+            &config,
+            &cli(
+                Some("manual"),
+                Some("c02a5966-b5c4-483a-8326-483edcf3680e"),
+                Some("Half Light"),
+                None,
+            ),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("MusicBrainz ID"), "got {message}");
+        assert!(message.contains("names no library folder"), "got {message}");
+    }
+
+    #[test]
+    fn a_malformed_code_shape_is_a_configuration_error_before_any_request() {
+        // Fifteen digits is a mistyped ISNI, not a name: searching Soulseek for the
+        // digit run is the outcome the design exists to prevent.
+        let config = config_with_mode("manual");
+        let error = resolve_execution_plan(
+            &config,
+            &cli(Some("manual"), Some("000000046659702"), None, None),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("15 digits"), "got {message}");
+        assert!(message.contains("IPI is 11 digits"), "got {message}");
     }
 
     #[test]

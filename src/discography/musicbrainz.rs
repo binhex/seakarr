@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::{ArtistCandidate, DiscographyError, DiscographyProvider, ReleaseGroup};
+use super::{ArtistCandidate, CodeIdentifier, DiscographyError, DiscographyProvider, ReleaseGroup};
 
 const MUSICBRAINZ_BASE_URL: &str = "https://musicbrainz.org";
 const REQUEST_INTERVAL: Duration = Duration::from_secs(1);
@@ -30,6 +30,50 @@ struct ArtistWire {
     name: String,
     #[serde(default, deserialize_with = "deserialize_optional_score")]
     score: Option<u8>,
+    /// The artist's own IPI codes. Absent on the entity-lookup endpoint.
+    #[serde(default)]
+    ipis: Vec<String>,
+    /// The artist's own ISNI codes. Absent on the entity-lookup endpoint.
+    #[serde(default)]
+    isnis: Vec<String>,
+    /// MusicBrainz disambiguation comment, e.g. "DnB producer Josh Jackson".
+    #[serde(default)]
+    disambiguation: Option<String>,
+}
+
+impl From<ArtistWire> for ArtistCandidate {
+    fn from(wire: ArtistWire) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            score: wire.score,
+            ipis: wire.ipis,
+            isnis: wire.isnis,
+            disambiguation: wire.disambiguation,
+        }
+    }
+}
+
+/// Reject an artist search page that cannot be trusted.
+///
+/// A non-zero offset means the provider answered the wrong page, and a payload
+/// that disagrees with the reported count means one inconsistent response. The
+/// two are classified apart because only the first is a provider defect.
+fn check_artist_page(page: &ArtistPage) -> std::result::Result<(), DiscographyError> {
+    if page.offset != 0 {
+        return Err(DiscographyError::IncompletePagination(format!(
+            "artist search returned a non-zero offset {}",
+            page.offset
+        )));
+    }
+    if page.count != page.artists.len() {
+        return Err(DiscographyError::ArtistSearchInconsistent(format!(
+            "artist search returned {} candidates but reported {}",
+            page.artists.len(),
+            page.count
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a MusicBrainz artist-search score.
@@ -257,36 +301,34 @@ impl MusicBrainzProvider {
                 ],
             )
             .await?;
-        if page.offset != 0 {
-            // The request never sends an offset, so a non-zero one means the
-            // provider (or an intermediary) answered with the wrong page. That
-            // is a provider defect, not an artist that cannot be resolved:
-            // classifying it as unresolved would hide a broken provider from
-            // the discover circuit breaker and let a run grind on.
-            return Err(DiscographyError::IncompletePagination(format!(
-                "artist search returned a non-zero offset {}",
-                page.offset
-            )));
-        }
-        if page.count != page.artists.len() {
-            // Still classified as an artist problem so this run falls back
-            // instead of aborting, but this describes one inconsistent response
-            // rather than a fact about the artist, so the failure cache must not
-            // remember it.
-            return Err(DiscographyError::ArtistSearchInconsistent(format!(
-                "artist search returned {} candidates but reported {}",
-                page.artists.len(),
-                page.count
-            )));
-        }
+        check_artist_page(&page)?;
         Ok(page
             .artists
             .into_iter()
-            .map(|wire| ArtistCandidate {
-                id: wire.id,
-                name: wire.name,
-                score: wire.score,
-            })
+            .map(ArtistCandidate::from)
+            .collect())
+    }
+
+    /// Search the artist index for the artist claiming a code.
+    async fn search_artists_by_code(
+        &self,
+        code: CodeIdentifier<'_>,
+    ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+        let page: ArtistPage = self
+            .request_json(
+                "/ws/2/artist",
+                &[
+                    ("query", code.query()),
+                    ("fmt", "json".into()),
+                    ("limit", PAGE_SIZE.to_string()),
+                ],
+            )
+            .await?;
+        check_artist_page(&page)?;
+        Ok(page
+            .artists
+            .into_iter()
+            .map(ArtistCandidate::from)
             .collect())
     }
 
@@ -306,13 +348,9 @@ impl MusicBrainzProvider {
                 wire.id
             )));
         }
-        // The lookup-by-MBID endpoint has no search relevance score, and a
-        // configured MBID needs no ranking.
-        Ok(ArtistCandidate {
-            id: wire.id,
-            name: wire.name,
-            score: None,
-        })
+        // The lookup-by-MBID endpoint carries no search relevance score and no
+        // search-index identifiers, and a configured MBID needs no ranking.
+        Ok(ArtistCandidate::from(wire))
     }
 
     async fn release_groups(
@@ -399,6 +437,13 @@ impl DiscographyProvider for MusicBrainzProvider {
         artist: &str,
     ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
         self.search_artists(artist).await
+    }
+
+    async fn search_artists_by_code(
+        &self,
+        code: CodeIdentifier<'_>,
+    ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+        self.search_artists_by_code(code).await
     }
 
     async fn artist_by_id(
@@ -554,6 +599,118 @@ mod tests {
         assert!(
             super::super::resolve_artist("AC DC", &artists).is_err(),
             "sort names, aliases, and scores must not widen canonical-name matching"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_search_parses_the_identifiers_and_disambiguation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "offset": 0,
+                "artists": [{
+                    "id": "c02a5966-b5c4-483a-8326-483edcf3680e",
+                    "name": "Grafix",
+                    "score": 100,
+                    "disambiguation": "DnB producer Josh Jackson",
+                    "ipis": ["00581977202"],
+                    "isnis": ["0000000466597022"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let candidates = provider.search_artists("Grafix").await.unwrap();
+
+        assert_eq!(
+            candidates[0].ipis,
+            vec!["00581977202".to_string()],
+            "the artist's own IPI must be carried, so a code match can be verified"
+        );
+        assert_eq!(candidates[0].isnis, vec!["0000000466597022".to_string()]);
+        assert_eq!(
+            candidates[0].disambiguation.as_deref(),
+            Some("DnB producer Josh Jackson")
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_search_defaults_missing_identifiers_to_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "offset": 0,
+                "artists": [{ "id": "11111111-1111-1111-1111-111111111111", "name": "AC/DC" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let candidates = provider.search_artists("AC/DC").await.unwrap();
+
+        assert!(candidates[0].ipis.is_empty());
+        assert!(candidates[0].isnis.is_empty());
+        assert_eq!(candidates[0].disambiguation, None);
+    }
+
+    #[tokio::test]
+    async fn code_search_sends_the_identifier_query_term() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .and(query_param("query", "isni:\"0000000466597022\""))
+            .and(query_param("fmt", "json"))
+            .and(query_param("limit", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "offset": 0,
+                "artists": [{
+                    "id": "c02a5966-b5c4-483a-8326-483edcf3680e",
+                    "name": "Grafix",
+                    "score": 100,
+                    "isnis": ["0000000466597022"]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let candidates = provider
+            .search_artists_by_code(CodeIdentifier::Isni("0000000466597022"))
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "Grafix");
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_a_non_zero_offset_like_the_name_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1,
+                "offset": 25,
+                "artists": [{ "id": "11111111-1111-1111-1111-111111111111", "name": "X" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = provider
+            .search_artists_by_code(CodeIdentifier::Ipi("00581977202"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DiscographyError::IncompletePagination(_)),
+            "an identifier search classifies a wrong page exactly as a name search does, got {error:?}"
         );
     }
 
@@ -1406,5 +1563,30 @@ mod tests {
             provider.search_artists("Ils").await,
             Err(DiscographyError::Decode(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_a_count_that_disagrees_with_the_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 3,
+                "offset": 0,
+                "artists": [{ "id": "11111111-1111-1111-1111-111111111111", "name": "Grafix" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = provider
+            .search_artists_by_code(CodeIdentifier::Ipi("00581977202"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DiscographyError::ArtistSearchInconsistent(_)),
+            "a count that disagrees with the payload describes one response, got {error:?}"
+        );
     }
 }

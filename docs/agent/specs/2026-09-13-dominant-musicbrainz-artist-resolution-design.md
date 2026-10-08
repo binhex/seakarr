@@ -97,6 +97,12 @@ partial-name or alias match cannot win.
 
 ## Selection algorithm
 
+*(Superseded on 2026-10-07: name resolution below is unchanged, and an
+identity-based alternative now exists for an artist the name rules cannot pin:
+`--artist` may carry an ISNI, an IPI or a MusicBrainz artist ID, each resolved
+without name matching or score ranking. See
+`2026-10-07-artist-identifier-resolution-design.md`.)*
+
 The resolver handles the canonical exact-name subset as follows.
 
 ### Zero exact matches
