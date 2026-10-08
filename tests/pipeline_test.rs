@@ -162,9 +162,10 @@ async fn test_full_pipeline_placement_uses_clean_names() {
     assert!(!lib_album.join("2 - 02 - Track Two.flac").exists());
     assert!(!lib_album.join("1 - 01 - Track One.flac").exists());
 
-    // The staging directory was consumed by the placement.
-    let album_staging = staging.path().join("Test Artist--Test Album");
+    // The staging tree was consumed by the placement, including the artist level.
+    let album_staging = staging.path().join("Test Artist").join("Test Album");
     assert!(!album_staging.exists());
+    assert!(!staging.path().join("Test Artist").exists());
 
     assert!(db.is_album_processed("Test Artist", "Test Album").unwrap());
 }

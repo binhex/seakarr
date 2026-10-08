@@ -20,6 +20,7 @@ pub mod runner;
 pub mod scan_progress;
 pub mod scanner;
 pub mod search;
+pub mod staging;
 pub mod tracks;
 
 #[cfg(test)]

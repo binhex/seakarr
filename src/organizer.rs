@@ -423,7 +423,7 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
         // "CD 01" folder or an embedded-marker "Gold (Disc 1)" folder),
         // keep that disc subdirectory under the album so same-named tracks
         // from different discs do not collide.
-        if let Some(disc) = disc_subdir(src) {
+        if let Some(disc) = disc_subdir(src, album) {
             dest = match dest.parent() {
                 Some(parent) => parent.join(disc).join(dest.file_name().unwrap_or_default()),
                 None => PathBuf::from(disc).join(dest.file_name().unwrap_or_default()),
@@ -462,7 +462,13 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
                 // file in a format with no score (DSF, for example) must still
                 // count as audio the library already holds.
                 ExistingFile::KeepWhenValid => {
-                    if parses_as_audio(&dest) {
+                    if is_the_same_file(src, &dest) {
+                        // The destination *is* the source, so there is nothing to
+                        // keep or replace: reporting it as kept would claim a file
+                        // was preserved that this run just downloaded. Falls through
+                        // to the same-file guard below.
+                        false
+                    } else if parses_as_audio(&dest) {
                         tracing::info!(
                             "Keeping existing file {} (placement never replaces a file that parses as audio)",
                             dest.display()
@@ -477,6 +483,12 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
                 continue;
             }
         }
+        if is_the_same_file(src, &dest) {
+            // The staging root lies inside a library root, so the album is already
+            // at its destination. Copying a file onto itself truncates it.
+            written.push(dest);
+            continue;
+        }
         fs::copy(src, &dest)?;
         tracing::debug!("Placed: {} -> {}", src.display(), dest.display());
         written.push(dest);
@@ -489,11 +501,123 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
     })
 }
 
+/// Remove download residue below `path`, leaving anything else in place, and
+/// report whether anything was removed.
+///
+/// Only the files a download can leave behind are deleted. A `cover.jpg` the
+/// operator added stays, and so does any directory that still holds it: the
+/// residue is the interleaving hazard, not the album directory itself.
+fn clear_download_residue(path: &Path) -> bool {
+    let mut removed = false;
+    let Ok(entries) = fs::read_dir(path) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if clear_download_residue(&entry.path()) {
+                removed = true;
+            }
+            match fs::remove_dir(entry.path()) {
+                Ok(()) => removed = true,
+                Err(e) => {
+                    tracing::debug!("Left the subdirectory {:?} in place: {e}", entry.path());
+                }
+            }
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".part") || name.ends_with(".tmp") || parses_as_audio(&entry.path()) {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed = true,
+                Err(e) => tracing::warn!(
+                    "Failed to remove the download residue {:?}: {e}",
+                    entry.path()
+                ),
+            }
+        }
+    }
+    removed
+}
+
+/// True when `path` holds anything an interrupted download can leave behind: an
+/// audio file it managed to fetch, or a partial file. A directory with neither is
+/// not download debris, and is left alone with a warning rather than deleted —
+/// the operator may have put content there, and the layout makes every child of
+/// an artist level look like an album.
+fn holds_download_residue(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if holds_download_residue(&entry.path()) {
+                return true;
+            }
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".part") || name.ends_with(".tmp") || parses_as_audio(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when two paths name the same existing file. A copy must never be
+/// performed onto itself: `fs::copy` opens the destination for writing before it
+/// reads the source, so it truncates the file it was about to copy.
+fn is_the_same_file(source: &Path, destination: &Path) -> bool {
+    match (
+        std::fs::canonicalize(source),
+        std::fs::canonicalize(destination),
+    ) {
+        (Ok(source), Ok(destination)) => source == destination,
+        _ => false,
+    }
+}
+
+/// Drop an artist level once it holds nothing. A directory that still holds a
+/// sibling album is the documented case and stays silent; any other failure is
+/// logged, because it is the only signal the operator would get.
+pub(crate) fn prune_artist_level(dir: &Path) {
+    match fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let holds_something = fs::read_dir(dir)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if holds_something {
+                tracing::debug!("Artist level {dir:?} still holds a sibling album");
+            } else {
+                tracing::warn!("Failed to remove the empty artist level {dir:?}: {e}");
+            }
+        }
+    }
+}
+
+/// True when two paths name the same directory, whether or not it exists yet. The
+/// staging layout mirrors the library layout, so a staging root inside a library
+/// root makes an album's staging path and its library destination the same
+/// directory; the comparison is canonical, so a symlinked or `.`-containing
+/// spelling of either path still matches.
+pub(crate) fn is_the_same_dir(left: &Path, right: &Path) -> bool {
+    // Shared with the staging module, which resolves a path that does not exist
+    // yet — a write destination may not.
+    crate::staging::is_the_same_path(left, right)
+}
+
 /// True when lofty can open and parse the file, i.e. the library already holds
 /// an audio file at this path. Unlike quality scoring this does not depend on
 /// the format being scoreable, so a valid DSF or DFF file, which has no entry
 /// in [`format_from_extension`], still counts.
-fn parses_as_audio(path: &Path) -> bool {
+pub(crate) fn parses_as_audio(path: &Path) -> bool {
     lofty::probe::Probe::open(path)
         .and_then(|probe| probe.read())
         .is_ok()
@@ -502,9 +626,16 @@ fn parses_as_audio(path: &Path) -> bool {
 /// Return the disc subdirectory component of a staging source path, if the
 /// file was downloaded into a per-disc folder — either a dedicated disc
 /// folder ("CD 01", "Disc 2") or an album folder carrying an embedded disc
-/// marker ("Gold (Disc 1)"). Walks the parent components and returns the
-/// deepest disc folder component. Files flattened directly into the album
-/// staging root return `None` so their destination is unchanged.
+/// marker ("Gold (Disc 1)"). Files flattened directly into the album staging
+/// root return `None` so their destination is unchanged.
+///
+/// `album` is the album title the write is for. The decision is made from the
+/// file's immediate parent and nothing above it: the stager nests at most one
+/// disc level inside the album directory, so the parent is either the album root
+/// (files flattened into it, destination unchanged) or the peer's disc folder.
+/// A parent whose name equals the sanitised album title is the album root even
+/// when that title itself carries an embedded disc marker, and walking further
+/// up would let an ancestor outside the album be taken for a disc label.
 ///
 /// The returned label is the peer's own folder name, so it is run through
 /// [`sanitize_component`] before it is handed back: it becomes a real path
@@ -513,27 +644,16 @@ fn parses_as_audio(path: &Path) -> bool {
 ///
 /// Uses [`crate::discs`] so the destination grouping matches the download
 /// stager exactly.
-fn disc_subdir(src: &Path) -> Option<String> {
-    let mut current = src.parent();
-    while let Some(dir) = current {
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            // The runner's per-album staging root uses Artist--Album. It can
-            // contain an embedded "(Disc N)" album name but is not itself a
-            // disc directory.
-            if name.contains("--") {
-                break;
-            }
-            if crate::discs::is_disc_designator(name) {
-                // Return the innermost folder, closest to the file. Only the
-                // classification is normalized across marker styles; the label
-                // itself is the peer's own, so it goes through the sanitiser
-                // before it becomes a library path component.
-                return Some(sanitize_component(name));
-            }
-        }
-        current = dir.parent();
+fn disc_subdir(src: &Path, album: &str) -> Option<String> {
+    let parent = src.parent()?;
+    let name = parent.file_name().and_then(|name| name.to_str())?;
+    if name == sanitize_component(album) || !crate::discs::is_disc_designator(name) {
+        return None;
     }
-    None
+    // Only the classification is normalized across marker styles; the label
+    // itself is the peer's own, so it goes through the sanitiser before it
+    // becomes a library path component.
+    Some(sanitize_component(name))
 }
 
 /// Delete audio files in the album directory that are lower quality than the
@@ -705,7 +825,12 @@ pub fn resume_library_upgrade(
     // Returns the destination paths of all files copied or verified identical,
     // so the caller can pass them as the protection set to
     // delete_lesser_quality_files.
-    fn walk(src_root: &Path, dest_root: &Path, copied: &mut Vec<PathBuf>) -> Result<()> {
+    fn walk(
+        src_root: &Path,
+        dest_root: &Path,
+        album: &str,
+        copied: &mut Vec<PathBuf>,
+    ) -> Result<()> {
         for entry in fs::read_dir(src_root)? {
             let entry = entry?;
             let src = entry.path();
@@ -721,13 +846,26 @@ pub fn resume_library_upgrade(
                 // normally fire because the stager derives these names from UTF-8
                 // peer metadata.
                 let leaf = sanitize_component(&entry.file_name().to_string_lossy());
+                // The album root is the source root itself, so a subdirectory whose
+                // sanitised name equals the album component is the album root seen
+                // again (an album whose own title is a disc designator). Its files
+                // belong in the album folder, exactly as the forward copy places
+                // them; recursing would add a level the completed write does not
+                // have.
+                if leaf == sanitize_component(album) {
+                    walk(&src, dest_root, album, copied)?;
+                    continue;
+                }
                 let dest_dir = dest_root.join(leaf);
                 fs::create_dir_all(&dest_dir)?;
-                walk(&src, &dest_dir, copied)?;
+                walk(&src, &dest_dir, album, copied)?;
             } else {
                 let dest = dest_root.join(sanitize_component(&entry.file_name().to_string_lossy()));
                 if dest.exists() {
-                    if file_hash(&src)? == file_hash(&dest)? {
+                    // The same-path check must come first: a staging root inside a
+                    // library root makes source and destination one file, and the
+                    // replace path below would delete it before it could be read.
+                    if is_the_same_file(&src, &dest) || file_hash(&src)? == file_hash(&dest)? {
                         copied.push(dest);
                         continue; // already copied correctly
                     }
@@ -741,10 +879,19 @@ pub fn resume_library_upgrade(
         Ok(())
     }
     let mut copied = Vec::new();
-    walk(album_staging, &album_dir, &mut copied)?;
+    walk(album_staging, &album_dir, album, &mut copied)?;
 
-    // Clean up staging — absence of the staging dir signals a completed run.
-    fs::remove_dir_all(album_staging)?;
+    // Clean up staging — absence of the staging dir signals a completed run. Not
+    // when the staging directory *is* the library location, which happens when
+    // the staging root sits inside a library root: removing it would delete the
+    // album that was just recovered.
+    if is_the_same_dir(album_staging, &album_dir) {
+        tracing::warn!(
+            "Not removing {album_staging:?}: it is the album's library location, not a staging copy (storage.staging_dir is inside a library.paths entry; keep it outside)"
+        );
+    } else {
+        fs::remove_dir_all(album_staging)?;
+    }
 
     // Delete lesser-quality files (if enabled).
     if config.library_upgrade.delete_lesser_quality {
@@ -753,7 +900,7 @@ pub fn resume_library_upgrade(
     Ok(())
 }
 
-/// Parse an album staging directory name (e.g. "Artist--Album") into
+/// Parse a legacy album staging directory name (e.g. "Artist--Album") into
 /// (artist, album) components. Slugs without a separator map to "Unknown".
 pub fn parse_album_slug(slug: &str) -> (String, String) {
     match slug.split_once("--") {
@@ -771,6 +918,10 @@ pub fn parse_album_slug(slug: &str) -> (String, String) {
 /// fully staged, so the directory is removed. This keeps a later download
 /// for the same album from interleaving with stale `.part` files or partial
 /// tracks from the crashed run.
+///
+/// The identity of each album comes from [`crate::staging::scan`], which
+/// matches the sanitised directory names against the raw names the database
+/// stores, so a title the sanitiser rewrote is still recovered.
 pub fn recover_interrupted_upgrades(
     config: &Config,
     db: &crate::db::Database,
@@ -784,31 +935,102 @@ pub fn recover_interrupted_upgrades(
     }
     let library_root = Path::new(&config.library.paths[0]);
 
-    for entry in fs::read_dir(staging_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    // A staging root that is itself a configured library root makes the walk see
+    // library content, which recovery must not touch at all.
+    if config
+        .library
+        .paths
+        .iter()
+        .any(|root| is_the_same_dir(Path::new(root), staging_dir))
+    {
+        tracing::warn!(
+            "Recovery skipped: {staging_dir:?} is a configured library path, so its contents are library albums rather than staged downloads (keep storage.staging_dir outside every library.paths entry)"
+        );
+        return Ok(());
+    }
+
+    for staged in crate::staging::scan(staging_dir, db)? {
+        // A directory inside a configured library root is library content, not
+        // staging: when storage.staging_dir sits inside a library path, the walk
+        // sees that root's artist and album folders. Recovery must not delete
+        // library albums that simply have no processed_albums row.
+        if let Some(root) = config.library.paths.iter().find(|root| {
+            let root = Path::new(root);
+            // Either direction. The scan reports paths two levels below the
+            // staging root, so a library root sitting deeper than that is reported
+            // as an *ancestor* of itself: without the reverse test the cleanup arm
+            // would delete the library below it.
+            crate::staging::is_inside(root, &staged.album_dir_path)
+                || crate::staging::is_inside(&staged.album_dir_path, root)
+        }) {
+            tracing::warn!(
+                "Recovery skipped {:?}: it and the library root {root:?} contain one another (keep storage.staging_dir outside every library.paths entry)",
+                staged.album_dir_path
+            );
             continue;
         }
-        let album_staging = entry.path();
-        let slug = album_staging
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let (artist, album) = parse_album_slug(&slug);
-        match db.get_album_status(&artist, &album)? {
-            Some(status) if status == "success" => {
+        let (artist, album) = match &staged.identity {
+            Some(identity) => (identity.artist.clone(), identity.album.clone()),
+            None => ("Unknown".to_string(), staged.dir_album.clone()),
+        };
+        match staged
+            .identity
+            .as_ref()
+            .map(|identity| identity.status.as_str())
+        {
+            Some("success") => {
                 tracing::warn!("Recovering interrupted library upgrade: {artist} - {album}");
-                resume_library_upgrade(config, &album_staging, library_root, &artist, &album)?;
+                resume_library_upgrade(
+                    config,
+                    &staged.album_dir_path,
+                    library_root,
+                    &artist,
+                    &album,
+                )?;
+                // This album's artist level exists only for it here, so drop it once
+                // it holds nothing — the same guarantee the cleanup arm gives.
+                prune_artist_level(&staged.artist_dir_path);
             }
             // "in-progress" is never written by any code path (downloads
             // record "failed" on interruption), so this arm also covers
-            // crashed downloads whose run ended with a recorded failure or
-            // no status at all.
+            // crashed downloads whose run ended with a recorded failure, a
+            // non-success status, or no identity at all.
             _ => {
+                // Only a directory that really holds download residue is cleared,
+                // and only the residue itself: the layout makes every child of an
+                // artist level look like an album, so content the operator put
+                // there has no row and must not be deleted.
+                // An unreadable directory is not the same as an empty one: the
+                // residue rule must not claim it holds nothing.
+                if fs::read_dir(&staged.album_dir_path).is_err() {
+                    tracing::warn!(
+                        "Leaving {:?}: it could not be read, so its contents are unknown",
+                        staged.album_dir_path
+                    );
+                    continue;
+                }
+                if !holds_download_residue(&staged.album_dir_path) {
+                    tracing::warn!(
+                        "Leaving {:?}: it holds no audio and no partial download, so it is not the debris of an interrupted download — remove it by hand if it is unwanted",
+                        staged.album_dir_path
+                    );
+                    continue;
+                }
                 tracing::info!(
                     "Cleaning up leftover staging from interrupted run: {artist} - {album}"
                 );
-                fs::remove_dir_all(&album_staging)?;
+                if clear_download_residue(&staged.album_dir_path) {
+                    // Remove the album directory only if the pass emptied it; a
+                    // surviving `cover.jpg` keeps the directory, which is right.
+                    match fs::remove_dir(&staged.album_dir_path) {
+                        Ok(()) => {}
+                        Err(e) => tracing::debug!(
+                            "Left {:?} in place after clearing its residue: {e}",
+                            staged.album_dir_path
+                        ),
+                    }
+                }
+                prune_artist_level(&staged.artist_dir_path);
             }
         }
     }
@@ -866,7 +1088,11 @@ mod tests {
         // and must not report it as the album folder itself.
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
-        let disc = staging.path().join("Artist--Album").join("CD 01");
+        let disc = staging
+            .path()
+            .join("The Artist")
+            .join("The Album")
+            .join("CD 01");
         fs::create_dir_all(&disc).unwrap();
         let source = disc.join("01 - One.flac");
         fs::write(&source, b"fake flac content").unwrap();
@@ -895,6 +1121,46 @@ mod tests {
                 .join("01 - One.flac")],
             "the disc subdirectory is preserved under the album folder"
         );
+    }
+
+    #[test]
+    fn disc_subdir_treats_an_album_named_like_a_disc_folder_as_the_root() {
+        // The album root's own name can carry an embedded disc marker. The
+        // decision uses the file's immediate parent, so a "Disc 1" album root is
+        // never mistaken for one of its own disc subdirectories.
+        let root = Path::new("/staging/Artist/Disc 1");
+        let flat = root.join("01 - One.flac");
+        assert_eq!(disc_subdir(&flat, "Disc 1"), None);
+
+        let disc = root.join("CD 01").join("01 - One.flac");
+        assert_eq!(disc_subdir(&disc, "Disc 1"), Some("CD 01".to_string()));
+    }
+
+    #[test]
+    fn disc_subdir_does_not_take_an_ancestor_outside_the_album_for_a_disc_label() {
+        // Only the immediate parent counts. A file flattened into an album whose
+        // own name looks like a disc folder yields no disc label, even though the
+        // artist level above it is named like one too.
+        let file = Path::new("/staging/CD 01/Artist/Gold (Disc 1)/01 - One.flac");
+        assert_eq!(disc_subdir(file, "Gold (Disc 1)"), None);
+
+        // A real new-layout nested case: the peer's own disc folder inside that
+        // album is still returned.
+        let nested = Path::new("/staging/Artist/Gold (Disc 1)/CD 02/01.flac");
+        assert_eq!(
+            disc_subdir(nested, "Gold (Disc 1)"),
+            Some("CD 02".to_string())
+        );
+    }
+
+    #[test]
+    fn disc_subdir_is_none_for_the_unknown_album_level() {
+        // An artist-only run stages under the `unknown` component while the
+        // library writers spell their own placeholder `Unknown`. The difference
+        // cannot leak into a destination, because only the immediate parent is
+        // consulted and `unknown` is not a disc designator.
+        let file = Path::new("/staging/Artist/unknown/01 - One.flac");
+        assert_eq!(disc_subdir(file, "unknown"), None);
     }
 
     #[test]
@@ -1387,8 +1653,8 @@ mod tests {
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
 
-        // Staging layout mirrors download.rs: Artist--Album/CD 01/...,
-        // Artist--Album/CD 02/...
+        // Staging layout mirrors the runner: The Artist/The Album/CD 01/...,
+        // The Artist/The Album/CD 02/...
         let cd1_dir = staging.path().join("CD 01");
         let cd2_dir = staging.path().join("CD 02");
         fs::create_dir_all(&cd1_dir).unwrap();
@@ -1795,6 +2061,48 @@ mod tests {
     }
 
     #[test]
+    fn is_the_same_file_recognises_one_file_reached_two_ways() {
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("01 - One.flac");
+        fs::write(&file, b"audio").unwrap();
+
+        assert!(is_the_same_file(&file, &file));
+        assert!(is_the_same_file(
+            &file,
+            &root.path().join(".").join("01 - One.flac")
+        ));
+        assert!(!is_the_same_file(&file, &root.path().join("other.flac")));
+    }
+
+    #[test]
+    fn placement_does_not_copy_a_file_onto_itself() {
+        // A staging root inside a library root makes source and destination one
+        // file. Copying it onto itself truncates it, so the write must be skipped
+        // and the album still reported as written.
+        let root = TempDir::new().unwrap();
+        let library = root.path().join("library");
+        let album = library.join("The Artist").join("The Album");
+        fs::create_dir_all(&album).unwrap();
+        let track = album.join("01 - Track.flac");
+        // Deliberately not valid audio, so the placement takes the replace path
+        // and reaches the copy guard rather than the keep-when-valid path.
+        fs::write(&track, b"not audio").unwrap();
+        let before = fs::read(&track).unwrap();
+
+        let outcome = place_into_library(
+            std::slice::from_ref(&track),
+            &library,
+            "The Artist",
+            "The Album",
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&track).unwrap(), before, "the file must be intact");
+        assert_eq!(outcome.written, vec![track.clone()]);
+        assert_eq!(outcome.album_dir, track.parent().unwrap().to_path_buf());
+    }
+
+    #[test]
     fn test_parse_album_slug() {
         assert_eq!(
             parse_album_slug("Artist--Album"),
@@ -1811,7 +2119,7 @@ mod tests {
         use crate::db::Database;
 
         let staging_root = TempDir::new().unwrap();
-        let staging = staging_root.path().join("Artist--Album");
+        let staging = staging_root.path().join("Artist").join("Album");
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("01 - Song.flac"), b"correct content").unwrap();
 
@@ -1828,6 +2136,51 @@ mod tests {
 
         assert!(library.path().join("Artist/Album/01 - Song.flac").exists());
         assert!(!staging.exists());
+        assert!(
+            !staging_root.path().join("Artist").exists(),
+            "a recovered album leaves no empty artist level behind"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_resumes_an_album_with_a_sanitised_directory_name() {
+        // The directory name is the sanitised title while the row holds the raw
+        // title. An exact lookup would miss and the album would be deleted as
+        // debris — the failure this match exists to prevent.
+        use crate::db::Database;
+
+        let staging_root = TempDir::new().unwrap();
+        let staging = staging_root
+            .path()
+            .join("Artist")
+            .join(sanitize_component("Gold: Greatest Hits"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("01 - Song.flac"), b"correct content").unwrap();
+
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Artist", "Gold: Greatest Hits", "success")
+            .unwrap();
+
+        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Artist")
+                .join("Gold Greatest Hits")
+                .join("01 - Song.flac")
+                .exists(),
+            "the raw row must drive the library destination, not the directory name"
+        );
+        assert!(
+            !staging.exists(),
+            "a resumed album must not be left in staging as well"
+        );
     }
 
     #[test]
@@ -1840,7 +2193,7 @@ mod tests {
         use crate::db::Database;
 
         let staging_root = TempDir::new().unwrap();
-        let staging = staging_root.path().join("Artist--Album");
+        let staging = staging_root.path().join("Artist").join("Album");
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("01 - Song.flac.part"), b"partial bytes").unwrap();
 
@@ -1859,18 +2212,53 @@ mod tests {
             !staging.exists(),
             "failed-status leftover staging dir must be cleaned up"
         );
+        assert!(
+            !staging_root.path().join("Artist").exists(),
+            "the cleanup also drops the artist level it emptied"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_leaves_a_directory_that_is_not_download_residue() {
+        // The layout makes every child of an artist level look like an album, so a
+        // directory the operator put there has no row and no download residue.
+        // Deleting it would destroy content the migration itself refuses to touch,
+        // so it is left with a warning.
+        use crate::db::Database;
+
+        let staging_root = TempDir::new().unwrap();
+        let scans = staging_root.path().join("Artist").join("Scans");
+        fs::create_dir_all(&scans).unwrap();
+        fs::write(scans.join("cover.jpg"), b"image").unwrap();
+
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let db = Database::open_in_memory().unwrap();
+
+        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+
+        assert!(
+            scans.join("cover.jpg").exists(),
+            "a directory holding no audio and no partial file is not download debris"
+        );
     }
 
     #[test]
     fn test_recover_interrupted_upgrades_cleans_untracked_leftover() {
-        // The same, for a leftover whose album has NO DB record at all (an
-        // album whose download crashed before any status could be recorded,
-        // or an album-only slug).
+        // The same, for a leftover whose album has NO DB record at all. An
+        // album-only run stages under the sanitiser's `_` placeholder and
+        // writes no row, because `mark_album_processed_if_identifiable`
+        // returns early for a blank artist.
         use crate::db::Database;
 
         let staging_root = TempDir::new().unwrap();
-        let staging = staging_root.path().join("Unknown--Album");
+        let staging = staging_root.path().join("_").join("Album");
         fs::create_dir_all(&staging).unwrap();
+        // Download residue, which is what makes the directory debris: a directory
+        // holding no audio and no partial file is left in place instead.
+        fs::write(staging.join("01 - Song.flac.part"), b"partial bytes").unwrap();
         fs::write(staging.join("cover.jpg"), b"image").unwrap();
 
         let library = TempDir::new().unwrap();
@@ -1883,8 +2271,63 @@ mod tests {
         recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
 
         assert!(
-            !staging.exists(),
-            "untracked leftover staging dir must be cleaned up"
+            !staging.join("01 - Song.flac.part").exists(),
+            "the partial download is the interleaving hazard and must be removed"
+        );
+        assert!(
+            staging.join("cover.jpg").exists(),
+            "content that is not download residue is kept"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_skips_a_library_root_nested_under_staging() {
+        // The scan reports paths two levels below the staging root, so a library
+        // root deeper than that is reported as an ancestor of itself. The guard
+        // must be symmetric, or the cleanup arm deletes the library below it.
+        use crate::db::Database;
+
+        let staging = TempDir::new().unwrap();
+        let library = staging.path().join("media").join("music").join("flac");
+        let album = library.join("Artist").join("Album");
+        fs::create_dir_all(&album).unwrap();
+        write_minimal_flac(&album.join("01 - Song.flac"));
+
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.to_string_lossy().into_owned()];
+        let db = Database::open_in_memory().unwrap();
+
+        recover_interrupted_upgrades(&config, &db, staging.path()).unwrap();
+
+        assert!(
+            album.join("01 - Song.flac").exists(),
+            "a library root below the staging root must survive a recovery pass"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_upgrades_skips_a_staging_root_that_is_a_library_root() {
+        // staging_dir == library root: the walk sees the library's own artist and
+        // album folders, and recovery must not delete one just because it has no
+        // processed_albums row.
+        use crate::db::Database;
+
+        let library = TempDir::new().unwrap();
+        let album = library.path().join("Artist").join("Album");
+        fs::create_dir_all(&album).unwrap();
+        write_minimal_flac(&album.join("01 - Song.flac"));
+
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+        let db = Database::open_in_memory().unwrap();
+
+        recover_interrupted_upgrades(&config, &db, library.path()).unwrap();
+
+        assert!(
+            album.join("01 - Song.flac").exists(),
+            "library content must survive a recovery pass over the library root"
         );
     }
 }

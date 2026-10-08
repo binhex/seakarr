@@ -261,7 +261,7 @@ A default config is created automatically on first run. The file is divided into
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | *(removed)* | `storage.organize` and `storage.organize_pattern` no longer exist: placement is the only library writer and the naming layout is fixed. A config file that still carries them keeps loading; they are dropped the next time the file is reconciled, with a `seakarr.yml.bak` backup. | — |
-| `staging_dir` | Directory where in-progress downloads land before they are placed into the library. Auto-created if missing. Keep it outside every `library.paths` entry: a staging folder inside a library root is scanned as if it were albums of its own artist. | `downloads/staging` |
+| `staging_dir` | Directory where in-progress downloads land before they are placed into the library. A staged album is two directories, `<staging_dir>/<artist>/<album>/`, with both names sanitised exactly as the library names them; two album titles that sanitise to the same folder name therefore share one staging directory, and one library folder, by design. Auto-created if missing. A directory directly under it that holds nothing at all is removed at startup. A directory written by an earlier version as a single `<artist>--<album>` folder is renamed into the nested shape on the next run when its tracks sit at its top level; one whose tracks all sit in disc folders is left in place and reported instead, because it cannot be told apart from an artist folder whose albums are named like discs. The migration is **one-way**, because an older binary treats each artist level as an album folder and deletes the album directories below it as untracked debris, so reverting needs an empty staging directory — confirm it with `find <staging_dir> -mindepth 1 -maxdepth 1`, which must print nothing. Keep it outside every `library.paths` entry: a staging folder inside a library root is scanned as if it were albums of its own artist, and when the two are the same directory the album is refused before the download starts, because its staging path would be its library folder. Directories that lie inside a configured library path are never pruned or renamed by the startup migration. | `downloads/staging` |
 
 ### `search`
 
@@ -511,14 +511,14 @@ because the artist has no folder there. With `library.paths` empty, staging is t
 every mode:
 
 ```text
-INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 2 (6 tracks) -> /downloads/Aquasky--Shadow Era Pt. 2 (kept in staging)
+INFO seakarr::runner: Completed: Aquasky - Shadow Era Pt. 2 (6 tracks) -> /downloads/Aquasky/Shadow Era Pt. 2 (kept in staging)
 ```
 
 The per-file line that appears as each track finishes reports the **staging** location, and is
 labelled accordingly so it cannot be mistaken for the final destination:
 
 ```text
-INFO seakarr::download: Download staged: 08 Moondance.flac -> /downloads/Aquasky--Shadow Era Pt. 1/08 Moondance.flac
+INFO seakarr::download: Download staged: 08 Moondance.flac -> /downloads/Aquasky/Shadow Era Pt. 1/08 Moondance.flac
 ```
 
 The same destination appears in the end-of-run summary and in the `message` of each success
@@ -597,8 +597,8 @@ the rejected peer, so it takes `--log-level DEBUG` to see it.
 Should a refusal ever happen after the download instead — the backstop above, or the library-upgrade
 path's own `expected_tracks` gate — the album is recorded failed and its staged files are removed with
 it, so a refusal leaves nothing of its own in `storage.staging_dir`. A directory that still
-holds an entry this run did not stage (another album on the same `artist--album` staging name, or
-leftovers from an earlier run) is left in place, with a warning naming the first such entry — a file
+holds an entry this run did not stage (leftovers from an earlier run) is left in place, with a
+warning naming the first such entry — a file
 or a subdirectory. Ownership is by path, so a foreign file that lands on the same path as one of
 ours goes with ours; the two cannot be told apart. The serving peer is
 recorded as an album failure too. The demotion is real but light: the tracks that peer did deliver are
@@ -824,9 +824,10 @@ when those are the artist's only albums. Such an artist owns no folder named aft
 spelling, so the folder gate keeps it out of an automatic sweep; `--artist` processes it. A placed
 album that keeps a marker folder is therefore
 indexed under the marker name, not the album title, so a later run with a cleared database or
-`--ignore-processed` can download it again. On the upgrade path the same shape can also nest one
-level too deep, giving `<artist>/Gold (Disc 1)/Gold (Disc 1)/...`, because the disc folder is
-preserved under an album whose own name is that marker. A manual run places albums into the
+`--ignore-processed` can download it again. On the upgrade path a file flattened into an album
+whose own name is that marker stays in the album folder instead of gaining a second level,
+because the album root is recognised by name before the disc-folder test. A manual run places
+albums into the
 artist's existing library folder and never creates one: with no folder for the artist the download
 stays in `staging_dir`.
 

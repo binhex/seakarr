@@ -735,7 +735,7 @@ async fn run_batch_mode(
     let line_word = if lines.len() == 1 { "line" } else { "lines" };
     tracing::info!("Batch mode: {} {line_word} to process", lines.len());
     let staging_dir = Path::new(&config.storage.staging_dir);
-    std::fs::create_dir_all(staging_dir)?;
+    seakarr::staging::prepare(staging_dir, &config.library.paths)?;
 
     let mut report = seakarr::report::RunReport::new();
 
@@ -1483,7 +1483,8 @@ mod tests {
 
         assert!(
             temp.path()
-                .join("Artist--unknown")
+                .join("Artist")
+                .join("unknown")
                 .join("01 - Track.flac")
                 .exists(),
             "an artist-only line has no album to file, so its download stays in staging"
@@ -1547,7 +1548,7 @@ mod tests {
             "the album must be placed into the artist folder the library already holds"
         );
         assert!(
-            !temp.path().join("Artist--Album").exists(),
+            !temp.path().join("Artist").join("Album").exists(),
             "a placed album leaves no staging copy"
         );
     }

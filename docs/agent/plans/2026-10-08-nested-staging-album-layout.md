@@ -1825,3 +1825,47 @@ The spec's error-handling table says an unwritable staging root "surfaces throug
 ## Execution Handoff
 
 Plan complete and saved to `docs/agent/plans/2026-10-08-nested-staging-album-layout.md`. Proceeding with subagent-driven execution.
+
+---
+
+## Verification notes (2026-10-08)
+
+Recorded after implementation from fresh command output. Where the text above was
+inaccurate, this note is the correction; the steps above are left as written history.
+
+- **Task 7 Step 2's predicted RED did not occur.** The two new Task 7 tests
+  (`a_library_write_leaves_no_empty_artist_staging_directory` and
+  `a_refused_download_leaves_no_empty_artist_directory`) PASSED against the pre-change
+  code, because the flattened layout never created an artist level, so
+  `!join("Test Artist").exists()` was trivially true. The RED that did occur came from the
+  swept positive fixtures. Non-vacuity was instead proven by disabling the new behaviour
+  (both `prune_empty_dir` calls and the `run_discover_mode` `staging::prepare`): 3 of the 4
+  new tests then FAILED (`test result: FAILED. 1 passed; 3 failed`, exit 101) and all
+  passed again after `src/runner.rs` was restored byte-for-byte
+  (sha1 `81afd9f2f9904fa11a331e200bb87d6205a0f8aa`, the state at that moment).
+  Precisely: the three tests that assert the new behaviour flip to FAIL when it is
+  disabled — `a_library_write_leaves_no_empty_artist_staging_directory`,
+  `a_refused_download_leaves_no_empty_artist_directory` and
+  `a_discovery_run_migrates_a_legacy_staging_directory_before_staging`. The fourth,
+  `a_completed_album_keeps_a_sibling_album_under_the_same_artist`, is a guard against
+  over-pruning rather than a non-vacuity proof; adversarial review found it asserted
+  only the sibling's survival, so it now also asserts that the completed album's
+  staging directory was removed and the artist level survived.
+- **The Task 7 fixture sweep under-counted.** 32 literals in `src/runner.rs` (not 19), 2 in
+  `src/main.rs`, and 1 test fixture in `src/report.rs` — a file the File Structure table did
+  not list — were converted to the nested layout. `src/report.rs` was included only to
+  honour this plan's own "no legacy literal" requirement; its production behaviour is
+  unchanged.
+- **Three Task 7/8/9 snippets did not match the code and were adapted with their assertion
+  intent preserved:** `client.add_search_result`/`make_result` do not exist in this
+  revision; `filters.min_tracks = 2` makes the pre-download filter return `NoCandidates`
+  rather than the asserted post-download `Failed { .. incomplete download }`; and the Task 8
+  test's `config.library.paths.clear()` makes `run_discover_mode` return a config error
+  before any staging setup, so the migration could never run.
+- **Coverage:** no coverage command is configured in this repository. Fresh
+  `cargo llvm-cov --summary-only`: TOTAL **97.13%** lines (46,101 lines, 1,325 missed),
+  96.60% functions, 97.59% regions — above the 95% floor. `src/staging.rs` is 91.25% lines,
+  100% functions, 93.37% regions.
+- **Remaining `<artist>--<album>` literals are intentional:** `parse_album_slug`'s doc
+  comment and its own test in `src/organizer.rs`, and the legacy input fixtures in
+  `src/staging.rs` and the Task 8 migration test in `src/runner.rs`.

@@ -356,16 +356,14 @@ fn first_remaining_entry(dir: &Path) -> Option<PathBuf> {
 /// `storage.staging_dir` while the album is re-downloaded from scratch on the
 /// next run.
 ///
-/// Exactly the paths this run staged are removed, never anything else. The staging
-/// slug is `artist--album`, which two different pairs can collapse onto (`A--B` +
-/// `C` and `A` + `B--C`), and albums are processed concurrently, so the directory
-/// can hold another album's file; directories are removed only once they are empty
-/// and anything left behind is named in a warning. A directory that was never
-/// created is not a failure.
+/// Exactly the paths this run staged are removed, never anything else. Albums
+/// are processed concurrently, so the artist directory can hold another album's
+/// directory; directories are removed only once they are empty and anything left
+/// behind is named in a warning. A directory that was never created is not a
+/// failure.
 ///
-/// Ownership is by path, so a foreign file that happens to land on the same path as
-/// one of ours is removed with ours — the two are indistinguishable, and the slug
-/// collapse that produces that state is the same one the warning below describes.
+/// Ownership is by path, so a foreign file that happens to land on the same path
+/// as one of ours is removed with ours — the two are indistinguishable.
 fn discard_refused_staging(album_staging: &Path, downloaded: &[PathBuf]) {
     for path in downloaded {
         match std::fs::remove_file(path) {
@@ -376,21 +374,24 @@ fn discard_refused_staging(album_staging: &Path, downloaded: &[PathBuf]) {
             ),
         }
     }
-    if let Some(remaining) = remove_empty_staging_dirs(album_staging) {
-        if remaining == album_staging {
-            tracing::warn!(
-                "Leaving {album_staging:?} in place: it could not be removed, and it may hold an entry this run did not stage (another album on the same artist--album staging name, or leftovers from an earlier run)"
-            );
-        } else {
-            tracing::warn!(
-                "Leaving {album_staging:?} in place: it still holds {remaining:?}, the first entry this run did not stage (a file or subdirectory — another album on the same artist--album staging name, or leftovers from an earlier run)"
-            );
+    match remove_empty_staging_dirs(album_staging) {
+        None => {
+            if let Some(artist_dir) = album_staging.parent() {
+                crate::organizer::prune_artist_level(artist_dir);
+            }
         }
+        Some(remaining) if remaining == album_staging => tracing::warn!(
+            "Leaving {album_staging:?} in place: it could not be removed, and it may hold an entry this run did not stage (leftovers from an earlier run)"
+        ),
+        Some(remaining) => tracing::warn!(
+            "Leaving {album_staging:?} in place: it still holds {remaining:?}, the first entry this run did not stage (a file or subdirectory — leftovers from an earlier run)"
+        ),
     }
 }
 
-/// Shared tail for both library writes: drop the staging copy, record the
-/// album as processed, notify, and report the completed album.
+/// Shared tail for both library writes: drop the staging copy — and the artist
+/// level with it when it holds nothing else — record the album as processed,
+/// notify, and report the completed album.
 async fn finish_library_write(
     config: &Config,
     db: &Database,
@@ -401,11 +402,25 @@ async fn finish_library_write(
     destination: DownloadDestination,
 ) -> Result<AlbumOutcome> {
     // A library write has moved the album out of staging, so the staging copy is
-    // dropped. A staging destination means staging *is* the album's final
-    // location — removing it would delete the album.
-    if matches!(destination, DownloadDestination::Library(_)) {
-        if let Err(e) = std::fs::remove_dir_all(album_staging) {
+    // dropped, and the artist level with it when it holds nothing else. A
+    // staging destination means staging *is* the album's final location —
+    // removing it would delete the album.
+    if let DownloadDestination::Library(library_album_dir) = &destination {
+        // Shared with the library writer (`organizer`) and with the staging
+        // module, so the runner and the writers can never drift on what "the same
+        // place" means.
+        if crate::organizer::is_the_same_dir(album_staging, library_album_dir) {
+            // The staging layout mirrors the library layout, so a staging root
+            // inside a library root makes the album's staging path and its library
+            // destination the same directory. Removing it would delete the album
+            // that was just written.
+            tracing::warn!(
+                "Not removing {album_staging:?}: it is the album's library location, not a staging copy (storage.staging_dir is inside a library.paths entry; keep it outside)"
+            );
+        } else if let Err(e) = std::fs::remove_dir_all(album_staging) {
             tracing::warn!("Failed to remove staging dir {album_staging:?}: {e}");
+        } else if let Some(artist_dir) = album_staging.parent() {
+            crate::organizer::prune_artist_level(artist_dir);
         }
     }
     mark_album_processed_if_identifiable(db, artist, album, "success")?;
@@ -507,13 +522,33 @@ async fn process_album_internal(
 
     // Create per-album staging subdirectory to prevent filename collisions
     // when multiple albums are processed concurrently (e.g. two albums both
-    // containing "01 - Intro.flac").
-    let album_slug = format!(
-        "{}--{}",
-        artist.replace(['/', '\\'], "-"),
-        album.unwrap_or("unknown").replace(['/', '\\'], "-")
-    );
-    let album_staging = staging_dir.join(&album_slug);
+    // containing "01 - Intro.flac"). The layout is two real levels,
+    // <staging>/<artist>/<album>, and both components come from the library
+    // sanitiser so the staging tree mirrors the library tree.
+    let album_staging = crate::staging::album_dir(staging_dir, artist, album);
+    // A staging path inside a configured library root *is* the album's library
+    // folder: downloading there writes into the library, and every cleanup path
+    // (cancel, failed candidate, refusal, prune) would then be deleting library
+    // content. The configuration is the README's forbidden one, so the album is
+    // refused before a single byte moves.
+    if let Some(root) = config.library.paths.iter().find(|root| {
+        // Equality, not containment: a staging root merely nested inside a library
+        // root has its own album paths, and must keep working.
+        crate::staging::is_the_same_path(
+            &crate::staging::album_dir(Path::new(root), artist, album),
+            &album_staging,
+        )
+    }) {
+        tracing::warn!(
+            "Refusing {artist} — {}: its staging path {album_staging:?} lies inside the library root {root:?} (keep storage.staging_dir outside every library.paths entry)",
+            album.unwrap_or("(all)")
+        );
+        return Ok(AlbumOutcome::Failed {
+            reason: format!(
+                "staging path {album_staging:?} lies inside the library root {root:?}; keep storage.staging_dir outside every library.paths entry"
+            ),
+        });
+    }
     // Note: album_staging directory is created by download_album, only when
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
@@ -1449,6 +1484,15 @@ pub async fn run_upgrade_mode(
         albums.len()
     );
 
+    // The migration and the recovery scan run before the target check: a run with
+    // nothing to upgrade must still bring the staging layout up to date and adopt
+    // what an interrupted run left behind.
+    let staging_dir = Path::new(&config.storage.staging_dir);
+    crate::staging::prepare(staging_dir, &config.library.paths)?;
+    if let Err(e) = organizer::recover_interrupted_upgrades(config, db, staging_dir) {
+        tracing::warn!("Library upgrade recovery scan failed: {e}");
+    }
+
     if targets_with_counts.is_empty() {
         tracing::info!("Nothing to upgrade.");
         return Ok(());
@@ -1462,13 +1506,6 @@ pub async fn run_upgrade_mode(
     // `client`/`config`/`db` and poll them cooperatively in this task via
     // `join_all` (FuturesUnordered under the hood), bounding the number of
     // albums in flight with a shared tokio semaphore.
-    let staging_dir = Path::new(&config.storage.staging_dir);
-    std::fs::create_dir_all(staging_dir)?;
-
-    // Recover any interrupted library upgrades from previous runs
-    if let Err(e) = organizer::recover_interrupted_upgrades(config, db, staging_dir) {
-        tracing::warn!("Library upgrade recovery scan failed: {e}");
-    }
 
     // Shared cancellation flag, created by `arm_cancellation` before the scan.
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
@@ -2482,13 +2519,18 @@ pub async fn run_discover_mode(
     let provider = MusicBrainzProvider::new().map_err(|error| {
         SeakarrError::MusicBrainz(format!("could not construct the provider: {error}"))
     })?;
+    // Discover mode stages downloads like every other mode, so it prepares the
+    // staging layout too: create the root, then migrate any legacy directory so
+    // a leftover from an earlier version is still found by the operator.
+    let staging_dir = Path::new(&config.storage.staging_dir);
+    crate::staging::prepare(staging_dir, &config.library.paths)?;
     run_discover_mode_with_provider(
         client,
         config,
         db,
         artist_filter,
         ignore_processed,
-        Path::new(&config.storage.staging_dir),
+        staging_dir,
         &provider,
     )
     .await
@@ -2973,7 +3015,7 @@ pub async fn run_manual_mode(
 ) -> Result<()> {
     let artist_name = artist.filter(|name| !name.trim().is_empty()).unwrap_or("");
     let staging_dir = Path::new(&config.storage.staging_dir);
-    std::fs::create_dir_all(staging_dir)?;
+    crate::staging::prepare(staging_dir, &config.library.paths)?;
 
     let album_display = album.unwrap_or("(all)");
     let mut report = RunReport::new();
@@ -3099,6 +3141,48 @@ mod tests {
     use crate::test_support::{make_file, write_minimal_flac, write_minimal_flac_with_tags};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn a_discovery_run_migrates_a_legacy_staging_directory_before_staging() {
+        // Discover mode had no staging setup at all before this change: it
+        // passed the configured path straight through. It must now migrate, so a
+        // leftover from an earlier version is still recovered.
+        let staging = TempDir::new().unwrap();
+        let legacy = staging.path().join("Leftover Artist--Leftover Album");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // Real audio: the migration's evidence rule requires it.
+        crate::test_support::write_minimal_flac(&legacy.join("01 - Song.flac"));
+
+        let client = MockClient::new();
+        let library = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.discography.enabled = true;
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        let db = Database::open_in_memory().unwrap();
+
+        // A malformed identity is rejected inside the discover run before any
+        // request or walk, so a completed migration is all this call can have
+        // done to staging.
+        let error = run_discover_mode(&client, &config, &db, Some("0000000466597023"), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SeakarrError::Config(_)), "got {error:?}");
+
+        assert!(
+            !legacy.exists(),
+            "the legacy directory must be renamed before the run stages anything"
+        );
+        assert!(
+            staging
+                .path()
+                .join("Leftover Artist")
+                .join("Leftover Album")
+                .join("01 - Song.flac")
+                .exists(),
+            "the migrated album keeps its file at the nested path"
+        );
+    }
 
     #[tokio::test]
     async fn discover_mode_requires_its_flag_and_a_library() {
@@ -3735,7 +3819,11 @@ mod tests {
             "no transfer may be started for a set that can never be placed"
         );
         assert!(
-            !staging.path().join("Test Artist--Test Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("Test Album")
+                .exists(),
             "a refused set must not be staged"
         );
         assert!(
@@ -3819,7 +3907,11 @@ mod tests {
             "no transfer may be started for a set that can never be placed"
         );
         assert!(
-            !staging.path().join("Test Artist--Test Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("Test Album")
+                .exists(),
             "a refused set must not be staged"
         );
         assert!(
@@ -4225,7 +4317,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Staging Fixture Artist--Staging Fixture Album")
+                .join("Staging Fixture Artist")
+                .join("Staging Fixture Album")
                 .exists(),
             "a staging destination must not remove the album's staging directory"
         );
@@ -4565,7 +4658,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--New Album")
+                .join("Test Artist")
+                .join("New Album")
                 .join("01 - track.flac")
                 .exists(),
             "with no library path the download stays in staging"
@@ -4604,7 +4698,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--New Album")
+                .join("Test Artist")
+                .join("New Album")
                 .join("01 - track.flac")
                 .exists(),
             "a failed placement must keep the staging copy"
@@ -4862,7 +4957,7 @@ mod tests {
             .await
             .expect("artist-only manual mode must still download every disc");
 
-        let staged = staging.path().join("Test Artist--Album One");
+        let staged = staging.path().join("Test Artist").join("Album One");
         assert!(staged.join("CD 01/01 - one.flac").exists());
         assert!(staged.join("CD 02/01 - one.flac").exists());
         assert!(
@@ -4898,7 +4993,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--New Album")
+                .join("Test Artist")
+                .join("New Album")
                 .join("01 - track.flac")
                 .exists(),
             "the album must stay in staging when the artist folder does not exist"
@@ -4987,7 +5083,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Report Folder Artist 9f2b--Report Album")
+                .join("Report Folder Artist 9f2b")
+                .join("Report Album")
                 .exists(),
             "the download stays in staging"
         );
@@ -5042,7 +5139,11 @@ mod tests {
             "disc 2 must be placed under the album folder"
         );
         assert!(
-            !staging.path().join("Test Artist--New Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("New Album")
+                .exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -5541,7 +5642,11 @@ mod tests {
             "the album must land in the nested artist folder"
         );
         assert!(
-            !staging.path().join("Radiohead--In Rainbows").exists(),
+            !staging
+                .path()
+                .join("Radiohead")
+                .join("In Rainbows")
+                .exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -5618,7 +5723,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Nowhere Artist 7f3a--Nowhere Album")
+                .join("Nowhere Artist 7f3a")
+                .join("Nowhere Album")
                 .exists(),
             "the download stays in staging"
         );
@@ -5685,10 +5791,11 @@ mod tests {
         .await
         .expect("a manual album-only run completes");
 
-        // The blank artist means the staging slug has no artist component, and the
-        // download must be there rather than anywhere in the library.
+        // The blank artist means the artist level is the sanitiser's `_`
+        // placeholder, and the download must be there rather than anywhere in
+        // the library.
         assert!(
-            staging.path().join("--Orphan Album 6a2b").exists(),
+            staging.path().join("_").join("Orphan Album 6a2b").exists(),
             "a manual album-only request keeps its download in staging"
         );
         let logs = capture.text();
@@ -6626,7 +6733,7 @@ mod tests {
             "the peer's folder spelling must not name the placed folder"
         );
         assert!(
-            !staging.path().join("Test Artist--Missing").exists(),
+            !staging.path().join("Test Artist").join("Missing").exists(),
             "the staging album directory is removed after a successful placement"
         );
         assert_eq!(
@@ -6766,7 +6873,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--Old Album")
+                .join("Test Artist")
+                .join("Old Album")
                 .join("01 - track.flac")
                 .exists(),
             "the download stays in staging"
@@ -6827,7 +6935,11 @@ mod tests {
             "placement with the flag off must report the library destination, got {outcome:?}"
         );
         assert!(
-            !staging.path().join("Test Artist--Old Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("Old Album")
+                .exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -6880,7 +6992,7 @@ mod tests {
             "a placement failure records the album as failed"
         );
         assert!(
-            staging.path().join("Alpha Artist--Missing").exists(),
+            staging.path().join("Alpha Artist").join("Missing").exists(),
             "staging is retained when placement fails so nothing is lost"
         );
         assert_eq!(
@@ -6944,7 +7056,7 @@ mod tests {
             "the destination that already parsed as audio must be untouched"
         );
         assert!(
-            !staging.path().join("Test Artist--Missing").exists(),
+            !staging.path().join("Test Artist").join("Missing").exists(),
             "a placed album removes its staging copy"
         );
         // The warning is the only signal that no incoming file was written while
@@ -7030,7 +7142,7 @@ mod tests {
             "the track with no existing destination must be written"
         );
         assert!(
-            !staging.path().join("Test Artist--Missing").exists(),
+            !staging.path().join("Test Artist").join("Missing").exists(),
             "a placed album removes its staging copy"
         );
         // A partial keep must be reported as well as the all-kept case: the kept
@@ -7404,7 +7516,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--Album")
+                .join("Test Artist")
+                .join("Album")
                 .join("01 - track.flac")
                 .exists(),
             "an unusable library path must leave the download in staging"
@@ -7476,7 +7589,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--Album")
+                .join("Test Artist")
+                .join("Album")
                 .join("01 - track.flac")
                 .exists(),
             "an existing album folder keeps the download in staging"
@@ -7537,7 +7651,7 @@ mod tests {
             "the album must be placed in the pre-existing artist folder"
         );
         assert!(
-            !staging.path().join("Test Artist--Album").exists(),
+            !staging.path().join("Test Artist").join("Album").exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -7575,7 +7689,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Folderless Artist 8c1d--Ghost")
+                .join("Folderless Artist 8c1d")
+                .join("Ghost")
                 .join("01 - track.flac")
                 .exists(),
             "without an artist folder the album stays in staging"
@@ -7658,12 +7773,11 @@ mod tests {
 
     #[test]
     fn discard_refused_staging_keeps_a_directory_holding_another_albums_file() {
-        // The staging name is artist--album, so two different pairs can collapse
-        // onto one directory (A--B + C and A + B--C) and albums run concurrently.
-        // Deleting the tree there would delete a download this run did not stage,
-        // so the directory is left alone with a warning instead.
+        // Only the paths this run staged are removed, and a directory is removed
+        // only once it is empty. A foreign file in the album directory must
+        // therefore survive a refusal in this album, with a warning instead.
         let root = TempDir::new().unwrap();
-        let album = root.path().join("Test Artist--Test Album");
+        let album = root.path().join("Test Artist").join("Test Album");
         std::fs::create_dir_all(&album).unwrap();
         let ours = album.join("01 - Ours.flac");
         let foreign = album.join("02 - Theirs.flac");
@@ -7685,12 +7799,12 @@ mod tests {
 
     #[test]
     fn discard_refused_staging_keeps_a_foreign_file_that_repeats_our_basename() {
-        // Ownership must be by staged path, not by basename: another album on the
-        // same staging name routinely holds the same track names, one flat and one
-        // under a disc folder. A basename test accepts `CD 01/01 - Track.flac` as
-        // ours and deletes it with the tree.
+        // Ownership must be by staged path, not by basename: a foreign file can
+        // share a track name with one we staged, one flat and one under a disc
+        // folder. A basename test accepts `CD 01/01 - Track.flac` as ours and
+        // deletes it with the tree.
         let root = TempDir::new().unwrap();
-        let album = root.path().join("Test Artist--Test Album");
+        let album = root.path().join("Test Artist").join("Test Album");
         std::fs::create_dir_all(album.join("CD 01")).unwrap();
         let ours = album.join("01 - Track.flac");
         let foreign = album.join("CD 01/01 - Track.flac");
@@ -7718,7 +7832,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         discard_refused_staging(&root.path().join("never-created"), &[]);
 
-        let album = root.path().join("Test Artist--Test Album");
+        let album = root.path().join("Test Artist").join("Test Album");
         std::fs::create_dir_all(album.join("disc 1")).unwrap();
         let ours = album.join("disc 1/01 - Track.flac");
         std::fs::write(&ours, b"not audio").unwrap();
@@ -7735,7 +7849,8 @@ mod tests {
         // be reported, not silently ignored: the warning names the path itself when
         // no entry can be read from it.
         let root = TempDir::new().unwrap();
-        let not_a_dir = root.path().join("Test Artist--Test Album");
+        let not_a_dir = root.path().join("Test Artist").join("Test Album");
+        std::fs::create_dir_all(not_a_dir.parent().unwrap()).unwrap();
         std::fs::write(&not_a_dir, b"not audio").unwrap();
 
         discard_refused_staging(&not_a_dir, &[]);
@@ -7743,6 +7858,336 @@ mod tests {
         assert!(
             not_a_dir.exists(),
             "a path this run did not stage must survive, even when it is not a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_write_leaves_no_empty_artist_staging_directory() {
+        let soulseek = MockClient::new();
+        search_index(&soulseek, "Test Artist", &[("Test Artist Album", "Album")]);
+        *soulseek.write_files.lock().unwrap() = true;
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("album", "Album", "1998")]);
+        let (config, db, staging, library) = discover_fixture(&[("Test Artist", "Present")]);
+
+        run_artist_only_mode_with_provider(
+            &soulseek,
+            "Test Artist",
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must be placed in the pre-existing artist folder"
+        );
+        assert!(
+            !staging.path().join("Test Artist").exists(),
+            "a placed album must leave neither the album directory nor an empty artist level"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_leaves_no_empty_artist_directory() {
+        let client = MockClient::new();
+        let staging = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.library.paths = vec![target.path().to_string_lossy().into()];
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = false;
+        // The peer-track-count filter would reject this single-file peer before
+        // any download; disable it so the completeness gate is what decides.
+        config.filters.peer_track_count = false;
+        let db = Database::open_in_memory().unwrap();
+
+        // One track where the album needs two: the completeness gate refuses the
+        // set after the files have been staged.
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![make_file(
+                r"Test Artist\Test Album\01 - Only.flac",
+                900,
+                12_000_000,
+            )],
+        }];
+        *client.write_files.lock().unwrap() = true;
+
+        let result = process_album(
+            &client,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            Some(2),
+            Some(LibraryTarget::Upgrade {
+                root: target.path().to_path_buf(),
+                expected_tracks: 2,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("incomplete download")),
+            "expected the completeness gate to reject, got {result:?}"
+        );
+        assert!(
+            !staging.path().join("Test Artist").exists(),
+            "a refused download must leave neither the album directory nor an empty artist level"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_album_keeps_a_sibling_album_under_the_same_artist() {
+        let staging = TempDir::new().unwrap();
+        let sibling = staging.path().join("Test Artist").join("Other Album");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("01 - Other.flac"), b"audio").unwrap();
+
+        let client = MockClient::new();
+        let library = TempDir::new().unwrap();
+        std::fs::create_dir_all(library.path().join("Test Artist")).unwrap();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.path().to_string_lossy().into();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.filters.min_tracks = 0;
+        let db = Database::open_in_memory().unwrap();
+
+        search_index(&client, "Test Artist", &[("Test Artist Album", "Album")]);
+        *client.write_files.lock().unwrap() = true;
+
+        let result = process_album(
+            &client,
+            "Test Artist",
+            Some("Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Upgrade {
+                root: library.path().to_path_buf(),
+                expected_tracks: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Downloaded { .. }),
+            "got {result:?}"
+        );
+        assert!(
+            !staging.path().join("Test Artist").join("Album").exists(),
+            "the completed album's staging directory must be removed"
+        );
+        assert!(
+            staging.path().join("Test Artist").exists(),
+            "the artist level must survive while a sibling album is staged under it"
+        );
+        assert!(
+            sibling.join("01 - Other.flac").exists(),
+            "pruning the artist level must never remove a sibling album"
+        );
+    }
+
+    #[test]
+    fn is_the_same_dir_matches_only_the_same_directory() {
+        let root = TempDir::new().unwrap();
+        let album = root.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+
+        assert!(crate::organizer::is_the_same_dir(&album, &album));
+        assert!(crate::organizer::is_the_same_dir(
+            &album,
+            &root.path().join("Artist").join(".").join("Album")
+        ));
+        assert!(!crate::organizer::is_the_same_dir(
+            &album,
+            &root.path().join("Artist")
+        ));
+        assert!(!crate::organizer::is_the_same_dir(
+            &album,
+            &root.path().join("Artist").join("Other")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_staging_root_inside_the_library_refuses_a_new_album_too() {
+        // The refusal must not depend on the album folder already existing: the
+        // guard runs before the download creates it, which is the common case.
+        let library = TempDir::new().unwrap();
+        std::fs::create_dir_all(library.path().join("Test Artist")).unwrap();
+
+        let client = MockClient::new();
+        let mut config = make_test_config();
+        config.storage.staging_dir = library.path().to_string_lossy().into();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.filters.min_tracks = 0;
+        let db = Database::open_in_memory().unwrap();
+
+        search_index(&client, "Test Artist", &[("Test Artist Album", "Album")]);
+        *client.write_files.lock().unwrap() = true;
+
+        let result = process_album(
+            &client,
+            "Test Artist",
+            Some("Album"),
+            false,
+            &config,
+            &db,
+            library.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Upgrade {
+                root: library.path().to_path_buf(),
+                expected_tracks: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("library root")),
+            "got {result:?}"
+        );
+        assert!(
+            !library.path().join("Test Artist").join("Album").exists(),
+            "nothing may be created inside the library"
+        );
+        assert!(client.download_filenames.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_staging_root_nested_in_the_library_is_not_refused() {
+        // A staging root that merely lives inside a library root has its own album
+        // paths, so the refusal must not fire: only real equality does.
+        let library = TempDir::new().unwrap();
+        let staging = library.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(library.path().join("Test Artist")).unwrap();
+
+        let client = MockClient::new();
+        let mut config = make_test_config();
+        config.storage.staging_dir = staging.to_string_lossy().into();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.filters.min_tracks = 0;
+        let db = Database::open_in_memory().unwrap();
+
+        search_index(&client, "Test Artist", &[("Test Artist Album", "Album")]);
+        *client.write_files.lock().unwrap() = true;
+
+        let result = process_album(
+            &client,
+            "Test Artist",
+            Some("Album"),
+            false,
+            &config,
+            &db,
+            &staging,
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Upgrade {
+                root: library.path().to_path_buf(),
+                expected_tracks: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Downloaded { .. }),
+            "a nested staging root must keep working, got {result:?}"
+        );
+        assert!(
+            library
+                .path()
+                .join("Test Artist")
+                .join("Album")
+                .join("01 - track.flac")
+                .exists(),
+            "the album must be placed into the library"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staging_root_inside_the_library_refuses_the_album() {
+        // The nested layout makes a staged album's path equal its library
+        // destination when storage.staging_dir is a configured library path. The
+        // album is refused before a byte moves, so no cleanup path (cancel, failed
+        // candidate, refusal, prune) can delete library content.
+        let library = TempDir::new().unwrap();
+        let artist_dir = library.path().join("Test Artist");
+        std::fs::create_dir_all(&artist_dir).unwrap();
+        let existing = artist_dir.join("Album");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("01 - track.flac"), b"library audio").unwrap();
+
+        let client = MockClient::new();
+        let mut config = make_test_config();
+        config.storage.staging_dir = library.path().to_string_lossy().into();
+        config.library.paths = vec![library.path().to_string_lossy().into()];
+        config.filters.min_tracks = 0;
+        let db = Database::open_in_memory().unwrap();
+
+        search_index(&client, "Test Artist", &[("Test Artist Album", "Album")]);
+        *client.write_files.lock().unwrap() = true;
+
+        let result = process_album(
+            &client,
+            "Test Artist",
+            Some("Album"),
+            false,
+            &config,
+            &db,
+            library.path(),
+            None,
+            None,
+            None,
+            Some(LibraryTarget::Upgrade {
+                root: library.path().to_path_buf(),
+                expected_tracks: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&result, AlbumOutcome::Failed { reason } if reason.contains("library root")),
+            "got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(existing.join("01 - track.flac")).unwrap(),
+            b"library audio",
+            "the library album must be untouched"
+        );
+        assert!(
+            client.download_filenames.lock().unwrap().is_empty(),
+            "no transfer may start for an album that can only write into the library"
         );
     }
 
@@ -8826,7 +9271,7 @@ mod tests {
             "MusicBrainz is asked under the name the operator typed, not the on-disk spelling"
         );
         assert!(
-            !staging.path().join("Shy Fx--Missing").exists(),
+            !staging.path().join("Shy Fx").join("Missing").exists(),
             "a placed album must not be left in staging as well"
         );
         assert!(
@@ -8918,7 +9363,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            staging.path().join("Nobody--Missing").exists(),
+            staging.path().join("Nobody").join("Missing").exists(),
             "the download must stay in staging when the library holds no folder"
         );
         assert!(
@@ -9209,7 +9654,11 @@ mod tests {
             "the explicit album must be placed in the existing artist folder"
         );
         assert!(
-            !staging.path().join("Test Artist--New Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("New Album")
+                .exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -9252,7 +9701,11 @@ mod tests {
             "the library write must not run twice after an early placement return"
         );
         assert!(
-            !staging.path().join("Test Artist--New Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("New Album")
+                .exists(),
             "a placed album leaves no staging copy"
         );
     }
@@ -9316,7 +9769,8 @@ mod tests {
         assert!(
             staging
                 .path()
-                .join("Test Artist--Old Album")
+                .join("Test Artist")
+                .join("Old Album")
                 .join("01 - track.flac")
                 .exists(),
             "an existing album folder keeps the download in staging"
@@ -9469,7 +9923,11 @@ mod tests {
             "expected the completeness gate to reject, got {result:?}"
         );
         assert!(
-            !staging.path().join("Test Artist--Test Album").exists(),
+            !staging
+                .path()
+                .join("Test Artist")
+                .join("Test Album")
+                .exists(),
             "a refused download must not be left in the staging directory"
         );
         // The serving peer is demoted at the album level as well as credited for

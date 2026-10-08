@@ -3274,6 +3274,16 @@ mod tests {
             d1.is_file() && d2.is_file(),
             "both disc copies must survive"
         );
+        // The disc level nests inside the album directory the caller passed
+        // (this test hands `download_album` the album root directly, so the
+        // nesting is relative to `dir.path()`), never beside it.
+        for p in &downloaded {
+            assert_eq!(
+                p.parent().and_then(|disc| disc.parent()),
+                Some(dir.path()),
+                "a disc folder must nest inside the album directory, not beside it: {p:?}"
+            );
+        }
     }
 
     #[tokio::test]

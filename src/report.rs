@@ -241,7 +241,7 @@ mod tests {
             AlbumOutcome::Downloaded {
                 track_count: 6,
                 destination: DownloadDestination::Staging(PathBuf::from(
-                    "/downloads/Aquasky--Shadow Era Pt. 2",
+                    "/downloads/Aquasky/Shadow Era Pt. 2",
                 )),
             },
         );
@@ -251,7 +251,7 @@ mod tests {
                 "=== Run summary ===".to_string(),
                 "Downloaded (1):".to_string(),
                 "  Aquasky — Shadow Era Pt. 2 (6 tracks) -> \
-                 /downloads/Aquasky--Shadow Era Pt. 2 (kept in staging)"
+                 /downloads/Aquasky/Shadow Era Pt. 2 (kept in staging)"
                     .to_string(),
             ]
         );

@@ -22,6 +22,196 @@ path component, and the code that consumes it has to decode it again:
 | `src/runner.rs:355-389` `discard_refused_staging` | Removes a refused album's staged files, then prunes directories that are now empty. Its warnings explain the `A--B` + `C` versus `A` + `B--C` slug collapse. |
 | `src/runner.rs:392-413` `finish_library_write` | Removes the album staging directory after the album has been written to the library. |
 
+> **Superseded in part (2026-10-08).** The change this spec describes was
+> implemented, so the `file:line` references above name the pre-change code.
+> The current sites are `src/runner.rs:549` (`process_album_internal` builds
+> `crate::staging::album_dir`), `src/organizer.rs:645` (`disc_subdir`),
+> `src/organizer.rs:903` (`parse_album_slug`), `src/organizer.rs:923`
+> (`recover_interrupted_upgrades`), `src/runner.rs:367`
+> (`discard_refused_staging`), and `src/runner.rs:419`
+> (`finish_library_write`). Line numbers drift; the names are the contract.
+>
+> Further corrections recorded after adversarial review (2026-10-08):
+>
+> - **`parse_album_slug` is not a runtime recovery boundary.** It is the legacy
+>   parser, called only by `staging::normalise_layout`; runtime recovery resolves
+>   identity through `crate::staging::scan`. Any prose above that treats it as the
+>   recovery key is superseded.
+> - **An unreadable staging root now aborts the run.** The error-handling table
+>   says an unwritable root surfaces through the existing `?`, "unchanged from
+>   today". That holds for a root that cannot be *created*, but a root that exists
+>   and cannot be *read* is now fatal, where the bare `create_dir_all` it replaced
+>   would have let the run continue.
+> - **Deliberate limit: sanitised-name collisions.** Two raw titles that sanitise
+>   to one component (`Album?` and `Album*` both become `Album`) share one staging
+>   directory, and share one library folder for the same reason. The flattened
+>   layout kept some of those names apart, so this widens an existing collision
+>   rather than introducing the concept. Accepted by the operator on 2026-10-08 in
+>   preference to a discriminator the library layout would not share.
+> - **Deliberate limit: an artist whose own name contains `--`.** When such a
+>   new-layout artist directory holds an album named like a disc folder, the
+>   migration cannot tell it from a legacy album directory, so `scan` skips every
+>   top-level directory that still carries the separator: those staged albums stay
+>   in place rather than being recovered, which is preferred to deleting them.
+> - **Rejected: pruning empty album directories during migration.** Review asked
+>   for empty second-level directories to be removed at startup. Attempting it
+>   deleted a real, intentionally empty library artist folder, because a staging
+>   root can contain directories that are not artist levels (the repository's own
+>   batch tests configure the staging root as the parent of the library). The
+>   migration therefore prunes the top level only; an empty album directory left
+>   behind by a failure path is cleared by the runner's own post-write prune, and
+>   otherwise survives until then.
+> - **Ambiguous legacy-named trees are never renamed.** A top-level directory
+>   carrying `--` whose children are all directories and which holds no file has
+>   the same shape whether it is a legacy multi-disc album directory (tracks all
+>   inside `CD 01/`) or an artist level whose albums are all named like disc
+>   folders. Only a top-level *file* is positive evidence of a legacy album
+>   directory, because the current layout never puts a file directly inside an
+>   artist level; an empty directory has nothing to lose and is migrated as
+>   debris. The ambiguous shape is recorded in `MigrationReport::ambiguous`,
+>   warned about, and left in place. The cost is that a genuine legacy multi-disc
+>   album directory is not migrated automatically; the operator is told instead.
+> - **`scan` skips every separator-named top level, identified artist level or
+>   not.** An earlier revision skipped only those it could not identify as artist
+>   levels, so an artist named `AC--DC` kept its recovery. That was reverted:
+>   such a level can hold a directory the operator added (`Scans/`), which has no
+>   `processed_albums` row and would be deleted as untracked debris. Skipping the
+>   whole level leaves its albums unrecovered instead, which is the safer of the
+>   two failures; the operator is told by the migration's warning.
+> - **Unreadable directories are reported as failures, not as ambiguous shapes.**
+>   A `--`-named directory whose `read_dir` fails used to fall through to the
+>   ambiguous bucket, which told the operator to look for a shape problem instead
+>   of a permission problem.
+> - **The accepted collision is worse at staging than the library framing implies.**
+>   Two titles that sanitise together share one staging directory while in flight,
+>   and albums are processed concurrently, so whichever finishes first removes the
+>   shared directory together with the other's partial files, and a matching
+>   basename can be copied from the sibling. Accepted with the collision itself on
+>   2026-10-08, and recorded here because the library-level framing understates it.
+> - **Migration successes are logged.** `migrated` and `merged` are logged at INFO
+>   and pruned artist directories at DEBUG, so a one-way migration leaves a record
+>   of what actually moved.
+> - **Acceptance criterion 6 is narrower than written.** "No empty artist directory
+>   is left in staging after a completed, refused, or failed album" holds for a
+>   completed or refused album, and for a failed one at the *next* run's
+>   `normalise_layout` — which is what the decisions section says, and what the
+>   download failure path does, since it removes only the album directory. Covered
+>   by `normalise_layout_prunes_an_empty_top_level_directory` and
+>   `a_refused_download_leaves_no_empty_artist_directory`.
+> - **A staging root inside a library root no longer truncates or deletes.** The
+>   nested layout makes a staged album's path equal its library destination when
+>   `storage.staging_dir` is inside a `library.paths` entry, which the flattened
+>   layout could not do. Three guards were added: `copy_into_library` and
+>   `resume_library_upgrade` skip a copy whose source and destination are the same
+>   file (a copy onto itself truncates), and `finish_library_write` and
+>   `resume_library_upgrade` refuse to remove a staging directory that lies inside
+>   a configured library root. The README still requires `staging_dir` to be kept
+>   outside every `library.paths` entry; no configuration validation was added,
+>   which remains out of scope.
+> - **Findings rebutted rather than fixed.** (a) An album whose own name is a disc
+>   designator (`CD 01`) with a peer disc folder of the same name stays resolved as
+>   the album root, as it was before this change; the alternative adds a spurious
+>   level to every flat file of such an album, and the case cannot be resolved
+>   without the album root path. (b) A top-level directory holding both files and
+>   subdirectories stays silent: that is the normal shape of an artist level once a
+>   stray file lands in it, and warning on every run would be noise. (c) The
+>   discover migration test does not depend on the network: the malformed ISNI is
+>   rejected by local check-character validation before any request, and the test
+>   asserts `SeakarrError::Config`. (d) The sanitised-name collision is accepted by
+>   the operator (2026-10-08) and its staging consequence is recorded above. (e)
+>   Empty album directories below an artist level and the absence of recovery in
+>   manual, discover and batch modes are pre-existing behaviours the spec keeps:
+>   the runner's post-write prune and upgrade mode's recovery own those cases, and
+>   `prepare` claims only that the layout is current, not that staging is empty.
+> - **A concurrent run can still be beaten to a rename.** `merge_without_overwrite`
+>   checks `target.exists()` and then renames, and `rename(2)` replaces an existing
+>   file, so a second process that creates the target inside that window loses it.
+>   The PID lock is what prevents two instances reaching `prepare` at once; this is
+>   recorded as an assumption, not guarded further.
+> - **Migration evidence must be audio.** An earlier revision treated any top-level
+>   file as evidence of a legacy album directory, so a stray sidecar (`.DS_Store`,
+>   `cover.jpg`, a `.part`) on an artist level whose albums were all named like disc
+>   folders was enough to rename that artist's whole tree into a fabricated album
+>   directory, which recovery then deleted. `looks_like_a_legacy_album` now requires
+>   a top-level file that parses as audio (or a directory holding nothing at all).
+>   A mixed legacy tree (top-level audio plus a disc folder) still migrates, so the
+>   recursion requirement stands.
+> - **Recovery deletes only download residue.** The layout makes every child of an
+>   artist level look like an album, so a directory the operator put there has no
+>   row and was deleted as untracked debris. The cleanup arm now removes a
+>   directory only when it holds audio or a partial file; anything else is left
+>   with a warning. The stale-`.part` interleaving hazard that made cleanup
+>   necessary is still covered, because partial files are residue.
+> - **The same-path guards test real equality, canonically.**
+>   `is_the_same_dir`/`is_the_same_file` compare canonical paths, so a symlinked or
+>   `.`-containing spelling of the same directory still matches; and the guard fires
+>   on the album staging path *equalling* the write destination, not on containment,
+>   so a staging root merely nested inside a library root still has its copy removed
+>   instead of leaving a duplicate of every placed album.
+> - **Recovery skips anything inside a library root.** When the staging root sits
+>   inside a library path, the scan sees the library's own artist and album folders;
+>   recovery now skips an entry that lies inside the library root rather than
+>   deleting library albums that have no `processed_albums` row.
+> - **The crash-recovery walk applies the album-root rule.** A subdirectory whose
+>   sanitised name equals the album component (an album whose own title is a disc
+>   designator) is flattened into the album folder, so a recovered album lands where
+>   the forward write would have put it.
+> - **A symlink at a merge destination is a collision, not a directory.** Renaming
+>   would replace the link and recursing would follow it into an unrelated tree, so
+>   the entry is skipped and reported like any other collision.
+> - **Rebuttal: `..` and absolute names cannot reach the migration.**
+>   `sanitize_component("..")` trims the trailing dots to nothing and returns the
+>   `_` placeholder, so no directory the layout creates is named `..` or absolute;
+>   a top-level entry is a real directory name, not a path expression.
+> - **An album is refused before download when its staging path is inside a library
+>   root.** The nested layout makes that path the album's library folder, so the
+>   download would write into the library and every cleanup path (cancel, failed
+>   candidate, refusal, prune) would delete library content. `process_album_internal`
+>   now returns `Failed` with a configuration reason before a byte moves, which
+>   closes the download-side deletion the earlier guards could not reach.
+> - **The migration never touches a configured library root.** `prepare` now takes
+>   the library paths and `normalise_layout_protecting` leaves any entry that is
+>   inside one untouched (reported in `MigrationReport::protected`), and refuses to
+>   rename a legacy directory *into* one. Without this, a staging root that is the
+>   parent of a library root deleted the empty root at startup and could rename a
+>   legacy directory into the library.
+> - **Legacy evidence must be audio, and an empty separator-named directory is
+>   removed.** A `--` directory holding only sidecars is left in place (reported as
+>   ambiguous), because it could be an artist level with a stray cover; an empty one
+>   is removed rather than renamed into an empty nested pair that no later pass would
+>   prune. A legacy name whose album half still carries the separator is ambiguous
+>   too, since the next pass would re-parse the directory it created.
+> - **Recovery removes residue, not content.** The cleanup arm deletes only audio
+>   and `.part`/`.tmp` files and drops the album directory only if that emptied it,
+>   so an operator's `cover.jpg` survives; and recovery skips every entry inside any
+>   configured library root (canonically, not just `paths[0]`), returning early when
+>   the staging root is itself a library root. A staging root nested inside a library
+>   root therefore disables recovery rather than risking library albums — the safer of
+>   the two failures, and it is warned about.
+> - **The same-directory test is shared.** `organizer::is_the_same_dir` is used by the
+>   runner's write guard too, so the two cannot drift on what "the same place" means.
+> - **Path guards resolve a path that does not exist yet.** `fs::canonicalize`
+>   requires every component to exist, so the earlier guards silently did nothing for
+>   an album folder a run was about to create. `canonicalize_lenient` resolves through
+>   the deepest existing ancestor, and the download refusal now tests *equality* with
+>   the album's library destination rather than containment — so it fires for a new
+>   album, and a staging root merely nested inside a library root keeps working.
+> - **The prune helper is shared too** (`organizer::prune_artist_level`), and a
+>   directory that *is* a configured library root is skipped silently, because a
+>   library root directly under the staging root is a supported configuration that
+>   does not warrant a warning.
+> - **Residual limit: a separator-named artist level with disc-shaped albums and one
+>   top-level audio file.** Such a level can still be renamed into a fabricated album
+>   directory, because audio at the top level is the migration's evidence rule and a
+>   disc-named child is exactly what a legacy multi-disc album directory looks like.
+>   The trigger needs all three conditions at once (a sanitised artist name containing
+>   `--`, every album named like a disc folder, and an operator-placed audio file) and
+>   the loss is re-downloadable staging, not library content. Narrowing it further
+>   would stop genuine mixed legacy trees from migrating, which the design keeps.
+> - **Cost note:** the audio-evidence rule and the residue check open each candidate
+>   file with `lofty`, so a legacy directory holding many sidecars is probed entry by
+>   entry. Accepted: migration runs once per run and legacy directories are rare.
+
 ## Goal
 
 A completed download stages under `<staging_dir>/<artist>/<album>/`, for every mode, with
