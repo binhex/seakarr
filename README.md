@@ -1126,8 +1126,15 @@ The integration deliberately favors safe fallback over guessing:
   are not negatively cached.
 - The SQLite cache keeps one bounded row per normalized artist queried and has no automatic eviction. A later
   refresh replaces that artist's row atomically.
-- `Retry-After` accepts integer delay-seconds from 0 through 30. HTTP-date, malformed, or larger values are
-  treated as provider unavailability so an external response cannot cause an unbounded wait.
+- Retries are bounded by the response's own rate-limit headers. A 429 waits its integer `Retry-After`
+  (0-30 s), and an HTTP-date, malformed, or larger value on a 429 is treated as provider unavailability. A
+  5xx waits the pause it names: `Retry-After` (delta seconds, an HTTP-date, or a comma-merged list) or the
+  later `X-RateLimit-Reset` epoch second, measured against the response's own `Date` when it carries a
+  parseable one and the local clock otherwise. An unusable `Retry-After` field is named in the warning, and
+  the 1 s then 2 s backoff is used only when no hint is usable. A pause beyond 30 s is reported instead of sat
+  on (a reset more than a day away is treated as unusable); one request spends at most two capped pauses of
+  up to 30 s each (60 s), three per-attempt timeouts and one pacing slot per attempt. The warning also carries
+  the sanitised `X-RateLimit-Zone` and a bounded excerpt of the body.
 
 **Q: What happens when MusicBrainz cannot resolve an artist from my library?**
 

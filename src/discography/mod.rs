@@ -110,6 +110,19 @@ pub enum DiscographyError {
     Transport(String),
     #[error("MusicBrainz returned HTTP {0}")]
     HttpStatus(u16),
+    /// A 5xx from the provider, carrying what the response said about it.
+    ///
+    /// MusicBrainz answers 503 for a global overload, a per-IP rate limit and a
+    /// per-application throttle alike; `X-RateLimit-Zone` and the body are the
+    /// only things that tell them apart, and the operator cannot act on an
+    /// outage without them. `detail` is empty only when the response carried no
+    /// zone, no `Retry-After` field and no body text that survives sanitising;
+    /// the message is then
+    /// exactly `MusicBrainz returned HTTP 503`. An unusable `Retry-After` field
+    /// is quoted (up to eight fields) instead of being dropped, and a body that
+    /// could not be read is reported as `<body omitted>`.
+    #[error("MusicBrainz returned HTTP {status}{detail}")]
+    ProviderError { status: u16, detail: String },
     #[error("MusicBrainz returned an invalid Retry-After header")]
     InvalidRetryAfter,
     #[error("MusicBrainz response exceeded 4 MiB")]
@@ -666,8 +679,8 @@ impl DiscographyError {
 
 impl DiscoveryFailure {
     /// Only an artist-resolution failure is an artist problem; every other
-    /// provider error (transport, HTTP status, decode, pagination, or unusable
-    /// candidate data) is an outage problem.
+    /// provider error (transport, decode, pagination, a rate-limited 5xx, or
+    /// unusable candidate data) is an outage problem.
     ///
     /// An inconsistent search page counts as an artist problem even though it is
     /// not cacheable, because falling back for this run is the pre-existing
@@ -3669,6 +3682,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_rate_limited_5xx_is_a_provider_outage_not_an_artist_failure() {
+        // The catch-all arm is what makes the new variant an outage. Pinning it
+        // stops a later edit from moving it into the artist-problem arm, which
+        // would change the breaker; cacheability is protected separately by
+        // `is_stable_artist_resolution_failure`, which only accepts
+        // `ArtistUnresolved`.
+        let error = DiscographyError::ProviderError {
+            status: 503,
+            detail: String::new(),
+        };
+        assert_eq!(
+            DiscoveryFailure::from_error(&error),
+            DiscoveryFailure::Provider
+        );
+        assert!(!error.is_stable_artist_resolution_failure());
     }
 
     #[test]

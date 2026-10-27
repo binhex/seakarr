@@ -17,6 +17,7 @@
 ignore = [
     { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained. It is pulled in transitively by indicatif for the progress bar and no advisory describes a vulnerability in it." },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained and archived. It is pulled in transitively by lofty for audio tag parsing, seakarr calls no paste macro directly, and cargo-deny reports no safe upgrade path." },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained. It is a c2rust translation of libyaml reached through serde_yaml (itself deprecated), no advisory describes a vulnerability in it, and cargo-deny reports no safe upgrade path; replacing the YAML parser is a separate change." },
 ]
 
 [licenses]
