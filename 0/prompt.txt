@@ -1,0 +1,9 @@
+Run the QA Gate skill exactly as written, including its Upstream Workflow
+Barrier, language gates, auto-generated configs, and terminal QA_GATE_STATUS
+marker. Do not substitute a workflow of your own.
+
+Every applicable gate must pass: do NOT skip any gate, do NOT declare "all
+clean" if a check was skipped or failed, and if a gate fails, report it and
+stop. Do NOT dispatch subagents; run checks directly.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
