@@ -1,0 +1,7 @@
+Follow the Systematic Debugging process Phase 1: Root Cause Investigation. Read error messages, reproduce the issue, check recent changes, trace data flow. Identify what is broken and why. Report all findings clearly.
+
+This step is investigation ONLY. Do NOT fix any code, do NOT edit files, do NOT dispatch any subagents. The chain will handle the fix in subsequent steps.
+
+**If your investigation uncovers a question the user needs to answer** (e.g. architectural choice, which approach to take, approval needed before proceeding): use `ask_user_question` to present the decision with clear options. Do NOT write the question in prose and hope the chain stops — the chain will not wait. Use the tool.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
