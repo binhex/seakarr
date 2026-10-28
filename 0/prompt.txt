@@ -1,0 +1,7 @@
+Follow the Create Spec skill. Explore project context by checking files, docs, and recent commits. Ask questions one at a time to refine the idea. Once the design is clear, present it formally and get user approval.
+
+**Use `ask_user_question` to present each question** — one at a time. Do NOT dump all questions in prose. Each question must use the tool so the chain waits for the user's answer.
+
+Do NOT write any code, scaffold any project, or take any implementation action until the design is approved. This step is design only.
+
+Context: at present when downloads are storing in the staging folder they are saved in a created folder with the format <artist>--<album> i want to change this so that the artist and album folder are create, so you end up with <path to staging folder>/<artist>/<album>/<tracks> as opposed to what it currently is which is <path to staging folder>/<artist>--<album>/<tracks>
