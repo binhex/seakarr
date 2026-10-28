@@ -1,0 +1,5 @@
+Apply the Sub-Agents skill. Step 1: Assess work size from the files and tasks. Step 2: Split work into independent chunks — each file belongs to exactly one chunk, coupled files stay together. Step 3: Dispatch sub-agents in parallel using the model appropriate for the work size. Step 4: Collect results, re-dispatch any failed sub-agents, verify file changes, check for conflicts. Report which files were changed by which sub-agent.
+
+Do NOT dispatch review sub-agents — handle implementation only. The chain will handle review, verification, and finalising in subsequent steps.
+
+Context: 
