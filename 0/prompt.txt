@@ -1,0 +1,7 @@
+Check if project context was already loaded by a previous chain step. If yes, report "Context already loaded." and stop. If not, gather context from session history, git log, and README. Synthesise findings into 5-8 bullet points.
+
+This step is ONLY information gathering. Do NOT read any target files, do NOT debug any issues, do NOT propose changes, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
