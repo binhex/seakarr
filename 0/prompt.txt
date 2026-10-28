@@ -1,0 +1,5 @@
+Detect the harness platform using the tables above. Set model variables (REVIEWER_A_MODEL, REVIEWER_B_MODEL, FAST_MODEL, IMPLEMENTER_MODEL) and agent variables (IMPLEMENTER_AGENT, REVIEWER_AGENT). Report which harness is active and the configured values.
+
+This step is ONLY harness detection and setup. Do NOT read any files, do NOT fix any code, do NOT debug any issues, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
