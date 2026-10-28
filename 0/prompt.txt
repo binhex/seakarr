@@ -1,0 +1,15 @@
+Apply the TDD skill exactly as written, including the Iron Law, the
+red-green-refactor cycle, and the RED verification steps. Do not substitute a
+workflow of your own.
+
+Do NOT skip the RED phase, and do NOT write production code before the failing
+test. Report the tests written and their results. This step handles
+implementation and testing only; do NOT dispatch subagents for review or
+verification.
+
+**If you need a user decision** (e.g. architectural choice before implementing,
+which test approach to take): use `ask_user_question` to present it. Do NOT
+write the question in prose and expect the chain to wait; the chain will not
+stop.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
