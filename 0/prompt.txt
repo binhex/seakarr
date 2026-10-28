@@ -1,0 +1,9 @@
+Follow the Systematic Debugging process Phase 1: Root Cause Investigation. Read error messages, reproduce the issue, check recent changes, trace data flow. Identify what is broken and why. Report all findings clearly.
+
+This step is investigation ONLY. Do NOT fix any code, do NOT edit files, do NOT dispatch any subagents. The chain will handle the fix in subsequent steps.
+
+**If your investigation uncovers a question the user needs to answer** (e.g. architectural choice, which approach to take, approval needed before proceeding): use `ask_user_question` to present the decision with clear options. Do NOT write the question in prose and hope the chain stops — the chain will not wait. Use the tool.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
