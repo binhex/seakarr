@@ -1,0 +1,7 @@
+Detect the harness platform using the tables above. Set model variables (REVIEWER_A_MODEL, REVIEWER_B_MODEL, FAST_MODEL, IMPLEMENTER_MODEL) and agent variables (IMPLEMENTER_AGENT, REVIEWER_AGENT). Report which harness is active and the configured values.
+
+This step is ONLY harness detection and setup. Do NOT read any files, do NOT fix any code, do NOT debug any issues, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
