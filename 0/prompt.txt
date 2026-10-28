@@ -1,0 +1,5 @@
+Check if project context was already loaded by a previous chain step. If yes, report "Context already loaded." and stop. If not, gather context from session history, git log, and README. Synthesise findings into 5-8 bullet points.
+
+This step is ONLY information gathering. Do NOT read any target files, do NOT debug any issues, do NOT propose changes, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: rename --mode auto to --mode upgrade as auto does not tell you what that mode really does!.
