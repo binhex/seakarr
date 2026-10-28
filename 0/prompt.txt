@@ -1,0 +1,12 @@
+Run the Adversarial Code Review skill exactly as written, including its
+max-round calculation, exemption/skip path, reviewer dispatch and completion
+barrier, and terminal REVIEW_GATE_STATUS marker. Do not substitute a workflow
+of your own.
+
+Do NOT stop the review loop early or reduce rounds below what the skill
+calculates. After all issues are fixed and the terminal marker is emitted,
+stop. The chain handles verification and finalising in subsequent steps.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
