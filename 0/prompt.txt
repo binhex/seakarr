@@ -1,0 +1,12 @@
+Follow the Create Spec skill. Explore project context by checking files, docs, and recent commits. Ask questions one at a time to refine the idea. Once the design is clear, present it formally and get user approval.
+
+**Use `ask_user_question` to present each question** — one at a time. Do NOT dump all questions in prose. Each question must use the tool so the chain waits for the user's answer.
+
+Do NOT write any code, scaffold any project, or take any implementation action until the design is approved. This step is design only.
+
+Context: when in discover mode and musicbrainz fails to identify the correct artist based on name alone would it be possible to enhance the --artist so that we can specify an exact musicbrainz related metadata identifier so that we can then pick up the albums based off that exact identifier, for exampler we could use one or both of the following to identify the artist Grafix:-
+IPI code:
+00581977202
+ISNI code:
+0000 0004 6659 7022
+so if we could specify --artist <name> or <ipi code> or <isni code> then if name fails then we can use either of the codces to get the exact artist and therefore the exact albums, clear on this?.
