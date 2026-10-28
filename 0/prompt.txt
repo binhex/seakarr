@@ -1,0 +1,17 @@
+Apply the TDD skill exactly as written, including the Iron Law, the
+red-green-refactor cycle, and the RED verification steps. Do not substitute a
+workflow of your own.
+
+Do NOT skip the RED phase, and do NOT write production code before the failing
+test. Report the tests written and their results. This step handles
+implementation and testing only; do NOT dispatch subagents for review or
+verification.
+
+**If you need a user decision** (e.g. architectural choice before implementing,
+which test approach to take): use `ask_user_question` to present it. Do NOT
+write the question in prose and expect the chain to wait; the chain will not
+stop.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
