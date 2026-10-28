@@ -1,0 +1,15 @@
+Apply the TDD skill exactly as written, including the Iron Law, the
+red-green-refactor cycle, and the RED verification steps. Do not substitute a
+workflow of your own.
+
+Do NOT skip the RED phase, and do NOT write production code before the failing
+test. Report the tests written and their results. This step handles
+implementation and testing only; do NOT dispatch subagents for review or
+verification.
+
+**If you need a user decision** (e.g. architectural choice before implementing,
+which test approach to take): use `ask_user_question` to present it. Do NOT
+write the question in prose and expect the chain to wait; the chain will not
+stop.
+
+Context: at present the script exits if an artist doesnt exist when in discover mode, however it still fails incorrectly when a artist folder is created with no albums present, this is incorrect, i assume the bug is that the folder is not taken as a artist name because there are no sub folders underneath, so the artist name is taken incorrectly as the album name and thus skipped, here is the command line:- root@Tower: /mnt/cache-downloads/appdata/data/qbittorrent/completed/release: # ./seakarr --listen-port 2234 --artist shy fx --mode discover --library-path /mnt/user/Music/Paul/Albums/Dance/Drum\ And\ Bass/ 2026-10-05T10:37:00.997828Z INFO seakarr: Connecting to Soulseek server server.slsknet.org:2242... [2026-10-05 10:37:00.998] [INFO] Logging in as test-slsk [2026-10-05 10:37:00.998] [INFO] [listener] listening on Ok(0.0.0.0:2234) [2026-10-05 10:37:01.293] [INFO] Login successful 2026-10-05T10:37:01.393496Z INFO seakarr::client: [listener] enabled on port 2234 2026-10-05T10:37:01.393575Z INFO seakarr: Connected to Soulseek. 2026-10-05T10:37:02.765260Z INFO seakarr::scanner: Library scan complete: 2114 audio file(s), 196 album(s), 0 unreadable file(s) in 1.4s seakarr: configuration error: artist shy fx was not found in the library; discover mode can only narrow to artists already present r library for this container is different to the command line (thats run on bare metal not containerr), so the path for you to investigate is library exists at /media/Music/Paul/Albums/Dance/Drum And Bass/ i do not know how this problem can be easily resolved, so we will need to come up with a way of identifying artist folders that may not contain albums.
