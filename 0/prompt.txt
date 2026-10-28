@@ -1,0 +1,5 @@
+Check if project context was already loaded by a previous chain step. If yes, report "Context already loaded." and stop. If not, gather context from session history, git log, and README. Synthesise findings into 5-8 bullet points.
+
+This step is ONLY information gathering. Do NOT read any target files, do NOT debug any issues, do NOT propose changes, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: at present when downloads are storing in the staging folder they are saved in a created folder with the format <artist>--<album> i want to change this so that the artist and album folder are create, so you end up with <path to staging folder>/<artist>/<album>/<tracks> as opposed to what it currently is which is <path to staging folder>/<artist>--<album>/<tracks>
