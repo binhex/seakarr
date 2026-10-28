@@ -1,0 +1,11 @@
+Run the QA Gate skill exactly as written, including its Upstream Workflow
+Barrier, language gates, auto-generated configs, and terminal QA_GATE_STATUS
+marker. Do not substitute a workflow of your own.
+
+Every applicable gate must pass: do NOT skip any gate, do NOT declare "all
+clean" if a check was skipped or failed, and if a gate fails, report it and
+stop. Do NOT dispatch subagents; run checks directly.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
