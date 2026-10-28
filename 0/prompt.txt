@@ -1,0 +1,9 @@
+Run the QA Gate skill exactly as written, including its Upstream Workflow
+Barrier, language gates, auto-generated configs, and terminal QA_GATE_STATUS
+marker. Do not substitute a workflow of your own.
+
+Every applicable gate must pass: do NOT skip any gate, do NOT declare "all
+clean" if a check was skipped or failed, and if a gate fails, report it and
+stop. Do NOT dispatch subagents; run checks directly.
+
+Context: 
