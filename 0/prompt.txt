@@ -1,0 +1,10 @@
+Run the Adversarial Code Review skill exactly as written, including its
+max-round calculation, exemption/skip path, reviewer dispatch and completion
+barrier, and terminal REVIEW_GATE_STATUS marker. Do not substitute a workflow
+of your own.
+
+Do NOT stop the review loop early or reduce rounds below what the skill
+calculates. After all issues are fixed and the terminal marker is emitted,
+stop. The chain handles verification and finalising in subsequent steps.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
