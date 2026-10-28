@@ -1,0 +1,5 @@
+Follow the Verification skill. Verification commands run fresh. All tests pass. All spec requirements confirmed with evidence (not assertion).
+
+Do NOT claim "done" or "fixed" without fresh verification evidence.
+
+Context: 
