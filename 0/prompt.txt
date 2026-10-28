@@ -1,0 +1,7 @@
+Apply the Finishing a Development Branch skill exactly as written, including its Step 0 review and QA completion gates. Verify tests pass before presenting options. Detect the environment (worktree vs normal repo) and the harness commit mode.
+
+Present the integration options the skill generates for the detected commit mode and branch — do not substitute a fixed menu. Wait for the user's choice, execute it, then show a summary of the changes (diff stat + log). Clean up only if applicable.
+
+Do NOT skip the test verification step. Do NOT dispatch subagents for any remaining work.
+
+Context: 
