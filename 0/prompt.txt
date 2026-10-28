@@ -1,0 +1,5 @@
+Check if project context was already loaded by a previous chain step. If yes, report "Context already loaded." and stop. If not, gather context from session history, git log, and README. Synthesise findings into 5-8 bullet points.
+
+This step is ONLY information gathering. Do NOT read any target files, do NOT debug any issues, do NOT propose changes, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
