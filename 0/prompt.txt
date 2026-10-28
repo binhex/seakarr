@@ -1,0 +1,5 @@
+Follow the Verification skill. Verification commands run fresh. All tests pass. All spec requirements confirmed with evidence (not assertion).
+
+Do NOT claim "done" or "fixed" without fresh verification evidence.
+
+Context: at present when performing a discover search mode for a specific artist seakarr will firstly scan your library and then it will identify the albums for the artist using musicbrainz, this is not the right order, as it means that you have to wait for the scan to complete before you can get a verificiation that the artist exists in musicbrainz, and if it doesnt then you have just wasted time waitinf for the scan to complete.
