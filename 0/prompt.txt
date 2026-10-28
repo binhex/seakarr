@@ -1,0 +1,11 @@
+Apply the Tech Debt Remediation skill exactly as written, including its Upstream
+Workflow Barrier, Step 0 routing, and the announcements it requires. Do not
+substitute a workflow of your own.
+
+Do NOT scope down without user approval. If you need to negotiate scope or ask a
+question, use `ask_user_question` — the chain will wait for the answer. Do NOT
+write the question in prose and trust the chain to stop.
+
+Context: i see the bug, the apostrophes are different and thus seakarr seems them as two different albums!, this needs to be normalised to fix this duplicaiton:-
+2026-09-22T18:43:26.273497Z  INFO seakarr::report:   The Beatles — Sgt. Pepper’s Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Pepper’s Lonely Hearts Club Band
+2026-09-22T18:43:26.273503Z  INFO seakarr::report:   The Beatles — Sgt. Peppers Lonely Hearts Club Band (13 tracks) -> /mnt/user/Music/Paul/Albums/Rock/Rock And Roll/The Beatles/Sgt. Peppers Lonely Hearts Club Band
