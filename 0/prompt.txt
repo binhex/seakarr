@@ -1,0 +1,5 @@
+Follow the Writing Plans skill. Check scope — if the spec covers multiple independent subsystems, suggest splitting into separate plans. Map which files will be created or modified. Decompose into bite-sized tasks with clear file paths, code snippets, test guidance, and documentation needs. Save the plan to docs/plans/.
+
+Do NOT implement any code. This step is planning only. The chain will handle implementation in subsequent steps.
+
+Context: 
