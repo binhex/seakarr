@@ -1,0 +1,23 @@
+Detect the harness platform using the tables above. Set model variables (REVIEWER_A_MODEL, REVIEWER_B_MODEL, FAST_MODEL, IMPLEMENTER_MODEL) and agent variables (IMPLEMENTER_AGENT, REVIEWER_AGENT). Report which harness is active and the configured values.
+
+This step is ONLY harness detection and setup. Do NOT read any files, do NOT fix any code, do NOT debug any issues, do NOT dispatch any subagents. The chain will handle all subsequent steps automatically.
+
+Context: add in ability to pick up new aritsts and <type wanted> e.g. studio albums based on record label name, for instance i want to pick up all new albums for record label Hospital Records, this mode would be part of discover mode and should use musicbrainz to identify the <type wanted> e.g. studio albums. this wil need a new cli option to allow you to specify the label name, ask me all questions
+
+---
+
+Check if project context was already loaded by a previous chain step. If yes, report "Context already loaded." and stop. If not, gather context from session history, git log, README, and the agent design docs (newest spec and plan; every review ledger). Synthesise findings into 5-8 bullet points.
+
+This step is ONLY information gathering. Do NOT read files you would change, do NOT debug any issues, do NOT propose changes, do NOT dispatch any subagents. The skill's bounded read of the latest design docs is context gathering and is allowed. The chain will handle all subsequent steps automatically.
+
+Context: add in ability to pick up new aritsts and <type wanted> e.g. studio albums based on record label name, for instance i want to pick up all new albums for record label Hospital Records, this mode would be part of discover mode and should use musicbrainz to identify the <type wanted> e.g. studio albums. this wil need a new cli option to allow you to specify the label name, ask me all questions
+
+---
+
+Follow the Create Spec skill. Explore project context by checking files, docs, and recent commits. Ask questions one at a time to refine the idea. Once the design is clear, present it formally and get user approval.
+
+**Use `ask_user_question` to present each question** — one at a time. Do NOT dump all questions in prose. Each question must use the tool so the chain waits for the user's answer.
+
+Do NOT write any code, scaffold any project, or take any implementation action until the design is approved. This step is design only.
+
+Context: add in ability to pick up new aritsts and <type wanted> e.g. studio albums based on record label name, for instance i want to pick up all new albums for record label Hospital Records, this mode would be part of discover mode and should use musicbrainz to identify the <type wanted> e.g. studio albums. this wil need a new cli option to allow you to specify the label name, ask me all questions
