@@ -267,11 +267,12 @@ Wire types:
   response carries them, otherwise honest `Option`s.
 - `ReleasePage { count, offset, releases: Vec<ReleaseWire> }` renamed from
   `release-count` / `release-offset`.
-- `ReleaseWire { id, title, date, status, release_group: Option<ReleaseGroupWire>, artist_credit: Vec<ArtistCreditWire> }`,
-  where `ArtistCreditWire { name, joinphrase }` is flattened into the credit string by
-  the same `credit_name()` helper the artist path uses for candidate names, so
-  `Nu:Tone feat. Stamina MC` is produced by concatenation of names and joinphrases
-  rather than by guesswork.
+- `ReleaseWire { id, title, date, status, release_group, artist_credit }`, where the
+  release group is `Option<ReleaseGroupWire>` and the credit is
+  `Vec<ArtistCreditWire>`, plus `ArtistCreditWire { name, joinphrase }` flattened into
+  the credit string by the same `credit_name()` helper the artist path uses for
+  candidate names, so `Nu:Tone feat. Stamina MC` is produced by concatenating names and
+  joinphrases rather than by guesswork.
 
 `LabelRelease`, the unit both the provider and the selector use:
 
@@ -399,8 +400,9 @@ makes a budget-limited sweep converge instead of oscillating.
 
 ## Download and placement
 
-- Every target is processed as `process_album(client, artist, Some(&album), ignore_processed, ..., Some(LibraryTarget::StagingOnly))`.
-  The album lands at `<storage.staging_dir>/<artist>/<album>/` via the nested staging
+- Every target is processed with
+  `process_album(client, artist, Some(&album), ignore_processed, ..., target)` where
+  `target` is `Some(LibraryTarget::StagingOnly)`. The album lands at `<storage.staging_dir>/<artist>/<album>/` via the nested staging
   layout, and nothing is written under `library.paths`.
 - `discover.max_cycle_downloads` bounds the run; the loop stops at the same points as
   the artist sweep (budget exhausted, cancellation), recording the artist it stopped on.
