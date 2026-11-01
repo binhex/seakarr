@@ -402,8 +402,9 @@ makes a budget-limited sweep converge instead of oscillating.
 
 - Every target is processed with
   `process_album(client, artist, Some(&album), ignore_processed, ..., target)` where
-  `target` is `Some(LibraryTarget::StagingOnly)`. The album lands at `<storage.staging_dir>/<artist>/<album>/` via the nested staging
-  layout, and nothing is written under `library.paths`.
+  `target` is `Some(LibraryTarget::StagingOnly)`. The album lands at
+  `<storage.staging_dir>/<artist>/<album>/` via the nested staging layout, and nothing
+  is written under `library.paths`.
 - `discover.max_cycle_downloads` bounds the run; the loop stops at the same points as
   the artist sweep (budget exhausted, cancellation), recording the artist it stopped on.
 - `discover.ignore_processed` and `--ignore-processed` behave as they do for an
