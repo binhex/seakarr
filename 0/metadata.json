@@ -1,0 +1,42 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M6DT8304GQ0H5BV2KQT1Y1BS",
+  "session_id": "01a198d0-7dec-7383-a777-24ecdc4f11d0",
+  "strategy": "manual-commit",
+  "created_at": "2026-11-02T09:43:03.077699235Z",
+  "branch": "main",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "docs/agent/plans/2026-11-01-label-based-discovery.md"
+  ],
+  "agent": "Pi",
+  "model": "deepseek-v4.1-flash",
+  "turn_id": "1f85ce9b3367",
+  "checkpoint_transcript_start": 166,
+  "transcript_lines_at_start": 166,
+  "compact_transcript_start": 67,
+  "token_usage": {
+    "input_tokens": 331434,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 8957824,
+    "output_tokens": 78579,
+    "api_call_count": 48
+  },
+  "redaction": {
+    "replacements": 26,
+    "layers": {
+      "betterleaks": 26,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  },
+  "session_metrics": {
+    "turn_count": 5
+  }
+}
