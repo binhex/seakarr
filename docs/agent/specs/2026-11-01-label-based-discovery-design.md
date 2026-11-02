@@ -169,7 +169,8 @@ library, and the operator moves albums deliberately.
 The label catalogue is cached in `discography_cache` under a namespaced key with the
 same `discography.cache_days` (30) lifetime and the same stale-on-refresh-failure
 behaviour as an artist discography. No schema change: `artist_key` is a
-`TEXT PRIMARY KEY COLLATE NOCASE`, so `label:<normalised name>` is a key, and the
+`TEXT PRIMARY KEY COLLATE NOCASE`, so `label:name:<normalised name>` (or
+`label:id:<uuid>`) is a key, and the
 label path is the only reader of that prefix.
 
 Accepted consequence: a brand-new release can take up to 30 days to appear in a sweep.
@@ -322,10 +323,10 @@ GET /ws/2/release
 
 | `discography_cache` column | Value for a label row |
 | --- | --- |
-| `artist_key` | `label:<pin_key(label)>` |
+| `artist_key` | `label:name:<pin_key(label)>` (or `label:id:<uuid>` for an ID input) |
 | `artist_mbid` | the resolved label MBID |
 | `canonical_artist` | the resolved label name |
-| `release_groups_json` | `LabelCacheEntry { version, label_name, releases: Vec<LabelRelease> }` |
+| `release_groups_json` | `LabelCacheEntry { version, releases: Vec<LabelRelease>, incomplete }` (see the correction below) |
 | `fetched_at` | unchanged |
 
 Read path: a fresh row is served as `DiscoveryProvenance::FreshCache`; a stale row is
@@ -417,13 +418,14 @@ makes a budget-limited sweep converge instead of oscillating.
 
 | Situation | Behaviour | Reported as |
 | --- | --- | --- |
-| Malformed UUID shape in `--label` or `label_mbids` | refuse before any request | configuration error naming the flag |
+| Malformed UUID shape in `--label` | refuse before any request | configuration error naming the flag |
+| A UUID-shaped key in `label_mbids` | accepted - only empty/duplicate keys and invalid values are refused. A *valid* UUID key still matches an ID-form `--label`, which is how a label literally named like a UUID is rescued; a near-miss UUID key can never match | documented in the README, not an error |
 | Label name resolves to no exact match, or ambiguous candidates | skip that label, continue with the remaining labels | `unresolved` list plus a `discography_failures` row |
 | Label search response internally inconsistent | skip that label, do not cache the failure | `unresolved` list, uncached |
 | Transport, 5xx, decode, oversized body, pagination guard | skip that label | `provider_failed`, counted by the circuit breaker |
 | Catalogue exceeds `MAX_LABEL_RELEASES` | skip that label, do not cache a partial catalogue | `provider_failed` with the limit named |
-| Three consecutive provider failures | abort the run through the existing `abort_discover_run` | `SeakarrError::MusicBrainz`, as today |
-| Library scan fails | warn, continue with an empty index, so every target is treated as missing | warning plus the existing notices |
+| Three consecutive provider failures | abort the run through a parallel `abort_label_run`, because the run summary (`finish_label_run`) differs from the artist sweep's | `SeakarrError::MusicBrainz`, as today |
+| Library scan fails | abort the run, exactly as the artist sweep does; an empty index would treat every catalogue album as missing and stage duplicates | error, after the run summary |
 | Library scan cancelled | stop before any download | cancelled notice, as today |
 | No label resolves at all | finish the run with an explanatory notice | notice, exit success |
 
@@ -431,24 +433,57 @@ An unresolved label never counts towards the circuit breaker, and a provider fai
 never writes a failure-cache row: the two failure classes stay separate, exactly as
 `DiscoveryFailure` already separates them for artists.
 
+> **Corrected during review (2026-11-02).** Two rows above no longer describe the
+> shipped code, and one limit was not recorded:
+>
+> - **The cache payload carries no `label_name`.** The resolved name and ID live in
+>   the row's own `canonical_artist` and `artist_mbid` columns, so duplicating the
+>   name inside the JSON was dead data and was removed. The payload is
+>   `LabelCacheEntry { version, releases, incomplete }`.
+> - **A library scan failure aborts the run** rather than continuing with an empty
+>   index. Continuing would make every catalogue album look missing and stage
+>   duplicates of albums the library already holds; the artist sweep propagates the
+>   same error. Cancellation during the scan still ends the run cleanly with its
+>   summary.
+> - **A collaboration is matched under its full credit**, so an album the library
+>   files under the lead artist alone is staged again as a second copy. That follows
+>   directly from using the full credit string as the searchable artist, and it is
+>   recorded here rather than fixed by guessing which part of a credit is the lead.
+> - **Cancellation is polled between labels, not during a label's paging**, because
+>   `discover_label_releases` takes no cancellation flag. That matches the artist
+>   sweep's per-artist granularity. The cancellation flag is now passed into the label
+>   core, so the poll is testable; a cancelled run also emits a `label: cancelled by
+>   user` notice, which the "cancelled notice" row above promises.
+> - **The end-to-end test is a placement test.** `tests/pipeline_test.rs` drives
+>   `process_album` with `LibraryTarget::StagingOnly`, not `--mode discover --label`,
+>   because a real label sweep needs network MusicBrainz. It is named for what it
+>   proves; the runner itself is covered by the `runner::tests` label block.
+
 ## Observability
 
 `LabelCounters` and `label_notices()` mirror `DiscoverCounters`/`discover_notices`,
-in this order:
+in this exact order, which is the order the code emits:
 
-1. Labels resolved, with the resolved names and MBIDs.
-2. Labels unresolved, listed; pin advice when more than one is unresolved.
-3. Labels whose provider request failed, with reasons.
-4. Releases examined, how many were dropped as not of the wanted type, and how many
-   were dropped as incomplete (no release group or no artist credit).
-5. Releases dropped by `--since`, and releases dropped as undated under `--since`.
-6. Releases dropped because their artist credit is excluded.
-7. Albums already present in the library.
-8. Albums eligible this run.
-9. Albums downloaded and staged; albums failed, with reasons.
-10. The budget stop point, when the budget ended the run.
-11. A closing line stating that staged albums were not written to the library, naming
-    `storage.staging_dir`, so the placement rule is never a surprise.
+1. Labels resolved, with the resolved names and MBIDs (truncated past ten).
+2. How many labels were examined of how many were requested. Emitted even when
+   nothing was examined, so a cancelled run is never silent.
+3. A cancellation line when the operator interrupted the run - before a label,
+   before an album, or during a download. The wording is phase-neutral.
+4. Labels unresolved, listed (truncated past ten), followed by pin advice when more
+   than one is unresolved.
+5. Labels skipped from a recorded resolution failure, followed by the line naming both
+   ways out: pin the name, or wait for `discography.failure_cache_days`.
+6. Labels whose provider request failed, with reasons.
+7. Releases examined, and how many were not of the wanted type.
+8. Releases the payload could not describe.
+9. Releases excluded by `--since`, and how many of those were undated.
+10. Releases skipped for an excluded artist credit.
+11. Albums already present in the library.
+12. Albums eligible this run - only for a run that reached the selection.
+13. Albums staged and failed - only for a run that reached the selection.
+14. The budget stop point, when the budget ended the run.
+15. A closing line stating that staged albums were not written to the library, naming
+    `storage.staging_dir`. Emitted only when something was staged.
 
 No counter claims staging unless the outcome was
 `AlbumOutcome::Downloaded { destination: DownloadDestination::Staging(_) }`, matching

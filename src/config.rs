@@ -249,6 +249,12 @@ pub struct DiscographyConfig {
     pub allowed_types: Vec<DiscographyReleaseType>,
     #[serde(default)]
     pub artist_mbids: BTreeMap<String, String>,
+    /// Pinned label name to MusicBrainz label ID. A pin wins over the input's own
+    /// shape and over search, so an ambiguous label name resolves deterministically
+    /// and a label literally named like a UUID is still pinned by name rather than
+    /// looked up as an ID.
+    #[serde(default)]
+    pub label_mbids: BTreeMap<String, String>,
 }
 
 fn default_discography_cache_days() -> u64 {
@@ -271,6 +277,7 @@ impl Default for DiscographyConfig {
             failure_cache_days: default_discography_failure_cache_days(),
             allowed_types: default_discography_release_types(),
             artist_mbids: BTreeMap::new(),
+            label_mbids: BTreeMap::new(),
         }
     }
 }
@@ -324,9 +331,41 @@ pub struct CliOverrides {
     pub batch_file: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// `--label` values as given, for a discover label sweep. Runtime only: not
+    /// merged into `Config`, because a label run is a per-invocation choice.
+    pub label: Option<Vec<String>>,
+    /// `--release-type` values as given. Runtime only, like `label`.
+    pub release_type: Option<Vec<String>>,
+    /// `--since` as given. Runtime only, like `label`.
+    pub since: Option<String>,
     pub schedule: bool,
     /// Runtime-only: bypass the processed-album success check for this run.
     pub ignore_processed: bool,
+}
+
+// ── Shared validators ──
+
+/// Validate one `discography.*_mbids` pin map.
+///
+/// `noun` names the pinned entity in the message (`artist`, `label`) and `field`
+/// is the configuration key, so the two maps share one rule rather than two
+/// copies that could drift apart.
+fn validate_mbid_pins(pins: &BTreeMap<String, String>, noun: &str, field: &str) -> Result<()> {
+    let mut normalized = HashSet::new();
+    for (name, mbid) in pins {
+        let key = crate::discography::identifier::pin_key(name);
+        if key.is_empty() || !normalized.insert(key) {
+            return Err(SeakarrError::Config(format!(
+                "{field} contains an empty or duplicate normalized {noun} key: {name:?}"
+            )));
+        }
+        if !crate::discography::identifier::valid_mbid(mbid) {
+            return Err(SeakarrError::Config(format!(
+                "{field} contains an invalid MusicBrainz ID for {name:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ── Default value functions ──
@@ -792,6 +831,9 @@ impl Config {
         if cli.schedule {
             self.schedule.enabled = true;
         }
+        // `label`, `release_type` and `since` are deliberately not merged: they
+        // select this run's work list, exactly as `--artist` in discover mode
+        // does, and have no Config field of their own.
     }
 
     /// Shared concurrent bounds used by both `validate()` (real startup) and
@@ -866,20 +908,16 @@ impl Config {
                 "discography.failure_cache_days is too large".into(),
             ));
         }
-        let mut normalized = HashSet::new();
-        for (artist, mbid) in &self.discography.artist_mbids {
-            let key = crate::discography::identifier::pin_key(artist);
-            if key.is_empty() || !normalized.insert(key) {
-                return Err(SeakarrError::Config(format!(
-                    "discography.artist_mbids contains an empty or duplicate normalized artist key: {artist:?}"
-                )));
-            }
-            if !crate::discography::identifier::valid_mbid(mbid) {
-                return Err(SeakarrError::Config(format!(
-                    "discography.artist_mbids contains an invalid MusicBrainz ID for {artist:?}"
-                )));
-            }
-        }
+        validate_mbid_pins(
+            &self.discography.artist_mbids,
+            "artist",
+            "discography.artist_mbids",
+        )?;
+        validate_mbid_pins(
+            &self.discography.label_mbids,
+            "label",
+            "discography.label_mbids",
+        )?;
         Ok(())
     }
 
@@ -2173,6 +2211,9 @@ library_upgrade:
             batch_file: None,
             artist: Some("Michael Bolton".into()),
             album: Some("The Essential Michael Bolton".into()),
+            label: None,
+            release_type: None,
+            since: None,
             schedule: true,
             ignore_processed: false,
         });
@@ -2928,6 +2969,93 @@ search:
         let error = config.validate_non_credential_constraints().unwrap_err();
         assert!(
             error.to_string().contains("invalid MusicBrainz ID"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn label_mbids_defaults_to_empty() {
+        let config = Config::default();
+        assert!(config.discography.label_mbids.is_empty());
+    }
+
+    #[test]
+    fn label_mbids_accepts_a_valid_pin() {
+        let mut config = Config::default();
+        config.discography.label_mbids.insert(
+            "Hospital Records".into(),
+            "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+        );
+        assert!(config.validate_non_credential_constraints().is_ok());
+    }
+
+    #[test]
+    fn label_mbids_rejects_an_invalid_mbid() {
+        let mut config = Config::default();
+        config
+            .discography
+            .label_mbids
+            .insert("Hospital Records".into(), "not-a-uuid".into());
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("an invalid MBID must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("discography.label_mbids contains an invalid MusicBrainz ID"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn label_mbids_rejects_an_empty_key() {
+        let mut config = Config::default();
+        config
+            .discography
+            .label_mbids
+            .insert("   ".into(), "8562598d-60d1-4bd6-8b85-4d709e951770".into());
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("a blank key must be refused");
+        assert!(
+            error.to_string().contains(
+                "discography.label_mbids contains an empty or duplicate normalized label key"
+            ),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn label_mbids_accepts_a_name_that_starts_with_an_identifier_word() {
+        let mut config = Config::default();
+        config.discography.label_mbids.insert(
+            "IPI: Records".into(),
+            "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+        );
+        assert!(
+            config.validate_non_credential_constraints().is_ok(),
+            "a label named with an identifier word is still a label name"
+        );
+    }
+
+    #[test]
+    fn label_mbids_rejects_two_keys_that_normalise_alike() {
+        let mut config = Config::default();
+        config.discography.label_mbids.insert(
+            "Hospital Records".into(),
+            "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+        );
+        config.discography.label_mbids.insert(
+            "hospital  records".into(),
+            "c8471d13-3574-4040-be20-229656068504".into(),
+        );
+        let error = config
+            .validate_non_credential_constraints()
+            .expect_err("a duplicate key must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("empty or duplicate normalized label key"),
             "got {error}"
         );
     }

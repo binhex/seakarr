@@ -10,6 +10,7 @@ use crate::search::album_identity_key;
 
 mod bundle;
 pub mod identifier;
+pub mod label;
 mod musicbrainz;
 pub use identifier::{resolve_code, ArtistInput, CodeIdentifier};
 pub use musicbrainz::MusicBrainzProvider;
@@ -143,6 +144,17 @@ pub enum DiscographyError {
     /// behaves exactly as it did before the failure cache existed.
     #[error("artist search was inconsistent: {0}")]
     ArtistSearchInconsistent(String),
+    /// The label could not be resolved to exactly one MusicBrainz candidate.
+    /// Recorded in the failure cache under `label:name:<key>`, so a name that will
+    /// not resolve is not asked about again until the expiry elapses.
+    #[error("label could not be resolved safely: {0}")]
+    LabelUnresolved(String),
+    /// A label search answered with a page whose reported total disagrees with
+    /// the candidates it carried. Classified as a resolution problem for this
+    /// run, like its artist equivalent, but never cached: it describes one
+    /// inconsistent response rather than a property of the name.
+    #[error("label search was inconsistent: {0}")]
+    LabelSearchInconsistent(String),
     /// The provider answered, but its candidate data was unusable: a search
     /// score outside the documented range, or a missing score where one is
     /// required. This is a provider defect, not an artist that genuinely cannot
@@ -172,6 +184,30 @@ pub trait DiscographyProvider: Send + Sync {
         &self,
         artist_mbid: &str,
     ) -> std::result::Result<ArtistCandidate, DiscographyError>;
+
+    /// Search the MusicBrainz label index for a label by name.
+    async fn search_labels(
+        &self,
+        label: &str,
+    ) -> std::result::Result<Vec<label::LabelCandidate>, DiscographyError>;
+
+    /// Look up one label by MusicBrainz ID. Exact: no ranking, no score.
+    async fn label_by_id(
+        &self,
+        label_mbid: &str,
+    ) -> std::result::Result<label::LabelCandidate, DiscographyError>;
+
+    /// Every official release on a label that the payload can describe, with its
+    /// release group inline. A release carrying no release group or no artist
+    /// credit cannot be represented and is counted in
+    /// [`label::LabelCatalogue::incomplete`] rather than guessed.
+    ///
+    /// Release groups cannot be browsed by label, so the catalogue is built from
+    /// releases and collapsed to release groups by the selector.
+    async fn releases_by_label(
+        &self,
+        label_mbid: &str,
+    ) -> std::result::Result<label::LabelCatalogue, DiscographyError>;
 
     async fn release_groups(
         &self,
@@ -287,11 +323,38 @@ pub fn resolve_artist_by_code(
     }
 }
 
-/// Apply the dominance rules to two or more canonical exact-name matches.
-fn resolve_dominant_artist(
-    artist_key: &str,
-    matches: &[&ArtistCandidate],
-) -> std::result::Result<ResolvedArtist, DiscographyError> {
+/// Which entity kind a resolution failure is about, so the shared dominance
+/// helper reports the variant its caller can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveKind {
+    Artist,
+    Label,
+}
+
+impl ResolveKind {
+    fn unresolved(&self, reason: String) -> DiscographyError {
+        match self {
+            Self::Artist => DiscographyError::ArtistUnresolved(reason),
+            Self::Label => DiscographyError::LabelUnresolved(reason),
+        }
+    }
+}
+
+/// The winner of the dominance rules, with the evidence that selected it.
+pub(crate) struct Dominance {
+    /// Index into the slice the caller passed.
+    pub index: usize,
+    pub evidence: DominanceEvidence,
+}
+
+/// Apply the dominance rules to two or more scored candidates.
+pub(crate) fn dominant_candidate_index<T>(
+    kind: ResolveKind,
+    key: &str,
+    matches: &[&T],
+    score_of: impl Fn(&T) -> Option<u8>,
+    id_of: impl Fn(&T) -> &str,
+) -> std::result::Result<Dominance, DiscographyError> {
     let exact_matches = matches.len();
     // Reject invalid provider data before absent data, and scan the whole set
     // rather than returning on the first offending candidate: the reported
@@ -299,64 +362,83 @@ fn resolve_dominant_artist(
     // MusicBrainz returned candidates in.
     if let Some(invalid) = matches
         .iter()
-        .filter_map(|candidate| candidate.score)
+        .filter_map(|candidate| score_of(candidate))
         .filter(|score| *score > REQUIRED_TOP_SCORE)
         .max()
     {
         return Err(DiscographyError::InvalidCandidateData(format!(
-            "{exact_matches} candidates match {artist_key:?} and one reports the invalid score {invalid}"
+            "{exact_matches} candidates match {key:?} and one reports the invalid score {invalid}"
         )));
     }
-    if matches.iter().any(|candidate| candidate.score.is_none()) {
+    if matches
+        .iter()
+        .any(|candidate| score_of(candidate).is_none())
+    {
         return Err(DiscographyError::InvalidCandidateData(format!(
-            "{exact_matches} candidates match {artist_key:?} and at least one has no search score"
+            "{exact_matches} candidates match {key:?} and at least one has no search score"
         )));
     }
     // Both defect classes were rejected above, so every score is present and in
     // range here.
-    let mut scored: Vec<(u8, &ArtistCandidate)> = matches
+    let mut scored: Vec<(u8, usize, &str)> = matches
         .iter()
-        .filter_map(|candidate| candidate.score.map(|score| (score, *candidate)))
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            score_of(candidate).map(|score| (score, index, id_of(candidate)))
+        })
         .collect();
     debug_assert_eq!(scored.len(), exact_matches);
     // Sort by score, then MBID, so the comparison never depends on the order
     // MusicBrainz returned the candidates in.
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.id.cmp(&right.1.id))
-    });
-    let (top_score, top) = scored[0];
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(right.2)));
+    let (top_score, top_index, _) = scored[0];
     let leaders = scored
         .iter()
-        .filter(|(score, _)| *score == top_score)
+        .filter(|(score, _, _)| *score == top_score)
         .count();
     if leaders != 1 {
-        return Err(DiscographyError::ArtistUnresolved(format!(
-            "{exact_matches} candidates match {artist_key:?} with a tied top score of {top_score}"
+        return Err(kind.unresolved(format!(
+            "{exact_matches} candidates match {key:?} with a tied top score of {top_score}"
         )));
     }
     if top_score < REQUIRED_TOP_SCORE {
-        return Err(DiscographyError::ArtistUnresolved(format!(
-            "{exact_matches} candidates match {artist_key:?} and the highest score {top_score} is below {REQUIRED_TOP_SCORE}"
+        return Err(kind.unresolved(format!(
+            "{exact_matches} candidates match {key:?} and the highest score {top_score} is below {REQUIRED_TOP_SCORE}"
         )));
     }
     let runner_up_score = scored[1].0;
     let margin = top_score - runner_up_score;
     if margin < REQUIRED_SCORE_MARGIN {
-        return Err(DiscographyError::ArtistUnresolved(format!(
-            "{exact_matches} candidates match {artist_key:?} and the leading margin {margin} is below {REQUIRED_SCORE_MARGIN}"
+        return Err(kind.unresolved(format!(
+            "{exact_matches} candidates match {key:?} and the leading margin {margin} is below {REQUIRED_SCORE_MARGIN}"
         )));
     }
-    Ok(ResolvedArtist {
-        candidate: top.clone(),
-        resolution: ArtistResolution::ScoreDominance(DominanceEvidence {
+    Ok(Dominance {
+        index: top_index,
+        evidence: DominanceEvidence {
             exact_matches,
             top_score,
             runner_up_score,
             margin,
-        }),
+        },
+    })
+}
+
+/// Apply the dominance rules to two or more canonical exact-name matches.
+fn resolve_dominant_artist(
+    artist_key: &str,
+    matches: &[&ArtistCandidate],
+) -> std::result::Result<ResolvedArtist, DiscographyError> {
+    let dominance = dominant_candidate_index(
+        ResolveKind::Artist,
+        artist_key,
+        matches,
+        |candidate| candidate.score,
+        |candidate| candidate.id.as_str(),
+    )?;
+    Ok(ResolvedArtist {
+        candidate: (*matches[dominance.index]).clone(),
+        resolution: ArtistResolution::ScoreDominance(dominance.evidence),
     })
 }
 
@@ -438,7 +520,14 @@ pub fn release_allowed(release: &ReleaseGroup, allowed: &[DiscographyReleaseType
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct PartialDate {
+/// A `YYYY[-MM[-DD]]` date, missing components treated as zero.
+///
+/// Public only because it appears in public signatures (`ExecutionPlan::Discover::since`
+/// and `label_targets`). It is not constructible outside the crate: the fields are
+/// private and `parse_partial_date` is crate-private, so an external caller can pass
+/// `None` or a value it received from this crate, and nothing else. Bounds reach the
+/// library through `--since` and `discography`, never through the API.
+pub struct PartialDate {
     year: i32,
     month: u32,
     day: u32,
@@ -447,7 +536,7 @@ struct PartialDate {
 /// Parse `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`. Year must be 1..=9999, month
 /// 1..=12 when present, and complete dates must be real calendar dates.
 /// Missing month/day sort as zero.
-fn parse_partial_date(value: &str) -> Option<PartialDate> {
+pub(crate) fn parse_partial_date(value: &str) -> Option<PartialDate> {
     let mut parts = value.trim().split('-');
     let year: i32 = parts.next()?.parse().ok()?;
     if !(1..=9999).contains(&year) {
@@ -644,24 +733,27 @@ pub enum DiscoveryProvenance {
 /// [`DiscoveryFailure::Unresolved`] artists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryFailure {
-    /// The artist could not be resolved to exactly one MusicBrainz candidate.
+    /// The artist or label could not be resolved to exactly one MusicBrainz
+    /// candidate.
     Unresolved,
     /// MusicBrainz could not be reached, or returned unusable data.
     Provider,
 }
 
 impl DiscographyError {
-    /// True when this failure means the artist could not be matched or
-    /// disambiguated - by canonical name, or by the IPI or ISNI the caller named -
-    /// as opposed to a transport, HTTP, decode, pagination or unusable-data
-    /// failure, and is therefore worth remembering across runs.
+    /// True when this failure means the entity could not be matched or
+    /// disambiguated - by canonical name, by the IPI or ISNI the caller named, or,
+    /// for a label, by name - as opposed to a transport, HTTP, decode, pagination or
+    /// unusable-data failure, and is therefore worth remembering across runs.
     ///
-    /// Only [`DiscographyError::ArtistUnresolved`] qualifies. Its sibling
-    /// [`DiscographyError::ArtistSearchInconsistent`] is deliberately classified
-    /// as an artist problem for the circuit breaker and the legacy fallback, but
-    /// a page whose reported total disagrees with its payload describes one
-    /// inconsistent response, so caching it would suppress a healthy artist
-    /// until the expiry elapsed.
+    /// Only [`DiscographyError::ArtistUnresolved`] and
+    /// [`DiscographyError::LabelUnresolved`] qualify. Their siblings
+    /// [`DiscographyError::ArtistSearchInconsistent`] and
+    /// [`DiscographyError::LabelSearchInconsistent`] are deliberately classified as
+    /// resolution problems for the circuit breaker and the legacy fallback, but a
+    /// page whose reported total disagrees with its payload describes one
+    /// inconsistent response, so caching it would suppress a healthy entity until
+    /// the expiry elapsed.
     ///
     /// The match is not entirely response-independent: three of the
     /// `ArtistUnresolved` producers decide from MusicBrainz's per-response search
@@ -672,24 +764,26 @@ impl DiscographyError {
     /// is recorded: the two producers an identifier request adds - no carrier and
     /// several carriers - are facts about the code itself, and an explicit code
     /// always asks again, so remembering one would only accumulate dead rows.
-    pub(crate) fn is_stable_artist_resolution_failure(&self) -> bool {
-        matches!(self, Self::ArtistUnresolved(_))
+    pub(crate) fn is_stable_resolution_failure(&self) -> bool {
+        matches!(self, Self::ArtistUnresolved(_) | Self::LabelUnresolved(_))
     }
 }
 
 impl DiscoveryFailure {
-    /// Only an artist-resolution failure is an artist problem; every other
-    /// provider error (transport, decode, pagination, a rate-limited 5xx, or
-    /// unusable candidate data) is an outage problem.
+    /// A resolution failure - for an artist or a label - is an entity problem;
+    /// every other provider error (transport, decode, pagination, a rate-limited
+    /// 5xx, or unusable candidate data) is an outage problem.
     ///
-    /// An inconsistent search page counts as an artist problem even though it is
-    /// not cacheable, because falling back for this run is the pre-existing
+    /// An inconsistent search page counts as a resolution problem even though it
+    /// is not cacheable, because falling back for this run is the pre-existing
     /// behaviour and changing it here would turn a response defect into a run
     /// abort.
     fn from_error(error: &DiscographyError) -> Self {
         match error {
             DiscographyError::ArtistUnresolved(_)
-            | DiscographyError::ArtistSearchInconsistent(_) => Self::Unresolved,
+            | DiscographyError::ArtistSearchInconsistent(_)
+            | DiscographyError::LabelUnresolved(_)
+            | DiscographyError::LabelSearchInconsistent(_) => Self::Unresolved,
             _ => Self::Provider,
         }
     }
@@ -838,7 +932,7 @@ pub(crate) async fn discover_artist_albums_at(
                     // from the binary. A public entry point must still not panic, and
                     // a malformed value could never resolve.
                     ArtistInput::Malformed { reason, .. } => {
-                        return Err(DiscographyError::ArtistUnresolved(reason.clone()))
+                        return Err(DiscographyError::ArtistUnresolved(reason.clone()));
                     }
                     _ => unreachable!("every other non-name input is an MBID or a code"),
                 };
@@ -987,7 +1081,7 @@ fn load_compatible_cache(
 
 /// A row is fresh only when `now >= fetched_at`, `age < cache_days * 86_400`,
 /// and `cache_days > 0`. Equality is stale; future timestamps are stale.
-fn cache_is_fresh(fetched_at: i64, cache_days: u64, now: i64) -> bool {
+pub(crate) fn cache_is_fresh(fetched_at: i64, cache_days: u64, now: i64) -> bool {
     if cache_days == 0 {
         return false;
     }
@@ -996,7 +1090,7 @@ fn cache_is_fresh(fetched_at: i64, cache_days: u64, now: i64) -> bool {
 }
 
 /// Non-negative saturating age in complete days, for stale-cache warnings.
-fn stale_age_days(now: i64, fetched_at: i64) -> u64 {
+pub(crate) fn stale_age_days(now: i64, fetched_at: i64) -> u64 {
     let age_seconds = (now as i128) - (fetched_at as i128);
     if age_seconds <= 0 {
         0
@@ -1005,16 +1099,10 @@ fn stale_age_days(now: i64, fetched_at: i64) -> u64 {
     }
 }
 
-/// Replay a recorded resolution failure instead of calling the provider.
+/// The adapter half of the failure replay: the artist-shaped [`Discovery`] a
+/// replayed entry stands for.
 ///
-/// Returns `None` when there is nothing to replay. In order of the checks below:
-/// a pinned MBID makes resolution deterministic, so the recorded row is deleted
-/// and the lookup runs; the caller bypassed the cache; the configured expiry is
-/// `0`; a compatible success row exists, which is the better answer even when it
-/// is stale; no row exists; the row is stale; or its kind is unknown.
-///
-/// Every one of those is a miss rather than an error, because a cache must never
-/// be able to block a lookup it was not written for.
+/// See [`replayable_failure`] for when an entry may be replayed at all.
 fn replay_recorded_failure(
     db: &Database,
     artist_key: &str,
@@ -1024,10 +1112,56 @@ fn replay_recorded_failure(
     configured_mbid: Option<&str>,
     has_success_row: bool,
 ) -> Option<Discovery> {
+    let entry = replayable_failure(
+        db,
+        artist_key,
+        config,
+        now,
+        use_cache,
+        configured_mbid,
+        has_success_row,
+    )?;
+    let reason = if entry.reason.trim().is_empty() {
+        "artist could not be resolved safely".to_string()
+    } else {
+        entry.reason
+    };
+    Some(Discovery {
+        outcome: DiscoveryOutcome::LegacyFallback {
+            reason,
+            kind: DiscoveryFailure::Unresolved,
+            from_cache: true,
+        },
+        canonical_name: None,
+        mbid: None,
+        disambiguation: None,
+    })
+}
+
+/// The decision half of [`replay_recorded_failure`]: the recorded entry when it
+/// may stand in for the provider call, `None` when the lookup must run.
+///
+/// Returns `None` when there is nothing to replay. In order of the checks below:
+/// a pinned MBID makes resolution deterministic, so the recorded row is deleted
+/// and the lookup runs; the caller bypassed the cache; the configured expiry is
+/// `0`; a compatible success row exists, which is the better answer even when it
+/// is stale; no row exists; the row is stale; or its kind is unknown.
+///
+/// Every one of those is a miss rather than an error, because a cache must never
+/// be able to block a lookup it was not written for.
+pub(crate) fn replayable_failure(
+    db: &Database,
+    key: &str,
+    config: &DiscographyConfig,
+    now: i64,
+    use_cache: FailureCacheUse,
+    configured_mbid: Option<&str>,
+    has_success_row: bool,
+) -> Option<DiscographyFailureEntry> {
     if configured_mbid.is_some() {
         // A pinned MBID makes resolution deterministic, so any recorded failure
         // is obsolete. Drop it and let the lookup run.
-        if let Err(error) = db.delete_discography_failure(artist_key) {
+        if let Err(error) = db.delete_discography_failure(key) {
             tracing::warn!("failed to clear discography failure row: {error}");
         }
         return None;
@@ -1039,11 +1173,11 @@ fn replay_recorded_failure(
     // delete or a crash between the success write and the failure delete can
     // leave both. A compatible success row is the better answer even when it is
     // stale - it is a usable fallback - so a failure row must never shadow it,
-    // or the artist would be skipped instead of falling back to those albums.
+    // or the entity would be skipped instead of falling back to those albums.
     if has_success_row {
         return None;
     }
-    let entry = match db.get_discography_failure(artist_key) {
+    let entry = match db.get_discography_failure(key) {
         Ok(Some(entry)) => entry,
         Ok(None) => return None,
         Err(error) => {
@@ -1057,43 +1191,33 @@ fn replay_recorded_failure(
     if entry.failure_kind != FAILURE_KIND_UNRESOLVED {
         return None;
     }
-    let reason = if entry.reason.trim().is_empty() {
-        "artist could not be resolved safely".to_string()
-    } else {
-        entry.reason
-    };
     tracing::debug!(
-        artist_key,
+        key,
         recorded_at = entry.recorded_at,
         "skipping a recorded resolution failure"
     );
-    Some(Discovery {
-        outcome: DiscoveryOutcome::LegacyFallback {
-            reason,
-            kind: DiscoveryFailure::Unresolved,
-            from_cache: true,
-        },
-        canonical_name: None,
-        mbid: None,
-        disambiguation: None,
-    })
+    Some(entry)
 }
 
-/// Record an artist-resolution failure so a later run can skip the lookup.
+/// Record a resolution failure so a later run can skip the lookup.
 ///
 /// Only a failure to match a name is recorded: an explicit code or ID always
 /// bypasses the recorded failure, so a row for one could never be replayed. Which
-/// errors qualify is [`DiscographyError::is_stable_artist_resolution_failure`]'s
+/// errors qualify is [`DiscographyError::is_stable_resolution_failure`]'s
 /// decision. That
 /// excludes a `Provider` failure, because an outage would otherwise keep
 /// suppressing a healthy MusicBrainz for the whole expiry, and it excludes
-/// [`DiscographyError::ArtistSearchInconsistent`], which is classified as an
-/// artist problem for this run's fallback but describes one response. Nothing is
+/// [`DiscographyError::ArtistSearchInconsistent`] and
+/// [`DiscographyError::LabelSearchInconsistent`], which are classified as
+/// resolution problems for this run's fallback but describe one response. Nothing is
 /// recorded when the feature is off, when there is no usable artist key, or when
 /// a success row already exists for this key — the two kinds of row are mutually
 /// exclusive by construction, so a stale-but-usable success row is never
 /// shadowed by a fresh failure.
-fn record_resolution_failure(
+///
+/// The key is namespaced by the caller: `label:name:<key>` rows are written by the
+/// label path and replayed by it alone.
+pub(crate) fn record_resolution_failure(
     db: &Database,
     artist_key: &str,
     config: &DiscographyConfig,
@@ -1108,7 +1232,7 @@ fn record_resolution_failure(
     // classification: an inconsistent search page is classified as unresolved so
     // this run falls back, but it describes one response and must not be
     // remembered.
-    if !error.is_stable_artist_resolution_failure() {
+    if !error.is_stable_resolution_failure() {
         return;
     }
     let entry = DiscographyFailureEntry {
@@ -1122,19 +1246,26 @@ fn record_resolution_failure(
     }
 }
 
-/// Reject cache payloads over the 16 MiB limit (a refresh error that falls
+/// Reject a cache payload over the 16 MiB limit (a refresh error that falls
 /// back to a stale cache or legacy discovery when no cache exists).
-fn serialize_cache_payload(
-    groups: &[ReleaseGroup],
-) -> std::result::Result<String, DiscographyError> {
-    let payload = serde_json::to_string(groups)
-        .map_err(|error| DiscographyError::Decode(format!("failed to serialize cache: {error}")))?;
+pub(crate) fn check_cache_payload_size(payload: &str) -> std::result::Result<(), DiscographyError> {
     if payload.len() > MAX_CACHE_PAYLOAD_BYTES {
         return Err(DiscographyError::Decode(format!(
             "cache payload of {} bytes exceeds the {MAX_CACHE_PAYLOAD_BYTES}-byte limit",
             payload.len()
         )));
     }
+    Ok(())
+}
+
+/// Serialize a release-group list for the cache, rejecting a payload over the
+/// 16 MiB limit.
+fn serialize_cache_payload(
+    groups: &[ReleaseGroup],
+) -> std::result::Result<String, DiscographyError> {
+    let payload = serde_json::to_string(groups)
+        .map_err(|error| DiscographyError::Decode(format!("failed to serialize cache: {error}")))?;
+    check_cache_payload_size(&payload)?;
     Ok(payload)
 }
 
@@ -2275,6 +2406,27 @@ mod tests {
                 isnis: Vec::new(),
                 disambiguation: None,
             })
+        }
+
+        async fn search_labels(
+            &self,
+            _label: &str,
+        ) -> std::result::Result<Vec<label::LabelCandidate>, DiscographyError> {
+            panic!("artist-sweep tests never query labels")
+        }
+
+        async fn label_by_id(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<label::LabelCandidate, DiscographyError> {
+            panic!("artist-sweep tests never query labels")
+        }
+
+        async fn releases_by_label(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<label::LabelCatalogue, DiscographyError> {
+            panic!("artist-sweep tests never query a label catalogue")
         }
 
         async fn release_groups(
@@ -3687,10 +3839,10 @@ mod tests {
     #[test]
     fn a_rate_limited_5xx_is_a_provider_outage_not_an_artist_failure() {
         // The catch-all arm is what makes the new variant an outage. Pinning it
-        // stops a later edit from moving it into the artist-problem arm, which
+        // stops a later edit from moving it into the resolution arm, which
         // would change the breaker; cacheability is protected separately by
-        // `is_stable_artist_resolution_failure`, which only accepts
-        // `ArtistUnresolved`.
+        // `is_stable_resolution_failure`, which only accepts
+        // `ArtistUnresolved` and `LabelUnresolved`.
         let error = DiscographyError::ProviderError {
             status: 503,
             detail: String::new(),
@@ -3699,7 +3851,36 @@ mod tests {
             DiscoveryFailure::from_error(&error),
             DiscoveryFailure::Provider
         );
-        assert!(!error.is_stable_artist_resolution_failure());
+        assert!(!error.is_stable_resolution_failure());
+    }
+
+    #[test]
+    fn label_resolution_failures_are_classified_for_the_breaker_and_the_cache() {
+        let unresolved =
+            DiscographyError::LabelUnresolved("no candidate matches \"hospital\"".into());
+        assert_eq!(
+            DiscoveryFailure::from_error(&unresolved),
+            DiscoveryFailure::Unresolved
+        );
+        assert!(unresolved.is_stable_resolution_failure());
+
+        let inconsistent =
+            DiscographyError::LabelSearchInconsistent("reported 2, carried 1".into());
+        assert_eq!(
+            DiscoveryFailure::from_error(&inconsistent),
+            DiscoveryFailure::Unresolved
+        );
+        assert!(
+            !inconsistent.is_stable_resolution_failure(),
+            "an inconsistent search page describes one response and must not be cached"
+        );
+
+        let outage = DiscographyError::HttpStatus(503);
+        assert_eq!(
+            DiscoveryFailure::from_error(&outage),
+            DiscoveryFailure::Provider
+        );
+        assert!(!outage.is_stable_resolution_failure());
     }
 
     #[test]

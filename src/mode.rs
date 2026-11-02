@@ -1,4 +1,6 @@
-use crate::config::{CliOverrides, Config};
+use crate::config::{CliOverrides, Config, DiscographyReleaseType};
+use crate::discography::label::LabelInput;
+use crate::discography::PartialDate;
 use crate::error::{Result, SeakarrError};
 
 /// The search modes that seakarr can execute.
@@ -21,9 +23,22 @@ pub enum ExecutionPlan {
     Batch {
         file_path: String,
     },
-    /// Gap filling: artists come from the library, optionally narrowed to one.
+    /// Gap filling: artists come from the library, optionally narrowed to one, or
+    /// from the labels named on the command line.
+    ///
+    /// The CLI enforces the cross-field rules (`--artist` with `--label` is refused,
+    /// and `release_types`/`since` need a label), but this type does not: a caller
+    /// building a plan directly can express those combinations, and the runner ignores
+    /// the fields that do not apply. Validate before constructing one.
     Discover {
+        /// The one explicitly named artist, when the operator named one.
         artist: Option<String>,
+        /// Labels to sweep. Empty means the library-derived artist sweep.
+        labels: Vec<LabelRequest>,
+        /// Per-run override of `discography.allowed_types`.
+        release_types: Option<Vec<DiscographyReleaseType>>,
+        /// Per-run lower bound on a release group's first-release-date.
+        since: Option<PartialDate>,
     },
 }
 
@@ -59,6 +74,87 @@ fn configured_value(value: &str) -> Option<String> {
 
 fn non_empty_path(value: Option<&str>) -> Option<String> {
     non_empty(value).map(|value| value.trim().to_owned())
+}
+
+/// One `--label` element, already classified and validated.
+///
+/// The runner rebuilds the classified input from these two fields with
+/// [`LabelInput::from_parts`], so it never re-parses or re-validates a CLI string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRequest {
+    /// The value as given, trimmed.
+    pub input: String,
+    /// The MusicBrainz ID, when the value was one.
+    pub mbid: Option<String>,
+}
+
+/// Parse, validate and refuse duplicate `--label` values.
+pub fn parse_labels(values: &[String]) -> Result<Vec<LabelRequest>> {
+    let mut requests = Vec::with_capacity(values.len());
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for raw in values {
+        let parsed = LabelInput::parse(raw);
+        parsed.validate().map_err(SeakarrError::Config)?;
+        if !seen.insert(parsed.cache_key()) {
+            return Err(SeakarrError::Config(format!(
+                "--label {raw:?} is given more than once"
+            )));
+        }
+        requests.push(LabelRequest {
+            input: raw.trim().to_string(),
+            mbid: parsed.mbid().map(str::to_string),
+        });
+    }
+    Ok(requests)
+}
+
+/// True when `value` is `YYYY`, `YYYY-MM` or `YYYY-MM-DD` with zero-padded components.
+fn is_padded_date(value: &str) -> bool {
+    let parts: Vec<&str> = value.trim().split('-').collect();
+    let widths_ok = match parts.as_slice() {
+        [year] => year.len() == 4,
+        [year, month] => year.len() == 4 && month.len() == 2,
+        [year, month, day] => year.len() == 4 && month.len() == 2 && day.len() == 2,
+        _ => false,
+    };
+    widths_ok
+        && parts
+            .iter()
+            .all(|part| part.chars().all(|character| character.is_ascii_digit()))
+}
+
+/// Parse the `--release-type` values into the enum the classifier uses.
+pub fn parse_release_types(values: &[String]) -> Result<Vec<DiscographyReleaseType>> {
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let kind = match value.trim().to_ascii_lowercase().as_str() {
+            // `album` is the operator's word for what the classifier calls a
+            // studio album: an `Album` primary type with no secondary types.
+            "album" | "studio_album" => DiscographyReleaseType::StudioAlbum,
+            "live_album" => DiscographyReleaseType::LiveAlbum,
+            "ep" => DiscographyReleaseType::Ep,
+            "single" => DiscographyReleaseType::Single,
+            "compilation" => DiscographyReleaseType::Compilation,
+            "remix" => DiscographyReleaseType::Remix,
+            "soundtrack" => DiscographyReleaseType::Soundtrack,
+            "dj_mix" => DiscographyReleaseType::DjMix,
+            "mixtape" => DiscographyReleaseType::Mixtape,
+            other => {
+                return Err(SeakarrError::Config(format!(
+                    "--release-type {other:?} is not a known release type; accepted: album \
+                     (studio_album), live_album, ep, single, compilation, remix, soundtrack, \
+                     dj_mix, mixtape"
+                )));
+            }
+        };
+        parsed.push(kind);
+    }
+    if parsed.is_empty() {
+        return Err(SeakarrError::Config(
+            "--release-type needs at least one value".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Format an upgrade-mode conflict error. When the mode came from the YAML
@@ -135,6 +231,15 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
     let cli_batch_file = non_empty_path(cli.batch_file.as_deref());
     let has_manual_cli_selector = cli.artist.is_some() || cli.album.is_some();
     let has_batch_cli_selector = cli.batch_file.is_some();
+    let has_label_selector = cli
+        .label
+        .as_deref()
+        .is_some_and(|values| !values.is_empty())
+        || cli
+            .release_type
+            .as_deref()
+            .is_some_and(|values| !values.is_empty())
+        || cli.since.is_some();
     let has_blank_manual_cli_selector = [cli.artist.as_deref(), cli.album.as_deref()]
         .into_iter()
         .flatten()
@@ -152,6 +257,11 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
 
     match mode {
         SearchMode::Upgrade => {
+            if has_label_selector {
+                return Err(SeakarrError::Config(
+                    "--label/--release-type/--since are only valid in discover mode".into(),
+                ));
+            }
             if has_blank_batch_cli_selector {
                 return Err(SeakarrError::Config(
                     "--batch-file must not be blank in upgrade mode; use --mode batch".into(),
@@ -182,6 +292,11 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
             Ok(ExecutionPlan::Upgrade)
         }
         SearchMode::Manual => {
+            if has_label_selector {
+                return Err(SeakarrError::Config(
+                    "--label/--release-type/--since are only valid in discover mode".into(),
+                ));
+            }
             if has_batch_cli_selector {
                 return Err(SeakarrError::Config(
                     "--batch-file is incompatible with manual mode; use --mode batch".into(),
@@ -231,6 +346,11 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
             Ok(ExecutionPlan::Manual { artist, album })
         }
         SearchMode::Batch => {
+            if has_label_selector {
+                return Err(SeakarrError::Config(
+                    "--label/--release-type/--since are only valid in discover mode".into(),
+                ));
+            }
             if has_manual_cli_selector {
                 return Err(SeakarrError::Config(
                     "--artist/--album are incompatible with batch mode; use --mode manual".into(),
@@ -293,14 +413,67 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                         .into(),
                 ));
             }
-            Ok(ExecutionPlan::Discover { artist: cli_artist })
+            let labels = match cli.label.as_deref() {
+                Some(values) if !values.is_empty() => parse_labels(values)?,
+                _ => Vec::new(),
+            };
+            let release_types = match cli.release_type.as_deref() {
+                Some(values) if !values.is_empty() => Some(parse_release_types(values)?),
+                _ => None,
+            };
+            let since = match cli.since.as_deref() {
+                Some(value) => {
+                    // `parse_partial_date` accepts unpadded components (it also reads
+                    // MusicBrainz's own dates), but a `--since` value is operator input
+                    // and the documented shapes are zero-padded, so an unpadded value is
+                    // refused rather than silently reinterpreted.
+                    let padded = is_padded_date(value);
+                    let bound = padded
+                        .then(|| crate::discography::parse_partial_date(value))
+                        .flatten()
+                        .ok_or_else(|| {
+                            SeakarrError::Config(format!(
+                                "--since {value:?} is not a date; use YYYY, YYYY-MM or YYYY-MM-DD"
+                            ))
+                        })?;
+                    Some(bound)
+                }
+                None => None,
+            };
+            if !labels.is_empty() && cli_artist.is_some() {
+                return Err(SeakarrError::Config(
+                    "--artist and --label are mutually exclusive; run one source per invocation"
+                        .into(),
+                ));
+            }
+            if labels.is_empty() {
+                if release_types.is_some() {
+                    return Err(SeakarrError::Config(
+                        "--release-type is only valid with --label".into(),
+                    ));
+                }
+                if since.is_some() {
+                    return Err(SeakarrError::Config(
+                        "--since is only valid with --label".into(),
+                    ));
+                }
+            }
+            Ok(ExecutionPlan::Discover {
+                artist: cli_artist,
+                labels,
+                release_types,
+                since,
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_mode_conflict, resolve_execution_plan, ExecutionPlan, SearchMode};
+    use super::{
+        configured_mode_conflict, parse_labels, parse_release_types, resolve_execution_plan,
+        ExecutionPlan, SearchMode,
+    };
     use crate::config::{CliOverrides, Config, ConfigSource};
     use crate::error::SeakarrError;
     use std::fs;
@@ -326,6 +499,32 @@ mod tests {
             batch_file: batch_file.map(str::to_owned),
             ..CliOverrides::default()
         }
+    }
+
+    /// The CLI shape of a label sweep. The multi-label and multi-type spellings
+    /// arrive as separate elements: splitting on the comma is clap's job, so this
+    /// constructor hands `mode` what clap would.
+    fn label_cli(labels: &[&str], release_types: &[&str], since: Option<&str>) -> CliOverrides {
+        CliOverrides {
+            mode: Some("discover".into()),
+            label: Some(labels.iter().map(|value| value.to_string()).collect()),
+            release_type: (!release_types.is_empty()).then(|| {
+                release_types
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect()
+            }),
+            since: since.map(str::to_owned),
+            ..CliOverrides::default()
+        }
+    }
+
+    /// A discover config with a library, which a label sweep needs just as the
+    /// artist sweep does: "already present" is answered from it.
+    fn label_config() -> Config {
+        let mut config = config_with_mode("discover");
+        config.library.paths = vec!["/library".to_string()];
+        config
     }
 
     fn assert_config_error(config: &Config, overrides: &CliOverrides, text: &str) {
@@ -991,7 +1190,15 @@ mod tests {
         let mut config = config_with_mode("discover");
         config.library.paths = vec!["/library".to_string()];
         let plan = resolve_execution_plan(&config, &cli(None, None, None, None)).unwrap();
-        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
+        assert_eq!(
+            plan,
+            ExecutionPlan::Discover {
+                artist: None,
+                labels: Vec::new(),
+                release_types: None,
+                since: None,
+            }
+        );
         assert_eq!(plan.mode(), SearchMode::Discover);
     }
 
@@ -1005,6 +1212,9 @@ mod tests {
             plan,
             ExecutionPlan::Discover {
                 artist: Some("Autechre".into()),
+                labels: Vec::new(),
+                release_types: None,
+                since: None,
             }
         );
     }
@@ -1069,7 +1279,15 @@ mod tests {
         let mut overrides = cli(None, None, None, None);
         overrides.library_path = Some(vec!["/override".to_string()]);
         let plan = resolve_execution_plan(&config, &overrides).unwrap();
-        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
+        assert_eq!(
+            plan,
+            ExecutionPlan::Discover {
+                artist: None,
+                labels: Vec::new(),
+                release_types: None,
+                since: None,
+            }
+        );
     }
 
     #[test]
@@ -1087,6 +1305,233 @@ mod tests {
         config.library.paths = vec!["/library".to_string()];
         let plan =
             resolve_execution_plan(&config, &cli(Some("discover"), None, None, None)).unwrap();
-        assert_eq!(plan, ExecutionPlan::Discover { artist: None });
+        assert_eq!(
+            plan,
+            ExecutionPlan::Discover {
+                artist: None,
+                labels: Vec::new(),
+                release_types: None,
+                since: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_label_plan_carries_its_labels_types_and_bound() {
+        let config = label_config();
+        let plan = resolve_execution_plan(
+            &config,
+            &label_cli(&["Hospital Records,Med School"], &[], None),
+        )
+        .expect("a label sweep is a valid discover plan");
+        let ExecutionPlan::Discover {
+            labels,
+            release_types,
+            since,
+            artist,
+        } = plan
+        else {
+            panic!("expected a discover plan");
+        };
+        assert_eq!(
+            labels.len(),
+            1,
+            "the value delimiter is clap's job; mode sees one element here"
+        );
+        assert_eq!(labels[0].input, "Hospital Records,Med School");
+        assert!(release_types.is_none());
+        assert!(since.is_none());
+        assert!(artist.is_none());
+    }
+
+    #[test]
+    fn several_labels_keep_their_order() {
+        let config = label_config();
+        let plan = resolve_execution_plan(
+            &config,
+            &label_cli(&["Hospital Records", "Med School"], &[], None),
+        )
+        .unwrap();
+        let ExecutionPlan::Discover { labels, .. } = plan else {
+            panic!("expected a discover plan");
+        };
+        assert_eq!(
+            labels
+                .iter()
+                .map(|label| label.input.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Hospital Records", "Med School"]
+        );
+    }
+
+    #[test]
+    fn an_mbid_label_is_recognised_as_an_id() {
+        let config = label_config();
+        let plan = resolve_execution_plan(
+            &config,
+            &label_cli(&["8562598d-60d1-4bd6-8b85-4d709e951770"], &[], None),
+        )
+        .unwrap();
+        let ExecutionPlan::Discover { labels, .. } = plan else {
+            panic!("expected a discover plan");
+        };
+        assert_eq!(
+            labels[0].mbid.as_deref(),
+            Some("8562598d-60d1-4bd6-8b85-4d709e951770")
+        );
+    }
+
+    #[test]
+    fn a_uuid_shaped_typo_in_label_is_a_config_error() {
+        let config = label_config();
+        assert_config_error(
+            &config,
+            &label_cli(&["8562598d-60d1-4bd6-8b85-4d709e95177"], &[], None),
+            "hyphenated like a MusicBrainz ID",
+        );
+    }
+
+    #[test]
+    fn a_blank_label_is_refused() {
+        let config = label_config();
+        assert_config_error(&config, &label_cli(&["   "], &[], None), "is blank");
+    }
+
+    #[test]
+    fn the_same_label_twice_is_refused() {
+        let config = label_config();
+        assert_config_error(
+            &config,
+            &label_cli(&["Hospital Records", "hospital  records"], &[], None),
+            "is given more than once",
+        );
+    }
+
+    #[test]
+    fn label_and_artist_are_mutually_exclusive() {
+        let config = label_config();
+        let overrides = CliOverrides {
+            mode: Some("discover".into()),
+            artist: Some("London Elektricity".into()),
+            label: Some(vec!["Hospital Records".into()]),
+            ..CliOverrides::default()
+        };
+        assert_config_error(&config, &overrides, "mutually exclusive");
+    }
+
+    #[test]
+    fn label_outside_discover_mode_is_refused() {
+        for mode in ["upgrade", "manual", "batch"] {
+            let config = config_with_mode(mode);
+            let overrides = CliOverrides {
+                label: Some(vec!["Hospital Records".into()]),
+                ..CliOverrides::default()
+            };
+            assert_config_error(&config, &overrides, "only valid in discover mode");
+        }
+    }
+
+    #[test]
+    fn release_type_without_label_is_refused() {
+        let config = label_config();
+        assert_config_error(
+            &config,
+            &label_cli(&[], &["album"], None),
+            "--release-type is only valid with --label",
+        );
+    }
+
+    #[test]
+    fn since_without_label_is_refused() {
+        let config = label_config();
+        assert_config_error(
+            &config,
+            &label_cli(&[], &[], Some("2025-01-01")),
+            "--since is only valid with --label",
+        );
+    }
+
+    #[test]
+    fn the_album_alias_maps_to_studio_album() {
+        let config = label_config();
+        let plan = resolve_execution_plan(
+            &config,
+            &label_cli(&["Hospital Records"], &["album", "ep"], None),
+        )
+        .unwrap();
+        let ExecutionPlan::Discover { release_types, .. } = plan else {
+            panic!("expected a discover plan");
+        };
+        assert_eq!(
+            release_types,
+            Some(vec![
+                crate::config::DiscographyReleaseType::StudioAlbum,
+                crate::config::DiscographyReleaseType::Ep,
+            ])
+        );
+    }
+
+    #[test]
+    fn release_type_parsing_rejects_an_empty_list() {
+        let error = parse_release_types(&[]).expect_err("an empty list must be refused");
+        assert!(
+            error.to_string().contains("needs at least one value"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_release_type_lists_the_accepted_set() {
+        let config = label_config();
+        assert_config_error(
+            &config,
+            &label_cli(&["Hospital Records"], &["bogus"], None),
+            "accepted: album (studio_album), live_album, ep, single, compilation, remix, soundtrack, dj_mix, mixtape",
+        );
+    }
+
+    #[test]
+    fn since_refuses_an_unpadded_component() {
+        let config = label_config();
+        for value in ["2025-1-1", "2025-1", "25-01-01"] {
+            assert_config_error(
+                &config,
+                &label_cli(&["Hospital Records"], &[], Some(value)),
+                "--since",
+            );
+        }
+    }
+
+    #[test]
+    fn since_accepts_a_year_month_and_day_and_rejects_anything_else() {
+        let config = label_config();
+        for value in ["2025", "2025-01", "2025-01-31"] {
+            let plan = resolve_execution_plan(
+                &config,
+                &label_cli(&["Hospital Records"], &[], Some(value)),
+            )
+            .expect("a valid bound must be accepted");
+            let ExecutionPlan::Discover { since, .. } = plan else {
+                panic!("expected a discover plan");
+            };
+            assert!(since.is_some(), "{value} must parse");
+        }
+        assert_config_error(
+            &config,
+            &label_cli(&["Hospital Records"], &[], Some("31-01-2025")),
+            "--since",
+        );
+        assert_config_error(
+            &config,
+            &label_cli(&["Hospital Records"], &[], Some("2025-02-30")),
+            "--since",
+        );
+    }
+
+    #[test]
+    fn parse_labels_records_the_id_form_separately() {
+        let labels = parse_labels(&[" Hospital Records ".to_string()]).unwrap();
+        assert_eq!(labels[0].input, "Hospital Records");
+        assert!(labels[0].mbid.is_none());
     }
 }

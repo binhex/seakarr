@@ -3,7 +3,7 @@
 use seakarr::client::{FileInfo, MockClient, SearchResult};
 use seakarr::config::Config;
 use seakarr::db::Database;
-use seakarr::report::AlbumOutcome;
+use seakarr::report::{AlbumOutcome, DownloadDestination};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -211,4 +211,92 @@ async fn test_full_pipeline_no_results() {
         .query_row("SELECT COUNT(*) FROM search_history", [], |r| r.get(0))
         .unwrap();
     assert_eq!(history_count, 1);
+}
+
+/// A staging-only download stages the album and leaves the library untouched.
+///
+/// This is a placement test, not a label-sweep test: it drives `process_album`
+/// with `LibraryTarget::StagingOnly`, the same call the label runner makes, and
+/// proves the staged tree shape and that no library folder is created. The label
+/// runner itself is covered by `runner::tests::a_label_run_stages_every_missing_album
+/// _and_never_writes_the_library` and the selection by `label_discover`'s tests.
+#[tokio::test]
+async fn test_staging_only_album_stages_without_writing_the_library() {
+    use seakarr::runner::{process_album, LibraryTarget};
+
+    let client = MockClient::new();
+    *client.search_results.lock().unwrap() = vec![SearchResult {
+        username: "fastuser".into(),
+        speed: 1000,
+        slots: 2,
+        files: vec![
+            make_file(
+                r"London Elektricity\Syncopated City\01 - Bare Liars.flac",
+                900,
+                15_000_000,
+            ),
+            make_file(
+                r"London Elektricity\Syncopated City\02 - Guess Who.flac",
+                850,
+                12_000_000,
+            ),
+        ],
+    }];
+
+    let staging = TempDir::new().unwrap();
+    let library = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.soulseek.username = "test".into();
+    config.soulseek.password = "test".into();
+    config.storage.staging_dir = staging.path().to_string_lossy().into();
+    config.library.paths = vec![library.path().to_string_lossy().into()];
+    config.download.min_upload_speed_kbps = 0;
+    config.download.max_retries = 1;
+    config.notifications.urls = vec![];
+    config.filters.min_tracks = 0;
+
+    let db = Database::open_in_memory().unwrap();
+
+    let outcome = process_album(
+        &client,
+        "London Elektricity",
+        Some("Syncopated City"),
+        false,
+        &config,
+        &db,
+        staging.path(),
+        None,
+        None,
+        None,
+        Some(LibraryTarget::StagingOnly),
+    )
+    .await
+    .expect("the staged download must succeed");
+
+    let expected_staging = staging
+        .path()
+        .join("London Elektricity")
+        .join("Syncopated City");
+    match &outcome {
+        AlbumOutcome::Downloaded {
+            track_count,
+            destination: DownloadDestination::Staging(path),
+        } => {
+            assert_eq!(*track_count, 2);
+            assert_eq!(
+                path, &expected_staging,
+                "the outcome must report the <artist>/<album> staging folder"
+            );
+        }
+        other => panic!("expected a staging destination, got {other:?}"),
+    }
+
+    assert!(
+        expected_staging.is_dir(),
+        "the album must be staged under <artist>/<album>"
+    );
+    assert!(
+        std::fs::read_dir(library.path()).unwrap().next().is_none(),
+        "a staging-only target must not create a library folder"
+    );
 }

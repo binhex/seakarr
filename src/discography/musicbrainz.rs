@@ -41,6 +41,21 @@ const MAX_PAGES: usize = 100;
 /// than 10,000 release groups) before allocating any collection.
 const MAX_RELEASE_GROUPS: usize = PAGE_SIZE * MAX_PAGES;
 
+/// Releases one label sweep will page through. A label above this ceiling is
+/// reported rather than silently truncated: a partial catalogue looks exactly
+/// like "nothing new".
+const MAX_LABEL_RELEASES: usize = PAGE_SIZE * 50;
+
+/// Point a paged query at `offset`, whatever position it occupies.
+///
+/// Looked up by key rather than indexed positionally, so re-ordering the query
+/// literal cannot silently re-send `offset=0` on every page.
+fn set_offset(query: &mut [(&str, String)], offset: usize) {
+    if let Some(slot) = query.iter_mut().find(|(name, _)| *name == "offset") {
+        slot.1 = offset.to_string();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ArtistPage {
     count: usize,
@@ -130,11 +145,9 @@ where
     match score {
         Some(score) if (0..=100).contains(&score) => Ok(Some(score as u8)),
         Some(invalid) => Err(serde::de::Error::custom(format!(
-            "artist search score {invalid} is outside the 0-100 range"
+            "search score {invalid} is outside the 0-100 range"
         ))),
-        None => Err(serde::de::Error::custom(
-            "artist search score is not an integer",
-        )),
+        None => Err(serde::de::Error::custom("search score is not an integer")),
     }
 }
 
@@ -169,6 +182,157 @@ impl From<ReleaseGroupWire> for ReleaseGroup {
             primary_type: wire.primary_type,
             secondary_types: wire.secondary_types,
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelPage {
+    count: usize,
+    offset: usize,
+    #[serde(default)]
+    labels: Vec<LabelWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelWire {
+    id: String,
+    name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_score")]
+    score: Option<u8>,
+    #[serde(rename = "label-code", default)]
+    label_code: Option<u32>,
+    #[serde(default)]
+    disambiguation: Option<String>,
+}
+
+impl From<LabelWire> for super::label::LabelCandidate {
+    fn from(wire: LabelWire) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            score: wire.score,
+            label_code: wire.label_code,
+            disambiguation: wire.disambiguation,
+        }
+    }
+}
+
+/// Reject a label search page that cannot be trusted.
+///
+/// A *full* page whose payload is shorter than the reported total is truncation,
+/// not inconsistency: MusicBrainz reports every match while `limit` caps the page,
+/// so a broad name such as `Records` arrives as `count = 600, len = 100`. That name
+/// is too wide to resolve safely, so it is refused as unresolved with the count and
+/// the escape hatch.
+///
+/// A *short* page that disagrees with its total is one inconsistent response: a page
+/// under the limit was not cut, so it cannot be truncation, and calling such a name
+/// unresolvable would cache a provider defect for `failure_cache_days`.
+fn check_label_page(label: &str, page: &LabelPage) -> std::result::Result<(), DiscographyError> {
+    if page.offset != 0 {
+        return Err(DiscographyError::IncompletePagination(format!(
+            "label search returned a non-zero offset {}",
+            page.offset
+        )));
+    }
+    if page.count == page.labels.len() {
+        return Ok(());
+    }
+    if page.count > page.labels.len() && page.labels.len() >= PAGE_SIZE {
+        return Err(DiscographyError::LabelUnresolved(format!(
+            "label search for {label:?} matched {} labels ({} shown); use a more specific name \
+             or pin discography.label_mbids",
+            page.count,
+            page.labels.len()
+        )));
+    }
+    Err(DiscographyError::LabelSearchInconsistent(format!(
+        "label search returned {} candidates but reported {}",
+        page.labels.len(),
+        page.count
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleasePage {
+    #[serde(rename = "release-count")]
+    count: usize,
+    #[serde(rename = "release-offset")]
+    offset: usize,
+    #[serde(default)]
+    releases: Vec<ReleaseWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseWire {
+    id: String,
+    #[serde(rename = "release-group", default)]
+    release_group: Option<ReleaseGroupWire>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCreditWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistCreditWire {
+    /// The credit-level name. MusicBrainz omits it when the credit simply repeats
+    /// the artist, so it cannot be the only source.
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    joinphrase: Option<String>,
+    /// The credited artist entity, whose `name` is the fallback above.
+    #[serde(default)]
+    artist: Option<ArtistRefWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistRefWire {
+    #[serde(default)]
+    name: String,
+}
+
+/// The full credit string MusicBrainz spells for a release.
+///
+/// Names and joinphrases are concatenated rather than re-derived, so
+/// `Nu:Tone feat. Stamina MC` is reproduced exactly.
+fn credit_string(credits: &[ArtistCreditWire]) -> Option<String> {
+    let mut credit = String::new();
+    for part in credits {
+        // A credit that repeats its artist carries no `name` of its own, so the
+        // artist entity's name is used as the payload's own data.
+        let name = if part.name.trim().is_empty() {
+            part.artist
+                .as_ref()
+                .map(|artist| artist.name.trim())?
+                .to_string()
+        } else {
+            part.name.trim().to_string()
+        };
+        if name.is_empty() {
+            // A part that names nothing cannot be reconstructed, and its joinphrase
+            // alone would name no artist. The release is reported as incomplete
+            // rather than searched for under a string nobody wrote.
+            return None;
+        }
+        credit.push_str(&name);
+        if let Some(join) = part.joinphrase.as_deref() {
+            credit.push_str(join);
+        }
+    }
+    let credit = credit.trim().to_string();
+    (!credit.is_empty()).then_some(credit)
+}
+
+impl super::label::LabelRelease {
+    /// Build from a wire release, or report that the payload cannot describe it.
+    fn from_wire(wire: ReleaseWire) -> Option<Self> {
+        let release_group = wire.release_group?;
+        let artist_credit = credit_string(&wire.artist_credit)?;
+        Some(Self {
+            release_id: wire.id,
+            release_group: release_group.into(),
+            artist_credit,
+        })
     }
 }
 
@@ -438,7 +602,7 @@ impl MusicBrainzProvider {
         let mut offset = PAGE_SIZE;
         while groups.len() < first.count {
             let expected_page_len = (first.count - offset).min(PAGE_SIZE);
-            query[3] = ("offset", offset.to_string());
+            set_offset(&mut query, offset);
             let page: ReleaseGroupPage = self.request_json("/ws/2/release-group", &query).await?;
             if page.count != first.count {
                 return Err(DiscographyError::IncompletePagination(format!(
@@ -500,6 +664,162 @@ impl DiscographyProvider for MusicBrainzProvider {
         artist_mbid: &str,
     ) -> std::result::Result<ArtistCandidate, DiscographyError> {
         self.artist_by_id(artist_mbid).await
+    }
+
+    async fn search_labels(
+        &self,
+        label: &str,
+    ) -> std::result::Result<Vec<super::label::LabelCandidate>, DiscographyError> {
+        let escaped = label.replace('\\', "\\\\").replace('"', "\\\"");
+        let page: LabelPage = self
+            .request_json(
+                "/ws/2/label",
+                &[
+                    ("query", format!("label:\"{escaped}\"")),
+                    ("fmt", "json".into()),
+                    ("limit", PAGE_SIZE.to_string()),
+                ],
+            )
+            .await?;
+        check_label_page(label, &page)?;
+        Ok(page
+            .labels
+            .into_iter()
+            .map(super::label::LabelCandidate::from)
+            .collect())
+    }
+
+    async fn label_by_id(
+        &self,
+        label_mbid: &str,
+    ) -> std::result::Result<super::label::LabelCandidate, DiscographyError> {
+        let wire: LabelWire = match self
+            .request_json(
+                &format!("/ws/2/label/{label_mbid}"),
+                &[("fmt", "json".into())],
+            )
+            .await
+        {
+            Ok(wire) => wire,
+            // A 404 means the ID is well formed but names no label. That is a bad
+            // identifier, not an outage: classifying it as a provider failure would
+            // let three mistyped IDs abort the run with a breaker message that never
+            // mentions them.
+            Err(DiscographyError::HttpStatus(404)) => {
+                return Err(DiscographyError::LabelUnresolved(format!(
+                    "no MusicBrainz label has the ID {label_mbid}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if !wire.id.eq_ignore_ascii_case(label_mbid) {
+            return Err(DiscographyError::Decode(format!(
+                "label id {} does not match the requested MBID {label_mbid}",
+                wire.id
+            )));
+        }
+        // The lookup endpoint carries no search relevance score and needs none.
+        Ok(super::label::LabelCandidate::from(wire))
+    }
+
+    async fn releases_by_label(
+        &self,
+        label_mbid: &str,
+    ) -> std::result::Result<super::label::LabelCatalogue, DiscographyError> {
+        let mut query = vec![
+            ("label", label_mbid.to_string()),
+            ("fmt", "json".into()),
+            ("limit", PAGE_SIZE.to_string()),
+            ("offset", "0".into()),
+            ("status", "official".into()),
+            ("inc", "release-groups+artist-credits".into()),
+        ];
+        let first: ReleasePage = self.request_json("/ws/2/release", &query).await?;
+        if first.count > MAX_LABEL_RELEASES {
+            return Err(DiscographyError::IncompletePagination(format!(
+                "count {} exceeds the {MAX_LABEL_RELEASES} release limit",
+                first.count
+            )));
+        }
+        if first.offset != 0 {
+            return Err(DiscographyError::IncompletePagination(format!(
+                "first page offset {} is not zero",
+                first.offset
+            )));
+        }
+        let expected_first_len = first.count.min(PAGE_SIZE);
+        if first.releases.len() != expected_first_len {
+            return Err(DiscographyError::IncompletePagination(format!(
+                "first page returned {} of the expected {expected_first_len} releases",
+                first.releases.len()
+            )));
+        }
+
+        fn collect_releases(
+            page: Vec<ReleaseWire>,
+            seen: &mut std::collections::HashSet<String>,
+            releases: &mut Vec<super::label::LabelRelease>,
+            incomplete: &mut usize,
+        ) -> std::result::Result<(), DiscographyError> {
+            for wire in page {
+                // Duplicate detection runs on the raw payload, before an
+                // incomplete release is dropped: otherwise a dropped release
+                // could hide a duplicate.
+                if !seen.insert(wire.id.clone()) {
+                    return Err(DiscographyError::IncompletePagination(
+                        "release pages contain duplicate IDs".into(),
+                    ));
+                }
+                match super::label::LabelRelease::from_wire(wire) {
+                    Some(release) => releases.push(release),
+                    None => *incomplete += 1,
+                }
+            }
+            Ok(())
+        }
+
+        let count = first.count;
+        let mut releases: Vec<super::label::LabelRelease> = Vec::with_capacity(count);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut incomplete = 0usize;
+        collect_releases(first.releases, &mut seen, &mut releases, &mut incomplete)?;
+        let mut offset = PAGE_SIZE;
+        while seen.len() < count {
+            let expected_page_len = (count - offset).min(PAGE_SIZE);
+            set_offset(&mut query, offset);
+            let page: ReleasePage = self.request_json("/ws/2/release", &query).await?;
+            if page.count != count {
+                return Err(DiscographyError::IncompletePagination(format!(
+                    "page count {} changed from {count}",
+                    page.count
+                )));
+            }
+            if page.offset != offset {
+                return Err(DiscographyError::IncompletePagination(format!(
+                    "page offset {} does not advance to requested offset {offset}",
+                    page.offset
+                )));
+            }
+            if page.releases.len() != expected_page_len {
+                return Err(DiscographyError::IncompletePagination(format!(
+                    "offset {offset} returned {} of the expected {expected_page_len} releases",
+                    page.releases.len()
+                )));
+            }
+            collect_releases(page.releases, &mut seen, &mut releases, &mut incomplete)?;
+            offset += PAGE_SIZE;
+        }
+        if seen.len() != count {
+            return Err(DiscographyError::IncompletePagination(format!(
+                "collected {} of {} releases",
+                seen.len(),
+                count
+            )));
+        }
+        Ok(super::label::LabelCatalogue {
+            releases,
+            incomplete,
+        })
     }
 
     async fn release_groups(
@@ -3236,7 +3556,7 @@ mod tests {
             DiscographyError::ArtistSearchInconsistent(_)
         ));
         assert!(
-            !error.is_stable_artist_resolution_failure(),
+            !error.is_stable_resolution_failure(),
             "a page-length mismatch must not be cacheable"
         );
     }
@@ -3735,6 +4055,556 @@ mod tests {
         assert!(
             matches!(error, DiscographyError::ArtistSearchInconsistent(_)),
             "a count that disagrees with the payload describes one response, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_search_carries_the_score_code_and_comment() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label"))
+            .and(query_param("query", "label:\"Hospital Records\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 2,
+                "offset": 0,
+                "labels": [
+                    {
+                        "id": "8562598d-60d1-4bd6-8b85-4d709e951770",
+                        "name": "Hospital Records",
+                        "score": 100,
+                        "label-code": 12939,
+                        "disambiguation": "UK drum & bass"
+                    },
+                    {
+                        "id": "c8471d13-3574-4040-be20-229656068504",
+                        "name": "Hospital Records",
+                        "score": 62,
+                        "disambiguation": "US noisecore label"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let labels = DiscographyProvider::search_labels(&provider, "Hospital Records")
+            .await
+            .unwrap();
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].score, Some(100));
+        assert_eq!(labels[0].label_code, Some(12939));
+        assert_eq!(labels[0].disambiguation.as_deref(), Some("UK drum & bass"));
+        assert_eq!(labels[1].label_code, None);
+    }
+
+    #[tokio::test]
+    async fn label_search_escapes_quotes_in_the_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label"))
+            .and(query_param("query", "label:\"The \\\"A\\\" Label\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 0,
+                "offset": 0,
+                "labels": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let labels = DiscographyProvider::search_labels(&provider, "The \"A\" Label")
+            .await
+            .unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_but_well_formed_label_id_is_unresolved_not_an_outage() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label/8562598d-60d1-4bd6-8b85-4d709e951770"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error =
+            DiscographyProvider::label_by_id(&provider, "8562598d-60d1-4bd6-8b85-4d709e951770")
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, DiscographyError::LabelUnresolved(_)),
+            "a mistyped ID must not count towards the outage breaker, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_label_search_is_a_broad_name_not_an_inconsistent_page() {
+        let server = MockServer::start().await;
+        // A FULL page whose total exceeds it is truncation: the name matched more
+        // than one page of labels.
+        let labels: Vec<serde_json::Value> = (0..PAGE_SIZE)
+            .map(|index| {
+                json!({
+                    "id": format!("8562598d-60d1-4bd6-8b85-4d709e95{index:04}"),
+                    "name": "Records"
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 600,
+                "offset": 0,
+                "labels": labels
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::search_labels(&provider, "Records")
+            .await
+            .unwrap_err();
+        let DiscographyError::LabelUnresolved(reason) = &error else {
+            panic!("a truncated page is a name too broad to resolve, got {error:?}");
+        };
+        assert!(reason.contains("matched 600 labels"), "got {reason}");
+        assert!(reason.contains("discography.label_mbids"), "got {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_short_label_page_that_disagrees_with_its_total_is_inconsistent() {
+        let server = MockServer::start().await;
+        // Under the page limit, so it cannot be truncation: the provider disagreed
+        // with itself, and that must not be cached as an unresolvable name.
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 5,
+                "offset": 0,
+                "labels": [
+                    { "id": "8562598d-60d1-4bd6-8b85-4d709e951770", "name": "Hospital Records" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::search_labels(&provider, "Hospital Records")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DiscographyError::LabelSearchInconsistent(_)),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_page_longer_than_its_count_is_inconsistent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1,
+                "offset": 0,
+                "labels": [
+                    { "id": "8562598d-60d1-4bd6-8b85-4d709e951770", "name": "Hospital Records" },
+                    { "id": "c8471d13-3574-4040-be20-229656068504", "name": "Hospital Records" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::search_labels(&provider, "Hospital Records")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DiscographyError::LabelSearchInconsistent(_)),
+            "a payload longer than its reported total is impossible, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_release_page_with_a_non_zero_offset_is_incomplete_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "release-count": 1,
+                "release-offset": 100,
+                "releases": []
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        let DiscographyError::IncompletePagination(reason) = &error else {
+            panic!("expected IncompletePagination, got {error:?}");
+        };
+        assert!(reason.contains("offset 100"), "got {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_release_page_count_that_drifts_is_incomplete_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_payload(101, 0, 100)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .and(query_param("offset", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_payload(102, 100, 2)))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        let DiscographyError::IncompletePagination(reason) = &error else {
+            panic!("expected IncompletePagination, got {error:?}");
+        };
+        assert!(reason.contains("changed from 101"), "got {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_label_catalogue_over_the_ceiling_is_incomplete_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "release-count": 5001,
+                "release-offset": 0,
+                "releases": []
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        let DiscographyError::IncompletePagination(reason) = &error else {
+            panic!("expected IncompletePagination, got {error:?}");
+        };
+        assert!(
+            reason.contains("5001") && reason.contains("5000"),
+            "got {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_lookup_checks_the_returned_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/label/8562598d-60d1-4bd6-8b85-4d709e951770"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "c8471d13-3574-4040-be20-229656068504",
+                "name": "Hospital Records"
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error =
+            DiscographyProvider::label_by_id(&provider, "8562598d-60d1-4bd6-8b85-4d709e951770")
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, DiscographyError::Decode(_)),
+            "got {error:?}"
+        );
+    }
+
+    fn release_payload(count: usize, offset: usize, length: usize) -> serde_json::Value {
+        let releases: Vec<serde_json::Value> = (0..length)
+            .map(|index| {
+                json!({
+                    "id": format!("release-{}", offset + index),
+                    "title": format!("Album {}", offset + index),
+                    "status": "Official",
+                    "release-group": {
+                        "id": format!("group-{}", offset + index),
+                        "title": format!("Album {}", offset + index),
+                        "first-release-date": "2004-05-10",
+                        "primary-type": "Album",
+                        "secondary-types": []
+                    },
+                    "artist-credit": [
+                        { "name": "Nu:Tone", "joinphrase": " feat. " },
+                        { "name": "Stamina MC", "joinphrase": "" }
+                    ]
+                })
+            })
+            .collect();
+        json!({
+            "release-count": count,
+            "release-offset": offset,
+            "releases": releases
+        })
+    }
+
+    #[tokio::test]
+    async fn releases_by_label_paginate_with_official_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .and(query_param("label", "8562598d-60d1-4bd6-8b85-4d709e951770"))
+            .and(query_param("status", "official"))
+            .and(query_param("inc", "release-groups+artist-credits"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_payload(101, 0, 100)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .and(query_param("offset", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_payload(101, 100, 1)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let catalogue = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalogue.releases.len(), 101);
+        assert_eq!(catalogue.incomplete, 0);
+        assert_eq!(
+            catalogue.releases[0].artist_credit,
+            "Nu:Tone feat. Stamina MC"
+        );
+        assert_eq!(
+            catalogue.releases[0].release_group.primary_type.as_deref(),
+            Some("Album")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credit_with_no_name_of_its_own_uses_the_artist_entity() {
+        let server = MockServer::start().await;
+        // MusicBrainz omits the credit-level `name` when it repeats the artist, so a
+        // payload that carries only the artist entity must still yield the credit.
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "release-count": 1,
+                "release-offset": 0,
+                "releases": [{
+                    "id": "release-1",
+                    "release-group": { "id": "group-1", "title": "Syncopated City" },
+                    "artist-credit": [{ "artist": { "id": "a-1", "name": "London Elektricity" } }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let catalogue = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalogue.incomplete, 0);
+        assert_eq!(catalogue.releases[0].artist_credit, "London Elektricity");
+    }
+
+    #[tokio::test]
+    async fn a_credit_part_that_names_nothing_makes_the_release_incomplete() {
+        let server = MockServer::start().await;
+        // The middle part carries only a joinphrase, so the assembled credit would be
+        // "Nu:Tone && Stamina MC" - a string nobody wrote. The release is counted
+        // incomplete instead of being searched for under it.
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "release-count": 2,
+                "release-offset": 0,
+                "releases": [
+                    {
+                        "id": "release-1",
+                        "release-group": { "id": "group-1", "title": "Words 2 Believe In" },
+                        "artist-credit": [
+                            { "name": "Nu:Tone", "joinphrase": " & " },
+                            { "joinphrase": " & " },
+                            { "name": "Stamina MC", "joinphrase": "" }
+                        ]
+                    },
+                    {
+                        "id": "release-2",
+                        "release-group": { "id": "group-2", "title": "Syncopated City" },
+                        "artist-credit": [{ "artist": { "id": "a-1", "name": "London Elektricity" } }]
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let catalogue = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalogue.incomplete, 1);
+        assert_eq!(catalogue.releases.len(), 1);
+        assert_eq!(catalogue.releases[0].artist_credit, "London Elektricity");
+    }
+
+    #[tokio::test]
+    async fn a_release_without_a_release_group_or_credit_is_counted_not_guessed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "release-count": 3,
+                "release-offset": 0,
+                "releases": [
+                    {
+                        "id": "release-1",
+                        "release-group": { "id": "group-1", "title": "Album 1" },
+                        "artist-credit": [{ "name": "Artist", "joinphrase": "" }]
+                    },
+                    { "id": "release-2" },
+                    {
+                        "id": "release-3",
+                        "release-group": { "id": "group-3", "title": "Album 3" },
+                        "artist-credit": []
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let catalogue = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalogue.releases.len(), 1);
+        assert_eq!(catalogue.incomplete, 2);
+    }
+
+    #[tokio::test]
+    async fn a_short_release_page_is_incomplete_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_payload(101, 0, 1)))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, DiscographyError::IncompletePagination(_)),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_release_id_is_incomplete_pagination() {
+        let server = MockServer::start().await;
+        let mut page = release_payload(2, 0, 1);
+        page["releases"] = json!([
+            {
+                "id": "release-1",
+                "release-group": { "id": "group-1", "title": "Album 1" },
+                "artist-credit": [{ "name": "Artist", "joinphrase": "" }]
+            },
+            {
+                "id": "release-1",
+                "release-group": { "id": "group-2", "title": "Album 2" },
+                "artist-credit": [{ "name": "Artist", "joinphrase": "" }]
+            }
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        let DiscographyError::IncompletePagination(reason) = &error else {
+            panic!("expected IncompletePagination, got {error:?}");
+        };
+        assert!(reason.contains("duplicate"), "got {reason}");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_hidden_by_an_incomplete_release_is_still_detected() {
+        let server = MockServer::start().await;
+        let mut page = release_payload(2, 0, 2);
+        page["releases"] = json!([
+            {
+                "id": "release-1",
+                "release-group": { "id": "group-1", "title": "Album 1" },
+                "artist-credit": [{ "name": "Artist", "joinphrase": "" }]
+            },
+            { "id": "release-1" }
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/ws/2/release"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error = DiscographyProvider::releases_by_label(
+            &provider,
+            "8562598d-60d1-4bd6-8b85-4d709e951770",
+        )
+        .await
+        .unwrap_err();
+        let DiscographyError::IncompletePagination(reason) = &error else {
+            panic!("expected IncompletePagination, got {error:?}");
+        };
+        assert!(
+            reason.contains("duplicate"),
+            "the incomplete duplicate must be detected before it is dropped, got {reason}"
         );
     }
 }

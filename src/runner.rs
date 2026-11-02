@@ -7,17 +7,19 @@ use tokio::sync::Semaphore;
 use futures::FutureExt;
 
 use crate::client::SoulseekClient;
-use crate::config::Config;
+use crate::config::{Config, DiscographyReleaseType};
 use crate::db::Database;
+use crate::discography::label::{discover_label_releases, LabelDiscoveryOutcome, LabelInput};
 use crate::discography::{
     discover_artist_albums, ArtistInput, DiscographyProvider, Discovery, DiscoveryFailure,
-    DiscoveryOutcome, DiscoveryProvenance, FailureCacheUse, MusicBrainzProvider,
+    DiscoveryOutcome, DiscoveryProvenance, FailureCacheUse, MusicBrainzProvider, PartialDate,
 };
 use crate::error::{Result, SeakarrError};
+use crate::mode::LabelRequest;
 use crate::progress::{is_interactive, ProgressDisplay};
 use crate::report::{AlbumOutcome, DownloadDestination, RunReport};
 use crate::scan_progress;
-use crate::{discover, download, filter, notifier, organizer, scanner, search};
+use crate::{discover, download, filter, label_discover, notifier, organizer, scanner, search};
 
 /// Spawn a SIGINT (Ctrl+C) listener for the duration of a run.
 ///
@@ -2536,10 +2538,466 @@ pub async fn run_discover_mode(
     .await
 }
 
-/// Account for a stale-cache provenance: warn, then count a genuine provider outage
-/// towards the circuit breaker while resetting the count for a name that no longer
-/// resolves (MusicBrainz answered, so the cached work list is still usable).
-/// Returns true when the failure limit is reached and the run must abort.
+/// Sweep one or more record labels, staging every album of the wanted type that
+/// the library does not hold, within the `discover.max_cycle_downloads` download
+/// budget.
+///
+/// Label discovery replaces the library-derived artist sweep for this run: the
+/// library is still scanned, because "already present" cannot be answered
+/// without it, but its artists never enter the work list.
+pub async fn run_label_discover_mode(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+    labels: &[LabelRequest],
+    release_types: Option<&[DiscographyReleaseType]>,
+    since: Option<PartialDate>,
+    ignore_processed: bool,
+) -> Result<()> {
+    if !config.discography.enabled {
+        return Err(SeakarrError::Config(
+            "discover mode requires discography.enabled: true".into(),
+        ));
+    }
+    if config.library.paths.is_empty() {
+        return Err(SeakarrError::Config(
+            "library.paths is empty - a label sweep needs a library to check what is present"
+                .into(),
+        ));
+    }
+    let provider = MusicBrainzProvider::new().map_err(|error| {
+        SeakarrError::MusicBrainz(format!("could not construct the provider: {error}"))
+    })?;
+    let staging_dir = Path::new(&config.storage.staging_dir);
+    crate::staging::prepare(staging_dir, &config.library.paths)?;
+    // Cancellation is armed once here, for the whole run, and passed into the core so
+    // a test can drive the flag instead of raising a signal. The artist discover sweep
+    // arms its own inside its core and so cannot be tested this way.
+    let (cancel, _guard) = arm_cancellation();
+    run_label_discover_mode_with_provider(
+        client,
+        config,
+        db,
+        labels,
+        release_types,
+        since,
+        ignore_processed,
+        staging_dir,
+        &provider,
+        &cancel,
+    )
+    .await
+}
+
+/// Timeline-free core of a label sweep, with the provider injected.
+#[allow(clippy::too_many_arguments)] // the run's plan, report, counters and
+                                     // staging root travel together
+async fn run_label_discover_mode_with_provider(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+    labels: &[LabelRequest],
+    release_types: Option<&[DiscographyReleaseType]>,
+    since: Option<PartialDate>,
+    ignore_processed: bool,
+    staging_dir: &Path,
+    provider: &dyn DiscographyProvider,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
+    // The public wrapper checks these before staging preparation; repeating them here
+    // keeps this core safe to call directly, exactly as the artist sweep's core does.
+    if !config.discography.enabled {
+        return Err(SeakarrError::Config(
+            "discover mode requires discography.enabled: true".into(),
+        ));
+    }
+    if config.library.paths.is_empty() {
+        return Err(SeakarrError::Config(
+            "library.paths is empty - a label sweep needs a library to check what is present"
+                .into(),
+        ));
+    }
+    let allowed: Vec<DiscographyReleaseType> = release_types
+        .map(<[DiscographyReleaseType]>::to_vec)
+        .unwrap_or_else(|| config.discography.allowed_types.clone());
+    let progress = if is_interactive() {
+        Some(ProgressDisplay::new())
+    } else {
+        None
+    };
+
+    let mut counters = label_discover::LabelCounters {
+        requested: labels.iter().map(|label| label.input.clone()).collect(),
+        budget_limit: config.discover.max_cycle_downloads,
+        ..label_discover::LabelCounters::default()
+    };
+    let mut report = RunReport::new();
+    let mut consecutive_provider_failures: u32 = 0;
+    let mut collected: Vec<crate::discography::label::LabelRelease> = Vec::new();
+
+    // Every request is validated before the loop, so a malformed entry in a slice ends
+    // the run as a configuration error with its summary, rather than aborting halfway
+    // through with no report of the labels already examined.
+    for request in labels {
+        LabelInput::from_parts(request.input.clone(), request.mbid.clone())
+            .validate()
+            .map_err(SeakarrError::Config)?;
+    }
+
+    for request in labels {
+        // Ctrl+C is honoured before each label. A label's paging is not splittable -
+        // `discover_label_releases` takes no cancellation flag - so this is the same
+        // per-unit granularity the artist sweep has: one artist, or one label.
+        if cancel.load(Ordering::SeqCst) {
+            counters.cancelled = true;
+            tracing::info!(
+                "label sweep: cancelled by user - stopping before {}",
+                request.input
+            );
+            finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
+            return Ok(());
+        }
+        counters.labels_examined += 1;
+        let input = LabelInput::from_parts(request.input.clone(), request.mbid.clone());
+        let discovery = discover_label_releases(
+            provider,
+            db,
+            &input,
+            &config.discography,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        match discovery.outcome {
+            LabelDiscoveryOutcome::Catalogue {
+                releases,
+                incomplete,
+                provenance,
+            } => {
+                counters.resolved.push((
+                    discovery
+                        .label_name
+                        .unwrap_or_else(|| request.input.clone()),
+                    discovery.label_mbid.unwrap_or_default(),
+                ));
+                counters.incomplete += incomplete;
+                if let DiscoveryProvenance::StaleCache {
+                    age_days,
+                    refresh_error,
+                    ..
+                } = &provenance
+                {
+                    tracing::warn!(
+                        "{}: label catalogue cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache",
+                        request.input
+                    );
+                }
+                if note_stale_cache_breaker(&provenance, &mut consecutive_provider_failures) {
+                    return Err(abort_label_run(
+                        &mut report,
+                        &counters,
+                        progress.as_ref(),
+                        staging_dir,
+                        &request.input,
+                    ));
+                }
+                collected.extend(releases);
+            }
+            LabelDiscoveryOutcome::Failed {
+                reason,
+                kind,
+                from_cache,
+            } => {
+                if from_cache {
+                    // No request was made, so this is no evidence about provider
+                    // health: neither increment nor reset the counter.
+                    counters.cached_failures.push(request.input.clone());
+                    continue;
+                }
+                match kind {
+                    DiscoveryFailure::Unresolved => {
+                        tracing::warn!(
+                            "{}: label could not be resolved on MusicBrainz: {reason}",
+                            request.input
+                        );
+                        counters.unresolved.push(request.input.clone());
+                        consecutive_provider_failures = 0;
+                    }
+                    DiscoveryFailure::Provider => {
+                        if note_provider_failure_for(
+                            &request.input,
+                            &reason,
+                            "label",
+                            &mut counters.provider_failed,
+                            &mut consecutive_provider_failures,
+                        ) {
+                            return Err(abort_label_run(
+                                &mut report,
+                                &counters,
+                                progress.as_ref(),
+                                staging_dir,
+                                &request.input,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let selection = label_discover::label_targets(
+        &collected,
+        &allowed,
+        since,
+        &config.discover.exclude_artists,
+    );
+    counters.selection = selection.counts;
+    counters.selection_ran = true;
+
+    // Nothing to download means nothing to ask the library about: skipping the walk
+    // avoids paying its longest phase, and avoids turning a run with no possible work
+    // into a nonzero exit when the library root cannot be read.
+    if selection.targets.is_empty() {
+        finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
+        return Ok(());
+    }
+
+    // One library walk answers "already present" for every label, exactly as the
+    // artist sweep pays for it once.
+    let index = match with_scan_indicator(progress.as_ref(), |walk_progress| {
+        discover::index_from_paths(
+            &config.library.paths,
+            &config.filters,
+            Some(cancel),
+            walk_progress,
+        )
+    }) {
+        Ok(index) => index,
+        Err(SeakarrError::Cancelled) => {
+            counters.cancelled = true;
+            tracing::info!(
+                "label sweep: library scan cancelled by user - stopping before any album"
+            );
+            finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
+            return Ok(());
+        }
+        Err(error) => {
+            // The artist sweep propagates a scan failure (`scan_library_cancellable(...)?`),
+            // so a library that cannot be read stops the run instead of pretending it
+            // is empty. Treating it as empty here would make every catalogue album look
+            // missing and stage duplicates of albums the library already holds.
+            tracing::error!("label sweep: library scan failed ({error}); aborting the run");
+            finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
+            return Err(error);
+        }
+    };
+
+    // Present albums are counted before the budget gate, so the count describes the
+    // catalogue rather than only the part the budget allowed. The artist sweep does
+    // the same for each of its artists.
+    let mut missing: Vec<&label_discover::LabelTarget> = Vec::new();
+    for target in &selection.targets {
+        if index.contains_album(&target.artist, &target.target.title) {
+            counters.present += 1;
+        } else {
+            missing.push(target);
+        }
+    }
+
+    let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
+    for target in missing {
+        // The interrupt is checked before the budget, so an interrupted run reports
+        // "cancelled", never "budget reached" - the same reason the artist sweep's
+        // loop carries its comment.
+        if cancel.load(Ordering::SeqCst) {
+            counters.cancelled = true;
+            break;
+        }
+        if budget.exhausted() {
+            counters.budget_reached_at = Some(target.artist.clone());
+            break;
+        }
+        let result = process_album(
+            client,
+            &target.artist,
+            Some(&target.target.title),
+            ignore_processed,
+            config,
+            db,
+            staging_dir,
+            progress.as_ref(),
+            Some(cancel),
+            None,
+            Some(LibraryTarget::StagingOnly),
+        )
+        .await;
+        match result {
+            Ok(outcome) => {
+                // The download stage reports the operator's own interrupt as a failure
+                // carrying "cancelled by user"; SeakarrError::Cancelled is only ever
+                // produced by the library walk. Charging, counting or recording that
+                // as a failed album would tell the operator their interrupt was a
+                // failure and would burn a download slot. The reason is matched rather
+                // than the flag, so a genuine failure that coincides with an interrupt
+                // is still reported.
+                if outcome_is_cancellation(&outcome) {
+                    counters.cancelled = true;
+                    break;
+                }
+                if charges_download_budget(&outcome) {
+                    budget.charge();
+                }
+                // Counted from the outcome, not from the selection: "staged" is
+                // only true once an album really was downloaded into staging, and
+                // a failure reported as an outcome counts exactly like one
+                // returned as an error.
+                count_label_outcome(&mut counters, &outcome);
+                report.record(&target.artist, &target.target.title, outcome);
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Album processing failed: {} - {}: {error}",
+                    target.artist,
+                    target.target.title
+                );
+                if charges_after_error(&error) {
+                    budget.charge();
+                }
+                counters.failed_albums += 1;
+                report.record(
+                    &target.artist,
+                    &target.target.title,
+                    AlbumOutcome::Failed {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
+    Ok(())
+}
+
+/// The tail of the reason the download stage reports for a cancelled transfer.
+///
+/// The stage stores `SeakarrError::Download("download cancelled by user")` by its
+/// `Display`, which is `download error: …`; a candidate-exhaustion path may prefix
+/// that with `all candidates exhausted: `. Matching the tail keeps the check immune
+/// to a peer-advertised filename (which is followed by more text, so the reason cannot
+/// end with this) while matching every real cancellation.
+const CANCELLED_REASON: &str = "download error: download cancelled by user";
+
+/// True when an album outcome is the operator's own interrupt rather than a failure.
+///
+/// The download stage reports a cancelled transfer as
+/// `AlbumOutcome::Failed { reason: "download cancelled by user" }` - the literal text
+/// of the only error `download.rs` produces when the flag is set; every other failure
+/// is prefixed with `all candidates exhausted: `. `SeakarrError::Cancelled` is produced
+/// only by the library walk, so this reason is the only evidence a label sweep gets.
+/// The reason is matched rather than the flag, so a genuine failure that happens to
+/// coincide with an interrupt is still counted.
+fn outcome_is_cancellation(outcome: &AlbumOutcome) -> bool {
+    // The tail is what identifies a cancellation: the download stage stores the
+    // cancellation error's own `Display`, while other failures embed a peer-advertised
+    // filename such as `01 - cancelled by user.flac` followed by more text. A substring
+    // test anywhere in the message would let such a filename stop the sweep.
+    matches!(outcome, AlbumOutcome::Failed { reason } if reason.trim().ends_with(CANCELLED_REASON))
+}
+
+/// Record one processed album in a label run's counters.
+///
+/// A failure `process_album` reports as an outcome is counted exactly like one it
+/// returns as an error, so the summary's "M failed" matches the report's Failed
+/// section whichever route the album took. Only a download that really ended in
+/// staging counts as staged, and a library destination never does.
+fn count_label_outcome(counters: &mut label_discover::LabelCounters, outcome: &AlbumOutcome) {
+    match outcome {
+        AlbumOutcome::Downloaded {
+            destination: DownloadDestination::Staging(_),
+            ..
+        } => counters.staged_albums += 1,
+        AlbumOutcome::Downloaded { .. } | AlbumOutcome::Skipped => {}
+        AlbumOutcome::Failed { .. } | AlbumOutcome::NoCandidates { .. } => {
+            counters.failed_albums += 1;
+        }
+    }
+}
+
+/// Report a label run that the provider circuit breaker aborted, and build the
+/// error to return.
+fn abort_label_run(
+    report: &mut RunReport,
+    counters: &label_discover::LabelCounters,
+    progress: Option<&ProgressDisplay>,
+    staging_dir: &Path,
+    label: &str,
+) -> SeakarrError {
+    finish_label_run(report, counters, progress, staging_dir);
+    SeakarrError::MusicBrainz(format!(
+        "{label}: {DISCOVER_PROVIDER_FAILURE_LIMIT} consecutive MusicBrainz failures; aborting discover run"
+    ))
+}
+
+/// Add a label run's notices, release the scan indicator and print the summary.
+///
+/// One owner for the run's exit reporting, mirroring [`finish_discover_run`], so a
+/// run that stops early (scan cancelled, breaker tripped) reports through the
+/// same path as one that ran to the end.
+fn finish_label_run(
+    report: &mut RunReport,
+    counters: &label_discover::LabelCounters,
+    progress: Option<&ProgressDisplay>,
+    staging_dir: &Path,
+) {
+    for notice in label_discover::label_notices(counters, &staging_dir.to_string_lossy()) {
+        report.add_notice(notice);
+    }
+    if let Some(display) = progress {
+        display.clear();
+    }
+    report.print_summary();
+}
+
+/// Count a stale-cache provenance towards the breaker: a genuine outage advances
+/// it, a name that no longer resolves resets it. Returns true when the limit is
+/// reached.
+///
+/// Shared by the artist sweep and the label sweep so the two cannot drift on what
+/// counts as an outage. Warning is the caller's job: each sweep words its own
+/// message (`discography cache` versus `label catalogue cache`).
+fn note_stale_cache_breaker(provenance: &DiscoveryProvenance, consecutive: &mut u32) -> bool {
+    match provenance {
+        DiscoveryProvenance::StaleCache {
+            kind: DiscoveryFailure::Provider,
+            ..
+        } => {
+            *consecutive += 1;
+            *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
+        }
+        _ => {
+            *consecutive = 0;
+            false
+        }
+    }
+}
+
+/// Record one provider failure for the breaker and report whether it has tripped.
+///
+/// `noun` is what the warning names (`artist`, `label`), so one implementation
+/// serves both sweeps without either copying the other's counting rule.
+fn note_provider_failure_for(
+    name: &str,
+    reason: &str,
+    noun: &str,
+    failed: &mut Vec<(String, String)>,
+    consecutive: &mut u32,
+) -> bool {
+    *consecutive += 1;
+    tracing::warn!("{name}: MusicBrainz unavailable ({reason}); {noun} skipped");
+    failed.push((name.to_string(), reason.to_string()));
+    *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
+}
+
 fn note_stale_cache(
     artist: &str,
     provenance: &DiscoveryProvenance,
@@ -2549,7 +3007,7 @@ fn note_stale_cache(
     let DiscoveryProvenance::StaleCache {
         age_days,
         refresh_error,
-        kind,
+        ..
     } = provenance
     else {
         *consecutive = 0;
@@ -2558,12 +3016,7 @@ fn note_stale_cache(
     tracing::warn!(
         "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); {cache_note}"
     );
-    if *kind == DiscoveryFailure::Provider {
-        *consecutive += 1;
-        return *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT;
-    }
-    *consecutive = 0;
-    false
+    note_stale_cache_breaker(provenance, consecutive)
 }
 
 /// Record one provider outage for the circuit breaker: warn, count the artist
@@ -2579,12 +3032,13 @@ fn note_provider_failure(
     counters: &mut discover::DiscoverCounters,
     consecutive: &mut u32,
 ) -> bool {
-    *consecutive += 1;
-    tracing::warn!("{artist}: MusicBrainz unavailable ({reason}); artist skipped");
-    counters
-        .provider_failed
-        .push((artist.to_string(), reason.to_string()));
-    *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
+    note_provider_failure_for(
+        artist,
+        reason,
+        "artist",
+        &mut counters.provider_failed,
+        consecutive,
+    )
 }
 
 /// Fill the gaps in one artist's library: process every album the library is
@@ -5445,6 +5899,11 @@ mod tests {
         requested_artists: Arc<std::sync::Mutex<Vec<String>>>,
         /// Every code the provider was asked about, in order, as `KIND:value`.
         requested_codes: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The one label this fake knows, for a test that sweeps a label with an
+        /// artist-sweep fixture. `None` makes every label search empty.
+        label_candidate: Option<LabelCandidate>,
+        /// Answers every label catalogue request.
+        label_catalogue: LabelCatalogue,
     }
 
     impl FakeDiscographyProvider {
@@ -5457,6 +5916,11 @@ mod tests {
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
                 requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                label_candidate: None,
+                label_catalogue: LabelCatalogue {
+                    releases: Vec::new(),
+                    incomplete: 0,
+                },
             }
         }
 
@@ -5469,6 +5933,11 @@ mod tests {
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
                 requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                label_candidate: None,
+                label_catalogue: LabelCatalogue {
+                    releases: Vec::new(),
+                    incomplete: 0,
+                },
             }
         }
 
@@ -5483,6 +5952,11 @@ mod tests {
                 artist_calls: Arc::new(AtomicUsize::new(0)),
                 requested_artists: Arc::new(std::sync::Mutex::new(Vec::new())),
                 requested_codes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                label_candidate: None,
+                label_catalogue: LabelCatalogue {
+                    releases: Vec::new(),
+                    incomplete: 0,
+                },
             }
         }
 
@@ -5571,6 +6045,45 @@ mod tests {
                 isnis: Vec::new(),
                 disambiguation: None,
             })
+        }
+
+        async fn search_labels(
+            &self,
+            label: &str,
+        ) -> std::result::Result<Vec<LabelCandidate>, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            // A name the fixture does not know has no candidate, which is how the
+            // provider reports a label MusicBrainz cannot find.
+            Ok(self
+                .label_candidate
+                .iter()
+                .filter(|candidate| candidate.name.eq_ignore_ascii_case(label))
+                .cloned()
+                .collect())
+        }
+
+        async fn label_by_id(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCandidate, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            self.label_candidate
+                .clone()
+                .ok_or_else(|| DiscographyError::LabelUnresolved("no label".into()))
+        }
+
+        async fn releases_by_label(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCatalogue, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(self.label_catalogue.clone())
         }
 
         async fn release_groups(
@@ -6603,6 +7116,1057 @@ mod tests {
         let library = library_with(albums);
         config.library.paths = vec![library.path().to_string_lossy().into_owned()];
         (config, db, staging, library)
+    }
+
+    // ── Label sweep ──
+
+    use crate::discography::label::{LabelCandidate, LabelCatalogue, LabelRelease};
+    use crate::mode::LabelRequest;
+
+    /// A provider that answers one label and one catalogue, and counts calls.
+    struct FakeLabelProvider {
+        candidate: Option<LabelCandidate>,
+        catalogue: LabelCatalogue,
+        failure: Option<String>,
+        catalogue_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeLabelProvider {
+        fn with_catalogue(releases: Vec<ReleaseGroup>) -> Self {
+            Self {
+                candidate: Some(LabelCandidate {
+                    id: "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+                    name: "Hospital Records".into(),
+                    score: Some(100),
+                    label_code: Some(12939),
+                    disambiguation: Some("UK drum & bass".into()),
+                }),
+                catalogue: LabelCatalogue {
+                    releases: releases
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, release_group)| LabelRelease {
+                            release_id: format!("release-{index}"),
+                            release_group,
+                            artist_credit: "London Elektricity".into(),
+                        })
+                        .collect(),
+                    incomplete: 0,
+                },
+                failure: None,
+                catalogue_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn unresolvable() -> Self {
+            Self {
+                candidate: Some(LabelCandidate {
+                    id: "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+                    name: "Some Other Label".into(),
+                    score: Some(100),
+                    label_code: None,
+                    disambiguation: None,
+                }),
+                catalogue: LabelCatalogue {
+                    releases: Vec::new(),
+                    incomplete: 0,
+                },
+                failure: None,
+                catalogue_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                candidate: None,
+                catalogue: LabelCatalogue {
+                    releases: Vec::new(),
+                    incomplete: 0,
+                },
+                failure: Some(reason.to_string()),
+                catalogue_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DiscographyProvider for FakeLabelProvider {
+        async fn search_artists(
+            &self,
+            _artist: &str,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            panic!("label tests never search artists")
+        }
+
+        async fn search_artists_by_code(
+            &self,
+            _code: CodeIdentifier<'_>,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            panic!("label tests never search artist codes")
+        }
+
+        async fn artist_by_id(
+            &self,
+            _artist_mbid: &str,
+        ) -> std::result::Result<ArtistCandidate, DiscographyError> {
+            panic!("label tests never look up artists")
+        }
+
+        async fn release_groups(
+            &self,
+            _artist_mbid: &str,
+        ) -> std::result::Result<Vec<ReleaseGroup>, DiscographyError> {
+            panic!("label tests never fetch an artist discography")
+        }
+
+        async fn search_labels(
+            &self,
+            _label: &str,
+        ) -> std::result::Result<Vec<LabelCandidate>, DiscographyError> {
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(self.candidate.iter().cloned().collect())
+        }
+
+        async fn label_by_id(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCandidate, DiscographyError> {
+            self.catalogue_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            self.candidate
+                .clone()
+                .ok_or_else(|| DiscographyError::LabelUnresolved("no candidate".into()))
+        }
+
+        async fn releases_by_label(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCatalogue, DiscographyError> {
+            self.catalogue_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(reason) = &self.failure {
+                return Err(DiscographyError::Transport(reason.clone()));
+            }
+            Ok(self.catalogue.clone())
+        }
+    }
+
+    /// A cancellation flag no signal can trip, for tests that do not exercise it.
+    fn active_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn label_request(value: &str) -> LabelRequest {
+        LabelRequest {
+            input: value.to_string(),
+            mbid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_run_stages_every_missing_album_and_never_writes_the_library() {
+        let (mut config, db, staging, library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            staging
+                .path()
+                .join("London Elektricity")
+                .join("Syncopated City")
+                .is_dir(),
+            "the album must be staged"
+        );
+        let library_entries: Vec<_> = std::fs::read_dir(library.path()).unwrap().collect();
+        assert!(
+            library_entries.is_empty(),
+            "a label run must never create a library folder, found {library_entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_album_the_library_holds_is_not_searched() {
+        let (config, db, staging, _library) =
+            discover_fixture(&[("London Elektricity", "Syncopated City")]);
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a present album must not be searched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_label_does_not_stop_the_run() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::unresolvable();
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect("an unresolvable label is reported, not fatal");
+        assert_eq!(
+            provider.catalogue_calls.load(Ordering::SeqCst),
+            0,
+            "a label that never resolved must not have its catalogue fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_label_failure_is_replayed_without_asking_musicbrainz() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        db.upsert_discography_failure(&crate::db::DiscographyFailureEntry {
+            artist_key: "label:name:hospital records".to_string(),
+            failure_kind: "unresolved".to_string(),
+            reason: "2 candidates match hospital records".to_string(),
+            recorded_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect("a replayed failure is reported, not fatal");
+
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a replayed failure must not reach the search stage"
+        );
+        assert!(
+            provider.catalogue_calls.load(Ordering::SeqCst) == 0,
+            "a replayed failure must not fetch the catalogue"
+        );
+        assert!(
+            std::fs::read_dir(staging.path()).unwrap().next().is_none(),
+            "nothing is staged from a replayed failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_since_bound_reaches_the_selection() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![
+            ReleaseGroup {
+                id: "group-1".into(),
+                title: "Album One".into(),
+                first_release_date: Some("2001".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+            ReleaseGroup {
+                id: "group-2".into(),
+                title: "Album Two".into(),
+                first_release_date: Some("2010".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+        ]);
+        let since = crate::discography::parse_partial_date("2005-01-01");
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            since,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        let queries = client.search_queries.lock().unwrap().clone();
+        assert!(
+            queries.iter().any(|query| query.contains("Album Two")),
+            "the album above the bound is searched: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|query| query.contains("Album One")),
+            "the album below the bound is not: {queries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_consecutive_provider_failures_abort_the_label_run() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::failing("MusicBrainz returned HTTP 503");
+
+        let error = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[
+                label_request("Hospital Records"),
+                label_request("Med School"),
+                label_request("Spearhead"),
+            ],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect_err("three consecutive provider failures must abort");
+
+        assert!(
+            error
+                .to_string()
+                .contains("3 consecutive MusicBrainz failures"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_album_is_a_cancellation_not_a_failure() {
+        assert!(
+            outcome_is_cancellation(&AlbumOutcome::Failed {
+                reason: "download error: download cancelled by user".into(),
+            }),
+            "the download stage prefixes the reason with its error kind"
+        );
+        assert!(
+            outcome_is_cancellation(&AlbumOutcome::Failed {
+                reason: "all candidates exhausted: download error: download cancelled by user"
+                    .into(),
+            }),
+            "the operator's interrupt must not count as a failed album"
+        );
+        assert!(
+            !outcome_is_cancellation(&AlbumOutcome::Failed {
+                reason: "no peer accepted the transfer".into(),
+            }),
+            "a genuine failure still counts, even during an interrupt"
+        );
+        assert!(!outcome_is_cancellation(&AlbumOutcome::NoCandidates {
+            reason: "download cancelled by user".into(),
+        }));
+        assert!(
+            !outcome_is_cancellation(&AlbumOutcome::Failed {
+                reason: "all candidates exhausted: 01 - cancelled by user.flac from peer \
+                         exceeded max_queue_time_secs=1800"
+                    .into(),
+            }),
+            "a peer-advertised filename must not be read as the operator's interrupt"
+        );
+        assert!(!outcome_is_cancellation(&AlbumOutcome::Skipped));
+    }
+
+    #[test]
+    fn label_counters_count_every_failure_route_and_only_staged_downloads() {
+        let mut counters = crate::label_discover::LabelCounters::default();
+        count_label_outcome(
+            &mut counters,
+            &AlbumOutcome::Downloaded {
+                track_count: 2,
+                destination: DownloadDestination::Staging(std::path::PathBuf::from(
+                    "/s/Artist/Album",
+                )),
+            },
+        );
+        count_label_outcome(
+            &mut counters,
+            &AlbumOutcome::Downloaded {
+                track_count: 2,
+                destination: DownloadDestination::Library(std::path::PathBuf::from(
+                    "/l/Artist/Album",
+                )),
+            },
+        );
+        count_label_outcome(
+            &mut counters,
+            &AlbumOutcome::Failed {
+                reason: "peer vanished".into(),
+            },
+        );
+        count_label_outcome(
+            &mut counters,
+            &AlbumOutcome::NoCandidates {
+                reason: "no results".into(),
+            },
+        );
+        count_label_outcome(&mut counters, &AlbumOutcome::Skipped);
+
+        assert_eq!(
+            counters.staged_albums, 1,
+            "only a staging download is staged"
+        );
+        assert_eq!(
+            counters.failed_albums, 2,
+            "a failure reported as an outcome counts like one returned as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_library_root_aborts_the_label_run_like_the_artist_sweep() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.library.paths = vec!["/nonexistent/library/root".to_string()];
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        let error = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect_err("a library that cannot be read must abort, not pretend it is empty");
+
+        assert!(
+            error.to_string().to_lowercase().contains("library")
+                || error.to_string().to_lowercase().contains("no such file"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_release_type_override_reaches_the_selection() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![crate::client::SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        // An EP-only run selects nothing, so the album is not staged: this proves the
+        // override reaches the selection rather than being silently ignored.
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            Some(&[crate::config::DiscographyReleaseType::Ep]),
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !staging.path().join("London Elektricity").exists(),
+            "an EP-only run must not stage a studio album"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_stale_label_catalogues_count_towards_the_breaker() {
+        use crate::discography::label::{LabelCacheEntry, LabelInput, LABEL_CACHE_VERSION};
+
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        let stale_at = chrono::Utc::now().timestamp() - 40 * 86_400;
+        let names = ["Hospital Records", "Med School", "Spearhead"];
+        for name in names {
+            let key = LabelInput::parse(name).cache_key();
+            db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+                artist_key: key,
+                artist_mbid: "8562598d-60d1-4bd6-8b85-4d709e951770".to_string(),
+                canonical_artist: name.to_string(),
+                fetched_at: stale_at,
+                release_groups_json: serde_json::to_string(&LabelCacheEntry {
+                    version: LABEL_CACHE_VERSION,
+                    releases: Vec::new(),
+                    incomplete: 0,
+                })
+                .unwrap(),
+            })
+            .unwrap();
+        }
+        let client = MockClient::new();
+        // The catalogue is served from the stale row, but the refresh failed for a
+        // provider reason, which is what the breaker must count.
+        let provider = FakeLabelProvider::failing("MusicBrainz returned HTTP 503");
+
+        let error = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[
+                label_request(names[0]),
+                label_request(names[1]),
+                label_request(names[2]),
+            ],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect_err("three stale caches with a failing provider must abort");
+
+        assert!(
+            error
+                .to_string()
+                .contains("3 consecutive MusicBrainz failures"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_label_request_is_a_configuration_error_before_any_request() {
+        let (config, db, staging, _library) = discover_fixture(&[]);
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![]);
+
+        for request in [
+            LabelRequest {
+                input: "8562598d-60d1-4bd6-8b85-4d709e95177".to_string(),
+                mbid: None,
+            },
+            LabelRequest {
+                input: "Hospital Records".to_string(),
+                mbid: Some("not-a-uuid".to_string()),
+            },
+        ] {
+            let error = run_label_discover_mode_with_provider(
+                &client,
+                &config,
+                &db,
+                &[request],
+                None,
+                None,
+                false,
+                staging.path(),
+                &provider,
+                &active_cancel(),
+            )
+            .await
+            .expect_err("a malformed request must be refused");
+            assert!(
+                matches!(error, SeakarrError::Config(_)),
+                "a malformed request is a configuration error, not a provider failure: {error:?}"
+            );
+        }
+
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a refused request must not search"
+        );
+        assert_eq!(
+            provider.catalogue_calls.load(Ordering::SeqCst),
+            0,
+            "a refused request must not reach MusicBrainz"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_selection_skips_the_library_walk() {
+        // Nothing can be downloaded, so an unreadable library must not turn the run
+        // into an error: the walk is skipped entirely.
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.library.paths = vec!["/nonexistent/library/root".to_string()];
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Single".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            Some(&[crate::config::DiscographyReleaseType::Ep]),
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect("an empty selection never needs the library");
+
+        assert!(client.search_queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_label_core_refuses_a_configuration_that_cannot_work() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![]);
+
+        let mut disabled = config.clone();
+        disabled.discography.enabled = false;
+        let error = run_label_discover_mode_with_provider(
+            &client,
+            &disabled,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect_err("discography must be enabled");
+        assert!(
+            error.to_string().contains("discography.enabled"),
+            "got {error}"
+        );
+
+        config.library.paths.clear();
+        let error = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .expect_err("a library is required");
+        assert!(
+            error
+                .to_string()
+                .contains("a label sweep needs a library to check what is present"),
+            "got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_label_run_stops_before_the_first_label() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let provider = FakeLabelProvider::with_catalogue(vec![]);
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &cancel,
+        )
+        .await
+        .expect("cancellation ends the run cleanly");
+
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a cancelled run must not download"
+        );
+        assert_eq!(
+            provider.catalogue_calls.load(Ordering::SeqCst),
+            0,
+            "a cancelled run must not fetch a catalogue"
+        );
+    }
+
+    /// A provider that trips the cancellation flag as soon as it has served one
+    /// catalogue, so the between-labels poll can be tested deterministically.
+    struct CancellingProvider {
+        cancel: Arc<AtomicBool>,
+        catalogues: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DiscographyProvider for CancellingProvider {
+        async fn search_artists(
+            &self,
+            _artist: &str,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            panic!("label cancellation tests never search artists")
+        }
+
+        async fn search_artists_by_code(
+            &self,
+            _code: CodeIdentifier<'_>,
+        ) -> std::result::Result<Vec<ArtistCandidate>, DiscographyError> {
+            panic!("label cancellation tests never search artist codes")
+        }
+
+        async fn artist_by_id(
+            &self,
+            _artist_mbid: &str,
+        ) -> std::result::Result<ArtistCandidate, DiscographyError> {
+            panic!("label cancellation tests never look up artists")
+        }
+
+        async fn release_groups(
+            &self,
+            _artist_mbid: &str,
+        ) -> std::result::Result<Vec<ReleaseGroup>, DiscographyError> {
+            panic!("label cancellation tests never fetch an artist discography")
+        }
+
+        async fn search_labels(
+            &self,
+            _label: &str,
+        ) -> std::result::Result<Vec<LabelCandidate>, DiscographyError> {
+            Ok(vec![LabelCandidate {
+                id: "8562598d-60d1-4bd6-8b85-4d709e951770".into(),
+                name: "Hospital Records".into(),
+                score: Some(100),
+                label_code: None,
+                disambiguation: None,
+            }])
+        }
+
+        async fn label_by_id(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCandidate, DiscographyError> {
+            self.search_labels("")
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| DiscographyError::LabelUnresolved("no candidate".into()))
+        }
+
+        async fn releases_by_label(
+            &self,
+            _label_mbid: &str,
+        ) -> std::result::Result<LabelCatalogue, DiscographyError> {
+            self.catalogues.fetch_add(1, Ordering::SeqCst);
+            // The sweep is now under way; the next label's poll must see this.
+            self.cancel.store(true, Ordering::SeqCst);
+            Ok(LabelCatalogue {
+                releases: Vec::new(),
+                incomplete: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_the_first_label_stops_the_sweep() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let provider = CancellingProvider {
+            cancel: Arc::clone(&cancel),
+            catalogues: AtomicUsize::new(0),
+        };
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[
+                label_request("Hospital Records"),
+                label_request("Med School"),
+                label_request("Spearhead"),
+            ],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &cancel,
+        )
+        .await
+        .expect("cancellation ends the run cleanly");
+
+        assert_eq!(
+            provider.catalogues.load(Ordering::SeqCst),
+            1,
+            "the poll before the second label must stop the sweep"
+        );
+        assert!(
+            client.search_queries.lock().unwrap().is_empty(),
+            "a cancelled sweep downloads nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_stops_the_label_run_without_a_failure() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let inner = MockClient::new();
+        *inner.search_results.lock().unwrap() = vec![crate::client::SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Album One\01 - A.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Album One\02 - B.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        // The flag trips inside the first search, so the interrupt lands in the
+        // download stage of album one - the path that used to be reported as a
+        // failed, budget-charged album.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let client = CancelAfterFirstSearchClient {
+            inner,
+            cancel: Arc::clone(&cancel),
+            searches: AtomicUsize::new(0),
+        };
+        let provider = FakeLabelProvider::with_catalogue(vec![
+            ReleaseGroup {
+                id: "group-1".into(),
+                title: "Album One".into(),
+                first_release_date: Some("2001".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+            ReleaseGroup {
+                id: "group-2".into(),
+                title: "Album Two".into(),
+                first_release_date: Some("2002".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+        ]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &cancel,
+        )
+        .await
+        .expect("an interrupted run ends cleanly");
+
+        assert!(
+            !staging.path().join("London Elektricity").exists(),
+            "an interrupted album must not be staged"
+        );
+        assert_eq!(
+            client.searches.load(Ordering::SeqCst),
+            1,
+            "the interrupt must stop the sweep after the album it interrupted"
+        );
+        // The summary text is not asserted here: `LogCapture` is a process-global
+        // window, so a parallel test that starts one makes this race. The counting
+        // rule it would pin is covered deterministically by
+        // `an_interrupted_album_is_a_cancellation_not_a_failure` and
+        // `label_counters_count_every_failure_route_and_only_staged_downloads`.
+    }
+
+    #[tokio::test]
+    async fn the_budget_stops_a_label_run_at_the_configured_number() {
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 1;
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Album One\01 - A.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Album One\02 - B.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![
+            ReleaseGroup {
+                id: "group-1".into(),
+                title: "Album One".into(),
+                first_release_date: Some("2001".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+            ReleaseGroup {
+                id: "group-2".into(),
+                title: "Album Two".into(),
+                first_release_date: Some("2002".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+        ]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            client.search_queries.lock().unwrap().len(),
+            1,
+            "the budget must stop the sweep after one download"
+        );
     }
 
     fn search_index(soulseek: &MockClient, artist: &str, queries: &[(&str, &str)]) {

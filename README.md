@@ -33,6 +33,28 @@ Automated Soulseek music downloader with library quality upgrading.
   searched or re-downloaded, and each run stops after
   `discover.max_cycle_downloads` download attempts so a large library fills in
   over successive runs. Release types come from `discography.allowed_types`.
+- **Label discovery** — `--label` sweeps a record label instead of your library:
+  the value is a label name or a MusicBrainz label ID, and several labels are
+  comma-delimited (`--label "Hospital Records,Med School"`). The label is resolved
+  on MusicBrainz with the same exact-match and score-dominance rules used for
+  artists, so an ambiguous name is refused with its candidates listed rather than
+  guessed; `discography.label_mbids` pins a name to an ID when the same label is
+  swept repeatedly. `--release-type` overrides `discography.allowed_types` for that
+  run (`album` is accepted as another word for `studio_album`), and
+  `--since YYYY[-MM[-DD]]` bounds the sweep by first-release-date; an undated
+  release group cannot satisfy a lower bound and is excluded. Albums already in
+  the library are skipped and every other eligible album is downloaded into
+  `storage.staging_dir` under `<artist>/<album>/` — a label sweep never writes
+  into your library. An album a run already downloaded and left in staging counts as
+  processed, so a repeat run before you move it reports it as skipped rather than
+  downloading it again.
+
+  Each run summarises itself with `label:` lines: the labels
+  resolved and unresolved, the releases examined and the drop reasons it counts, the albums
+  already present, eligible, staged and failed, and where staged albums are waiting. A release is searched and matched under its full MusicBrainz
+  credit, so a collaboration the library files under the lead artist alone can be
+  staged again as a second copy. A label's catalogue is cached for `discography.cache_days`,
+  so a brand-new release can take up to that long to appear.
 - **Manual & batch modes** — search for a specific artist/album on demand, or process a newline-separated
   text file of `artist - album` lines to download a curated wantlist.
   A run places each completed album into the artist's existing library folder when one exists
@@ -202,6 +224,9 @@ All options are optional overrides. When an option is omitted, the value from `s
 | `--artist <name>` | Manual selector; without `--album`, processes each eligible MusicBrainz conceptual album (or each identifiable folder when legacy discovery is selected). In `discover` mode, an optional narrowing filter that overrides both `discover.exclude_artists` and the folder-ownership gate for that one artist; the name need not be an artist the library holds an album for (a folder named after it becomes the destination, and with neither album nor folder the downloads stay in staging instead), and it is verified on MusicBrainz before the library is walked, so a name MusicBrainz cannot resolve fails the run without scanning. Manual downloads are placed into the artist's existing library folder when one exists anywhere under a configured `library.paths` entry. The value is read by shape: an artist name (the default), an ISNI such as `0000 0004 6659 7022`, an IPI such as `00581977202`, or a MusicBrainz artist ID (a hyphenated UUID); spaces and hyphens in an ISNI are ignored and its check character is validated, so a malformed code is a configuration error rather than a name to search. A code or ID identifies the artist exactly, is resolved against MusicBrainz before the library is walked and never falls back to the folder heuristic: exactly one MusicBrainz artist carrying the code resolves, while a code matching none or several is a configuration error naming the code — a shared one also names its carriers and the fix, `discography.artist_mbids` keyed `isni:<digits>`, `ipi:<digits>` or `mbid:<uuid>`. A code is rejected when combined with `--album` and in a batch line, because neither path asks MusicBrainz and a code names no library folder. The `isni:`, `ipi:` or `mbid:` prefixed form is `discography.artist_mbids` key syntax, not an accepted `--artist` value. | *(from config)* |
 | `--album <name>` | Manual selector; may be used without `--artist`. The explicit form places into that folder too, without scanning the library; an album folder that already exists keeps the download in staging. | *(from config)* |
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
+| `--label <name[,name...]>` | Discover-mode selector; sweeps one or more record labels instead of the library-derived artist list. Each value is a label name or a MusicBrainz label ID, and a comma separates several. A name is resolved on MusicBrainz with the same exact-match and score-dominance rules as an artist, so an ambiguous name is refused with its candidates listed rather than guessed, and `discography.label_mbids` pins a name to an ID. A blank value, a value hyphenated like a MusicBrainz ID that is not one (four hyphens separating five hexadecimal groups, within two characters of a UUID's 32 digits), and the same label given twice are configuration errors. A label sweep needs `discography.enabled: true` and at least one `library.paths` entry, and `discover.exclude_artists` applies to the artist credits it finds. Discover only: it is mutually exclusive with `--artist`, and discover mode already refuses `--album` and `--batch-file`, so it cannot be combined with them.  A label name that contains a comma cannot be expressed this way; pass its MusicBrainz ID instead. | — |
+| `--release-type <type[,type...]>` | Release types wanted in a label sweep, comma-delimited; overrides `discography.allowed_types` for that run. `album` is accepted as another word for `studio_album`, and the other values are those `discography.allowed_types` accepts. An unknown value is a configuration error naming the accepted set. Requires `--label`, because no other mode selects releases by type. | *(from config)* |
+| `--since <date>` | Lower bound on a release group's first-release date in a label sweep: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`. A release group without a first-release date cannot satisfy a lower bound and is excluded. Any other shape, or a date that does not exist such as `2025-02-30`, is a configuration error. Requires `--label`. | — |
 | `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
 
@@ -308,10 +333,11 @@ is unaffected, and so is a venue-and-date title such as
 | Key | Description | Default |
 | --- | ----------- | ------- |
 | `enabled` | Use MusicBrainz release groups before artist-only Soulseek searches; `false` selects legacy folder discovery. | `true` |
-| `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback. | `30` |
-| `failure_cache_days` | How long an artist that MusicBrainz could not resolve is remembered, so a later run skips the lookup instead of asking again. An explicitly named or identified artist always asks instead, and a code or ID is never remembered at all, because a row keyed by one could never be replayed. `0` disables the failure cache: nothing is recorded and nothing is skipped. Only resolution failures are remembered — a MusicBrainz outage is always retried. | `7` |
+| `cache_days` | Complete 24-hour periods before refresh; `0` refreshes every run but keeps stale fallback for an artist discography. A label catalogue row is written only when this is above `0`, so `0` stops new label rows being cached; a row cached earlier is still served as stale when a refresh fails. | `30` |
+| `failure_cache_days` | How long a name MusicBrainz could not resolve is remembered, so a later run skips the lookup instead of asking again. For artists, an explicitly named or identified artist always asks instead, and a code or ID is never remembered at all. For labels, an unresolved name is remembered and replayed, and pinning it with `label_mbids` bypasses the row. `0` disables the failure cache: nothing is recorded and nothing is skipped. Only resolution failures are remembered — a MusicBrainz outage is always retried. | `7` |
 | `allowed_types` | Any of `studio_album`, `live_album`, `ep`, `single`, `compilation`, `remix`, `soundtrack`, `dj_mix`, `mixtape`. Must not be empty while `enabled` is true. | `[studio_album]` |
 | `artist_mbids` | Optional artist-identity to MusicBrainz UUID map for ambiguous names and shared codes. Keys may be an artist name (normalized before matching, so `Nirvana` and ` nirvana ` cannot both appear), `isni:<digits>`, `ipi:<digits>` or `mbid:<uuid>`; an ISNI or IPI key may be written with its usual spaces or hyphens, which are ignored. The value is always a hyphenated MusicBrainz UUID. | `{}` |
+| `label_mbids` | Label name to MusicBrainz label ID, for a name that resolves ambiguously. A key is matched against the text passed to `--label`, after case and spacing are folded, so write it the way you would type it; keys are unique after folding and values must be valid MBIDs. A key can never match in two cases: a hyphenated near-miss UUID (refused as a `--label` value before any pin is read), and an artist-style `mbid:`/`isni:`/`ipi:` key (only a label literally named that way matches it). | `{}` |
 
 ### `discover`
 
@@ -407,6 +433,17 @@ MusicBrainz; the row is cleared as soon as the artist name resolves, and pinning
 an MBID clears it immediately. Only a failure to match the artist name is remembered —
 an outage, and a search whose reported result count disagrees with the page it
 returned, are retried every run rather than cached.
+
+A label name that MusicBrainz cannot resolve to exactly one candidate is recorded
+the same way and honoured for `discography.failure_cache_days`, so a `--label` run
+reports it as skipped instead of asking again. That is deliberately unlike
+`--artist`: every label sweep is an explicit request, but a label resolution
+failure is a property of the name rather than of the run, and re-asking a name
+that cannot be disambiguated only spends a request. The escape hatch is
+`discography.label_mbids`, which pins the name and bypasses the recorded failure.
+Removing a pin does not invalidate the catalogue already cached under that name:
+the cached copy keeps being served until `discography.cache_days` expires, so a
+pin change takes effect immediately while a pin removal takes effect by expiry.
 
 ### `filters`
 

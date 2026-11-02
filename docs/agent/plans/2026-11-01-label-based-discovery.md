@@ -18,6 +18,35 @@
 
 Single subsystem: one crate, one new provider surface plus one selection module and one runner entry point. The parts are not separable into independent plans, because the CLI flag, the provider method, the selection rules, the cache rows and the staging placement must land together or `--label` either does nothing or does the wrong thing. **No split.**
 
+## Corrections found during implementation
+
+Recorded as they were found, so a later reader does not re-derive them.
+
+1. **Task 10's tests called `config.validate()`** on `Config::default()`, which rejects an
+   empty `soulseek.username`/`password` before `validate_discography()` runs, so four of
+   the five tests could never pass as written. Fixed: the four validation tests call
+   `config.validate_non_credential_constraints()`, which is what the sibling
+   `discography.artist_mbids` tests already use and which still runs
+   `validate_discography()`. The production code in Task 10 is unchanged.
+2. **Task 1 asked for `ResolveKind` and a `kind` parameter**, but `LabelUnresolved` does
+   not exist until Task 2, and `ResolveKind::Label` is not constructed until
+   `resolve_label` lands - so the variant would be dead code and `-D warnings` would
+   fail. Fixed: Task 1 keeps the helper artist-flavoured; Task 4 (same chunk as
+   `resolve_label`) adds `ResolveKind` and the parameter, and the artist messages must
+   stay byte-identical across that change. (The Task 1 correction note below says the
+   same thing about Task 4; the earlier phrasing that named Task 3 was superseded.)
+3. **Every `rustfmt --edition 2024` instruction in this plan is wrong.** The crate is
+   `edition = "2021"` and HEAD is edition-2021 fmt-clean; formatting a file with the
+   2024 style edition reformats it, and `cargo fmt --check` then fails. Use plain
+   `cargo fmt` (which reads the edition from Cargo.toml) or `rustfmt <file>` with no
+   `--edition`, and never run rustfmt on a module root such as `src/lib.rs` or
+   `src/discography/mod.rs` unless you intend to format that whole subtree.
+4. **`PartialDate` had to become `pub`** (fields private, `parse_partial_date` still
+   `pub(crate)`): `pub fn label_targets(..., since: Option<PartialDate>, ...)` and the
+   later `pub enum ExecutionPlan::Discover { since: Option<PartialDate> }` expose it in
+   public signatures, which `private_interfaces` rejects under `-D warnings`. Making
+   the type public once is the fix; an `#[allow(private_interfaces)]` is not.
+
 ## Plan-level clarifications against the spec
 
 Two places where the spec's wording is refined so the types stay honest. Neither changes a behaviour the spec describes.
@@ -166,28 +195,16 @@ pub(crate) fn dominant_candidate_index<T>(
 }
 ```
 
-The helper is shared, but the *error variant* is not: a label problem must not be reported as `ArtistUnresolved`. The `ResolveKind` enum makes the two possibilities explicit and exhaustive:
-
-```rust
-/// Which entity kind a resolution failure is about, so the shared dominance
-/// helper reports the variant its caller can act on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolveKind {
-    Artist,
-    Label,
-}
-
-impl ResolveKind {
-    fn unresolved(&self, reason: String) -> DiscographyError {
-        match self {
-            Self::Artist => DiscographyError::ArtistUnresolved(reason),
-            Self::Label => DiscographyError::LabelUnresolved(reason),
-        }
-    }
-}
-```
-
-Inside the helper, the three refusal arms construct their error with `kind.unresolved(format!(...))` instead of naming `ArtistUnresolved` directly.
+**Correction (found during implementation, wave 1).** Do NOT add `ResolveKind` or a
+`kind` parameter here. `DiscographyError::LabelUnresolved` does not exist until Task 2,
+and once it does, nothing in the crate constructs `ResolveKind::Label` until
+`src/discography/label.rs` lands in Task 3 - and a `pub(crate)` variant that is never
+constructed fails `cargo clippy -D warnings` with "variant `Label` is never
+constructed". Suppressing that with `#[allow(dead_code)]` would leave an attribute
+nobody is responsible for removing. So the helper stays artist-flavoured in this
+task - its refusal arms construct `DiscographyError::ArtistUnresolved(format!(...))`
+inline - and **Task 4 adds `ResolveKind` and the `kind` parameter** in the same chunk
+that first constructs `ResolveKind::Label`.
 
 Then `resolve_dominant_artist` becomes:
 
@@ -765,7 +782,40 @@ cargo test --lib discography::label 2>&1 | tail -20
 
 Expected: FAIL to compile - `LabelCandidate` and `resolve_label` do not exist.
 
-- [ ] **Step 3: Implement it**
+- [ ] **Step 3: Parameterise the shared dominance helper**
+
+In `src/discography/mod.rs`, add the `ResolveKind` enum and give
+`dominant_candidate_index` a `kind` parameter. This belongs in this task, not Task 1:
+`ResolveKind::Label` is first constructed by `resolve_label` below, so a variant added
+earlier would be dead code under `-D warnings`.
+
+```rust
+/// Which entity kind a resolution failure is about, so the shared dominance
+/// helper reports the variant its caller can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveKind {
+    Artist,
+    Label,
+}
+
+impl ResolveKind {
+    fn unresolved(&self, reason: String) -> DiscographyError {
+        match self {
+            Self::Artist => DiscographyError::ArtistUnresolved(reason),
+            Self::Label => DiscographyError::LabelUnresolved(reason),
+        }
+    }
+}
+```
+
+Then replace the three inline `DiscographyError::ArtistUnresolved(format!(...))`
+constructions in `dominant_candidate_index` with `kind.unresolved(format!(...))`, and
+pass `ResolveKind::Artist` from `resolve_dominant_artist`.
+
+Run `cargo test --lib discography` here: every existing artist message must be
+unchanged.
+
+- [ ] **Step 4: Implement the label types and resolution**
 
 Add above the `#[cfg(test)]` block:
 
@@ -859,15 +909,17 @@ fn describe_label(candidate: &LabelCandidate) -> String {
 }
 ```
 
-- [ ] **Step 4: Run to confirm it passes**
+- [ ] **Step 5: Run to confirm it passes**
 
 ```bash
-cargo test --lib discography::label 2>&1 | tail -5
+cargo test --lib discography 2>&1 | tail -5
+cargo clippy --all-targets -- -D warnings
 ```
 
-Expected: PASS, 13 tests.
+Expected: PASS, 13 label tests plus the unchanged artist suite, and no clippy warning
+(the `Label` arm is now constructed, so nothing is dead).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/discography/label.rs

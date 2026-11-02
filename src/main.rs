@@ -104,6 +104,21 @@ struct Cli {
     #[arg(long)]
     album: Option<String>,
 
+    /// Record labels to sweep in discover mode: a name or a MusicBrainz label ID,
+    /// comma-delimited for several.
+    #[arg(long, value_delimiter = ',')]
+    label: Option<Vec<String>>,
+
+    /// Release types wanted in a label sweep, comma-delimited.
+    /// Defaults to discography.allowed_types.
+    #[arg(long, value_delimiter = ',')]
+    release_type: Option<Vec<String>>,
+
+    /// Lower bound on a release group's first-release date:
+    /// YYYY, YYYY-MM or YYYY-MM-DD.
+    #[arg(long)]
+    since: Option<String>,
+
     /// Validate configuration and exit
     #[arg(long)]
     test: bool,
@@ -228,6 +243,9 @@ async fn run_with(cli: Cli, client_factory: ClientFactory) -> Result<()> {
         batch_file: cli.batch_file.as_ref().map(|p| p.to_string_lossy().into()),
         artist: cli.artist.clone(),
         album: cli.album.clone(),
+        label: cli.label.clone(),
+        release_type: cli.release_type.clone(),
+        since: cli.since.clone(),
         schedule: cli.schedule || cli.daemon,
         ignore_processed: cli.ignore_processed,
     };
@@ -583,8 +601,27 @@ async fn dispatch_execution_plan(
         ExecutionPlan::Batch { file_path } => {
             run_batch_mode(client, file_path, config, db, ignore_processed).await
         }
-        ExecutionPlan::Discover { artist } => {
-            runner::run_discover_mode(client, config, db, artist.as_deref(), ignore_processed).await
+        ExecutionPlan::Discover {
+            artist,
+            labels,
+            release_types,
+            since,
+        } => {
+            if labels.is_empty() {
+                runner::run_discover_mode(client, config, db, artist.as_deref(), ignore_processed)
+                    .await
+            } else {
+                runner::run_label_discover_mode(
+                    client,
+                    config,
+                    db,
+                    labels,
+                    release_types.as_deref(),
+                    *since,
+                    ignore_processed,
+                )
+                .await
+            }
         }
     }
 }
@@ -857,6 +894,48 @@ mod tests {
                 "help must mention {expected}:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn the_label_flags_are_parsed_by_clap() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "seakarr",
+            "--mode",
+            "discover",
+            "--label",
+            "Hospital Records,Med School",
+            "--release-type",
+            "album,ep",
+            "--since",
+            "2025-01-01",
+        ])
+        .expect("the label flags must parse");
+
+        assert_eq!(
+            cli.label,
+            Some(vec![
+                "Hospital Records".to_string(),
+                "Med School".to_string()
+            ])
+        );
+        assert_eq!(
+            cli.release_type,
+            Some(vec!["album".to_string(), "ep".to_string()])
+        );
+        assert_eq!(cli.since.as_deref(), Some("2025-01-01"));
+    }
+
+    #[test]
+    fn a_single_label_needs_no_delimiter() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["seakarr", "--label", "Hospital Records"])
+            .expect("one label must parse");
+        assert_eq!(cli.label, Some(vec!["Hospital Records".to_string()]));
+        assert!(cli.release_type.is_none());
+        assert!(cli.since.is_none());
     }
 
     #[test]
@@ -1163,7 +1242,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         config.storage.staging_dir = temp.path().to_string_lossy().into();
         let db = Database::open_in_memory().unwrap();
-        let plan = ExecutionPlan::Discover { artist: None };
+        let plan = ExecutionPlan::Discover {
+            artist: None,
+            labels: Vec::new(),
+            release_types: None,
+            since: None,
+        };
 
         let error = dispatch_execution_plan(&client, &plan, &config, &db, false)
             .await
@@ -1175,6 +1259,43 @@ mod tests {
         assert!(
             client.search_queries.lock().unwrap().is_empty(),
             "a refused plan must not search before it refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_plan_dispatches_to_the_label_sweep_not_the_artist_sweep() {
+        // The two branches refuse a missing library with different wording, so an
+        // inverted `labels.is_empty()` check cannot pass silently.
+        let client = MockClient::new();
+        let mut config = Config::default();
+        config.notifications.urls = vec![];
+        config.library.paths.clear();
+        assert!(
+            config.discography.enabled,
+            "the fixture must exercise the library refusal, not the discography one"
+        );
+        let temp = TempDir::new().unwrap();
+        config.storage.staging_dir = temp.path().to_string_lossy().into();
+        let db = Database::open_in_memory().unwrap();
+        let plan = ExecutionPlan::Discover {
+            artist: None,
+            labels: vec![seakarr::mode::LabelRequest {
+                input: "Hospital Records".to_string(),
+                mbid: None,
+            }],
+            release_types: None,
+            since: None,
+        };
+
+        let error = dispatch_execution_plan(&client, &plan, &config, &db, false)
+            .await
+            .expect_err("a label sweep without a library must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("a label sweep needs a library to check what is present"),
+            "the label branch must answer, got {error}"
         );
     }
 
@@ -1713,6 +1834,9 @@ mod tests {
             batch_file: None,
             artist: None,
             album: None,
+            label: None,
+            release_type: None,
+            since: None,
             test: false,
             schedule: false,
             daemon: false,
