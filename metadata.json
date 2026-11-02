@@ -1,0 +1,53 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M6EJQNYPMZWX6CYC9XHRWY63",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 6,
+  "files_touched": [
+    "README.md",
+    "docs/agent/plans/2026-11-01-label-based-discovery.md",
+    "docs/agent/reviews/2026-11-02-label-based-discovery-residuals.md",
+    "docs/agent/specs/2026-11-01-label-based-discovery-design.md",
+    "src/config.rs",
+    "src/discography/label.rs",
+    "src/discography/mod.rs",
+    "src/discography/musicbrainz.rs",
+    "src/label_discover.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/mode.rs",
+    "src/runner.rs",
+    "tests/pipeline_test.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 2019102,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 170393728,
+    "output_tokens": 236695,
+    "api_call_count": 376
+  },
+  "redaction": {
+    "replacements": 30,
+    "layers": {
+      "betterleaks": 26,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 4,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
