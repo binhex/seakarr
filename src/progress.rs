@@ -197,7 +197,10 @@ impl ProgressDisplay {
 /// control sequence would be interpreted by the terminal.
 fn safe_label(text: &str, max_chars: usize) -> String {
     text.chars()
-        .filter(|c| !c.is_control())
+        // A peer controls its username and its file names. Control characters and Unicode
+        // format characters (bidi overrides, zero-width marks) can both repaint or reorder a
+        // progress label, so neither reaches the terminal.
+        .filter(|c| !c.is_control() && !crate::formatting::is_format_character(*c))
         .take(max_chars)
         .collect()
 }
@@ -465,5 +468,17 @@ mod tests {
         );
         assert_eq!(display.queue_bars_updated(), 1);
         display.clear_queue_bar(bar);
+    }
+}
+
+#[cfg(test)]
+mod hostile_label_tests {
+    use super::safe_label;
+
+    #[test]
+    fn a_label_drops_control_and_format_characters() {
+        let label = safe_label("01 - Track\u{1b}[2J\u{202e}.flac", 48);
+        assert!(!label.contains('\u{1b}'));
+        assert!(!label.chars().any(crate::formatting::is_format_character));
     }
 }

@@ -542,3 +542,162 @@ fn test_retired_auto_mode_is_rejected_before_login() {
         "the mode error must occur before login:\n{combined}"
     );
 }
+
+#[test]
+fn test_discover_mode_with_a_label_passes_validation() {
+    // A label plan reaches the same validated dispatch as an artist sweep, and must not
+    // need the network to prove it.
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    let library = temp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        format!(
+            "soulseek:\n  username: user\n  password: pass\nlibrary:\n  paths:\n    - {}\n",
+            library.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--mode",
+            "discover",
+            "--label",
+            "Hospital Records",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected --test to accept a label plan, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Configuration is valid."),
+        "got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Connecting to Soulseek"),
+        "--test must not connect:\n{combined}"
+    );
+}
+
+#[test]
+fn test_discover_mode_rejects_an_unknown_release_type_before_login() {
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    let library = temp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        format!(
+            "soulseek:\n  username: user\n  password: pass\nlibrary:\n  paths:\n    - {}\n",
+            library.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--mode",
+            "discover",
+            "--label",
+            "Hospital Records",
+            "--release-type",
+            "not-a-type",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(output.status.code(), Some(0), "got:\n{combined}");
+    assert!(
+        combined.contains("--release-type"),
+        "the refusal must name the flag, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Connecting to Soulseek"),
+        "--test must not connect:\n{combined}"
+    );
+}
+
+#[test]
+fn test_mode_rejects_a_bad_isni_check_character_before_login() {
+    for mode in ["manual", "discover"] {
+        assert_bad_isni_is_refused_by_test_mode(mode);
+    }
+}
+
+fn assert_bad_isni_is_refused_by_test_mode(mode: &str) {
+    // `--test` promises to find every configuration error before a login, and a code with a
+    // bad check character is one; discovering it after the PID lock is taken is late.
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    let log_dir = temp.path().join("logs");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("seakarr.yml"),
+        "soulseek:\n  username: user\n  password: pass\n",
+    )
+    .unwrap();
+
+    let library = temp.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_seakarr"))
+        .args([
+            "--config-path",
+            config_dir.to_str().unwrap(),
+            "--log-path",
+            log_dir.to_str().unwrap(),
+            "--library-path",
+            library.to_str().unwrap(),
+            "--mode",
+            mode,
+            "--artist",
+            "0000000466597023",
+            "--test",
+        ])
+        .output()
+        .expect("failed to start seakarr");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(output.status.code(), Some(0), "got:\n{combined}");
+    assert!(
+        !combined.contains("Configuration is valid."),
+        "--test must not accept a bad ISNI, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Connecting to Soulseek"),
+        "--test must not connect:\n{combined}"
+    );
+}

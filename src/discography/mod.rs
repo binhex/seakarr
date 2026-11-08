@@ -159,8 +159,9 @@ pub enum DiscographyError {
     /// score outside the documented range, or a missing score where one is
     /// required. This is a provider defect, not an artist that genuinely cannot
     /// be resolved, so it must not be reported as an unresolved artist where it
-    /// would hide a MusicBrainz outage from the circuit breaker.
-    #[error("MusicBrainz returned unusable artist candidate data: {0}")]
+    /// would hide a MusicBrainz outage from the circuit breaker. The message names no
+    /// entity kind: the same defect is reported for an artist and for a label.
+    #[error("MusicBrainz returned unusable candidate data: {0}")]
     InvalidCandidateData(String),
 }
 
@@ -348,6 +349,10 @@ pub(crate) struct Dominance {
 }
 
 /// Apply the dominance rules to two or more scored candidates.
+///
+/// The two-candidate minimum is a precondition, not a runtime check: a caller with one
+/// match has already picked it and must not pay for the comparison. `debug_assert`
+/// keeps a future caller honest in tests without charging production for the test.
 pub(crate) fn dominant_candidate_index<T>(
     kind: ResolveKind,
     key: &str,
@@ -355,6 +360,10 @@ pub(crate) fn dominant_candidate_index<T>(
     score_of: impl Fn(&T) -> Option<u8>,
     id_of: impl Fn(&T) -> &str,
 ) -> std::result::Result<Dominance, DiscographyError> {
+    debug_assert!(
+        matches.len() >= 2,
+        "the dominance rules compare two or more candidates"
+    );
     let exact_matches = matches.len();
     // Reject invalid provider data before absent data, and scan the whole set
     // rather than returning on the first offending candidate: the reported
@@ -542,40 +551,37 @@ pub(crate) fn parse_partial_date(value: &str) -> Option<PartialDate> {
     if !(1..=9999).contains(&year) {
         return None;
     }
-    let month = match parts.next() {
-        None => 0,
-        Some(part) => {
-            let month: u32 = part.parse().ok()?;
-            if !(1..=12).contains(&month) {
-                return None;
-            }
-            month
-        }
-    };
-    let day = match parts.next() {
-        None => 0,
-        Some(part) => part.parse().ok()?,
-    };
+    let month_part = parts.next();
+    let day_part = parts.next();
     if parts.next().is_some() {
         return None;
     }
-    match (month, day) {
-        (0, 0) => Some(PartialDate {
+    let Some(month_part) = month_part else {
+        // A bare year: no month and no day.
+        return Some(PartialDate {
             year,
             month: 0,
             day: 0,
-        }),
-        (month, 0) => Some(PartialDate {
+        });
+    };
+    let month: u32 = month_part.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let Some(day_part) = day_part else {
+        // Year and month only.
+        return Some(PartialDate {
             year,
             month,
             day: 0,
-        }),
-        (0, _) => None,
-        (month, day) => {
-            chrono::NaiveDate::from_ymd_opt(year, month, day)?;
-            Some(PartialDate { year, month, day })
-        }
-    }
+        });
+    };
+    // A day is present, so it must be a real one. `2025-01-00` is not "all of January"
+    // spelled differently: silently widening it to the month would break the documented
+    // rule that a date which does not exist is a configuration error.
+    let day: u32 = day_part.parse().ok()?;
+    chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    Some(PartialDate { year, month, day })
 }
 
 /// Filter allowed release groups with non-empty titles, drop any whose title
@@ -1215,8 +1221,11 @@ pub(crate) fn replayable_failure(
 /// exclusive by construction, so a stale-but-usable success row is never
 /// shadowed by a fresh failure.
 ///
-/// The key is namespaced by the caller: `label:name:<key>` rows are written by the
-/// label path and replayed by it alone.
+/// The key is namespaced by the caller - `label:name:<key>` for the label path,
+/// `name`/`isni:`/`ipi:`/`mbid:` for artists. The namespace is a prefix, not a column
+/// of its own, so the two paths are separated exactly as far as their keys are; see
+/// [`label::LabelInput::cache_key`] for what that means for a deliberately confusing
+/// name.
 pub(crate) fn record_resolution_failure(
     db: &Database,
     artist_key: &str,

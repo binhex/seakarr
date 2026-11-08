@@ -24,10 +24,11 @@ pub struct LabelTarget {
 
 /// How many releases each filter removed.
 ///
-/// The reasons are counted per release and are **not** mutually exclusive: a release
-/// can be, say, both of an unwanted type and undated, and is counted under each
-/// reason that applies. They explain why releases were dropped; they must not be
-/// summed to `releases_examined`.
+/// The reasons are counted per release; they explain why releases were dropped and must
+/// not be summed to `releases_examined`. The type and `--since` reasons are not mutually
+/// exclusive: a release can be, say, both of an unwanted type and undated, and is counted
+/// under each reason that applies. An excluded artist credit is decided first and is
+/// exclusive: such a release is counted only as `excluded_credits`.
 ///
 /// `eligible` is measured after the `--since` filter as well as after collapsing, so
 /// it is smaller than the number of eligible releases whenever a release is dropped
@@ -40,6 +41,13 @@ pub struct LabelTarget {
 /// qualifies. The only unconditional drop is an identity with no qualifying group,
 /// which is already counted per release by `since_skipped`/`undated_skipped`. The
 /// representative's own date is what orders the work list.
+///
+/// The rescue set is built from the release groups the catalogue lists, before the
+/// bundle split. A bundle title ("A / B") that is at or after the bound therefore
+/// qualifies the identity of an album literally titled the same way, even though
+/// `select_albums` will not select the bundle itself. That errs towards keeping an
+/// album, which is the safe direction: the alternative would drop an album the operator
+/// asked for because of a naming coincidence in someone else's catalogue.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SelectionCounts {
     pub releases_examined: usize,
@@ -47,6 +55,9 @@ pub struct SelectionCounts {
     pub since_skipped: usize,
     pub undated_skipped: usize,
     pub excluded_credits: usize,
+    /// Releases whose artist credit folds away to nothing, so there is no artist to
+    /// search under. A data problem, counted apart from the operator's exclusions.
+    pub undescribed_credits: usize,
     pub eligible: usize,
 }
 
@@ -59,17 +70,28 @@ pub struct LabelTargets {
 
 /// Turn a label's release groups into the albums this run should download.
 ///
-/// Rejections are counted per release, so the summary can explain a catalogue
-/// that produced no work. Ordering is total and deterministic - artist key, then
+/// A release listed twice under two credit spellings ("Nu:Tone" and "Nu:Tone feat. Stamina
+/// MC") produces one target, under the credit whose folded key sorts first, because the
+/// second copy of the same release group is dropped. Both spellings are legitimate search
+/// names, and downloading the album twice would be worse than choosing one; the choice is a
+/// deterministic ordering rather than a preference for either credit.
+///
+/// The label-specific rejections are counted per release, so the summary can explain a
+/// catalogue that produced no work. Two drops are not counted here because they are not
+/// this module's decisions: a release whose title is empty or names a bundle, and a release
+/// group already seen for the same identity, are dropped inside `select_albums` (which logs
+/// each at debug level). A catalogue consisting only of those reports its examined count and
+/// no drop reason. Ordering is total and deterministic - artist key, then
 /// the existing partial-date order (dated before undated, earliest first), then
 /// normalised title, then release-group id - which is what makes a
 /// budget-limited sweep converge instead of oscillating.
 ///
-/// Bundle detection is scoped to what the label lists: `select_albums` decides a
-/// title bundles other albums from the release groups it is given, and a label sweep
-/// only holds that label's releases. A composite whose companion was released on a
-/// different label is therefore not recognised as a bundle here, which is the
-/// conservative direction (it is downloaded, not silently dropped).
+/// Bundle detection is scoped to one folded artist credit: `select_albums` decides a title
+/// bundles other albums from the titles of the group it is given, so a composite and its
+/// companion are recognised together only when both appear under the same credit. Two
+/// spellings of a credit are separate groups, and a composite whose companion this run never
+/// saw at all is not recognised as a bundle - the conservative direction (it is downloaded,
+/// not silently dropped).
 pub fn label_targets(
     releases: &[LabelRelease],
     allowed: &[DiscographyReleaseType],
@@ -106,11 +128,22 @@ pub fn label_targets(
 
     for release in releases {
         let credit_key = normalize_catalog_key(&release.artist_credit);
-        if credit_key.is_empty() || excluded.contains(&credit_key) {
+        if credit_key.is_empty() {
+            // Nothing to search under: a data problem, not an operator exclusion, so it
+            // must not be reported as one - but it must still be reported.
+            counts.undescribed_credits += 1;
+            tracing::debug!(
+                release_id = %release.release_id,
+                "skipping a release whose artist credit folds away"
+            );
+            continue;
+        }
+        if excluded.contains(&credit_key) {
             counts.excluded_credits += 1;
             continue;
         }
-        if !release_allowed(&release.release_group, allowed) {
+        let wanted = release_allowed(&release.release_group, allowed);
+        if !wanted {
             counts.not_wanted_type += 1;
         }
         let date = release
@@ -124,7 +157,7 @@ pub fn label_targets(
                 // a qualifying group of an unwanted type must not pull in an album
                 // whose own representative is below the bound.
                 Some(date) if date >= bound => {
-                    if release_allowed(&release.release_group, allowed) {
+                    if wanted {
                         identities_in_bound.insert((
                             credit_key.clone(),
                             album_identity_key(
@@ -135,7 +168,8 @@ pub fn label_targets(
                     }
                 }
                 Some(_) => counts.since_skipped += 1,
-                // An undated release group cannot prove it satisfies a lower
+                // A release group with no date - or with one MusicBrainz wrote in a
+                // shape this crate cannot read - cannot prove it satisfies a lower
                 // bound, so it is excluded rather than assumed recent.
                 None => counts.undated_skipped += 1,
             }
@@ -243,6 +277,10 @@ pub struct LabelCounters {
     pub cached_failures: Vec<String>,
     /// Labels whose request failed, with the reason.
     pub provider_failed: Vec<(String, String)>,
+    /// Labels served from a stale catalogue because the refresh failed. Kept apart from
+    /// `provider_failed`: the label was *not* skipped - its albums were selected - so the
+    /// "label skipped" wording would contradict the staged line in the same summary.
+    pub stale_catalogues: Vec<(String, String)>,
     /// Labels actually examined before the run stopped.
     pub labels_examined: usize,
     /// What the selection filters removed and kept.
@@ -260,6 +298,10 @@ pub struct LabelCounters {
     pub incomplete: usize,
     /// Albums the library already holds.
     pub present: usize,
+    /// Albums skipped because an earlier run recorded them as processed. Counted apart
+    /// from `present`: the library does not hold them, which is exactly why a repeated
+    /// sweep looks as if it had nothing to do unless this is reported.
+    pub skipped_processed: usize,
     /// Albums downloaded and left in staging, counted from the outcome.
     pub staged_albums: usize,
     /// Albums that failed, with the reason recorded on the report.
@@ -315,7 +357,7 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
         // cancelled before its first label would otherwise print nothing at all,
         // which is indistinguishable from a crash-free no-op.
         notices.push(format!(
-            "label: {} of {} label(s) examined",
+            "label: {} of {} label(s) processed",
             counters.labels_examined,
             counters.requested.len()
         ));
@@ -360,6 +402,11 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
             "label: provider failed for {label} ({reason}); label skipped"
         ));
     }
+    for (label, reason) in &counters.stale_catalogues {
+        notices.push(format!(
+            "label: provider failed for {label} ({reason}); its stale catalogue was used"
+        ));
+    }
     if counters.selection.releases_examined > 0 {
         notices.push(format!(
             "label: {} release(s) examined; {} not of the wanted type",
@@ -372,10 +419,22 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
             counters.incomplete
         ));
     }
-    if counters.selection.since_skipped > 0 || counters.selection.undated_skipped > 0 {
+    if counters.selection.undescribed_credits > 0 {
         notices.push(format!(
-            "label: {} release(s) excluded by --since ({} undated)",
-            counters.selection.since_skipped, counters.selection.undated_skipped
+            "label: {} release(s) skipped: the artist credit names nobody",
+            counters.selection.undescribed_credits
+        ));
+    }
+    if counters.selection.since_skipped > 0 || counters.selection.undated_skipped > 0 {
+        // The two counts are disjoint - a dated release below the bound, and one with no
+        // usable date - so the first number is their total and the parenthetical breaks it
+        // down. Reporting only the dated count beside the undated count read as if the
+        // undated ones were a subset of it.
+        notices.push(format!(
+            "label: {} release(s) excluded by --since ({} below the bound, {} undated or unparseable)",
+            counters.selection.since_skipped + counters.selection.undated_skipped,
+            counters.selection.since_skipped,
+            counters.selection.undated_skipped
         ));
     }
     if counters.selection.excluded_credits > 0 {
@@ -390,9 +449,20 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
             counters.present
         ));
     }
-    if counters.selection_ran {
+    if counters.skipped_processed > 0 {
         notices.push(format!(
-            "label: {} album(s) eligible",
+            "label: {} album(s) already processed; skipped",
+            counters.skipped_processed
+        ));
+    }
+    if counters.selection_ran {
+        // No derived "still to fetch" number: what is left depends on the budget, on
+        // which albums were already processed, and on how many were staged - each of
+        // which is reported on its own line. A subtraction here would either overstate
+        // the work (a budget-stopped run never examined the rest) or contradict the
+        // staged/failed line right below it.
+        notices.push(format!(
+            "label: {} album(s) selected",
             counters.selection.eligible
         ));
         notices.push(format!(
@@ -465,6 +535,26 @@ mod tests {
         assert_eq!(selected.targets.len(), 1);
         assert_eq!(selected.targets[0].artist, "London Elektricity");
         assert_eq!(selected.targets[0].target.title, "Syncopated City");
+        assert_eq!(selected.counts.eligible, 1);
+    }
+
+    #[test]
+    fn a_release_whose_credit_names_nobody_is_counted() {
+        // The release is dropped because there is no artist to search under. That is a
+        // data problem, so it is not an operator exclusion - but it must still appear in
+        // the counts, or the summary reports releases examined and none dropped.
+        let releases = vec![
+            // A credit made only of apostrophe-like marks folds away to nothing.
+            release(
+                "1",
+                "\u{2019}",
+                group("g1", "Album", Some("2001"), "Album", &[]),
+            ),
+            release("2", "A", group("g2", "Kept", Some("2002"), "Album", &[])),
+        ];
+        let selected = label_targets(&releases, &studio(), None, &nothing_excluded());
+        assert_eq!(selected.counts.undescribed_credits, 1);
+        assert_eq!(selected.counts.excluded_credits, 0);
         assert_eq!(selected.counts.eligible, 1);
     }
 
@@ -906,20 +996,89 @@ mod tests {
             "{notices:?}"
         );
         assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains("5 release(s) excluded by --since")),
-            "{notices:?}"
-        );
-        assert!(
-            notices.iter().any(|notice| notice.contains("3 undated")),
-            "{notices:?}"
+            notices.iter().any(|notice| notice
+                == "label: 8 release(s) excluded by --since (5 below the bound, 3 undated or unparseable)"),
+            "the total, not the dated subset, is the exclusion count: {notices:?}"
         );
         assert!(
             notices
                 .iter()
                 .any(|notice| notice.contains("2 release(s) skipped: excluded artist credit")),
             "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_credit_cannot_fold_a_lead_prefixed_title() {
+        // `select_albums` folds "Artist - Title" onto "Title" only when the prefix is the whole
+        // artist or its initials. Under a collaboration credit the lead artist's name is
+        // neither, so the two spellings keep separate identities and both become targets: one
+        // album downloaded twice. Pinned deliberately - the alternative is guessing which part
+        // of a credit is the lead artist.
+        let credit = "Grafix feat. Stamina MC";
+        let releases = vec![
+            release(
+                "1",
+                credit,
+                group("g1", "Half Light", Some("2001"), "Album", &[]),
+            ),
+            release(
+                "2",
+                credit,
+                group("g2", "Grafix - Half Light", Some("2001"), "Album", &[]),
+            ),
+        ];
+
+        let selected = label_targets(&releases, &studio(), None, &nothing_excluded());
+
+        assert_eq!(
+            selected.targets.len(),
+            2,
+            "the full-credit artist cannot fold the prefixed title, so both survive"
+        );
+        assert!(selected
+            .targets
+            .iter()
+            .all(|target| target.artist == credit));
+    }
+
+    #[test]
+    fn a_stale_catalogue_is_not_reported_as_a_skipped_label() {
+        // The albums from a stale catalogue are selected and staged, so saying the label was
+        // skipped would contradict the staged line printed beside it.
+        let mut run = counters();
+        run.stale_catalogues
+            .push(("Hospital Records".into(), "connection reset".into()));
+
+        let notices = label_notices(&run, "downloads/staging");
+        let line = notices
+            .iter()
+            .find(|notice| {
+                notice.contains("Hospital Records") && notice.contains("provider failed")
+            })
+            .unwrap_or_else(|| panic!("no provider line: {notices:?}"));
+        assert!(line.contains("its stale catalogue was used"), "got: {line}");
+        assert!(
+            !line.contains("label skipped"),
+            "a label whose albums were used was not skipped: {line}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_sweep_reports_the_albums_it_skipped_as_processed() {
+        // An album this run skipped because an earlier one recorded it is neither in the
+        // library nor staged nor failed, so without its own line the summary reads as if
+        // the sweep found no work at all.
+        let mut run = counters();
+        run.selection.eligible = 3;
+        run.skipped_processed = 2;
+
+        let notices = label_notices(&run, "downloads/staging");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == "label: 2 album(s) already processed; skipped"),
+            "a repeat run must say what it skipped: {notices:?}"
         );
     }
 
@@ -957,7 +1116,7 @@ mod tests {
         assert!(
             !notices
                 .iter()
-                .any(|notice| notice.contains("album(s) eligible")),
+                .any(|notice| notice.contains("album(s) selected")),
             "a run that never selected must not claim a selection: {notices:?}"
         );
         assert!(
@@ -971,6 +1130,38 @@ mod tests {
                 .iter()
                 .any(|notice| notice.contains("move them from")),
             "nothing was staged, so there is nothing to move: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_selected_run_reports_the_selection_without_deriving_what_is_left() {
+        // The selection line counts what was selected and nothing else. What remains to
+        // fetch depends on the budget and on albums already present, processed, staged or
+        // failed, and each of those has its own line; a derived number here contradicted
+        // them (a run could report "3 to fetch" beside "3 staged").
+        let mut run = counters();
+        run.selection_ran = true;
+        run.selection.eligible = 7;
+        run.present = 2;
+        run.skipped_processed = 3;
+        run.staged_albums = 2;
+
+        let notices = label_notices(&run, "downloads/staging");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == "label: 7 album(s) selected"),
+            "the selection must be reported: {notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|notice| notice.contains("to fetch")),
+            "no line may derive a remaining-work count: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == "label: 2 album(s) staged; 0 failed"),
+            "the staged count stands on its own: {notices:?}"
         );
     }
 
@@ -1013,7 +1204,7 @@ mod tests {
         let notices = label_notices(&run, "downloads/staging");
         assert_eq!(
             notices,
-            vec!["label: 0 of 1 label(s) examined".to_string()],
+            vec!["label: 0 of 1 label(s) processed".to_string()],
             "a cancelled run must not be silent"
         );
     }

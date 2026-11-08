@@ -208,7 +208,9 @@ fn candidate_disc_numbers(result: &crate::client::SearchResult) -> std::collecti
 /// Remove marked candidates that contain fewer discs than the most complete
 /// candidate for this identity. Flat-folder candidates remain eligible. When
 /// every marked candidate contains only one disc but several disc numbers are
-/// advertised across peers, none is complete and the album fails for retry.
+/// advertised across peers, no marked candidate holds the whole album: the flat
+/// candidates stay eligible (they carry no disc evidence either way), and the
+/// album fails for retry only when none remains.
 fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::SearchResult>) -> bool {
     let disc_sets: Vec<std::collections::BTreeSet<u32>> =
         results.iter().map(candidate_disc_numbers).collect();
@@ -222,8 +224,13 @@ fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::Sear
         .max()
         .unwrap_or(0);
     if largest <= 1 {
-        results.clear();
-        return true;
+        let mut index = 0usize;
+        results.retain(|_| {
+            let keep = disc_sets[index].is_empty();
+            index += 1;
+            keep
+        });
+        return results.is_empty();
     }
     let mut index = 0usize;
     results.retain(|_| {
@@ -254,7 +261,13 @@ fn remove_incomplete_split_disc_candidates(results: &mut Vec<crate::client::Sear
 pub enum LibraryTarget {
     Upgrade {
         root: PathBuf,
+        /// Files that failed the quality gate: the replacement set's floor.
         expected_tracks: usize,
+        /// The album's total file count, used to decide whether an upgrade replaced
+        /// the whole album. Only a whole-album replacement may run the lesser-quality
+        /// deletion pass: a partial upgrade must not delete the files it did not
+        /// replace.
+        album_tracks: usize,
     },
     Place {
         root: PathBuf,
@@ -516,9 +529,13 @@ async fn process_album_internal(
     target: Option<LibraryTarget>,
     presearched_results: Option<Vec<crate::client::SearchResult>>,
 ) -> Result<AlbumOutcome> {
-    if skip_already_processed(db, artist, album, ignore_processed)? {
-        return Ok(AlbumOutcome::Skipped);
-    }
+    let replacing_previous_copy = match skip_already_processed(db, artist, album, ignore_processed)?
+    {
+        ProcessedCheck::Skip => return Ok(AlbumOutcome::Skipped),
+        ProcessedCheck::Process {
+            cleared_recorded_success,
+        } => cleared_recorded_success,
+    };
 
     tracing::info!("Processing: {artist} — {}", album.unwrap_or("(all)"));
 
@@ -547,10 +564,14 @@ async fn process_album_internal(
         );
         return Ok(AlbumOutcome::Failed {
             reason: format!(
-                "staging path {album_staging:?} lies inside the library root {root:?}; keep storage.staging_dir outside every library.paths entry"
+                "{STAGING_INSIDE_LIBRARY_PREFIX}{album_staging:?} lies inside the library root {root:?}; keep storage.staging_dir outside every library.paths entry"
             ),
         });
     }
+    // A forced reprocess replaces the previous staged copy only once a candidate has
+    // actually delivered its files: clearing it here, before a search, would destroy the
+    // album's only copy when the retry then failed or found nothing. `download_album` owns
+    // that decision because it knows what the new attempt wrote.
     // Note: album_staging directory is created by download_album, only when
     // a valid peer with downloadable files is found. This prevents empty
     // staging directories from accumulating for albums with no results.
@@ -576,7 +597,7 @@ async fn process_album_internal(
         artist,
         album,
     };
-    let results = match collect_candidate_results(
+    let (results, album_gate) = match collect_candidate_results(
         &search_context,
         anchor,
         library_track_count,
@@ -584,7 +605,10 @@ async fn process_album_internal(
     )
     .await?
     {
-        SearchStage::Results(results) => results,
+        SearchStage::Results {
+            results,
+            album_gate,
+        } => (results, album_gate),
         SearchStage::Finished(outcome) => return Ok(outcome),
     };
 
@@ -594,7 +618,14 @@ async fn process_album_internal(
     // Artist-only legacy results were already assigned to one normalized album
     // group. Reapplying one chosen display spelling as an album-name gate would
     // discard peers whose folder uses another spelling of that same release.
-    let filter_album = if presearched { None } else { album };
+    // The album-name gate is skipped for presearched artist-only results (a display
+    // spelling is not the peer's spelling) and for the album-only tier (whose purpose is
+    // to admit a folder that names the album differently).
+    let filter_album = if presearched || !album_gate {
+        None
+    } else {
+        album
+    };
     let filtered = filter::filter_results_with_queue_limit(
         &results,
         &config.filters,
@@ -669,9 +700,17 @@ async fn process_album_internal(
         "{artist} — {}: {total_results} files from {total_users} users, {} users passed filters, best: {} (speed={})",
         album.unwrap_or("(all)"),
         unique_user_count(&filtered),
-        ranked.first().map(|r| r.username.as_str()).unwrap_or("?"),
+        ranked
+            .first()
+            .map(|r| crate::formatting::single_line(&r.username))
+            .unwrap_or_else(|| "?".to_string()),
         ranked.first().map(|r| r.speed).unwrap_or(0),
     );
+
+    // Snapshot the staging directory only when this attempt is replacing *this* album's
+    // previous copy. Without that proof the directory may hold another album's staged files
+    // - two titles that sanitise alike share it by design - and nothing here may delete them.
+    let superseded = replacing_previous_copy.then(|| crate::download::files_under(&album_staging));
 
     // Download
     let (downloaded, stats) = match download_ranked_candidates(
@@ -687,6 +726,17 @@ async fn process_album_internal(
         DownloadStage::Failed { outcome } => return Ok(outcome),
     };
 
+    // Files that were already in the album's staging directory are reported, never deleted:
+    // they may belong to another album whose title sanitises to the same folder.
+    if let Some(superseded) = superseded {
+        crate::download::warn_about_undeleted_staging(
+            &album_staging,
+            &superseded,
+            &downloaded,
+            true,
+        );
+    }
+
     // Library write: upgrade mode's gated upgrade, or placement for every other mode.
     let album_write = AlbumWrite {
         config,
@@ -701,8 +751,9 @@ async fn process_album_internal(
         Some(LibraryTarget::Upgrade {
             root,
             expected_tracks,
+            album_tracks,
         }) => {
-            return apply_upgrade_target(&album_write, &root, expected_tracks).await;
+            return apply_upgrade_target(&album_write, &root, expected_tracks, album_tracks).await;
         }
         Some(LibraryTarget::Place {
             root,
@@ -754,6 +805,7 @@ async fn apply_upgrade_target(
     write: &AlbumWrite<'_>,
     root: &Path,
     expected_tracks: usize,
+    album_tracks: usize,
 ) -> Result<AlbumOutcome> {
     let AlbumWrite {
         config,
@@ -774,7 +826,14 @@ async fn apply_upgrade_target(
     }
     match organizer::copy_to_library(downloaded, root, artist, album.unwrap_or("Unknown")) {
         Ok(outcome) => {
-            delete_lesser_quality_after_upgrade(config, root, artist, album, &outcome.written);
+            // Deleting files below the new baseline is safe only when the upgrade
+            // replaced the whole album. A partial replacement (the gate above only
+            // requires the files that failed quality) leaves the album's other files
+            // in place, and deleting them would strip tracks the download never
+            // supplied.
+            if upgrade_replaced_whole_album(downloaded.len(), album_tracks) {
+                delete_lesser_quality_after_upgrade(config, root, artist, album, &outcome.written);
+            }
             finish_library_write(
                 config,
                 db,
@@ -797,6 +856,16 @@ async fn apply_upgrade_target(
             })
         }
     }
+}
+
+/// True when an upgrade replaced the whole album.
+///
+/// Only then may files below the new baseline be deleted: a partial replacement leaves
+/// the album's other files in place, and deleting them strips tracks the download never
+/// supplied. `album_tracks == 0` is a scanned album with no counted files, which cannot
+/// authorise a deletion either.
+fn upgrade_replaced_whole_album(downloaded: usize, album_tracks: usize) -> bool {
+    album_tracks > 0 && downloaded >= album_tracks
 }
 
 /// Delete the files the copy-back beat, reporting the count. A failure here is
@@ -1233,40 +1302,65 @@ fn explain_no_candidates(
     })
 }
 
+/// What the already-processed check decided for one album.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessedCheck {
+    /// A recorded success, and the run leaves it alone.
+    Skip,
+    /// The album is processed. `cleared_recorded_success` is true when
+    /// `--ignore-processed` deleted a recorded success to do it, so the album's staging
+    /// directory holds that run's copy and a successful download replaces it.
+    Process { cleared_recorded_success: bool },
+}
+
 /// Skip an album the database already records as processed, or delete the matching
-/// success record when the caller explicitly asked for a reprocess. Returns true
-/// when the album should be skipped.
+/// success record when the caller explicitly asked for a reprocess.
 fn skip_already_processed(
     db: &Database,
     artist: &str,
     album: Option<&str>,
     ignore_processed: bool,
-) -> Result<bool> {
+) -> Result<ProcessedCheck> {
     // An album without an artist has no identity to look up: ("", album) is not an
     // unambiguous key, so it is never recorded and never skipped.
     if artist.trim().is_empty() {
-        return Ok(false);
+        return Ok(ProcessedCheck::Process {
+            cleared_recorded_success: false,
+        });
     }
     let Some(album_name) = album else {
-        return Ok(false);
+        return Ok(ProcessedCheck::Process {
+            cleared_recorded_success: false,
+        });
     };
     if ignore_processed {
-        if db.delete_processed_album(artist, album_name)? {
+        let cleared_recorded_success = db.delete_processed_album(artist, album_name)?;
+        if cleared_recorded_success {
             tracing::info!("Ignoring already-processed record: {artist} — {album_name}");
         }
-        return Ok(false);
+        return Ok(ProcessedCheck::Process {
+            cleared_recorded_success,
+        });
     }
     if db.is_album_processed(artist, album_name)? {
         tracing::info!("Skipping already-processed: {artist} — {album_name}");
-        return Ok(true);
+        return Ok(ProcessedCheck::Skip);
     }
-    Ok(false)
+    Ok(ProcessedCheck::Process {
+        cleared_recorded_success: false,
+    })
 }
 
 /// The result of the search stage.
 enum SearchStage {
     /// Candidates to filter and rank.
-    Results(Vec<crate::client::SearchResult>),
+    Results {
+        results: Vec<crate::client::SearchResult>,
+        /// False when the results came from the album-only tier, whose purpose is to admit
+        /// a folder that names the album differently. The album-name gate must not be
+        /// re-applied to them, or the tier's rescue is undone one call later.
+        album_gate: bool,
+    },
     /// The stage already decided the album is unattainable, and the caller reports
     /// this outcome.
     Finished(AlbumOutcome),
@@ -1291,7 +1385,7 @@ async fn collect_candidate_results(
         album,
     } = *search;
 
-    let presearched = presearched_results.is_some();
+    let mut album_only_tier = false;
     let mut results = match presearched_results {
         Some(results) => results,
         None => {
@@ -1331,13 +1425,20 @@ async fn collect_candidate_results(
                     album.unwrap_or("(all)")
                 );
             }
+            album_only_tier = outcome.album_only_tier;
             outcome.results
         }
     };
     if album.is_some() && !artist.trim().is_empty() {
         search::retain_artist_files(&mut results, artist);
     }
-    if presearched && remove_incomplete_split_disc_candidates(&mut results) {
+    // Run for every album search, not only the legacy presearched path: a label or
+    // MusicBrainz-driven target has the same risk, and a 2-CD release split across peers
+    // would otherwise be completed with one disc and recorded as success. An
+    // artist-only search names no album, so it is not this guard's business: the
+    // per-album grouping that follows decides what each refusal is about. The
+    // function is a no-op unless two or more disc numbers are advertised.
+    if album.is_some() && remove_incomplete_split_disc_candidates(&mut results) {
         mark_album_processed_if_identifiable(db, artist, album, "failed")?;
         // No download was attempted, so this is a no-candidate outcome rather than
         // a failed attempt. It keeps the discover budget honest if this path is
@@ -1347,7 +1448,10 @@ async fn collect_candidate_results(
                 .into(),
         }));
     }
-    Ok(SearchStage::Results(results))
+    Ok(SearchStage::Results {
+        results,
+        album_gate: !album_only_tier,
+    })
 }
 
 /// The result of the download stage.
@@ -1491,7 +1595,14 @@ pub async fn run_upgrade_mode(
     // what an interrupted run left behind.
     let staging_dir = Path::new(&config.storage.staging_dir);
     crate::staging::prepare(staging_dir, &config.library.paths)?;
-    if let Err(e) = organizer::recover_interrupted_upgrades(config, db, staging_dir) {
+    // Presence decides whether a staged "success" album is an interrupted upgrade or a
+    // download that was staged on purpose: only the former's album is in the library.
+    let library_index = discover::build_index(&albums);
+    if let Err(e) =
+        organizer::recover_interrupted_upgrades(config, db, staging_dir, |artist, album| {
+            library_index.contains_album(artist, album)
+        })
+    {
         tracing::warn!("Library upgrade recovery scan failed: {e}");
     }
 
@@ -1512,19 +1623,21 @@ pub async fn run_upgrade_mode(
     // Shared cancellation flag, created by `arm_cancellation` before the scan.
     let semaphore = Arc::new(Semaphore::new(config.download.concurrent.max(1)));
 
-    let targets_vec: Vec<(String, String, usize, PathBuf)> = targets_with_counts;
+    let targets_vec: Vec<scanner::UpgradeTarget> = targets_with_counts;
     // One artist-folder index per run: the lookup walks the configured roots for
     // directory names only, at most once, and only when an album needs it.
     let artist_folders = discover::ArtistFolderIndex::new(config);
     let mut futures_vec = Vec::new();
 
-    for (artist, album, track_count, library_path) in &targets_vec {
+    for target in &targets_vec {
         let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
         let cancel = cancel.clone();
-        let artist = artist.clone();
-        let album = album.clone();
-        let library_track_count = *track_count;
+        let artist = target.artist.clone();
+        let album = target.album.clone();
+        let replacement_floor = target.needs_upgrade;
+        let album_track_count = target.track_count;
+        let library_path = target.location.clone();
         // Upgrade mode's copy-back is the upgrade path: it replaces an album that
         // exists but fails the quality gate, so it is gated on
         // `library_upgrade.enabled` and carries the library's own track count
@@ -1535,7 +1648,8 @@ pub async fn run_upgrade_mode(
         let target = if config.library_upgrade.enabled {
             LibraryTarget::Upgrade {
                 root: library_path.clone(),
-                expected_tracks: library_track_count,
+                expected_tracks: replacement_floor,
+                album_tracks: album_track_count,
             }
         } else {
             automatic_place_target(&artist_folders, &artist)
@@ -1557,7 +1671,7 @@ pub async fn run_upgrade_mode(
                     staging_dir,
                     progress.as_deref(),
                     Some(&cancel),
-                    Some(library_track_count),
+                    Some(replacement_floor),
                     Some(target),
                 )
                 .await;
@@ -1579,29 +1693,54 @@ pub async fn run_upgrade_mode(
     // propagates but runs before the report exists (no summary printed).
     let mut report = RunReport::new();
     let mut explained: BTreeSet<String> = BTreeSet::new();
-    for (artist, album, result) in results {
-        match result {
-            Ok(outcome) => {
-                explain_staging_outcome(&artist, config, &outcome, &mut explained);
-                report.record(&artist, &album, outcome)
-            }
-            Err(e) => {
-                tracing::error!("Album processing failed: {artist} — {album}: {e}");
-                report.record(
-                    &artist,
-                    &album,
-                    AlbumOutcome::Failed {
-                        reason: e.to_string(),
-                    },
-                );
-            }
-        }
-    }
+    record_upgrade_outcomes(results, config, &cancel, &mut report, &mut explained);
     report.print_summary();
 
     // `_guard` aborts the listener as it drops. Each cycle of a scheduled run
     // calls this mode again, so the task must not outlive its run.
     Ok(())
+}
+
+/// Record every finished upgrade album in the run report.
+///
+/// The operator's own interrupt is not an album failure, so it records nothing; the
+/// same rule, and the same predicate, apply in the label, discover and batch loops.
+/// Every future has already finished (`join_all`), so there is nothing left to stop:
+/// skipping the record must not drop the albums that completed after it in the vector.
+fn record_upgrade_outcomes(
+    results: Vec<(String, String, Result<AlbumOutcome>)>,
+    config: &Config,
+    cancel: &AtomicBool,
+    report: &mut RunReport,
+    explained: &mut BTreeSet<String>,
+) {
+    for (artist, album, result) in results {
+        match result {
+            Ok(outcome) => {
+                if outcome_is_operator_interrupt(&outcome, cancel) {
+                    tracing::info!("upgrade run: cancelled during {artist} — {album}");
+                    // Same operator-visible event, same summary line as the other modes: an
+                    // interrupted run must not be mistakable for a completed one.
+                    report.add_notice(
+                        "upgrade: cancelled by user; the run stopped before it finished",
+                    );
+                    continue;
+                }
+                explain_staging_outcome(&artist, config, &outcome, explained);
+                report.record(&artist, &album, outcome);
+            }
+            Err(error) => {
+                tracing::error!("Album processing failed: {artist} — {album}: {error}");
+                report.record(
+                    &artist,
+                    &album,
+                    AlbumOutcome::Failed {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn processed_target_identity(artist: &str, album: &str) -> (String, String) {
@@ -1657,6 +1796,9 @@ fn canonical_processed_target(
 struct ArtistOnlyRun {
     outcomes: Vec<(String, AlbumOutcome)>,
     notice: Option<String>,
+    /// True when the work list stopped with albums still unattempted, because the operator
+    /// interrupted the run. A Ctrl+C after the last album completed is not this.
+    stopped_for_cancel: bool,
 }
 
 /// The artist folder a manual run should place into, or `None` when the artist
@@ -1781,12 +1923,8 @@ async fn process_artist_album_work(
         .collect();
     for (album_title, presearched) in work {
         if cancel.load(Ordering::SeqCst) {
-            outcomes.push((
-                "(all)".to_string(),
-                AlbumOutcome::Failed {
-                    reason: "download cancelled by user".into(),
-                },
-            ));
+            // Stop before the next album without inventing a failure for an album that
+            // was never searched, queued or attempted.
             break;
         }
         // An authoritative target keeps its MusicBrainz title for searching,
@@ -1833,10 +1971,7 @@ async fn process_artist_album_work(
             presearched,
         )
         .await?;
-        let cancelled = matches!(
-            &result,
-            AlbumOutcome::Failed { reason } if reason.contains("cancelled by user")
-        );
+        let cancelled = outcome_is_cancellation(&result);
         if matches!(result, AlbumOutcome::Downloaded { .. }) {
             successful_identities.insert(processed_target_identity(artist, &album_title));
         }
@@ -1903,6 +2038,7 @@ async fn run_legacy_artist_only_mode(
             return Ok(ArtistOnlyRun {
                 outcomes: Vec::new(),
                 notice: Some(format!("{artist}: library scan cancelled by user")),
+                stopped_for_cancel: true,
             });
         }
         Err(error) => {
@@ -1921,6 +2057,7 @@ async fn run_legacy_artist_only_mode(
             "no identifiable albums found"
         };
         return Ok(ArtistOnlyRun {
+            stopped_for_cancel: cancel.load(Ordering::SeqCst),
             outcomes: vec![(
                 "(all)".to_string(),
                 AlbumOutcome::Failed {
@@ -1941,6 +2078,7 @@ async fn run_legacy_artist_only_mode(
             notice: Some(format!(
                 "Artist-only run: all {present} eligible album(s) already present"
             )),
+            stopped_for_cancel: false,
         });
     }
     let notice = if present > 0 {
@@ -1980,7 +2118,11 @@ async fn run_legacy_artist_only_mode(
     {
         log_no_artist_folder(artist, config, &destination);
     }
-    Ok(ArtistOnlyRun { outcomes, notice })
+    Ok(ArtistOnlyRun {
+        outcomes,
+        notice,
+        stopped_for_cancel: cancel.load(Ordering::SeqCst),
+    })
 }
 
 /// Artist-only manual mode against an injected authoritative discography
@@ -2062,6 +2204,7 @@ async fn run_artist_only_mode_with_provider(
                     return Ok(ArtistOnlyRun {
                         outcomes: Vec::new(),
                         notice: Some(format!("{artist}: library scan cancelled by user")),
+                        stopped_for_cancel: true,
                     });
                 }
                 Err(error) => {
@@ -2079,6 +2222,7 @@ async fn run_artist_only_mode_with_provider(
                     notice: Some(format!(
                         "Artist-only run: all {present} eligible album(s) already present"
                     )),
+                    stopped_for_cancel: false,
                 });
             }
             let notice = if present > 0 {
@@ -2116,7 +2260,11 @@ async fn run_artist_only_mode_with_provider(
             {
                 log_no_artist_folder(artist, config, &destination);
             }
-            Ok(ArtistOnlyRun { outcomes, notice })
+            Ok(ArtistOnlyRun {
+                outcomes,
+                notice,
+                stopped_for_cancel: cancel.load(Ordering::SeqCst),
+            })
         }
         DiscoveryOutcome::AuthoritativeEmpty { provenance, .. } => {
             if let DiscoveryProvenance::StaleCache {
@@ -2134,6 +2282,7 @@ async fn run_artist_only_mode_with_provider(
                 notice: Some(format!(
                     "No eligible authoritative albums found for {artist}"
                 )),
+                stopped_for_cancel: false,
             })
         }
         DiscoveryOutcome::LegacyFallback { reason, kind, .. } => {
@@ -2181,6 +2330,7 @@ async fn run_artist_only_mode_with_provider(
                         "Authoritative discography unavailable: {reason}; album names were discovered heuristically from Soulseek folders"
                     ),
                 }),
+                stopped_for_cancel: run.stopped_for_cancel,
             })
         }
     }
@@ -2298,6 +2448,7 @@ async fn run_artist_only_mode(
                         "Authoritative discography unavailable: {error}; album names were discovered heuristically from Soulseek folders"
                     ),
                 }),
+                stopped_for_cancel: run.stopped_for_cancel,
             });
         }
     };
@@ -2315,6 +2466,10 @@ async fn run_artist_only_mode(
     .await
 }
 
+/// How the staging-path refusal begins. Shared with the message it classifies, so
+/// `charges_download_budget` cannot stop recognising it when the wording changes.
+const STAGING_INSIDE_LIBRARY_PREFIX: &str = "staging path ";
+
 /// Whether a completed album attempt consumes one unit of the discover
 /// download budget.
 ///
@@ -2327,6 +2482,14 @@ async fn run_artist_only_mode(
 /// This helper covers the `Ok` outcomes only; `charges_after_error` covers the
 /// `Err` case.
 fn charges_download_budget(outcome: &AlbumOutcome) -> bool {
+    if let AlbumOutcome::Failed { reason } = outcome {
+        // The staging-path refusal is a configuration problem detected before the search:
+        // charging it would let a misconfigured staging root spend the whole budget and then
+        // report "budget reached" instead of the configuration fault.
+        if reason.starts_with(STAGING_INSIDE_LIBRARY_PREFIX) {
+            return false;
+        }
+    }
     matches!(
         outcome,
         AlbumOutcome::Downloaded { .. } | AlbumOutcome::Failed { .. }
@@ -2571,8 +2734,7 @@ pub async fn run_label_discover_mode(
     let staging_dir = Path::new(&config.storage.staging_dir);
     crate::staging::prepare(staging_dir, &config.library.paths)?;
     // Cancellation is armed once here, for the whole run, and passed into the core so
-    // a test can drive the flag instead of raising a signal. The artist discover sweep
-    // arms its own inside its core and so cannot be tested this way.
+    // a test can drive the flag instead of raising a signal.
     let (cancel, _guard) = arm_cancellation();
     run_label_discover_mode_with_provider(
         client,
@@ -2587,6 +2749,7 @@ pub async fn run_label_discover_mode(
         &cancel,
     )
     .await
+    .map(|_| ())
 }
 
 /// Timeline-free core of a label sweep, with the provider injected.
@@ -2603,7 +2766,7 @@ async fn run_label_discover_mode_with_provider(
     staging_dir: &Path,
     provider: &dyn DiscographyProvider,
     cancel: &Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<label_discover::LabelCounters> {
     // The public wrapper checks these before staging preparation; repeating them here
     // keeps this core safe to call directly, exactly as the artist sweep's core does.
     if !config.discography.enabled {
@@ -2635,9 +2798,10 @@ async fn run_label_discover_mode_with_provider(
     let mut consecutive_provider_failures: u32 = 0;
     let mut collected: Vec<crate::discography::label::LabelRelease> = Vec::new();
 
-    // Every request is validated before the loop, so a malformed entry in a slice ends
-    // the run as a configuration error with its summary, rather than aborting halfway
-    // through with no report of the labels already examined.
+    // Every request is validated before the loop, so a malformed entry in a slice fails
+    // the run before it starts rather than halfway through. No summary is printed for it:
+    // nothing was examined, and the CLI has already validated the same values, so this
+    // only guards a library caller passing a slice directly.
     for request in labels {
         LabelInput::from_parts(request.input.clone(), request.mbid.clone())
             .validate()
@@ -2655,7 +2819,7 @@ async fn run_label_discover_mode_with_provider(
                 request.input
             );
             finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
-            return Ok(());
+            return Ok(counters);
         }
         counters.labels_examined += 1;
         let input = LabelInput::from_parts(request.input.clone(), request.mbid.clone());
@@ -2683,13 +2847,21 @@ async fn run_label_discover_mode_with_provider(
                 if let DiscoveryProvenance::StaleCache {
                     age_days,
                     refresh_error,
-                    ..
+                    kind,
                 } = &provenance
                 {
                     tracing::warn!(
                         "{}: label catalogue cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache",
                         request.input
                     );
+                    // The spec's summary promises the labels whose provider request failed.
+                    // This one was served from a stale row, but the request still failed and
+                    // it still counts towards the breaker, so the operator must see it.
+                    if *kind == DiscoveryFailure::Provider {
+                        counters
+                            .stale_catalogues
+                            .push((request.input.clone(), refresh_error.clone()));
+                    }
                 }
                 if note_stale_cache_breaker(&provenance, &mut consecutive_provider_failures) {
                     return Err(abort_label_run(
@@ -2758,7 +2930,7 @@ async fn run_label_discover_mode_with_provider(
     // into a nonzero exit when the library root cannot be read.
     if selection.targets.is_empty() {
         finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
-        return Ok(());
+        return Ok(counters);
     }
 
     // One library walk answers "already present" for every label, exactly as the
@@ -2778,7 +2950,7 @@ async fn run_label_discover_mode_with_provider(
                 "label sweep: library scan cancelled by user - stopping before any album"
             );
             finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
-            return Ok(());
+            return Ok(counters);
         }
         Err(error) => {
             // The artist sweep propagates a scan failure (`scan_library_cancellable(...)?`),
@@ -2805,9 +2977,11 @@ async fn run_label_discover_mode_with_provider(
 
     let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
     for target in missing {
-        // The interrupt is checked before the budget, so an interrupted run reports
-        // "cancelled", never "budget reached" - the same reason the artist sweep's
-        // loop carries its comment.
+        // The interrupt is checked before the budget so an interrupted run reports
+        // "cancelled", never "budget reached". Deliberate divergence from the artist
+        // sweep, which checks the budget first: where both would trip on the same
+        // unit, the two sweeps attribute the stop differently, and this order is the
+        // one that reports an operator's interrupt as an interrupt.
         if cancel.load(Ordering::SeqCst) {
             counters.cancelled = true;
             break;
@@ -2836,10 +3010,16 @@ async fn run_label_discover_mode_with_provider(
                 // carrying "cancelled by user"; SeakarrError::Cancelled is only ever
                 // produced by the library walk. Charging, counting or recording that
                 // as a failed album would tell the operator their interrupt was a
-                // failure and would burn a download slot. The reason is matched rather
-                // than the flag, so a genuine failure that coincides with an interrupt
-                // is still reported.
-                if outcome_is_cancellation(&outcome) {
+                // failure and would burn a download slot. The predicate has two arms:
+                // the download stage's own message, and - for a `Failed` or
+                // `NoCandidates` outcome only - the flag, because the search stage takes
+                // no cancellation flag and an interrupted search comes back as "no
+                // candidates". A genuine failure that coincides with an interrupt is
+                // therefore not counted: the flag cannot say which album it interrupted,
+                // and charging the operator's Ctrl+C to the album is the worse error. A
+                // completed album is always counted: it is on disk, and dropping it would
+                // make the summary disagree with the library.
+                if outcome_is_operator_interrupt(&outcome, cancel) {
                     counters.cancelled = true;
                     break;
                 }
@@ -2875,7 +3055,7 @@ async fn run_label_discover_mode_with_provider(
     }
 
     finish_label_run(&mut report, &counters, progress.as_ref(), staging_dir);
-    Ok(())
+    Ok(counters)
 }
 
 /// The tail of the reason the download stage reports for a cancelled transfer.
@@ -2887,21 +3067,50 @@ async fn run_label_discover_mode_with_provider(
 /// end with this) while matching every real cancellation.
 const CANCELLED_REASON: &str = "download error: download cancelled by user";
 
+/// The same reason when every candidate was tried first, which is how
+/// `download_ranked_candidates` reports it to the album outcome.
+const EXHAUSTED_CANCELLED_REASON: &str =
+    "all candidates exhausted: download error: download cancelled by user";
+
 /// True when an album outcome is the operator's own interrupt rather than a failure.
 ///
 /// The download stage reports a cancelled transfer as
-/// `AlbumOutcome::Failed { reason: "download cancelled by user" }` - the literal text
-/// of the only error `download.rs` produces when the flag is set; every other failure
-/// is prefixed with `all candidates exhausted: `. `SeakarrError::Cancelled` is produced
+/// `AlbumOutcome::Failed { reason }` where `reason` stores
+/// `SeakarrError::Download("download cancelled by user")` by its `Display`, i.e.
+/// `download error: download cancelled by user` (optionally prefixed
+/// `all candidates exhausted: `); the constructor's own string is the bare
+/// `download cancelled by user`. Every other failure is prefixed differently. `SeakarrError::Cancelled` is produced
 /// only by the library walk, so this reason is the only evidence a label sweep gets.
 /// The reason is matched rather than the flag, so a genuine failure that happens to
 /// coincide with an interrupt is still counted.
-fn outcome_is_cancellation(outcome: &AlbumOutcome) -> bool {
-    // The tail is what identifies a cancellation: the download stage stores the
-    // cancellation error's own `Display`, while other failures embed a peer-advertised
-    // filename such as `01 - cancelled by user.flac` followed by more text. A substring
-    // test anywhere in the message would let such a filename stop the sweep.
-    matches!(outcome, AlbumOutcome::Failed { reason } if reason.trim().ends_with(CANCELLED_REASON))
+pub fn outcome_is_cancellation(outcome: &AlbumOutcome) -> bool {
+    // Exact equality with the two shapes the download stage really produces. A tail test is
+    // not enough: a peer controls the crate's `Failed` reason, which is forwarded verbatim
+    // inside `transfer failed: {reason}` and then prefixed with `all candidates exhausted: `,
+    // so a hostile peer could end its reason with the cancellation text and fake an
+    // interrupt - stopping a sweep, skipping the remaining albums and cancelling the budget.
+    matches!(outcome, AlbumOutcome::Failed { reason } if {
+        let reason = reason.trim();
+        reason == CANCELLED_REASON || reason == EXHAUSTED_CANCELLED_REASON
+    })
+}
+
+/// True when an album outcome records the operator's own interrupt.
+///
+/// The download stage reports the interrupt as a failure carrying its own message
+/// (see [`outcome_is_cancellation`]). The search stage takes no cancellation flag, so
+/// an interrupted search comes back as `NoCandidates`; the flag is the only evidence
+/// there. A completed album is never discarded: an interrupt that lands during its
+/// post-download work still leaves a real album on disk, and dropping it would make
+/// the run's summary undercount what the run did.
+pub fn outcome_is_operator_interrupt(outcome: &AlbumOutcome, cancel: &AtomicBool) -> bool {
+    if outcome_is_cancellation(outcome) {
+        return true;
+    }
+    matches!(
+        outcome,
+        AlbumOutcome::Failed { .. } | AlbumOutcome::NoCandidates { .. }
+    ) && cancel.load(Ordering::SeqCst)
 }
 
 /// Record one processed album in a label run's counters.
@@ -2916,7 +3125,10 @@ fn count_label_outcome(counters: &mut label_discover::LabelCounters, outcome: &A
             destination: DownloadDestination::Staging(_),
             ..
         } => counters.staged_albums += 1,
-        AlbumOutcome::Downloaded { .. } | AlbumOutcome::Skipped => {}
+        AlbumOutcome::Downloaded { .. } => {}
+        // A recorded success from an earlier run is not staging and not a failure: the
+        // album exists, just not in this run's library.
+        AlbumOutcome::Skipped => counters.skipped_processed += 1,
         AlbumOutcome::Failed { .. } | AlbumOutcome::NoCandidates { .. } => {
             counters.failed_albums += 1;
         }
@@ -2958,13 +3170,17 @@ fn finish_label_run(
     report.print_summary();
 }
 
-/// Count a stale-cache provenance towards the breaker: a genuine outage advances
-/// it, a name that no longer resolves resets it. Returns true when the limit is
-/// reached.
+/// Count a cache provenance towards the breaker. Returns true when the limit is reached.
 ///
-/// Shared by the artist sweep and the label sweep so the two cannot drift on what
-/// counts as an outage. Warning is the caller's job: each sweep words its own
-/// message (`discography cache` versus `label catalogue cache`).
+/// Only evidence about the provider moves the counter. A `FreshCache` row means no request
+/// was made, so it is no evidence either way and leaves the counter alone - exactly like a
+/// replayed failure row. A `Refreshed` run, or a stale row whose refresh was answered with a
+/// resolution failure, means MusicBrainz answered, so a run of consecutive failures is over
+/// and the counter resets. A stale row whose refresh failed for an outage reason advances it.
+///
+/// Shared by the artist sweep and the label sweep so the two cannot drift on what counts as
+/// an outage. Warning is the caller's job: each sweep words its own message (`discography
+/// cache` versus `label catalogue cache`).
 fn note_stale_cache_breaker(provenance: &DiscoveryProvenance, consecutive: &mut u32) -> bool {
     match provenance {
         DiscoveryProvenance::StaleCache {
@@ -2974,7 +3190,10 @@ fn note_stale_cache_breaker(provenance: &DiscoveryProvenance, consecutive: &mut 
             *consecutive += 1;
             *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
         }
-        _ => {
+        // No request was made: neither an outage nor a recovery.
+        DiscoveryProvenance::FreshCache => false,
+        // MusicBrainz answered (successfully, or with a resolution failure).
+        DiscoveryProvenance::Refreshed | DiscoveryProvenance::StaleCache { .. } => {
             *consecutive = 0;
             false
         }
@@ -3010,8 +3229,10 @@ fn note_stale_cache(
         ..
     } = provenance
     else {
-        *consecutive = 0;
-        return false;
+        // A fresh cache row made no request, so it is no evidence about the provider and
+        // must not reset a partially advanced breaker; a refreshed row means MusicBrainz
+        // answered. `note_stale_cache_breaker` owns that distinction for both paths.
+        return note_stale_cache_breaker(provenance, consecutive);
     };
     tracing::warn!(
         "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); {cache_note}"
@@ -3071,6 +3292,10 @@ async fn fill_artist_gap(
             break;
         }
         if cancel.load(Ordering::SeqCst) {
+            // The next album was never searched, queued or attempted, so nothing is
+            // charged or counted as a failure - but the run did stop early, and a
+            // summary that does not say so reads like a completed sweep.
+            counters.cancelled = true;
             break;
         }
         let result = process_album(
@@ -3089,6 +3314,19 @@ async fn fill_artist_gap(
         .await;
         match result {
             Ok(outcome) => {
+                // An interrupt is the operator's, not an album failure: stop before
+                // charging the budget, counting a failure or recording one. The label
+                // sweep and this sweep must report the same event the same way, so a
+                // completed album stays recorded here too.
+                if outcome_is_operator_interrupt(&outcome, cancel) {
+                    counters.cancelled = true;
+                    tracing::info!(
+                        "discover run: cancelled during {} - {}",
+                        artist.name,
+                        target.title
+                    );
+                    break;
+                }
                 if charges_download_budget(&outcome) {
                     budget.charge();
                 }
@@ -3132,19 +3370,18 @@ async fn fill_artist_gap(
                 );
             }
         }
-        if budget.exhausted() {
-            counters
-                .budget_reached_at
-                .get_or_insert_with(|| artist.name.clone());
-            break;
-        }
     }
     Ok(())
 }
 
-/// Timeline-free core of discover mode, with the provider injected.
+/// Timeline-free core of discover mode, with the provider and the cancellation flag
+/// injected.
+///
+/// The flag is a parameter rather than something this core arms for itself, so a test
+/// can trip it and observe the run's own accounting; the wrapper below owns the signal
+/// listener.
 #[allow(clippy::too_many_arguments)]
-async fn run_discover_mode_with_provider(
+async fn run_discover_mode_with_cancel(
     client: &dyn SoulseekClient,
     config: &Config,
     db: &Database,
@@ -3152,7 +3389,8 @@ async fn run_discover_mode_with_provider(
     ignore_processed: bool,
     staging_dir: &Path,
     provider: &dyn DiscographyProvider,
-) -> Result<()> {
+    cancel: &Arc<AtomicBool>,
+) -> Result<discover::DiscoverCounters> {
     if !config.discography.enabled {
         return Err(SeakarrError::Config(
             "discover mode requires discography.enabled: true".into(),
@@ -3163,15 +3401,6 @@ async fn run_discover_mode_with_provider(
             "library.paths is empty - discover mode needs a library to derive artists from".into(),
         ));
     }
-
-    // The sweep reads the whole library before it can pick a single work item, so
-    // cancellation is armed first: interrupting the slow scan must be possible
-    // without killing the process and stranding the PID lock. That walk, the
-    // downloads and the loop between artists all poll the flag; the extra
-    // MusicBrainz request an explicitly named artist makes first is one bounded
-    // request and is not polled. The guard aborts the listener on every return
-    // path.
-    let (cancel, _guard) = arm_cancellation();
 
     // Created before the scan so the scan's indicator and the later downloads
     // share one display, and so a headless run creates none at all.
@@ -3249,13 +3478,30 @@ async fn run_discover_mode_with_provider(
             }
             // The outage was warned about and summarised before the walk: there
             // is no work list for an artist MusicBrainz could not be asked about.
-            NamedArtistVerification::Stop => return Ok(()),
+            NamedArtistVerification::Stop => return Ok(counters),
         },
         None => None,
     };
 
-    let Some(scanned) = scan_library_cancellable(config, &cancel, progress.as_ref())? else {
-        return Ok(());
+    let scanned = match scan_library_cancellable(config, cancel, progress.as_ref()) {
+        Ok(Some(scanned)) => scanned,
+        // A cancelled scan stopped the run before any artist was examined. Report it
+        // through the same counters and summary as a run that ran to the end, exactly
+        // as the label sweep does, so an interrupted run is neither silent nor
+        // mistakable for a completed one.
+        Ok(None) => {
+            counters.cancelled = true;
+            finish_discover_run(&mut report, &counters, progress.as_ref());
+            return Ok(counters);
+        }
+        // A library that cannot be read stops the run: pretending it is empty would
+        // make every artist look absent and stage duplicates. The summary is printed
+        // first, exactly as the label sweep does, so the failure does not also swallow
+        // the run's report.
+        Err(error) => {
+            finish_discover_run(&mut report, &counters, progress.as_ref());
+            return Err(error);
+        }
     };
     let index = discover::build_index(&scanned);
     // An explicitly named artist the library holds no album for is resolved
@@ -3310,7 +3556,8 @@ async fn run_discover_mode_with_provider(
         if cancel.load(Ordering::SeqCst) {
             // Cancellation is not a budget stop. Conflating the two would print
             // a false "download budget reached" notice for a run the user
-            // interrupted.
+            // interrupted, so the flag is recorded instead of the budget.
+            counters.cancelled = true;
             break;
         }
         // Where this artist's completed albums belong: the artist folder the
@@ -3383,7 +3630,7 @@ async fn run_discover_mode_with_provider(
                     &missing,
                     &placement,
                     ignore_processed,
-                    &cancel,
+                    cancel,
                     progress.as_ref(),
                     &mut budget,
                     &mut counters,
@@ -3454,8 +3701,60 @@ async fn run_discover_mode_with_provider(
     }
 
     finish_discover_run(&mut report, &counters, progress.as_ref());
-    // `_guard` aborts the listener as it drops; a scheduled cycle must not leak.
-    Ok(())
+    Ok(counters)
+}
+
+/// Run discover mode with the signal listener armed for the whole run.
+#[allow(clippy::too_many_arguments)]
+async fn run_discover_mode_with_provider(
+    client: &dyn SoulseekClient,
+    config: &Config,
+    db: &Database,
+    artist_filter: Option<&str>,
+    ignore_processed: bool,
+    staging_dir: &Path,
+    provider: &dyn DiscographyProvider,
+) -> Result<()> {
+    // The sweep reads the whole library before it can pick a single work item, so
+    // cancellation is armed first: interrupting the slow scan must be possible
+    // without killing the process and stranding the PID lock. That walk, the
+    // downloads and the loop between artists all poll the flag; the extra
+    // MusicBrainz request an explicitly named artist makes first is one bounded
+    // request and is not polled. The guard aborts the listener on every return
+    // path.
+    let (cancel, _guard) = arm_cancellation();
+    run_discover_mode_with_cancel(
+        client,
+        config,
+        db,
+        artist_filter,
+        ignore_processed,
+        staging_dir,
+        provider,
+        &cancel,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Record one manual-mode album outcome, reporting whether the operator interrupted it.
+///
+/// The interrupt is not an album failure: upgrade, label, discover and batch runs all leave
+/// it unrecorded, and a summary that lists it under Failed tells the operator their Ctrl+C
+/// was a defect.
+fn record_manual_outcome(
+    report: &mut RunReport,
+    artist: &str,
+    album: &str,
+    outcome: AlbumOutcome,
+    cancel: &AtomicBool,
+) -> bool {
+    if outcome_is_operator_interrupt(&outcome, cancel) {
+        tracing::info!("Manual mode: cancelled during {artist} — {album}");
+        return true;
+    }
+    report.record(artist, album, outcome);
+    false
 }
 
 /// Run in manual mode: process a single artist and/or album search target.
@@ -3473,6 +3772,9 @@ pub async fn run_manual_mode(
 
     let album_display = album.unwrap_or("(all)");
     let mut report = RunReport::new();
+    // Set when the operator interrupted the run. The notice makes an interrupted manual
+    // run as visible as the other modes' "cancelled by user" lines.
+    let mut manual_cancelled = false;
 
     // Environment errors from inside process_album (DB write, search)
     // are recorded as Failed entries so they appear in the summary,
@@ -3516,12 +3818,25 @@ pub async fn run_manual_mode(
         .await
         {
             Ok(run) => {
+                // The interrupt can land between albums, in which case no outcome carries it:
+                // the work list simply stops early and the remaining albums would vanish from
+                // the record. `run.stopped_for_cancel` says that happened, so a Ctrl+C after
+                // the last album completed is not reported as a cut-short run.
+                manual_cancelled |= run.stopped_for_cancel;
                 let (report_artist, resolution) = manual_report_identity(db, artist_name);
                 if let Some(notice) = resolution {
                     report.add_notice(notice);
                 }
                 for (album_name, outcome) in run.outcomes {
-                    report.record(&report_artist, &album_name, outcome);
+                    if record_manual_outcome(
+                        &mut report,
+                        &report_artist,
+                        &album_name,
+                        outcome,
+                        &cancel,
+                    ) {
+                        manual_cancelled = true;
+                    }
                 }
                 if let Some(notice) = run.notice {
                     report.add_notice(notice);
@@ -3562,7 +3877,17 @@ pub async fn run_manual_mode(
             log_no_artist_folder(artist_name, config, &destination);
         }
         match &result {
-            Ok(outcome) => report.record(artist_name, album_display, outcome.clone()),
+            Ok(outcome) => {
+                if record_manual_outcome(
+                    &mut report,
+                    artist_name,
+                    album_display,
+                    outcome.clone(),
+                    &cancel,
+                ) {
+                    manual_cancelled = true;
+                }
+            }
             Err(e) => {
                 tracing::error!("Manual mode: {artist_name} — {album_display}: {e}");
                 report.record(
@@ -3577,6 +3902,9 @@ pub async fn run_manual_mode(
         result.map(|_| ())
     };
 
+    if manual_cancelled {
+        report.add_notice("manual: cancelled by user; the run stopped before it finished");
+    }
     if let Some(ref p) = progress {
         p.clear();
     }
@@ -7129,6 +7457,7 @@ mod tests {
         catalogue: LabelCatalogue,
         failure: Option<String>,
         catalogue_calls: Arc<AtomicUsize>,
+        search_calls: Arc<AtomicUsize>,
     }
 
     impl FakeLabelProvider {
@@ -7155,6 +7484,7 @@ mod tests {
                 },
                 failure: None,
                 catalogue_calls: Arc::new(AtomicUsize::new(0)),
+                search_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -7173,6 +7503,7 @@ mod tests {
                 },
                 failure: None,
                 catalogue_calls: Arc::new(AtomicUsize::new(0)),
+                search_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -7185,6 +7516,7 @@ mod tests {
                 },
                 failure: Some(reason.to_string()),
                 catalogue_calls: Arc::new(AtomicUsize::new(0)),
+                search_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -7223,6 +7555,7 @@ mod tests {
             &self,
             _label: &str,
         ) -> std::result::Result<Vec<LabelCandidate>, DiscographyError> {
+            self.search_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -7554,7 +7887,362 @@ mod tests {
             }),
             "a peer-advertised filename must not be read as the operator's interrupt"
         );
+        assert!(
+            !outcome_is_cancellation(&AlbumOutcome::Failed {
+                reason: "all candidates exhausted: download error: transfer failed: \
+                         download error: download cancelled by user"
+                    .into(),
+            }),
+            "a peer-supplied transfer-failure reason must not fake an interrupt"
+        );
         assert!(!outcome_is_cancellation(&AlbumOutcome::Skipped));
+        // The constant is a copy of the download error's `Display`. Binding it to the real
+        // error means a rewording there fails here instead of silently turning every Ctrl+C
+        // into a budget-charged failure.
+        assert!(
+            crate::error::SeakarrError::Download("download cancelled by user".into())
+                .to_string()
+                .ends_with(CANCELLED_REASON),
+            "CANCELLED_REASON must stay the tail of the download error's Display"
+        );
+    }
+
+    #[test]
+    fn only_a_whole_album_replacement_may_delete_lesser_files() {
+        assert!(
+            upgrade_replaced_whole_album(12, 12),
+            "a full replacement may delete the files it beat"
+        );
+        assert!(
+            upgrade_replaced_whole_album(13, 12),
+            "a replacement larger than the album is still a full replacement"
+        );
+        assert!(
+            !upgrade_replaced_whole_album(3, 12),
+            "a partial replacement must not authorise deleting the other nine tracks"
+        );
+        assert!(
+            !upgrade_replaced_whole_album(0, 0),
+            "an album with no counted files cannot authorise a deletion"
+        );
+    }
+
+    #[test]
+    fn split_disc_filter_keeps_flat_candidates_when_every_marked_peer_has_one_disc() {
+        // Two peers advertise a single disc each, so no marked candidate holds the whole
+        // album. A flat candidate carries no disc evidence either way and may be the
+        // complete set, so it must stay eligible rather than being cleared with the
+        // marked ones.
+        let mut results = vec![
+            SearchResult {
+                username: "disc-one".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album {cd1}\01.flac", 900, 10_000_000)],
+            },
+            SearchResult {
+                username: "disc-two".into(),
+                speed: 400,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album {cd2}\01.flac", 900, 10_000_000)],
+            },
+            SearchResult {
+                username: "flat".into(),
+                speed: 300,
+                slots: 1,
+                files: vec![make_file(r"Artist\Album\01.flac", 900, 10_000_000)],
+            },
+        ];
+
+        assert!(
+            !remove_incomplete_split_disc_candidates(&mut results),
+            "the flat candidate may hold the album, so the set is not empty"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.username.as_str())
+                .collect::<Vec<_>>(),
+            ["flat"],
+            "only the candidate without disc evidence survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_artist_only_search_is_not_checked_for_split_discs() {
+        // An artist-only search names no album: its results are grouped into albums and
+        // each album is checked on its own. Applying the guard to the artist-level set
+        // would clear results for albums that are perfectly complete, and the run would
+        // report no identifiable albums.
+        let client = MockClient::new();
+        let config = make_test_config();
+        let db = Database::open_in_memory().unwrap();
+        let search = SearchContext {
+            client: &client,
+            db: &db,
+            config: &config,
+            artist: "Test Artist",
+            album: None,
+        };
+        let presearched = vec![
+            SearchResult {
+                username: "disc-one".into(),
+                speed: 600,
+                slots: 1,
+                files: vec![make_file(
+                    r"Test Artist\Album {cd1}\01.flac",
+                    900,
+                    10_000_000,
+                )],
+            },
+            SearchResult {
+                username: "disc-two".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Test Artist\Album {cd2}\01.flac",
+                    900,
+                    10_000_000,
+                )],
+            },
+        ];
+
+        let stage = collect_candidate_results(
+            &search,
+            filter::TrackOneAnchor::Required,
+            None,
+            Some(presearched),
+        )
+        .await
+        .unwrap();
+
+        match stage {
+            SearchStage::Results { results, .. } => assert_eq!(
+                results.len(),
+                2,
+                "both peers must survive for the per-album pass"
+            ),
+            SearchStage::Finished(outcome) => {
+                panic!("an album-less search must not be refused as split: {outcome:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_completed_album_is_not_discarded_by_an_interrupt() {
+        // Ctrl+C can land after the download finished while the album is being written.
+        // The album is on disk, so the sweep must count and record it rather than
+        // summarise the run as if it never happened.
+        let cancel = AtomicBool::new(true);
+        assert!(!outcome_is_operator_interrupt(
+            &AlbumOutcome::Downloaded {
+                track_count: 12,
+                destination: DownloadDestination::Staging(std::path::PathBuf::from("/s/A/B")),
+            },
+            &cancel
+        ));
+        assert!(
+            outcome_is_operator_interrupt(
+                &AlbumOutcome::NoCandidates {
+                    reason: "no results".into()
+                },
+                &cancel
+            ),
+            "an interrupted search reports no candidates, and the flag explains it"
+        );
+        assert!(
+            outcome_is_operator_interrupt(
+                &AlbumOutcome::Failed {
+                    reason: "download error: download cancelled by user".into()
+                },
+                &AtomicBool::new(false)
+            ),
+            "the download stage's own message identifies the interrupt"
+        );
+        assert!(
+            !outcome_is_operator_interrupt(
+                &AlbumOutcome::Failed {
+                    reason: "no peer accepted the transfer".into()
+                },
+                &AtomicBool::new(false)
+            ),
+            "a genuine failure is not an interrupt"
+        );
+    }
+
+    #[test]
+    fn a_fresh_cache_hit_neither_advances_nor_resets_the_breaker() {
+        // A fresh cache row means no MusicBrainz request was made. Resetting the counter for
+        // it would let an interleaved cache hit hide a sustained outage: three consecutive
+        // *request* failures would never be observed.
+        let mut consecutive = 2;
+        assert!(
+            !note_stale_cache_breaker(&DiscoveryProvenance::FreshCache, &mut consecutive),
+            "a cache hit cannot trip the breaker"
+        );
+        assert_eq!(
+            consecutive, 2,
+            "a cache hit must leave a partially advanced breaker alone"
+        );
+
+        // A successful refresh is proof the provider answered, so the run starts over.
+        assert!(!note_stale_cache_breaker(
+            &DiscoveryProvenance::Refreshed,
+            &mut consecutive
+        ));
+        assert_eq!(consecutive, 0, "an answer resets the run of failures");
+
+        // A stale row whose refresh failed for an outage reason advances it.
+        let outage = DiscoveryProvenance::StaleCache {
+            age_days: 40,
+            refresh_error: "connection reset".into(),
+            kind: crate::discography::DiscoveryFailure::Provider,
+        };
+        assert!(!note_stale_cache_breaker(&outage, &mut consecutive));
+        assert_eq!(consecutive, 1);
+        assert!(!note_stale_cache_breaker(&outage, &mut consecutive));
+        assert_eq!(consecutive, 2);
+        assert!(
+            note_stale_cache_breaker(&outage, &mut consecutive),
+            "three consecutive outage refreshes must trip the breaker"
+        );
+    }
+
+    #[test]
+    fn a_staging_path_refusal_does_not_spend_the_download_budget() {
+        // The refusal is a configuration fault found before any search. Charging it would
+        // let a misconfigured staging root consume the budget and then report "budget
+        // reached" instead of the configuration problem.
+        assert!(!charges_download_budget(&AlbumOutcome::Failed {
+            reason: format!(
+                "{STAGING_INSIDE_LIBRARY_PREFIX}/music/Artist/Album\" lies inside the library root"
+            ),
+        }));
+        assert!(
+            charges_download_budget(&AlbumOutcome::Failed {
+                reason: "no peer accepted the transfer".into(),
+            }),
+            "a genuine download failure is still charged"
+        );
+    }
+
+    #[test]
+    fn the_label_summary_says_a_stale_catalogue_was_used_not_that_the_label_was_skipped() {
+        // The albums from a stale catalogue are staged, so the "label skipped" wording would
+        // contradict the staged line printed beside it.
+        let mut counters = label_discover::LabelCounters {
+            requested: vec!["Hospital Records".into()],
+            ..label_discover::LabelCounters::default()
+        };
+        counters
+            .stale_catalogues
+            .push(("Hospital Records".into(), "connection reset".into()));
+
+        let notices = label_discover::label_notices(&counters, "downloads/staging");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("its stale catalogue was used")),
+            "the stale case needs its own wording: {notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains("label skipped")),
+            "a label whose albums were used was not skipped: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_manual_interrupt_is_not_recorded_as_a_failed_album() {
+        // Manual mode is the last mode to record the operator's Ctrl+C as a failure, which
+        // made a summary list it under Failed and left the run looking broken.
+        let mut report = RunReport::new();
+        let cancel = AtomicBool::new(true);
+
+        let interrupted = record_manual_outcome(
+            &mut report,
+            "Artist",
+            "Album",
+            AlbumOutcome::Failed {
+                reason: "download error: download cancelled by user".into(),
+            },
+            &cancel,
+        );
+
+        assert!(interrupted, "the interrupt must be recognised");
+        assert_eq!(report.failed_count(), 0, "an interrupt is not a failure");
+
+        let genuine = record_manual_outcome(
+            &mut report,
+            "Artist",
+            "Album",
+            AlbumOutcome::Failed {
+                reason: "no peer accepted the transfer".into(),
+            },
+            &AtomicBool::new(false),
+        );
+
+        assert!(!genuine, "a genuine failure must still be recorded");
+        assert_eq!(report.failed_count(), 1);
+    }
+
+    #[test]
+    fn an_interrupted_upgrade_album_does_not_drop_the_rest_of_the_run() {
+        // Every future has finished by the time the outcomes are recorded, so an
+        // interrupted album in the middle of the vector must not hide the albums after
+        // it.
+        let config = make_test_config();
+        let results = vec![
+            (
+                "Artist".to_string(),
+                "First".to_string(),
+                Ok(AlbumOutcome::Downloaded {
+                    track_count: 10,
+                    destination: DownloadDestination::Library(std::path::PathBuf::from(
+                        "/l/Artist/First",
+                    )),
+                }),
+            ),
+            (
+                "Artist".to_string(),
+                "Interrupted".to_string(),
+                Ok(AlbumOutcome::Failed {
+                    reason: "download error: download cancelled by user".into(),
+                }),
+            ),
+            (
+                "Artist".to_string(),
+                "Third".to_string(),
+                Ok(AlbumOutcome::Downloaded {
+                    track_count: 11,
+                    destination: DownloadDestination::Library(std::path::PathBuf::from(
+                        "/l/Artist/Third",
+                    )),
+                }),
+            ),
+        ];
+        let mut report = RunReport::new();
+        let mut explained = BTreeSet::new();
+
+        record_upgrade_outcomes(
+            results,
+            &config,
+            &AtomicBool::new(false),
+            &mut report,
+            &mut explained,
+        );
+
+        assert_eq!(
+            report.downloaded_count(),
+            2,
+            "both completed albums must be recorded"
+        );
+        assert_eq!(
+            report.failed_count(),
+            0,
+            "the operator's interrupt is not an album failure"
+        );
     }
 
     #[test]
@@ -7599,6 +8287,10 @@ mod tests {
         assert_eq!(
             counters.failed_albums, 2,
             "a failure reported as an outcome counts like one returned as an error"
+        );
+        assert_eq!(
+            counters.skipped_processed, 1,
+            "an album skipped as already processed is neither staged nor failed"
         );
     }
 
@@ -8105,6 +8797,437 @@ mod tests {
         // rule it would pin is covered deterministically by
         // `an_interrupted_album_is_a_cancellation_not_a_failure` and
         // `label_counters_count_every_failure_route_and_only_staged_downloads`.
+    }
+
+    #[tokio::test]
+    async fn a_label_run_leaves_an_existing_library_tree_byte_identical() {
+        // The "never writes into your library" promise has to hold against a library that
+        // already holds content: an empty-library fixture would pass even if the runner
+        // regressed to a placement target, because there would be no folder to write into.
+        let (mut config, db, staging, library) = discover_fixture(&[
+            ("Existing Artist", "Existing Album"),
+            ("London Elektricity", "Present"),
+        ]);
+        config.filters.min_tracks = 0;
+        let existing = library
+            .path()
+            .join("Existing Artist")
+            .join("Existing Album")
+            .join("01 - track.flac");
+        let before = std::fs::read(&existing).unwrap();
+        let tree_before = library_snapshot(library.path());
+
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            before,
+            "the existing library file must be untouched"
+        );
+        assert_eq!(
+            library_snapshot(library.path()),
+            tree_before,
+            "a label run must not add, remove or rename anything under library.paths"
+        );
+        assert!(
+            staging
+                .path()
+                .join("London Elektricity")
+                .join("Syncopated City")
+                .is_dir(),
+            "the album must be staged"
+        );
+    }
+
+    /// Every directory and file under `root`, as sorted relative paths.
+    fn library_snapshot(root: &std::path::Path) -> Vec<String> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if path.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_forced_reprocess_keeps_a_colliding_album_and_leaves_the_old_copy_reported() {
+        // Two album titles can sanitise to one staging folder ("Re:Vision" and "ReVision"),
+        // so the directory is shared by design. A forced reprocess of one of them must drop
+        // only the copy it is replacing: deleting everything that was already there would
+        // silently destroy the other album, whose own success record would then keep later
+        // runs from ever fetching it again.
+        let root = TempDir::new().unwrap();
+        // The label fixture credits London Elektricity, and the search results must name
+        // that artist or the artist restriction drops them.
+        let staging = root.path().join("London Elektricity").join("ReVision");
+        std::fs::create_dir_all(&staging).unwrap();
+        // The superseded copy of this album, and the other album's staged files.
+        let old = staging.join("01 - old.flac");
+        std::fs::write(&old, b"old").unwrap();
+        let foreign = staging.join("99 - other album.flac");
+        std::fs::write(&foreign, b"other").unwrap();
+
+        let client = MockClient::new();
+        *client.write_files.lock().unwrap() = true;
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Re:Vision\01 - new.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Re:Vision\02 - newer.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let (mut config, db, _unused, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.storage.staging_dir = root.path().to_string_lossy().into_owned();
+        config.discover.max_cycle_downloads = 1;
+        // The album was staged by an earlier run.
+        db.mark_album_processed("London Elektricity", "Re:Vision", "success")
+            .unwrap();
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            true, // --ignore-processed
+            Path::new(&config.storage.staging_dir),
+            &FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+                id: "group-1".into(),
+                title: "Re:Vision".into(),
+                first_release_date: Some("2001".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            }]),
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            foreign.exists(),
+            "the other album sharing this folder must survive untouched"
+        );
+        // The superseded copy is kept and reported rather than deleted: it cannot be told
+        // apart from the other album's files, and deleting the wrong one is unrecoverable.
+        assert!(
+            old.exists(),
+            "the previous copy is left for the operator and named in a warning"
+        );
+        assert!(
+            staging.join("01 - new.flac").exists() && staging.join("02 - newer.flac").exists(),
+            "the new download must land beside it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_label_run_skips_the_album_it_staged_and_ignore_processed_redoes_it() {
+        // The README promises a second sweep reports the staged album as skipped rather
+        // than downloading it again, and that --ignore-processed is the way to redo it.
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+        let searches_after_first = client.search_queries.lock().unwrap().len();
+
+        // Second run: the recorded success is replayed as a skip, so nothing is searched
+        // and nothing is downloaded again.
+        let second = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !second.cancelled,
+            "sanity: a completed run must not claim to be cancelled"
+        );
+        assert_eq!(
+            second.skipped_processed, 1,
+            "the staged album must be counted as already processed"
+        );
+        assert_eq!(
+            second.staged_albums, 0,
+            "a repeat run must not stage the album again"
+        );
+        assert_eq!(
+            client.search_queries.lock().unwrap().len(),
+            searches_after_first,
+            "a repeat run must not search for an album it already has"
+        );
+
+        // --ignore-processed is the documented way to redo it.
+        let third = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            true,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            third.skipped_processed, 0,
+            "--ignore-processed must bypass the recorded success"
+        );
+        assert!(
+            client.search_queries.lock().unwrap().len() > searches_after_first,
+            "--ignore-processed must search again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_label_is_resolved_by_id_without_searching_its_name() {
+        // `discography.label_mbids` is the documented way to sweep a label whose name is
+        // ambiguous or unstable; a pin must therefore skip the name search entirely.
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discography.label_mbids.insert(
+            "Hospital Records".to_string(),
+            "8562598d-60d1-4bd6-8b85-4d709e951770".to_string(),
+        );
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let provider = FakeLabelProvider::with_catalogue(vec![ReleaseGroup {
+            id: "group-1".into(),
+            title: "Syncopated City".into(),
+            first_release_date: Some("2008-06-02".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        }]);
+        let searches = Arc::clone(&provider.search_calls);
+
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            searches.load(Ordering::SeqCst),
+            0,
+            "a pinned label must be looked up by ID, not searched by name"
+        );
+        assert!(
+            staging
+                .path()
+                .join("London Elektricity")
+                .join("Syncopated City")
+                .is_dir(),
+            "the pinned label's album must be staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_label_budget_is_unlimited() {
+        // `discover.max_cycle_downloads: 0` means "no limit"; the label sweep must read it
+        // the same way the artist sweep does, or a sweep silently stages one album.
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 0;
+        let client = MockClient::new();
+        *client.search_results_by_query.lock().unwrap() =
+            ["Album One".to_string(), "Album Two".to_string()]
+                .into_iter()
+                .map(|title| {
+                    (
+                        title.clone(),
+                        vec![SearchResult {
+                            username: "peer".into(),
+                            speed: 1000,
+                            slots: 2,
+                            files: (1..=2)
+                                .map(|track| FileInfo {
+                                    name: format!(
+                                        r"London Elektricity\{title}\0{track} - Track.flac"
+                                    ),
+                                    size: 20_000_000,
+                                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                                })
+                                .collect(),
+                        }],
+                    )
+                })
+                .collect();
+        let provider = FakeLabelProvider::with_catalogue(vec![
+            ReleaseGroup {
+                id: "group-1".into(),
+                title: "Album One".into(),
+                first_release_date: Some("2001".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+            ReleaseGroup {
+                id: "group-2".into(),
+                title: "Album Two".into(),
+                first_release_date: Some("2002".into()),
+                primary_type: Some("Album".into()),
+                secondary_types: Vec::new(),
+            },
+        ]);
+
+        let counters = run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request("Hospital Records")],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.staged_albums, 2,
+            "an unlimited budget must stage both albums"
+        );
+        assert_eq!(counters.budget_reached_at, None);
     }
 
     #[tokio::test]
@@ -8937,6 +10060,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_partial_upgrade_does_not_delete_the_files_it_did_not_replace() {
+        // 12-track library album, 3 files of which need replacing; the peer supplies only
+        // those 3. This is a smoke test of the whole path: the guard's own decision is
+        // pinned by `only_a_whole_album_replacement_may_delete_lesser_files`, because the
+        // fixture files do not parse as audio and the deletion pass would skip them anyway.
+        let client = Arc::new(MockClient::new());
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 500,
+            slots: 1,
+            files: vec![
+                make_file(r"Test Artist\Test Album\01 - one.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Test Album\02 - two.flac", 900, 10_000_000),
+                make_file(r"Test Artist\Test Album\03 - three.flac", 900, 10_000_000),
+            ],
+        }];
+        *client.write_files.lock().unwrap() = true;
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 3;
+        config.library_upgrade.enabled = true;
+        config.library_upgrade.delete_lesser_quality = true;
+        config.filters.peer_track_count = false;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+
+        // The library album: 12 files, all worse than the replacements.
+        let album_dir = target.path().join("Test Artist").join("Test Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        for track in 1..=12 {
+            std::fs::write(
+                album_dir.join(format!("{track:02} - track.flac")),
+                b"low quality flac data",
+            )
+            .unwrap();
+        }
+
+        process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Test Artist",
+            Some("Test Album"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            Some(3), // three files need replacing
+            Some(LibraryTarget::Upgrade {
+                root: target.path().to_path_buf(),
+                expected_tracks: 3,
+                album_tracks: 12, // the album holds twelve tracks
+            }),
+        )
+        .await
+        .unwrap();
+
+        for track in 4..=12 {
+            let path = album_dir.join(format!("{track:02} - track.flac"));
+            assert!(
+                path.exists(),
+                "a partial upgrade must not delete the untouched {track:02} track"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn an_upgrade_may_deliver_only_the_files_that_need_replacing() {
         // The library already holds its own track 1, so a peer sharing only the
         // non-conforming files is a legitimate upgrade source: the anchor half of
@@ -8980,6 +10171,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: target.path().to_path_buf(),
                 expected_tracks: 3,
+                album_tracks: 3,
             }),
         )
         .await
@@ -9506,6 +10698,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: target.path().to_path_buf(),
                 expected_tracks: 2,
+                album_tracks: 2,
             }),
         )
         .await
@@ -9554,6 +10747,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: library.path().to_path_buf(),
                 expected_tracks: 0,
+                album_tracks: 0,
             }),
         )
         .await
@@ -9629,6 +10823,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: library.path().to_path_buf(),
                 expected_tracks: 0,
+                album_tracks: 0,
             }),
         )
         .await
@@ -9678,6 +10873,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: library.path().to_path_buf(),
                 expected_tracks: 0,
+                album_tracks: 0,
             }),
         )
         .await
@@ -9735,6 +10931,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: library.path().to_path_buf(),
                 expected_tracks: 0,
+                album_tracks: 0,
             }),
         )
         .await
@@ -9752,6 +10949,68 @@ mod tests {
         assert!(
             client.download_filenames.lock().unwrap().is_empty(),
             "no transfer may start for an album that can only write into the library"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_discover_album_is_not_counted_as_a_failure() {
+        // Ctrl+C during the first album's search must stop the sweep, charge no budget,
+        // count no failure - and mark the run cancelled, or the summary reads like a
+        // completed sweep that simply had nothing left to do.
+        let inner = MockClient::new();
+        *inner.search_results.lock().unwrap() = vec![crate::client::SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"Test Artist\Missing\01 - A.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"Test Artist\Missing\02 - B.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let client = CancelAfterFirstSearchClient {
+            inner,
+            cancel: Arc::clone(&cancel),
+            searches: AtomicUsize::new(0),
+        };
+        let (config, db, staging, _library) = discover_fixture(&[("Test Artist", "Present")]);
+        let provider =
+            FakeDiscographyProvider::with_groups(vec![release_group("missing", "Missing", "1999")]);
+
+        let counters = run_discover_mode_with_cancel(
+            &client,
+            &config,
+            &db,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &cancel,
+        )
+        .await
+        .expect("an interrupted run ends cleanly");
+
+        assert!(counters.cancelled, "the run must report the interrupt");
+        assert_eq!(
+            counters.staged_albums, 0,
+            "an interrupted album is not staged"
+        );
+        assert!(
+            !staging.path().join("Test Artist").exists(),
+            "an interrupted album must leave no staging directory"
+        );
+        assert_eq!(
+            client.searches.load(Ordering::SeqCst),
+            1,
+            "the interrupt must stop the sweep after the album it interrupted"
         );
     }
 
@@ -11477,6 +12736,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: target.path().to_path_buf(),
                 expected_tracks: 2,
+                album_tracks: 2,
             }),
         )
         .await
@@ -11508,6 +12768,60 @@ mod tests {
         assert_eq!(
             peer.successful, 1,
             "only the delivered track was usable audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_album_only_tier_reaches_the_download_with_a_differently_named_folder() {
+        // The tier exists because a peer's folder may name the album differently from the
+        // MusicBrainz title. Re-applying the album-name gate to its results deletes exactly
+        // that peer, which is what this pins: the download must actually happen.
+        let client = Arc::new(MockClient::new());
+        client.search_results_by_query.lock().unwrap().insert(
+            "Musicology".into(),
+            vec![SearchResult {
+                username: "user1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    "Prince/The Best Of Prince/01 - Musicology.flac",
+                    900,
+                    10_000_000,
+                )],
+            }],
+        );
+
+        let mut config = make_test_config();
+        config.filters.min_tracks = 0;
+        let db = Database::open_in_memory().unwrap();
+        let staging = TempDir::new().unwrap();
+
+        let result = process_album(
+            client.as_ref() as &dyn crate::client::SoulseekClient,
+            "Prince",
+            Some("Musicology"),
+            false,
+            &config,
+            &db,
+            staging.path(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result.unwrap(),
+                AlbumOutcome::Downloaded { track_count: 1, .. }
+            ),
+            "the album-only tier's folder must reach the download"
+        );
+        assert_eq!(
+            client.download_filenames.lock().unwrap().len(),
+            1,
+            "the peer must be downloaded from"
         );
     }
 
@@ -11633,6 +12947,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: target.path().to_path_buf(),
                 expected_tracks: 2,
+                album_tracks: 2,
             }),
         )
         .await;
@@ -11695,6 +13010,7 @@ mod tests {
             Some(LibraryTarget::Upgrade {
                 root: target.path().to_path_buf(),
                 expected_tracks: 2,
+                album_tracks: 2,
             }),
         )
         .await

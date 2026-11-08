@@ -549,12 +549,25 @@ impl MusicBrainzProvider {
         &self,
         artist_mbid: &str,
     ) -> std::result::Result<ArtistCandidate, DiscographyError> {
-        let wire: ArtistWire = self
+        let wire: ArtistWire = match self
             .request_json(
                 &format!("/ws/2/artist/{artist_mbid}"),
                 &[("fmt", "json".into())],
             )
-            .await?;
+            .await
+        {
+            Ok(wire) => wire,
+            // A 404 means the ID is well formed but names no artist. That is a bad
+            // identifier, not an outage: classifying it as a provider failure would let
+            // three mistyped pins abort the run with a breaker message that never
+            // mentions them. The label lookup applies the same rule.
+            Err(DiscographyError::HttpStatus(404)) => {
+                return Err(DiscographyError::ArtistUnresolved(format!(
+                    "no MusicBrainz artist has the ID {artist_mbid}"
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         if !wire.id.eq_ignore_ascii_case(artist_mbid) {
             return Err(DiscographyError::Decode(format!(
                 "artist id {} does not match the requested MBID {artist_mbid}",
@@ -1060,7 +1073,6 @@ async fn provider_error(
         .take(MAX_QUOTED_RETRY_AFTER)
         .map(header_evidence)
         .collect();
-    let now = server_now_epoch(&response).unwrap_or_else(local_now_epoch);
     let unusable_reset = response
         .headers()
         .get("x-ratelimit-reset")
@@ -1121,6 +1133,8 @@ async fn provider_error(
 /// semicolon are removed as well, so a value cannot forge one of the quoted,
 /// semicolon-separated parts of the error message.
 fn single_line(text: &str, limit: usize) -> String {
+    use crate::formatting::is_format_character;
+
     let printable: String = text
         .chars()
         .map(|character| {
@@ -1141,41 +1155,6 @@ fn single_line(text: &str, limit: usize) -> String {
     } else {
         collapsed
     }
-}
-
-/// Unicode format characters (category Cf) that are invisible but reorder or
-/// hide the text around them: zero-width characters, the bidirectional
-/// overrides and isolates, the Arabic letter mark, the prepended concatenation
-/// marks, the Khmer vowel signs, the interlinear annotation anchors, the tag
-/// characters (the standard ASCII-smuggling vector), and the byte-order mark.
-/// Control characters are handled separately by [`single_line`].
-fn is_format_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{17B4}'..='\u{17B5}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{1107F}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-            | '\u{FEFF}'
-    )
 }
 
 fn parse_retry_after(
@@ -4119,6 +4098,27 @@ mod tests {
             .await
             .unwrap();
         assert!(labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_but_well_formed_artist_id_is_unresolved_not_an_outage() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ws/2/artist/8562598d-60d1-4bd6-8b85-4d709e951770"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = MusicBrainzProvider::for_test(server.uri(), Duration::ZERO).unwrap();
+        let error =
+            DiscographyProvider::artist_by_id(&provider, "8562598d-60d1-4bd6-8b85-4d709e951770")
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, DiscographyError::ArtistUnresolved(_)),
+            "a mistyped ID must not count towards the outage breaker, got {error:?}"
+        );
     }
 
     #[tokio::test]

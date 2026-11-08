@@ -120,8 +120,15 @@ impl LabelInput {
     /// marker is structural rather than folded, so a label literally named like an ID
     /// cannot share a row with that ID. The leading `label:` keeps the whole space
     /// apart from the artist keys that share the table (`name`, `isni:`, `ipi:`,
-    /// `mbid:`); an artist literally named `label:name:vault` would still fold onto a
-    /// label key, and the mismatched row fails to parse and is refetched.
+    /// `mbid:`).
+    ///
+    /// An artist literally named `label:name:vault` still folds onto a label key. Each
+    /// cache survives that differently: a catalogue row's payload decodes only as its
+    /// own type, so a mismatched row fails to parse and is refetched, while a failure
+    /// row stores only a kind and a reason, so such an artist and a label of the same
+    /// name would replay each other's unresolved failure for
+    /// `discography.failure_cache_days`. The prefix makes that require a deliberately
+    /// adversarial name and costs one suppressed lookup, not a wrong write.
     pub fn cache_key(&self) -> String {
         match self {
             Self::Mbid(value) => format!("label:id:{value}"),
@@ -203,13 +210,26 @@ pub fn resolve_label(
                 many,
                 |candidate| candidate.score,
                 |candidate| candidate.id.as_str(),
-            )?;
+            )
+            // The dominance rules answer in scores; the operator needs names. Every
+            // ambiguity is therefore answered with the same bounded candidate list the
+            // zero-match branch uses, so the refusal can be acted on by pinning one of the
+            // listed IDs.
+            .map_err(|error| match error {
+                DiscographyError::LabelUnresolved(reason) => DiscographyError::LabelUnresolved(
+                    format!("{reason}{}", nearest_labels(candidates)),
+                ),
+                other => other,
+            })?;
             Ok((*many[dominance.index]).clone())
         }
     }
 }
 
 /// A bounded, human answer to "which label did you mean?".
+///
+/// Each entry carries the MBID: the refusal's whole purpose is to let the operator pin the
+/// right one with `discography.label_mbids`, and a name alone cannot do that.
 fn nearest_labels(candidates: &[LabelCandidate]) -> String {
     if candidates.is_empty() {
         return String::new();
@@ -241,7 +261,12 @@ fn describe_label(candidate: &LabelCandidate) -> String {
     if detail.is_empty() {
         format!("{} ({})", candidate.name, candidate.id)
     } else {
-        format!("{} ({})", candidate.name, detail.join(", "))
+        format!(
+            "{} ({}, id {})",
+            candidate.name,
+            detail.join(", "),
+            candidate.id
+        )
     }
 }
 
@@ -335,13 +360,16 @@ pub(crate) async fn discover_label_releases_at(
     now: i64,
     failure_cache: FailureCacheUse,
 ) -> LabelDiscovery {
-    // A malformed value claims to be an ID but is not one. Refusing it here keeps
-    // the invariant every caller relies on: a near-miss UUID is never searched for
-    // as a name, and no request is spent on it.
-    if let Some(reason) = input.malformed_reason() {
+    // Every caller reaches this function with the same full validation the CLI applies:
+    // a near-miss UUID is never searched for as a name, a blank name is never searched
+    // for at all, and an `Mbid` whose value is not a UUID never reaches the URL it would
+    // be interpolated into. `malformed_reason` covers only the near-miss shape, so
+    // validating here is what keeps the promise for a library caller that builds a
+    // `LabelInput` variant directly.
+    if let Err(reason) = input.validate() {
         return LabelDiscovery {
             outcome: LabelDiscoveryOutcome::Failed {
-                reason: reason.to_string(),
+                reason,
                 kind: DiscoveryFailure::Unresolved,
                 from_cache: false,
             },
@@ -351,7 +379,12 @@ pub(crate) async fn discover_label_releases_at(
     }
     let label_key = input.cache_key();
     let configured_mbid = pinned_mbid(&config.label_mbids, input);
-    let cached = load_cached_catalogue(db, &label_key, configured_mbid);
+    // A row must describe the label this run asked for. When the input names an ID, that ID
+    // is the expectation even without a pin: a row written while a pin pointed elsewhere was
+    // stored under this same key with the other label's MBID, and serving it after the pin
+    // was removed would stage a completely different label's albums.
+    let expected_mbid = configured_mbid.or_else(|| input.mbid());
+    let cached = load_cached_catalogue(db, &label_key, expected_mbid);
 
     if let Some(cached) = &cached {
         if cache_is_fresh(cached.entry.fetched_at, config.cache_days, now) {
@@ -486,7 +519,12 @@ fn load_cached_catalogue(
             return None;
         }
     };
-    if identifier_pin_key(&entry.artist_key) != label_key {
+    // The column is `COLLATE NOCASE`, so the lookup may return the row under an
+    // equivalently-cased key. Compare case-insensitively rather than re-folding: the
+    // stored key is already folded, and re-folding a `label:`-prefixed key with the
+    // artist rule lower-cases the ISNI check character the name form keeps upper-case,
+    // which would miss the row and re-fetch the catalogue on every run.
+    if !entry.artist_key.eq_ignore_ascii_case(label_key) {
         return None;
     }
     if let Some(mbid) = configured_mbid {
@@ -751,6 +789,19 @@ mod tests {
             matches!(&error, DiscographyError::LabelUnresolved(reason) if reason.contains("margin 5")),
             "got {error:?}"
         );
+        // The README promises the refusal lists the candidates so one can be pinned;
+        // a score margin alone is not actionable.
+        let DiscographyError::LabelUnresolved(reason) = &error else {
+            unreachable!("checked above");
+        };
+        assert!(
+            reason.contains("nearest:") && reason.contains("UK drum & bass"),
+            "an ambiguous refusal must name its candidates, got: {reason}"
+        );
+        assert!(
+            reason.contains(&candidates[0].id) && reason.contains(&candidates[1].id),
+            "both candidate IDs are needed to pin one, got: {reason}"
+        );
     }
 
     #[test]
@@ -890,6 +941,9 @@ mod tests {
         search_calls: AtomicUsize,
         lookup_calls: AtomicUsize,
         catalogue_calls: AtomicUsize,
+        /// Every ID asked for by `label_by_id`, in order: a pin test must prove *which*
+        /// label was looked up, not merely that a lookup happened.
+        requested_ids: std::sync::Mutex<Vec<String>>,
     }
 
     impl FakeLabelProvider {
@@ -901,6 +955,7 @@ mod tests {
                 search_calls: AtomicUsize::new(0),
                 lookup_calls: AtomicUsize::new(0),
                 catalogue_calls: AtomicUsize::new(0),
+                requested_ids: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -915,6 +970,7 @@ mod tests {
                 search_calls: AtomicUsize::new(0),
                 lookup_calls: AtomicUsize::new(0),
                 catalogue_calls: AtomicUsize::new(0),
+                requested_ids: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -962,9 +1018,13 @@ mod tests {
 
         async fn label_by_id(
             &self,
-            _label_mbid: &str,
+            label_mbid: &str,
         ) -> std::result::Result<LabelCandidate, DiscographyError> {
             self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            self.requested_ids
+                .lock()
+                .unwrap()
+                .push(label_mbid.to_string());
             if let Some(reason) = &self.failure {
                 return Err(DiscographyError::Transport(reason.clone()));
             }
@@ -1043,6 +1103,344 @@ mod tests {
         assert_eq!(provenance, super::super::DiscoveryProvenance::FreshCache);
         assert_eq!(provider.search_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.catalogue_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_pin_from_an_id_input_refetches_the_requested_label() {
+        // While the pin was in place the catalogue was stored under `label:id:<A>` with the
+        // *pinned* label's MBID. With the pin gone, the run asks for A: serving that row
+        // would stage a completely different label's albums under a "resolved" line naming
+        // the wrong label.
+        const ASKED: &str = "11111111-1111-1111-1111-111111111111";
+        const PINNED: &str = "22222222-2222-2222-2222-222222222222";
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeLabelProvider::new(vec![LabelCandidate {
+            id: PINNED.to_string(),
+            name: "Pinned Label".to_string(),
+            score: Some(100),
+            label_code: None,
+            disambiguation: None,
+        }]);
+        let input = LabelInput::parse(ASKED);
+        let mut pinned = config();
+        pinned
+            .label_mbids
+            .insert(ASKED.to_string(), PINNED.to_string());
+
+        discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &pinned,
+            NOW,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        assert_eq!(
+            provider.requested_ids.lock().unwrap().as_slice(),
+            [PINNED],
+            "the pin must be the ID that is fetched"
+        );
+
+        let unpinned = config();
+        let discovery = discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &unpinned,
+            NOW + 60,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                discovery.outcome,
+                LabelDiscoveryOutcome::Catalogue {
+                    provenance: super::super::DiscoveryProvenance::Refreshed,
+                    ..
+                }
+            ),
+            "a row describing another label must not be served, got {:?}",
+            discovery.outcome
+        );
+        assert_eq!(
+            provider.requested_ids.lock().unwrap().as_slice(),
+            [PINNED, ASKED],
+            "the requested ID must be fetched once the pin is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_days_zero_fetches_every_time_and_writes_nothing() {
+        // `discography.cache_days: 0` means "never cache". The label path has its own
+        // store/read branch, so it needs its own proof.
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeLabelProvider::new(vec![hospital()]);
+        let input = LabelInput::parse("Hospital Records");
+        let mut without_cache = config();
+        without_cache.cache_days = 0;
+
+        discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &without_cache,
+            NOW,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        // An hour later: still well inside a non-zero `cache_days`, so a cache that was
+        // not actually disabled would serve this second call from the row.
+        discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &without_cache,
+            NOW + 3_600,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert_eq!(
+            provider.catalogue_calls.load(Ordering::SeqCst),
+            2,
+            "nothing may be reused when the cache is disabled"
+        );
+        assert!(
+            db.get_discography_cache(&input.cache_key())
+                .unwrap()
+                .is_none(),
+            "nothing may be written when the cache is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_cache_days_zero_neither_replays_nor_records() {
+        // The label failure cache is a separate read and write from the artist one, so both
+        // halves need their own proof: a row written while caching was on must not be
+        // replayed when it is off, and nothing may be written while it is off.
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeLabelProvider::new(vec![LabelCandidate {
+            name: "Some Other Label".to_string(),
+            ..hospital()
+        }]);
+        let input = LabelInput::parse("Hospital Records");
+
+        // With caching on, the failed resolution is recorded.
+        discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &config(),
+            NOW,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        assert!(
+            db.get_discography_failure(&input.cache_key())
+                .unwrap()
+                .is_some(),
+            "sanity: the failure must be recorded while the cache is enabled"
+        );
+
+        let mut without_failures = config();
+        without_failures.failure_cache_days = 0;
+        discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &without_failures,
+            NOW + 60,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert_eq!(
+            provider.search_calls.load(Ordering::SeqCst),
+            2,
+            "a disabled failure cache must not replay the recorded failure"
+        );
+    }
+
+    #[test]
+    fn failure_cache_days_zero_writes_no_row_for_a_label() {
+        // The write half of the same setting: a zero expiry must suppress the row itself,
+        // not merely keep it from being replayed.
+        let db = Database::open_in_memory().unwrap();
+        let input = LabelInput::parse("Hospital Records");
+        let mut without_failures = config();
+        without_failures.failure_cache_days = 0;
+        let error = DiscographyError::LabelUnresolved("no such label".into());
+
+        record_resolution_failure(
+            &db,
+            &input.cache_key(),
+            &without_failures,
+            NOW,
+            &error,
+            false,
+        );
+
+        assert!(
+            db.get_discography_failure(&input.cache_key())
+                .unwrap()
+                .is_none(),
+            "a disabled failure cache must not be written"
+        );
+    }
+
+    #[test]
+    fn an_inconsistent_search_page_leaves_no_failure_row() {
+        // Only a resolution failure is worth remembering; one inconsistent response is not,
+        // and remembering it would suppress a healthy MusicBrainz for the whole expiry.
+        let db = Database::open_in_memory().unwrap();
+        let input = LabelInput::parse("Hospital Records");
+        let error = DiscographyError::LabelSearchInconsistent("short page".into());
+        record_resolution_failure(&db, &input.cache_key(), &config(), NOW, &error, false);
+
+        assert!(
+            db.get_discography_failure(&input.cache_key())
+                .unwrap()
+                .is_none(),
+            "an inconsistent page must not be recorded as a resolution failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalogue_too_large_to_cache_is_still_returned() {
+        // The cache write can fail on serialisation or the payload ceiling. The catalogue was
+        // fetched successfully, so the run must use it and only warn - a cache failure is not a
+        // resolution failure.
+        let db = Database::open_in_memory().unwrap();
+        // The *payload* is oversized, not the label name: the label must still resolve.
+        let mut huge = group("group-1", "Syncopated City");
+        huge.title = "x".repeat(super::super::MAX_CACHE_PAYLOAD_BYTES + 1);
+        let provider = Arc::new(FakeLabelProvider {
+            candidates: vec![hospital()],
+            catalogue: LabelCatalogue {
+                releases: vec![LabelRelease {
+                    release_id: "release-1".to_string(),
+                    release_group: huge,
+                    artist_credit: "London Elektricity".to_string(),
+                }],
+                incomplete: 0,
+            },
+            failure: None,
+            search_calls: AtomicUsize::new(0),
+            lookup_calls: AtomicUsize::new(0),
+            catalogue_calls: AtomicUsize::new(0),
+            requested_ids: std::sync::Mutex::new(Vec::new()),
+        });
+        let input = LabelInput::parse("Hospital Records");
+
+        let discovery = discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &config(),
+            NOW,
+            FailureCacheUse::Honour,
+        )
+        .await;
+
+        assert!(
+            matches!(discovery.outcome, LabelDiscoveryOutcome::Catalogue { .. }),
+            "an uncacheable catalogue is still a catalogue, got {:?}",
+            discovery.outcome
+        );
+        assert!(
+            db.get_discography_cache(&input.cache_key())
+                .unwrap()
+                .is_none(),
+            "an oversized payload must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_input_is_refused_before_any_request() {
+        // The public variants can be built directly, so the guarantee has to live here
+        // too: a value that is not a UUID must never reach the URL it is interpolated
+        // into, and must not be searched for as a name either.
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeLabelProvider::new(vec![hospital()]);
+
+        for input in [
+            LabelInput::Mbid("../../evil".to_string()),
+            LabelInput::Name("   ".to_string()),
+        ] {
+            let discovery = discover_label_releases_at(
+                &*provider,
+                &db,
+                &input,
+                &config(),
+                NOW,
+                FailureCacheUse::Honour,
+            )
+            .await;
+            assert!(
+                matches!(
+                    discovery.outcome,
+                    LabelDiscoveryOutcome::Failed {
+                        kind: DiscoveryFailure::Unresolved,
+                        ..
+                    }
+                ),
+                "an invalid input must be refused, got {:?}",
+                discovery.outcome
+            );
+        }
+        assert_eq!(provider.search_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.lookup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_name_whose_key_keeps_an_upper_case_character_still_hits_the_cache() {
+        // An ISNI-shaped name folds to a key with an upper-case check character. The row
+        // is read back through a NOCASE column, so the comparison must not re-fold the
+        // stored key with the artist rule: doing so lower-cases that character and the
+        // catalogue is re-fetched on every run.
+        const ISNI_NAME: &str = "isni:0000 0004 6659 702X";
+        let db = Database::open_in_memory().unwrap();
+        let provider = FakeLabelProvider::new(vec![LabelCandidate {
+            name: ISNI_NAME.to_string(),
+            ..hospital()
+        }]);
+        let input = LabelInput::parse(ISNI_NAME);
+
+        let first = discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &config(),
+            NOW,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        assert!(
+            matches!(first.outcome, LabelDiscoveryOutcome::Catalogue { .. }),
+            "the first run must resolve, got {:?}",
+            first.outcome
+        );
+
+        let second = discover_label_releases_at(
+            &*provider,
+            &db,
+            &input,
+            &config(),
+            NOW + SECONDS_PER_DAY as i64,
+            FailureCacheUse::Honour,
+        )
+        .await;
+        let LabelDiscoveryOutcome::Catalogue { provenance, .. } = second.outcome else {
+            panic!("expected a catalogue, got {:?}", second.outcome);
+        };
+        assert_eq!(provenance, super::super::DiscoveryProvenance::FreshCache);
+        assert_eq!(
+            provider.catalogue_calls.load(Ordering::SeqCst),
+            1,
+            "the cached catalogue must be reused rather than fetched again"
+        );
     }
 
     #[tokio::test]
@@ -1134,6 +1532,7 @@ mod tests {
             search_calls: AtomicUsize::new(0),
             lookup_calls: AtomicUsize::new(0),
             catalogue_calls: AtomicUsize::new(0),
+            requested_ids: std::sync::Mutex::new(Vec::new()),
         });
         let input = LabelInput::parse("Hospital Records");
 

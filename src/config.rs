@@ -872,8 +872,9 @@ impl Config {
         Ok(())
     }
 
-    /// Shared download-bound checks used by both `validate()` (real startup)
-    /// and `validate_for_test` (`--test` mode). Keeps the two paths in sync.
+    /// The download-bound checks, called by [`Self::validate_non_credential_constraints`],
+    /// which both the real startup path and `--test` mode run. Kept as one function so the
+    /// two paths cannot drift on a bound.
     pub fn validate_download_bounds(&self) -> Result<()> {
         Self::validate_concurrent_bounds(self.download.concurrent)?;
         if self.download.max_retries > 10 {
@@ -924,6 +925,18 @@ impl Config {
     /// Validate configuration constraints that do not require credentials.
     /// Shared by normal startup and `--test` mode to keep their checks in sync.
     pub fn validate_non_credential_constraints(&self) -> Result<()> {
+        // An empty entry is not a library: it passes an is_empty() check and then fails the
+        // scan with "library path does not exist: ". Say so here, where `--test` sees it.
+        if let Some(blank) = self
+            .library
+            .paths
+            .iter()
+            .find(|path| path.trim().is_empty())
+        {
+            return Err(SeakarrError::Config(format!(
+                "library.paths contains a blank entry ({blank:?}); remove it or name a directory"
+            )));
+        }
         let valid_levels = ["DEBUG", "INFO", "WARN", "ERROR"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
             return Err(SeakarrError::Config(format!(
@@ -1176,6 +1189,14 @@ fn migrate_rename(
 fn merge_with_defaults(default: &serde_yaml::Value, file: &serde_yaml::Value) -> serde_yaml::Value {
     match (default, file) {
         (serde_yaml::Value::Mapping(default_map), serde_yaml::Value::Mapping(file_map)) => {
+            // An empty default mapping means a free-form map - the MBID pin maps are the
+            // only ones - so every entry belongs to the operator and none of them exists in
+            // the schema. Walking only the default's keys would drop them all, and since the
+            // reconciled file is then rewritten, the pins would be deleted from disk before
+            // they were ever used.
+            if default_map.is_empty() {
+                return file.clone();
+            }
             let mut merged = serde_yaml::Mapping::new();
             for (key, default_val) in default_map {
                 let value = match file_map.get(key) {
@@ -1454,6 +1475,57 @@ schedule:
         assert_eq!(
             config.download.concurrent, 1,
             "default concurrency must stay at 1 — see the thread-explosion regression notes"
+        );
+    }
+
+    #[test]
+    fn a_blank_library_path_is_a_configuration_error() {
+        // A blank entry passes an "is the list empty" check and then fails the scan with
+        // "library path does not exist: ", long after `--test` said the plan was valid.
+        let mut config = Config::default();
+        config.library.paths = vec!["".to_string()];
+        let error = config.validate_non_credential_constraints().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("library.paths contains a blank entry"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_configured_mbid_pin_survives_loading_and_reconciliation() {
+        // The pin maps are free-form: their schema default is empty, so every entry in the
+        // file is the operator's. A merge that only walks the default's keys would drop them
+        // - and because the reconciled file is then rewritten, the operator's pins would be
+        // deleted from disk before they were ever used.
+        let dir = TempDir::new().unwrap();
+        let yaml_path = dir.path().join("seakarr.yml");
+        fs::write(
+            &yaml_path,
+            "soulseek:\n  username: user\n  password: pass\n\
+             library:\n  paths:\n    - /music\n\
+             discography:\n  artist_mbids:\n    Nightmares on Wax: 01234567-89ab-cdef-0123-456789abcdef\n\
+             \x20 label_mbids:\n    Hospital Records: 8562598d-60d1-4bd6-8b85-4d709e951770\n",
+        )
+        .unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+
+        assert_eq!(
+            config.discography.artist_mbids.get("Nightmares on Wax"),
+            Some(&"01234567-89ab-cdef-0123-456789abcdef".to_string()),
+            "an artist pin must reach the loaded config"
+        );
+        assert_eq!(
+            config.discography.label_mbids.get("Hospital Records"),
+            Some(&"8562598d-60d1-4bd6-8b85-4d709e951770".to_string()),
+            "a label pin must reach the loaded config"
+        );
+        let rewritten = fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            rewritten.contains("Nightmares on Wax") && rewritten.contains("Hospital Records"),
+            "reconciliation must not delete the pins from the file, got:\n{rewritten}"
         );
     }
 

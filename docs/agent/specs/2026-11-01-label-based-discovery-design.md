@@ -101,7 +101,9 @@ two labels is owned by the first label that produced it.
 
 When `--label` is present the run's work list is the label catalogue alone. The
 library is still scanned, because "already present" cannot be answered without it, but
-its artists never enter the work list. Mixing the two sources would make a run's cost
+its artists never enter the work list. A selection that ends up empty skips the walk: there
+is nothing to check presence against, so paying its cost (or failing on an unreadable root)
+would report a problem the run does not have. Mixing the two sources would make a run's cost
 and its summary depend on two very different inputs, and the shared download budget
 (`discover.max_cycle_downloads`) would let the library sweep consume the budget before
 the label was reached.
@@ -340,7 +342,7 @@ Write path: only after a complete, validated catalogue, and only when
 `MAX_CACHE_PAYLOAD_BYTES` before insert.
 
 Failure caching: `LabelUnresolved` is recorded in `discography_failures` under
-`label:<pin_key>` with `failure_kind = "unresolved"` and honoured for
+`label:name:<pin_key>` with `failure_kind = "unresolved"` and honoured for
 `discography.failure_cache_days`. `LabelSearchInconsistent` is deliberately **not**
 cached - it describes one inconsistent response, not a property of the name.
 
@@ -408,8 +410,9 @@ makes a budget-limited sweep converge instead of oscillating.
   is written under `library.paths`.
 - `discover.max_cycle_downloads` bounds the run; the loop stops at the same points as
   the artist sweep (budget exhausted, cancellation), recording the artist it stopped on.
-- `discover.ignore_processed` and `--ignore-processed` behave as they do for an
-  artist-only run: a recorded success is skipped unless the flag bypasses it.
+- `--ignore-processed` behaves as it does for an artist-only run: a recorded success is
+  skipped unless the flag bypasses it. There is no `discover.ignore_processed` key; the
+  flag is CLI-only, as `README.md` says.
 - Every album is charged exactly as an artist-sweep album is (`charges_download_budget`
   on success, `charges_after_error` on failure), so the budget cannot be gamed by
   failed attempts.
@@ -444,11 +447,13 @@ never writes a failure-cache row: the two failure classes stay separate, exactly
 >   index. Continuing would make every catalogue album look missing and stage
 >   duplicates of albums the library already holds; the artist sweep propagates the
 >   same error. Cancellation during the scan still ends the run cleanly with its
->   summary.
-> - **A collaboration is matched under its full credit**, so an album the library
->   files under the lead artist alone is staged again as a second copy. That follows
->   directly from using the full credit string as the searchable artist, and it is
->   recorded here rather than fixed by guessing which part of a credit is the lead.
+>   summary, and an empty selection skips the walk (see the discover-mode section).
+> - **A collaboration is matched under its full credit**, and a candidate's folder must
+>   match that credit, so an album the library files under the lead artist alone usually
+>   yields no candidate at all rather than a second copy. That follows directly from using
+>   the full credit string as the searchable artist and from the album gate, which rejects a
+>   directory that does not name the requested album; it is recorded here rather than fixed
+>   by guessing which part of a credit is the lead.
 > - **Cancellation is polled between labels, not during a label's paging**, because
 >   `discover_label_releases` takes no cancellation flag. That matches the artist
 >   sweep's per-artist granularity. The cancellation flag is now passed into the label
@@ -462,7 +467,9 @@ never writes a failure-cache row: the two failure classes stay separate, exactly
 ## Observability
 
 `LabelCounters` and `label_notices()` mirror `DiscoverCounters`/`discover_notices`,
-in this exact order, which is the order the code emits:
+in this exact order, which is the order the code emits. The artist sweep emits its own
+`discover: cancelled by user` line from the same `cancelled` flag, so an interrupted sweep
+is never silent either:
 
 1. Labels resolved, with the resolved names and MBIDs (truncated past ten).
 2. How many labels were examined of how many were requested. Emitted even when
@@ -476,13 +483,21 @@ in this exact order, which is the order the code emits:
 6. Labels whose provider request failed, with reasons.
 7. Releases examined, and how many were not of the wanted type.
 8. Releases the payload could not describe.
-9. Releases excluded by `--since`, and how many of those were undated.
-10. Releases skipped for an excluded artist credit.
-11. Albums already present in the library.
-12. Albums eligible this run - only for a run that reached the selection.
-13. Albums staged and failed - only for a run that reached the selection.
-14. The budget stop point, when the budget ended the run.
-15. A closing line stating that staged albums were not written to the library, naming
+9. Releases dropped because their artist credit folds away to nothing, so there is no
+    artist to search under. Counted apart from the operator's own exclusions.
+10. Releases excluded by `--since`, and how many of those were undated.
+11. Releases skipped for an excluded artist credit.
+12. Albums already present in the library.
+13. Albums skipped because an earlier run recorded them as processed. Separate from
+    "present": the library does not hold them, which is why a repeated sweep otherwise
+    looks as if it had nothing to do.
+14. Albums selected this run, as a bare count. No derived "still to fetch" figure is
+    emitted: what is left depends on the budget as well as on the present, processed, staged
+    and failed counts, each of which has its own line. Only for a run that reached the
+    selection.
+15. Albums staged and failed - only for a run that reached the selection.
+16. The budget stop point, when the budget ended the run.
+17. A closing line stating that staged albums were not written to the library, naming
     `storage.staging_dir`. Emitted only when something was staged.
 
 No counter claims staging unless the outcome was
@@ -541,9 +556,12 @@ stops the run at the configured number; an unresolved label does not stop the ru
 consecutive provider failures abort with the existing error; the summary carries the
 staging notice.
 
-End-to-end (`tests/pipeline_test.rs`): one label fixture through `--mode discover
---label ... --release-type album`, asserting the staged tree and that no library folder
-was created.
+End-to-end (`tests/pipeline_test.rs`): one label fixture driven through the runner's
+label core, asserting the staged tree and that no library folder was created. It is not
+driven through `--mode discover --label`, because a real sweep needs network
+MusicBrainz; the CLI side is covered by `tests/mode_resolution_test.rs`, which runs
+`--mode discover --label` in `--test` mode and asserts a valid plan exits 0 without
+connecting, and an unknown `--release-type` exits non-zero before login.
 
 Gate: TDD with a genuine RED phase, cognitive complexity ceiling 25, `cargo clippy
 --all-targets -- -D warnings`, `cargo fmt --check`, the full test suite, the repository's
@@ -559,6 +577,14 @@ Gate: TDD with a genuine RED phase, cognitive complexity ceiling 25, `cargo clip
   the `--label` conflicts.
 
 ## Accepted consequences
+
+0. A label sweep searches under the release's full artist credit, and `select_albums` can only
+   fold an explicit artist prefix whose identity equals that whole credit (or its initials). A
+   catalogue that lists one album both as `Half Light` and as `Grafix - Half Light` under the
+   credit `Grafix feat. Stamina MC` therefore yields two targets and downloads the album twice.
+   Guessing which part of a collaboration credit is the lead artist is the alternative, and it
+   is rejected here for the same reason the artist sweep rejects it. Pinned by
+   `a_full_credit_cannot_fold_a_lead_prefixed_title`.
 
 1. A newly released album can take up to `discography.cache_days` (30) to appear in a
    sweep. A run that finds the cache older than that refreshes it; when the refresh

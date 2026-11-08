@@ -2,6 +2,8 @@
 
 # Label-Based Discovery — Code Review Residuals
 
+Triage: PLAY (branch main, 2026-11-03)
+
 | | |
 | --- | --- |
 | Branch | `main` |

@@ -81,10 +81,15 @@ async fn test_full_pipeline_manual_mode() {
 
 /// End-to-end regression for library placement (Finding 1 in the release review):
 /// with a placement target and real numbered staging files, `process_album` must
-/// place each track into the library with a CLEAN name — zero-padded track number
-/// and the leading track token stripped from the title. It must never produce the
-/// duplicated, unpadded "2 - 02 - Track Two.flac" that shipped when the placement
-/// and upgrade paths derived metadata differently.
+/// place each track into the library with a CLEAN name — the track number
+/// zero-padded to two digits and the leading track token stripped from the title.
+/// It must never produce the unpadded "2 - Track Two.flac" that shipped when the
+/// placement and upgrade paths derived metadata differently.
+///
+/// A source name that carries a *disc* prefix as well ("2 - 02 - Track Two") keeps
+/// that second token in the title, by design; `organizer::library_name_from_stem`'s
+/// own test pins that shape, because changing it would rename files in libraries
+/// that already hold them.
 #[tokio::test]
 async fn test_full_pipeline_placement_uses_clean_names() {
     let client = MockClient::new();

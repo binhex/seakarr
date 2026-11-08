@@ -489,6 +489,7 @@ fn copy_into_library(write: LibraryWrite<'_>) -> Result<LibraryWriteOutcome> {
             written.push(dest);
             continue;
         }
+        replace_symlink_with_file(&dest)?;
         fs::copy(src, &dest)?;
         tracing::debug!("Placed: {} -> {}", src.display(), dest.display());
         written.push(dest);
@@ -579,6 +580,28 @@ fn is_the_same_file(source: &Path, destination: &Path) -> bool {
     ) {
         (Ok(source), Ok(destination)) => source == destination,
         _ => false,
+    }
+}
+
+/// Remove a symlink at `path` so a following copy writes a regular file there.
+///
+/// `fs::copy` follows a symlink at the destination, so copying through one rewrites
+/// whatever it points at - a file that may live outside the library entirely, and one
+/// the operator linked deliberately. The link is dropped instead, and the album's own
+/// path receives the download. A path that is not a symlink is left untouched.
+fn replace_symlink_with_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(path)?;
+            tracing::info!(
+                "Replaced the symlink {} with the downloaded file; its target was left as it was",
+                path.display()
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -922,10 +945,19 @@ pub fn parse_album_slug(slug: &str) -> (String, String) {
 /// The identity of each album comes from [`crate::staging::scan`], which
 /// matches the sanitised directory names against the raw names the database
 /// stores, so a title the sanitiser rewrote is still recovered.
+///
+/// `library_holds_album` is what separates an interrupted upgrade from a download
+/// that was staged on purpose. An upgrade replaces an album the library already
+/// holds, so an interrupted upgrade's album is always in the library; a label or
+/// discover sweep leaves its download in staging precisely because the library does
+/// not hold it. Without the distinction the recovery would adopt those staged albums
+/// into `library.paths[0]` on the next upgrade run, quietly writing into the library
+/// an album the operator was told to move themselves.
 pub fn recover_interrupted_upgrades(
     config: &Config,
     db: &crate::db::Database,
     staging_dir: &Path,
+    library_holds_album: impl Fn(&str, &str) -> bool,
 ) -> Result<()> {
     if !config.library_upgrade.enabled {
         return Ok(());
@@ -948,6 +980,10 @@ pub fn recover_interrupted_upgrades(
         );
         return Ok(());
     }
+
+    // Albums left alone because the library does not hold them: reported once, so an
+    // operator who runs an upgrade after a label sweep learns why nothing was adopted.
+    let mut left_in_staging = 0usize;
 
     for staged in crate::staging::scan(staging_dir, db)? {
         // A directory inside a configured library root is library content, not
@@ -978,6 +1014,13 @@ pub fn recover_interrupted_upgrades(
             .as_ref()
             .map(|identity| identity.status.as_str())
         {
+            Some("success") if !library_holds_album(&artist, &album) => {
+                // A completed download the library does not hold was staged on purpose
+                // - a label sweep or a discover placement fallback. Staging is its final
+                // location until the operator moves it; adopting it here would write
+                // into the library on the next upgrade run.
+                left_in_staging += 1;
+            }
             Some("success") => {
                 tracing::warn!("Recovering interrupted library upgrade: {artist} - {album}");
                 resume_library_upgrade(
@@ -1033,6 +1076,11 @@ pub fn recover_interrupted_upgrades(
                 prune_artist_level(&staged.artist_dir_path);
             }
         }
+    }
+    if left_in_staging > 0 {
+        tracing::warn!(
+            "Left {left_in_staging} completed album(s) in staging: the library does not hold them, so they are downloads waiting to be placed, not interrupted upgrades"
+        );
     }
     Ok(())
 }
@@ -1731,6 +1779,65 @@ mod tests {
     }
 
     #[test]
+    fn an_upgrade_copy_replaces_a_symlink_instead_of_writing_through_it() {
+        // `fs::copy` follows a symlink at the destination, so copying through one would
+        // rewrite whatever it points at - a file the operator keeps outside the library,
+        // and one this run was never asked to touch. The library path must receive the
+        // download as a regular file and the link's target must survive unchanged.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let staged = staging.path().join("02 - Track.flac");
+        write_minimal_flac(&staged);
+
+        let dest_dir = library.path().join("Test Artist/Test Album");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let target = outside.path().join("shared.flac");
+        write_minimal_flac(&target);
+        let link = dest_dir.join("02 - Track.flac");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let target_len = fs::metadata(&target).unwrap().len();
+
+        copy_to_library(&[staged], library.path(), "Test Artist", "Test Album").unwrap();
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().len(),
+            target_len,
+            "the symlink's target must not be rewritten"
+        );
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the library path must hold a real file, not a link into the download"
+        );
+    }
+
+    #[test]
+    fn a_disc_prefixed_source_name_keeps_its_second_number_in_the_title() {
+        // The first number in the filename is the track, as the README's contiguous-track
+        // rules document, so "2 - 05 - Title" is track 2 and the title keeps "05". Pinned
+        // rather than "fixed": stripping the second token would rename files in libraries
+        // that already hold them, leaving a duplicate beside each one.
+        assert_eq!(
+            library_name_from_stem("2 - 05 - Title"),
+            ("02".to_string(), "05 - Title".to_string())
+        );
+        assert_eq!(
+            library_name_from_stem("2 - 02 - Track Two"),
+            ("02".to_string(), "02 - Track Two".to_string())
+        );
+        // The hyphenated DISC-TRACK form is recognised and stripped, which is the shape
+        // that would otherwise duplicate the number.
+        assert_eq!(
+            library_name_from_stem("1-11 - Steel Bars"),
+            ("11".to_string(), "Steel Bars".to_string())
+        );
+    }
+
+    #[test]
     fn place_into_library_reports_the_album_folder_when_nothing_is_written() {
         // `written` is empty when every destination already holds audio (a
         // deliberate keep policy), yet the album is still placed. The album
@@ -2132,7 +2239,10 @@ mod tests {
         db.mark_album_processed("Artist", "Album", "success")
             .unwrap();
 
-        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |artist, album| {
+            artist == "Artist" && album == "Album"
+        })
+        .unwrap();
 
         assert!(library.path().join("Artist/Album/01 - Song.flac").exists());
         assert!(!staging.exists());
@@ -2166,7 +2276,7 @@ mod tests {
         db.mark_album_processed("Artist", "Gold: Greatest Hits", "success")
             .unwrap();
 
-        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |_, _| true).unwrap();
 
         assert!(
             library
@@ -2206,7 +2316,7 @@ mod tests {
         db.mark_album_processed("Artist", "Album", "failed")
             .unwrap();
 
-        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |_, _| false).unwrap();
 
         assert!(
             !staging.exists(),
@@ -2237,7 +2347,7 @@ mod tests {
         config.library.paths = vec![library.path().to_string_lossy().into_owned()];
         let db = Database::open_in_memory().unwrap();
 
-        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |_, _| false).unwrap();
 
         assert!(
             scans.join("cover.jpg").exists(),
@@ -2268,7 +2378,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap(); // no record at all
 
-        recover_interrupted_upgrades(&config, &db, staging_root.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |_, _| false).unwrap();
 
         assert!(
             !staging.join("01 - Song.flac.part").exists(),
@@ -2298,11 +2408,44 @@ mod tests {
         config.library.paths = vec![library.to_string_lossy().into_owned()];
         let db = Database::open_in_memory().unwrap();
 
-        recover_interrupted_upgrades(&config, &db, staging.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, staging.path(), |_, _| false).unwrap();
 
         assert!(
             album.join("01 - Song.flac").exists(),
             "a library root below the staging root must survive a recovery pass"
+        );
+    }
+
+    #[test]
+    fn a_staged_download_the_library_does_not_hold_is_left_alone() {
+        // A label or discover sweep deliberately leaves its download in staging and
+        // records it as a success. Adopting it here would write it into the library on
+        // the next upgrade run - the one thing the sweep promised not to do.
+        use crate::db::Database;
+
+        let staging_root = TempDir::new().unwrap();
+        let staging = staging_root.path().join("Swept Artist").join("Swept Album");
+        fs::create_dir_all(&staging).unwrap();
+        write_minimal_flac(&staging.join("01 - Song.flac"));
+
+        let library = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.library_upgrade.enabled = true;
+        config.library.paths = vec![library.path().to_string_lossy().into_owned()];
+
+        let db = Database::open_in_memory().unwrap();
+        db.mark_album_processed("Swept Artist", "Swept Album", "success")
+            .unwrap();
+
+        recover_interrupted_upgrades(&config, &db, staging_root.path(), |_, _| false).unwrap();
+
+        assert!(
+            staging.join("01 - Song.flac").exists(),
+            "the staged download must stay in staging"
+        );
+        assert!(
+            !library.path().join("Swept Artist").exists(),
+            "nothing may be written into the library"
         );
     }
 
@@ -2323,7 +2466,7 @@ mod tests {
         config.library.paths = vec![library.path().to_string_lossy().into_owned()];
         let db = Database::open_in_memory().unwrap();
 
-        recover_interrupted_upgrades(&config, &db, library.path()).unwrap();
+        recover_interrupted_upgrades(&config, &db, library.path(), |_, _| false).unwrap();
 
         assert!(
             album.join("01 - Song.flac").exists(),

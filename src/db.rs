@@ -212,13 +212,20 @@ impl Database {
             );",
         )?;
 
-        // Add speed_samples to peer_reputation for databases created before
-        // this column existed (fresh DBs get it from CREATE TABLE above). The
-        // duplicate-column error on an up-to-date DB is expected and ignored.
-        let _ = self.conn.execute(
+        // Add speed_samples to peer_reputation for databases created before this column
+        // existed (fresh DBs get it from CREATE TABLE above). The duplicate-column error on
+        // an up-to-date DB is expected; every other failure is not, and swallowing it would
+        // surface later as a confusing runtime error from the SQL that reads the column.
+        match self.conn.execute(
             "ALTER TABLE peer_reputation ADD COLUMN speed_samples INTEGER NOT NULL DEFAULT 0",
             [],
-        );
+        ) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column") => {}
+            Err(error) => {
+                tracing::warn!("could not add peer_reputation.speed_samples: {error}");
+            }
+        }
 
         Ok(())
     }

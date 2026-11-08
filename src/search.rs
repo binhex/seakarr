@@ -48,6 +48,11 @@ pub async fn search_album(
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
+    /// True when these results came from the album-only tier. Its whole purpose is to
+    /// admit a peer whose folder names the album differently from the MusicBrainz title,
+    /// so the caller must not re-apply the album-name gate to them: doing so puts back
+    /// the premise the tier exists to bridge.
+    pub album_only_tier: bool,
 }
 
 /// A distinct album discovered from one artist-only search.
@@ -885,6 +890,8 @@ pub async fn search_album_with_fallback(
 /// Take one search tier's results: hand them back when they pass the queue-aware
 /// filter, otherwise remember them as the fallback set a later tier or the caller
 /// can fall back on. An empty tier changes nothing.
+#[allow(clippy::too_many_arguments)] // the tier's identity travels with the same
+                                     // filter inputs its siblings take
 fn take_tier_results(
     results: Vec<SearchResult>,
     filters: &FilterConfig,
@@ -893,6 +900,8 @@ fn take_tier_results(
     max_queue_length: u32,
     anchor: crate::filter::TrackOneAnchor,
     fallback: &mut Option<Vec<SearchResult>>,
+    album_only_tier: bool,
+    fallback_is_album_tier: &mut bool,
 ) -> Option<SearchOutcome> {
     if results.is_empty() {
         return None;
@@ -905,10 +914,14 @@ fn take_tier_results(
         max_queue_length,
         anchor,
     ) {
-        return Some(SearchOutcome { results });
+        return Some(SearchOutcome {
+            results,
+            album_only_tier,
+        });
     }
     if fallback.is_none() {
         *fallback = Some(results);
+        *fallback_is_album_tier = album_only_tier;
     }
     None
 }
@@ -936,6 +949,9 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
     // result set, so the caller's rejection summary and title-search
     // fallback still have data to work with.
     let mut fallback: Option<Vec<SearchResult>> = None;
+    // Which tier the remembered fallback came from, so the caller knows whether the
+    // album-name gate applies to the results it finally receives.
+    let mut fallback_is_album_tier = false;
 
     // Tier 1a: primary "Artist Album" search (original casing)
     if let Some(a) = album.filter(|a| !a.trim().is_empty()) {
@@ -963,6 +979,8 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
         max_queue_length,
         anchor,
         &mut fallback,
+        false,
+        &mut fallback_is_album_tier,
     ) {
         return Ok(outcome);
     }
@@ -990,6 +1008,8 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                     max_queue_length,
                     anchor,
                     &mut fallback,
+                    false,
+                    &mut fallback_is_album_tier,
                 ) {
                     return Ok(outcome);
                 }
@@ -1026,6 +1046,8 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                     max_queue_length,
                     anchor,
                     &mut fallback,
+                    false,
+                    &mut fallback_is_album_tier,
                 ) {
                     return Ok(outcome);
                 }
@@ -1051,6 +1073,8 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
                     max_queue_length,
                     anchor,
                     &mut fallback,
+                    true,
+                    &mut fallback_is_album_tier,
                 ) {
                     return Ok(outcome);
                 }
@@ -1058,10 +1082,19 @@ pub(crate) async fn search_album_with_fallback_with_queue_limit(
         }
     }
 
-    // No tier yielded a usable result set: return the first non-empty tier's
-    // results (today's behaviour) or empty if every tier was empty.
+    // No tier yielded a usable result set: return the first non-empty tier's results
+    // (today's behaviour) or empty if every tier was empty.
+    //
+    // This is what lets the album-only tier serve its purpose. Its results are judged by
+    // the same album-name gate as every other tier, and a peer whose folder names the
+    // album differently - a compilation title, a catalogue number - fails that gate. The
+    // results are still returned here as the run's last resort, restricted to the artist
+    // and to the album-only query that produced them, so the naming difference the tier
+    // exists to bridge cannot make the album unattainable. Pinned by
+    // `the_album_only_tier_returns_a_folder_that_names_the_album_differently`.
     Ok(SearchOutcome {
         results: fallback.unwrap_or_default(),
+        album_only_tier: fallback_is_album_tier,
     })
 }
 
@@ -2377,6 +2410,47 @@ mod tests {
                 "michael jackson history".to_string(),
                 "History".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_album_only_tier_returns_a_folder_that_names_the_album_differently() {
+        // The tier exists because the album's name in a peer's folder may differ from the
+        // one MusicBrainz gave - a compilation title, a catalogue number, a spelling the
+        // folder drops entirely. Re-applying the album-name gate to its results would
+        // reject exactly that peer, so the tier's results are admitted on the artist
+        // restriction and the album-only query alone.
+        let client = MockClient::new();
+        client.search_results_by_query.lock().unwrap().insert(
+            "History".into(),
+            vec![SearchResult {
+                username: "peer1".into(),
+                speed: 500,
+                slots: 1,
+                files: vec![make_file(
+                    r"Music\Michael Jackson\The Essential Michael Jackson\01 - Billie Jean.flac",
+                    900,
+                    30_000_000,
+                )],
+            }],
+        );
+
+        let outcome = search_album_with_fallback(
+            &client,
+            "Michael Jackson",
+            Some("History"),
+            15,
+            &test_filters(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "the album-only tier's result must reach the caller even though its folder does \
+             not name the album: the tier exists to bridge exactly that naming difference"
         );
     }
 

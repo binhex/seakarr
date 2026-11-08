@@ -741,6 +741,11 @@ pub struct DiscoverCounters {
     pub artists_total: usize,
     /// Artists actually examined before the run stopped.
     pub artists_examined: usize,
+    /// True when the run stopped because the operator cancelled it - during the
+    /// library walk, before an artist, or during an album. A cancelled run would
+    /// otherwise report like a completed one, and an interrupted download would be
+    /// counted as a failure.
+    pub cancelled: bool,
 }
 
 /// Names listed before an unresolved-artist notice is truncated.
@@ -758,11 +763,17 @@ pub fn discover_notices(counters: &DiscoverCounters) -> Vec<String> {
     // explicitly named artist is resolved before the library walk, so a run that
     // stops there never fills `artists_total`.
     let nothing_examined = counters.artists_total == 0
+        && !counters.cancelled
         && counters.unresolved.is_empty()
         && counters.cached_failures.is_empty()
         && counters.provider_failed.is_empty();
     if nothing_examined {
         notices.push("discover: no eligible library artists found; nothing to do".to_string());
+    }
+    if counters.cancelled {
+        // Phase-neutral wording: cancellation is honoured during the walk, before an
+        // artist and during a download, so the notice must not claim a phase.
+        notices.push("discover: cancelled by user; the run stopped before it finished".to_string());
     }
     if counters.present > 0 {
         notices.push(format!(
@@ -2506,6 +2517,7 @@ mod tests {
             budget_limit: 5,
             artists_total: 10,
             artists_examined: 4,
+            cancelled: false,
         };
         assert_eq!(
             discover_notices(&counters),
@@ -2543,6 +2555,21 @@ mod tests {
         assert!(names.contains("Artist 10"), "got: {names}");
         assert!(!names.contains("Artist 11"), "got: {names}");
         assert!(names.ends_with("and 2 more"), "got: {names}");
+    }
+
+    #[test]
+    fn an_interrupted_run_says_it_was_cancelled() {
+        // A run stopped by Ctrl+C must not be mistakable for a completed one, and it
+        // must not claim there was nothing to do: the walk never finished, so the
+        // library's artists were never counted.
+        let counters = DiscoverCounters {
+            cancelled: true,
+            ..DiscoverCounters::default()
+        };
+        assert_eq!(
+            discover_notices(&counters),
+            vec!["discover: cancelled by user; the run stopped before it finished".to_string()]
+        );
     }
 
     #[test]

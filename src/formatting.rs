@@ -67,6 +67,66 @@ pub fn format_duration(elapsed: std::time::Duration) -> String {
     }
 }
 
+/// Unicode format characters (category Cf) that are invisible but reorder or
+/// hide the text around them: zero-width characters, the bidirectional
+/// overrides and isolates, the Arabic letter mark, the prepended concatenation
+/// marks, the Khmer vowel signs, the interlinear annotation anchors, the tag
+/// characters (the standard ASCII-smuggling vector), and the byte-order mark.
+/// Control characters are handled separately by [`single_line`].
+pub(crate) fn is_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1107F}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Collapse control characters so peer-supplied text cannot forge or corrupt a log or
+/// summary line.
+///
+/// A Soulseek peer controls both its username and the file names it advertises, and both
+/// reach the run summary through an album's reason string. A raw ESC sequence there can
+/// repaint the operator's terminal or fake a summary line - the summary is the record of
+/// what the run did, so it must read as data no matter what the network sent.
+pub fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            // Control characters (ESC and friends) and Unicode format characters (the bidi
+            // overrides U+202E, zero-width marks) can both repaint or reorder a line the
+            // operator reads, and a peer or provider controls this text.
+            if character.is_control() || is_format_character(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

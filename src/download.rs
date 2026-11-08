@@ -24,7 +24,19 @@ pub(crate) fn safe_basename(remote_name: &str) -> Result<&str> {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(remote_name);
-    if basename.is_empty() || basename == "." || basename.contains("..") {
+    // Only the last path component is ever used as a file name, so the separators are
+    // gone by now and a traversal cannot be spelled here. What is left to reject is the
+    // degenerate component: `..`, `.`, and nothing at all. A `..` *inside* a name is an
+    // ordinary character - a title with an ellipsis ("Wait... What.flac") would otherwise
+    // lose its track.
+    // A control character is never part of a real track name, and the basename is logged
+    // and reported: an ESC sequence from a hostile peer would otherwise repaint the
+    // operator's terminal or forge a line in the run summary.
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.chars().any(char::is_control)
+    {
         return Err(SeakarrError::Download(format!(
             "unsafe or empty remote filename: {remote_name:?}"
         )));
@@ -456,16 +468,18 @@ async fn expire_queue_wait(
     config: &DownloadConfig,
     observed_queue_position: Option<u32>,
 ) -> SeakarrError {
+    // The peer controls its username, and this reason reaches logs and the run summary.
+    let peer = crate::formatting::single_line(username);
     let reason = match kind {
         QueueDeadlineKind::TotalQueue => format!(
-            "{basename} from {username} exceeded max_queue_time_secs={} (last queue position: {})",
+            "{basename} from {peer} exceeded max_queue_time_secs={} (last queue position: {})",
             config.max_queue_time_secs,
             observed_queue_position
                 .map(|position| position.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
         ),
         QueueDeadlineKind::QueueHead => format!(
-            "{basename} from {username} exceeded max_start_time_secs={} at queue position 1",
+            "{basename} from {peer} exceeded max_start_time_secs={} at queue position 1",
             config.max_start_time_secs,
         ),
     };
@@ -503,11 +517,12 @@ async fn reject_queued_attempt(
 /// the peer answers, and one line carrying it is what the operator asked for. A
 /// `None` position means the notice fired on the transfer-start or grace path.
 fn emit_queue_notice(basename: &str, username: &str, position: Option<u32>) {
+    let peer = crate::formatting::single_line(username);
     match position {
         Some(position) => {
-            tracing::info!("Download queued: {basename} from {username} - position {position}");
+            tracing::info!("Download queued: {basename} from {peer} - position {position}");
         }
-        None => tracing::info!("Download queued: {basename} from {username}"),
+        None => tracing::info!("Download queued: {basename} from {peer}"),
     }
 }
 
@@ -527,8 +542,9 @@ fn emit_download_started(
     wait: Duration,
     last_position: Option<u32>,
 ) {
+    let peer = crate::formatting::single_line(username);
     if last_position.is_none() && wait <= IMMEDIATE_START_WINDOW {
-        tracing::info!("Download started: {basename} from {username} immediately (free slot)");
+        tracing::info!("Download started: {basename} from {peer} immediately (free slot)");
         return;
     }
     // Reaching this form means either the wait exceeded the immediacy window, or a
@@ -539,10 +555,10 @@ fn emit_download_started(
     let reported = crate::formatting::format_duration(wait.max(Duration::from_secs(1)));
     match last_position {
         Some(position) => tracing::info!(
-            "Download started: {basename} from {username} after {reported} queued (last position {position})"
+            "Download started: {basename} from {peer} after {reported} queued (last position {position})"
         ),
         None => tracing::info!(
-            "Download started: {basename} from {username} after {reported} queued"
+            "Download started: {basename} from {peer} after {reported} queued"
         ),
     }
 }
@@ -1171,7 +1187,10 @@ async fn download_once(
                 return Ok((dest, transfer.elapsed()));
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
-                tracing::warn!("Download of {basename} failed: {reason}");
+                tracing::warn!(
+                    "Download of {basename} failed: {}",
+                    crate::formatting::single_line(&reason)
+                );
                 queue.release_bar(progress);
                 transfer.clear();
                 return Err(SeakarrError::Download(format!("transfer failed: {reason}")));
@@ -1350,25 +1369,143 @@ pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInf
 /// embedded markers in the album folder name ("Gold (Disc 1)"). Only the
 /// disc designator is stripped — a genuinely different album name keeps a
 /// distinct key and is never merged in.
-fn album_group_key(parent: &str) -> String {
-    // Split the parent into (grandparent, leaf) on the last separator.
-    let Some(sep_idx) = parent.rfind(['/', '\\']) else {
-        return parent.to_string();
+pub(crate) fn album_group_key(parent: &str) -> String {
+    // Split the parent into (prefix, separator, leaf). A parent with no separator at
+    // all is a single component - a root-level share such as "Gold (Disc 1)" - and
+    // its embedded disc marker must still be stripped, or the album's discs stay two
+    // separate groups.
+    let (prefix, sep, leaf) = match parent.rfind(['/', '\\']) {
+        Some(sep_idx) => (
+            &parent[..sep_idx],
+            &parent[sep_idx..sep_idx + 1],
+            &parent[sep_idx + 1..],
+        ),
+        None => ("", "", parent),
     };
-    let (grandparent, leaf) = (&parent[..sep_idx], &parent[sep_idx + 1..]);
-    let sep = &parent[sep_idx..sep_idx + 1];
 
-    // Dedicated disc folder as the leaf, e.g. "...\\CD 01": key = grandparent.
+    // Dedicated disc folder as the leaf, e.g. "...\\CD 01": key = prefix.
     if discs::is_disc_folder(leaf) {
-        return grandparent.to_string();
+        return prefix.to_string();
     }
-    // Embedded disc marker in the leaf, e.g. "Gold (Disc 1)": key = parent
-    // with the marker stripped from the leaf.
+    // Embedded disc marker in the leaf, e.g. "Gold (Disc 1)": key = parent with
+    // the marker stripped from the leaf.
     if let Some(stripped) = discs::strip_embedded_disc_marker(leaf) {
-        return format!("{grandparent}{sep}{stripped}");
+        return format!("{prefix}{sep}{stripped}");
     }
 
     parent.to_string()
+}
+
+/// Report files that were already in the album's staging directory and are not part of the
+/// download that just landed.
+///
+/// Nothing is deleted. Two album titles that sanitise to the same folder share the directory
+/// by design, and the files that were there before an attempt cannot be attributed to this
+/// album: deleting them destroys a download nobody asked this attempt to touch, and leaves the
+/// other album's success record claiming a copy that is gone. A forced reprocess therefore
+/// leaves the previous copy beside the new one, and the operator is told to clear it.
+pub(crate) fn warn_about_undeleted_staging(
+    staging_dir: &Path,
+    before: &std::collections::BTreeSet<PathBuf>,
+    delivered: &[PathBuf],
+    forced_reprocess: bool,
+) {
+    let delivered: std::collections::BTreeSet<&PathBuf> = delivered.iter().collect();
+    let remaining: Vec<&PathBuf> = before
+        .iter()
+        .filter(|path| !delivered.contains(path))
+        .collect();
+    if remaining.is_empty() {
+        return;
+    }
+    let reason = if forced_reprocess {
+        "the previous copy of this album was left in place rather than deleted"
+    } else {
+        "another album may share this staging folder"
+    };
+    tracing::warn!(
+        "{staging_dir:?} still holds {} file(s) this download did not deliver; {reason}. Remove them by hand if they are unwanted",
+        remaining.len()
+    );
+}
+
+/// Every file currently under `root`, so a later attempt can tell what it added.
+pub(crate) fn files_under(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                _ => {
+                    found.insert(path);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Remove directories below `dir` that this attempt emptied, `dir` included.
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            prune_empty_dirs(&entry.path());
+        }
+    }
+    // Fails when the directory still holds something, which is the point: only an empty
+    // directory is an attempt's own to remove.
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Clear what one failed or cancelled attempt left behind.
+///
+/// Only the paths this attempt chose are removed, plus their partial forms (the vendor
+/// library writes `<name>.part` and sometimes `<name>.tmp` before the final rename). A
+/// directory scan would also catch a file another album wrote into the same shared staging
+/// directory - two album titles that sanitise to the same folder name share one by design,
+/// and downloads run concurrently - and deleting that would destroy a download nobody asked
+/// this attempt to touch. Directories the removal leaves empty are dropped, so a fresh
+/// attempt still leaves nothing behind.
+///
+/// The removal is retried once after a brief pause: a transfer abandoned moments ago can
+/// still hold its files open on some platforms.
+async fn discard_failed_attempt(staging_dir: &Path, attempted: &[PathBuf]) {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(attempted.len() * 3);
+    for path in attempted {
+        paths.push(path.clone());
+        for suffix in ["part", "tmp"] {
+            paths.push(path.with_extension(format!(
+                "{}.{suffix}",
+                path.extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default()
+            )));
+        }
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("Failed to clean up {path:?} (retrying): {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("Failed to clean up {path:?}: {e}"),
+                }
+            }
+        }
+    }
+    prune_empty_dirs(staging_dir);
 }
 
 /// Download all files for an album from the best candidate, with fallback.
@@ -1393,18 +1530,12 @@ pub async fn download_album(
     for candidate in candidates {
         // Check cancellation between candidates — avoid queuing network
         // requests to the next peer after the user pressed Ctrl+C.
-        // Clean the staging dir before returning so no partial downloads
+        // Clean up after this attempt before returning so no partial downloads
         // are left behind (same cleanup as the post-loop failure path).
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            // Remove staging dir if it was created; suppress ENOENT
-            // (dir may not exist yet if cancel fires before first download).
-            match std::fs::remove_dir_all(staging_dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!("Failed to clean staging dir on cancel {staging_dir:?}: {e}")
-                }
-            }
+            // Nothing of this candidate has been written: the previous candidate's own
+            // cleanup already ran, so only an empty directory could be left.
+            discard_failed_attempt(staging_dir, &[]).await;
             return Err(SeakarrError::Download("download cancelled by user".into()));
         }
 
@@ -1454,6 +1585,11 @@ pub async fn download_album(
         std::fs::create_dir_all(staging_dir)?;
 
         let mut downloaded = Vec::new();
+        // Every path this attempt may write, chosen before the transfer: cleanup removes
+        // exactly these and their partial forms. A directory scan would also catch files a
+        // concurrent album wrote to the same shared staging directory after this attempt
+        // started, and delete them.
+        let mut attempted: Vec<PathBuf> = Vec::with_capacity(filtered_files.len());
         let mut failed = false;
 
         for file in &filtered_files {
@@ -1483,6 +1619,14 @@ pub async fn download_album(
                 staging_dir.to_path_buf()
             };
             std::fs::create_dir_all(&disc_dir)?;
+            attempted.push(
+                disc_dir.join(
+                    file.name
+                        .rsplit_once(['/', '\\'])
+                        .map(|(_, basename)| basename)
+                        .unwrap_or(file.name.as_str()),
+                ),
+            );
 
             match download_file_for_candidate(
                 client,
@@ -1535,29 +1679,16 @@ pub async fn download_album(
         }
 
         if !failed {
+            // Superseding an earlier copy is *not* done here. This function knows which
+            // files it wrote, but not whose files were already present: two album titles
+            // that sanitise to the same folder share this directory by design, so deleting
+            // "everything that predates this attempt" would destroy another album's staged
+            // copy. The caller owns that decision, because it is the caller that knows the
+            // album is being replaced on purpose.
             return Ok(downloaded);
         }
 
-        // The album's staging directory is per-album (created by the runner).
-        // A failed candidate must leave no staging directory at all —
-        // the album is either fully downloaded (directory exists with files)
-        // or absent (failed/never attempted). This removes completed tracks,
-        // `.part` files, and the directory itself. Retry once after a brief
-        // pause to handle transient locks from a just-cancelled transfer.
-        for attempt in 0..2 {
-            match std::fs::remove_dir_all(staging_dir) {
-                Ok(()) => break,
-                Err(e) if attempt == 0 => {
-                    tracing::warn!(
-                        "Failed to clean up staging directory {staging_dir:?} (retrying): {e}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to clean up staging directory {staging_dir:?}: {e}");
-                }
-            }
-        }
+        discard_failed_attempt(staging_dir, &attempted).await;
     }
 
     Err(last_err.unwrap_or_else(|| SeakarrError::Download("all candidates exhausted".into())))
@@ -1568,12 +1699,72 @@ mod tests {
     use super::*;
     use crate::client::{DownloadHandle, FileInfo, MockClient, SearchResult};
     use crate::config::{DownloadConfig, FilterConfig};
-    use crate::test_support::{make_file, write_minimal_flac};
+    use crate::test_support::{make_file, write_minimal_flac, write_minimal_mp3};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn a_peer_name_cannot_repaint_a_notice() {
+        // A peer controls its username, and these lines reach the operator's terminal. A
+        // control or bidi character must not survive into them.
+        let hostile = "peer\u{1b}[2J\u{202e}";
+        let sanitised = crate::formatting::single_line(hostile);
+        assert!(!sanitised.contains('\u{1b}'));
+        assert!(
+            !sanitised
+                .chars()
+                .any(crate::formatting::is_format_character),
+            "a bidi override must not survive"
+        );
+    }
+
+    #[test]
+    fn a_file_name_may_not_carry_control_characters() {
+        // A peer controls its file names, and the basename is logged and reported. An ESC
+        // sequence must not reach the operator's terminal or forge a summary line.
+        assert!(safe_basename("Artist/Album/01 - \u{1b}[2J.flac").is_err());
+        assert!(safe_basename("Artist/Album/01 - Tab\there.flac").is_err());
+        // Ordinary text keeps working.
+        assert_eq!(
+            safe_basename("Artist/Album/01 - Track.flac").unwrap(),
+            "01 - Track.flac"
+        );
+    }
+
+    #[test]
+    fn a_file_name_may_contain_dots_in_the_middle() {
+        // Only the final path component is used, so the separators are gone and a `..`
+        // inside the name is an ordinary character. Rejecting it loses real tracks: an
+        // ellipsis in a title is common.
+        assert_eq!(
+            safe_basename(r"Artist\Album\Wait... What.flac").unwrap(),
+            "Wait... What.flac"
+        );
+        // The degenerate components stay refused.
+        assert!(safe_basename("..").is_err());
+        assert!(safe_basename(r"Artist\..").is_err());
+        assert!(safe_basename(".").is_err());
+        assert!(safe_basename(r"Artist\Album\").is_err());
+        assert!(safe_basename("").is_err());
+    }
+
+    #[test]
+    fn album_group_key_merges_embedded_disc_markers_without_a_directory() {
+        // A root-level share has no separator to split on. The embedded marker still
+        // names a disc of the album, so the discs must collapse into one group; leaving
+        // them apart turns one album into two downloads.
+        assert_eq!(album_group_key("Gold (Disc 1)"), "Gold");
+        assert_eq!(album_group_key("Gold (Disc 2)"), "Gold");
+        // The directory forms keep working, with the marker stripped from the leaf and
+        // the ancestor path preserved.
+        assert_eq!(album_group_key("Artist\\Gold (Disc 1)"), "Artist\\Gold");
+        assert_eq!(album_group_key("Artist\\Album\\CD 01"), "Artist\\Album");
+        // A name with no disc marker is its own key.
+        assert_eq!(album_group_key("Gold"), "Gold");
+    }
 
     fn default_dl_config() -> DownloadConfig {
         DownloadConfig {
@@ -1604,9 +1795,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_candidate_with_only_unsafe_paths_is_skipped() {
-        // Every file in this candidate has a basename that escapes the download
-        // directory, so the candidate is abandoned before any request is queued,
-        // and the run reports the reason instead of downloading nothing quietly.
+        // Every file in this candidate has a degenerate final path component - a
+        // trailing separator, and `..` itself - so there is no file name to write, the
+        // candidate is abandoned before any request is queued, and the run reports the
+        // reason instead of downloading nothing quietly.
         let client = ScriptedClient::new(vec![]);
         let dir = TempDir::new().unwrap();
         let candidates = vec![SearchResult {
@@ -1614,8 +1806,8 @@ mod tests {
             speed: 500,
             slots: 1,
             files: vec![
-                make_file("Music\\A\\B\\..hidden.flac", 900, 10_000_000),
-                make_file("Music\\A\\B\\..also-hidden.flac", 900, 10_000_000),
+                make_file("Music\\A\\B\\", 900, 10_000_000),
+                make_file("Music\\A\\..", 900, 10_000_000),
             ],
         }];
         let mut config = default_dl_config();
@@ -3022,20 +3214,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_candidate_cleans_up_part_files() {
-        // A candidate whose download fails partway must leave the staging
-        // directory clean — no completed tracks, no stale `.part` files.
-        // Regression: the orphan loop only removed files returned as `Ok`,
-        // leaving `.part` files behind after a failed transfer.
+    async fn a_reprocess_keeps_the_previous_copy_until_the_new_one_lands() {
+        // `--ignore-processed` must not clear the staged copy before the retry has
+        // delivered anything: in a staging-only run that copy is the album's only one, so a
+        // retry that fails or finds nothing would destroy it and its success record too.
+        let root = TempDir::new().unwrap();
+        let staging = root.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("01 - previous.flac"), b"the only copy").unwrap();
+
+        // A retry that fails changes nothing.
+        let client = MockClient::new();
+        *client.download_speed.lock().unwrap() = 100_000;
+        let mut config = default_dl_config();
+        config.min_upload_speed_kbps = 10_000_000;
+        config.speed_check_wait_secs = 0;
+        let candidates = vec![SearchResult {
+            username: "user1".into(),
+            speed: 300,
+            slots: 1,
+            files: vec![make_file("01 - track.flac", 900, 10_000_000)],
+        }];
+        let failed = download_album(
+            &client,
+            &candidates,
+            &staging,
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(
+            staging.join("01 - previous.flac").exists(),
+            "a failed retry must leave the previous copy alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_candidate_leaves_no_staging_directory_behind() {
+        // A candidate whose download fails partway must leave the album's staging
+        // directory clean: the directory is created by this attempt, so it goes too.
         let client = MockClient::new();
         // Slow speed forces the speed-check failure on the first file.
         *client.download_speed.lock().unwrap() = 100_000; // 100 KB/s
-        let dir = TempDir::new().unwrap();
-
-        // Simulate a leftover `.part` file (as the vendor lib leaves behind
-        // on an interrupted transfer) plus a completed track.
-        std::fs::write(dir.path().join("01 - track.flac.part"), b"partial").unwrap();
-        std::fs::write(dir.path().join("02 - track.flac"), b"complete").unwrap();
+        let root = TempDir::new().unwrap();
+        // The shape production uses: the album directory does not exist until the first
+        // candidate has something to download.
+        let staging = root.path().join("Artist").join("Album");
 
         let candidates = vec![SearchResult {
             username: "user1".into(),
@@ -3051,7 +3279,7 @@ mod tests {
         let result = download_album(
             &client,
             &candidates,
-            dir.path(),
+            &staging,
             &config,
             &default_filter_config_test(),
             None,
@@ -3061,10 +3289,60 @@ mod tests {
         .await;
         assert!(result.is_err());
 
-        // The staging directory must be gone — no partial downloads at all.
         assert!(
-            !dir.path().exists(),
-            "staging dir must be removed after failed candidate"
+            !staging.exists(),
+            "the staging directory this attempt created must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_keeps_files_it_did_not_write() {
+        // Two album titles can sanitise to the same folder name, so the staging
+        // directory is shared by design, and albums are downloaded concurrently. A failed
+        // attempt must remove only the paths it chose: deleting everything that appeared
+        // since it started would destroy a sibling album's completed or in-flight tracks
+        // while its own success record still claimed they were staged.
+        let root = TempDir::new().unwrap();
+        let staging = root.path().join("AlbumTwo");
+        std::fs::create_dir_all(staging.join("CD 01")).unwrap();
+        std::fs::write(staging.join("01 - foreign.flac"), b"another album").unwrap();
+
+        // What this attempt wrote, including a partial file the vendor leaves behind.
+        let ours = staging.join("02 - ours.flac");
+        let partial = staging.join("03 - ours.flac");
+        std::fs::write(&ours, b"ours").unwrap();
+        std::fs::write(ours.with_extension("flac.part"), b"partial").unwrap();
+        let disc = staging.join("CD 01").join("01 - ours.flac");
+        std::fs::write(&disc, b"ours").unwrap();
+
+        // Written after the attempt started, by the album that shares this directory.
+        std::fs::write(staging.join("04 - concurrent.flac"), b"theirs").unwrap();
+
+        discard_failed_attempt(&staging, &[ours.clone(), partial, disc]).await;
+
+        assert!(
+            staging.join("01 - foreign.flac").exists(),
+            "a file that predates the attempt must survive"
+        );
+        assert!(
+            !staging.join("02 - ours.flac").exists(),
+            "a file this attempt wrote must be removed"
+        );
+        assert!(
+            !staging.join("03 - ours.flac.part").exists(),
+            "a partial file this attempt wrote must be removed"
+        );
+        assert!(
+            staging.join("04 - concurrent.flac").exists(),
+            "a file another album wrote while this attempt ran must survive"
+        );
+        assert!(
+            !staging.join("CD 01").exists(),
+            "a disc directory this attempt emptied must be removed"
+        );
+        assert!(
+            staging.exists(),
+            "the directory itself must stay: it belongs to the other album too"
         );
     }
 
@@ -3083,8 +3361,9 @@ mod tests {
         }];
 
         let dir = TempDir::new().unwrap();
-        // Simulate a leftover .part file from a previous run.
-        std::fs::write(dir.path().join("01 - track.flac.part"), b"stale partial").unwrap();
+        // Production shape: the album directory is created by the attempt, so a
+        // cancellation before the first transfer must leave nothing at all.
+        let staging = dir.path().join("Artist").join("Album");
 
         let config = default_dl_config();
         let filter_config = default_filter_config_test();
@@ -3096,7 +3375,7 @@ mod tests {
         let result = download_album(
             client.as_ref(),
             &results,
-            dir.path(),
+            &staging,
             &config,
             &filter_config,
             None,
@@ -3110,10 +3389,10 @@ mod tests {
             "error must indicate cancellation"
         );
 
-        // The staging directory must be gone — no partial downloads at all.
+        // Nothing was created, so nothing may be left behind.
         assert!(
-            !dir.path().exists(),
-            "staging dir must be removed after cancellation"
+            !staging.exists(),
+            "a cancelled attempt must leave no staging directory"
         );
     }
 
@@ -3390,8 +3669,9 @@ mod tests {
     fn test_download_fails_fast_on_bitrate_failure() {
         // verify_downloaded_quality on a real lossless FLAC: min_bitrate
         // only applies to lossy formats, so extract_bitrate returns None
-        // (lossless) and the file passes. A genuine low-bitrate lossy MP3
-        // is not feasible to generate in a unit test — see final report.
+        // (lossless) and the file passes. The lossy half of the rule is pinned
+        // separately, against a real MP3 frame header, in
+        // `test_download_rejects_a_lossy_file_below_the_bitrate_floor`.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("track.flac");
         write_minimal_flac(&path);
@@ -3414,6 +3694,47 @@ mod tests {
         assert!(
             result.is_ok(),
             "lossless file must pass the min_bitrate verification: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_rejects_a_lossy_file_below_the_bitrate_floor() {
+        // The peer omitted the bitrate attribute, so the post-download verification reads
+        // the rate from the file itself. A 32 kbps MP3 must be refused by the default
+        // 320 kbps floor; the same file at a floor of 32 must pass, which proves the
+        // branch is reading the file rather than failing for another reason.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("track.mp3");
+        write_minimal_mp3(&path);
+
+        let file = FileInfo {
+            name: "track.mp3".into(),
+            size: std::fs::metadata(&path).unwrap().len(),
+            attribs: HashMap::new(),
+        };
+
+        let strict = FilterConfig {
+            min_bit_rate: 320,
+            min_bit_depth: 0,
+            ..default_filter_config_test()
+        };
+        let error = verify_downloaded_quality(&path, &file, &strict)
+            .expect_err("a 32 kbps file must fail a 320 kbps minimum");
+        assert!(
+            error
+                .to_string()
+                .contains("bitrate 32 kbps below minimum 320 kbps"),
+            "the refusal must name the measured rate, got: {error}"
+        );
+
+        let permissive = FilterConfig {
+            min_bit_rate: crate::test_support::MINIMAL_MP3_BITRATE_KBPS,
+            min_bit_depth: 0,
+            ..default_filter_config_test()
+        };
+        assert!(
+            verify_downloaded_quality(&path, &file, &permissive).is_ok(),
+            "the same file must pass a floor it meets"
         );
     }
 

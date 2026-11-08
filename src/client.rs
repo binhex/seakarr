@@ -663,7 +663,13 @@ fn forward_transfer_status(
 ) {
     // Sanitize peer-supplied filename for logging: strip control characters
     // to prevent terminal injection.
-    let safe_filename: String = filename.chars().filter(|c| !c.is_control()).collect();
+    // Control characters and Unicode format characters (bidi overrides, zero-width marks)
+    // can both repaint or reorder a terminal line, and the peer chooses this text.
+    // `formatting::single_line` applies the same rule to the run summary.
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control() && !crate::formatting::is_format_character(*c))
+        .collect();
     // Throttle per-status progress logs: the crate emits InProgress
     // updates several times a second, which floods the console. Log
     // state transitions immediately, but progress at most once per
@@ -715,14 +721,17 @@ fn forward_transfer_status(
                 } else {
                     tracing::debug!("Bridge status for {safe_filename}: {status:?}");
                 }
-                if forward_cancelled.load(Ordering::SeqCst) {
-                    break;
-                }
                 let mapped = ss_download_status_to_domain(status);
                 let terminal = matches!(
                     mapped,
                     DownloadStatus::Completed | DownloadStatus::Failed { .. }
                 );
+                // A terminal status is forwarded before the cancellation check: the transfer
+                // really did end, and dropping that fact would make the log report an
+                // interruption for a download that finished.
+                if forward_cancelled.load(Ordering::SeqCst) && !terminal {
+                    break;
+                }
                 if forward_tx.blocking_send(mapped).is_err() {
                     break;
                 }

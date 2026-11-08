@@ -161,6 +161,9 @@ fn finish_progress(progress: Option<&dyn ScanProgress>) {
 /// the line shows progress rather than proving health.
 const SCAN_HEARTBEAT_SECS: u64 = 60;
 
+/// Walk entries named individually before the scan reports the rest as a count.
+const MAX_LOGGED_WALK_ERRORS: usize = 10;
+
 /// Report the walk's progress at info level when the heartbeat is due, advancing
 /// the clock it is given. Returns whether it reported.
 ///
@@ -294,6 +297,11 @@ fn scan_library_with_heartbeat(
     let mut last_progress = scan_started;
     let mut files_seen: usize = 0;
     let mut unreadable: usize = 0;
+    // Walk entries the scan could not read: a directory the process may not list, or
+    // an I/O error mid-tree. Counted rather than swallowed, because a tree with an
+    // unreadable album otherwise looks like a library that does not hold it, and the
+    // run re-downloads what it already has.
+    let mut unreadable_entries: usize = 0;
     // Acquire, which is sufficient alongside every other reader of this flag
     // (the listener stores with SeqCst and downloads load with SeqCst). Relaxed
     // would also do for a cooperative check, but a lone weaker ordering invites
@@ -312,11 +320,28 @@ fn scan_library_with_heartbeat(
                 "library path does not exist: {lib_path_str}"
             )));
         }
-        for entry in WalkDir::new(lib_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        // A path that exists but is not a directory yields no walk entries, so the scan would
+        // report an empty library: in discover and label mode that makes every catalogue
+        // album look missing, and in upgrade mode it silently upgrades nothing.
+        if !lib_path.is_dir() {
+            finish_progress(progress);
+            return Err(SeakarrError::Scanner(format!(
+                "library path is not a directory: {lib_path_str}"
+            )));
+        }
+        for entry in WalkDir::new(lib_path).follow_links(false).into_iter() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    unreadable_entries += 1;
+                    if unreadable_entries <= MAX_LOGGED_WALK_ERRORS {
+                        tracing::warn!(
+                            "Library scan: skipped an unreadable entry under {lib_path_str}: {error}"
+                        );
+                    }
+                    continue;
+                }
+            };
             // Checked before the entry is classified, so a tree dominated by
             // non-audio files is still interruptible, and so the count in the
             // cancellation message is what has actually been handled rather
@@ -513,6 +538,12 @@ fn scan_library_with_heartbeat(
         }
     }
 
+    if unreadable_entries > MAX_LOGGED_WALK_ERRORS {
+        tracing::warn!(
+            "Library scan: skipped {unreadable_entries} unreadable entries in total; the scan may not have seen the whole library"
+        );
+    }
+
     let album_count = albums.len();
     if let Some(progress) = progress {
         progress.update(files_seen, album_count, scan_started.elapsed());
@@ -569,23 +600,38 @@ fn unreadable(error: impl std::fmt::Display) -> AudioTags {
     }
 }
 
+/// One album the upgrade workflow should replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeTarget {
+    pub artist: String,
+    pub album: String,
+    /// Files that failed the quality gate: the floor for a replacement set.
+    pub needs_upgrade: usize,
+    /// The album's total file count. The lesser-quality deletion pass may run only
+    /// when the replacement covered the whole album; a partial replacement must not
+    /// authorise deleting tracks the download never supplied.
+    pub track_count: usize,
+    /// The directory the album was found in.
+    pub location: PathBuf,
+}
+
 /// Determine which albums need upgrading based on filter config.
 /// An album is flagged if any track is in a non-allowed format, or when
 /// `min_bit_rate` is set and the album's lowest reported bitrate is missing or
 /// below it. A file with no reported bitrate counts towards `needs_upgrade`
 /// per file, but only flags the album when no file reports one.
-/// Returns (artist, album, replacement_count, library_location) where
-/// `replacement_count` is the number of files failing the quality gate
-/// (computed per-file during the scan, see [`ScannedAlbum::needs_upgrade`]) —
-/// NOT the album's total track count. The library location (the directory the
-/// album was found in; for a standard <root>/Artist/Album layout this is the
-/// library root, for nested layouts it is the directory above the artist
-/// folder) is threaded to the runner so upgrade mode copies upgrades back into
-/// the album's real location.
+///
+/// `needs_upgrade` is the number of files failing the quality gate (computed
+/// per-file during the scan, see [`ScannedAlbum::needs_upgrade`]) and is NOT the
+/// album's total track count; [`UpgradeTarget::track_count`] carries that. The
+/// library location (the directory the album was found in; for a standard
+/// <root>/Artist/Album layout this is the library root, for nested layouts it is
+/// the directory above the artist folder) is threaded to the runner so upgrade
+/// mode copies upgrades back into the album's real location.
 pub fn find_albums_to_upgrade(
     albums: &[ScannedAlbum],
     config: &FilterConfig,
-) -> Vec<(String, String, usize, PathBuf)> {
+) -> Vec<UpgradeTarget> {
     let allowed_set: HashSet<String> = config
         .allowed_extensions
         .iter()
@@ -613,13 +659,12 @@ pub fn find_albums_to_upgrade(
 
             false
         })
-        .map(|a| {
-            (
-                a.artist.clone(),
-                a.album.clone(),
-                a.needs_upgrade,
-                a.path.clone(),
-            )
+        .map(|a| UpgradeTarget {
+            artist: a.artist.clone(),
+            album: a.album.clone(),
+            needs_upgrade: a.needs_upgrade,
+            track_count: a.track_count,
+            location: a.path.clone(),
         })
         .collect()
 }
@@ -835,6 +880,23 @@ mod tests {
     }
 
     #[test]
+    fn a_library_root_that_is_a_file_is_refused_rather_than_scanned_as_empty() {
+        // Exists-but-not-a-directory is the dangerous shape: the walk yields nothing, so the
+        // library looks empty and every catalogue album looks missing.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, b"music").unwrap();
+
+        let error =
+            scan_library(&library_paths(&file), &FilterConfig::default(), None, None).unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn scan_counts_and_names_files_whose_tags_cannot_be_read() {
         let dir = library_with_albums(1);
         let broken = dir
@@ -870,6 +932,46 @@ mod tests {
         assert!(
             logs.contains(&broken.display().to_string()) && logs.contains("cannot read tags from"),
             "the unreadable file must be named individually at debug level, got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn scan_warns_about_entries_it_could_not_read_but_still_returns_the_rest() {
+        // An unreadable directory used to be dropped by `filter_map(|entry| entry.ok())`.
+        // The scan then looked complete while missing a whole album, so a later run would
+        // re-download a library that already held it. The entry must be reported.
+        let dir = library_with_albums(1);
+        let locked = dir.path().join("Artist").join("Locked Album");
+        fs::create_dir_all(&locked).unwrap();
+        write_minimal_flac_with_tags(&locked.join("01 - track.flac"), "Artist", "Locked Album");
+        fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // Running with privileges that ignore the mode bits: the walk cannot fail here.
+            fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            return;
+        }
+        let capture = LogCapture::start();
+
+        let albums = scan_library(
+            &library_paths(dir.path()),
+            &FilterConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let logs = capture.text();
+        assert_eq!(
+            albums.len(),
+            1,
+            "the readable part of the library is still returned"
+        );
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("skipped an unreadable entry")),
+            "a skipped entry must be named, got:\n{logs}"
         );
     }
 
@@ -1132,9 +1234,51 @@ mod tests {
         // Artist1: mp3 (not in allowed extensions) → upgrade
         // Artist2: flac, min bitrate 900 (above 320) → no upgrade
         assert_eq!(to_upgrade.len(), 1);
-        assert_eq!(to_upgrade[0].0, "Artist1");
-        assert_eq!(to_upgrade[0].1, "Album1");
-        assert_eq!(to_upgrade[0].2, 3); // needs_upgrade: all 3 mp3 files fail the gate
+        assert_eq!(to_upgrade[0].artist, "Artist1");
+        assert_eq!(to_upgrade[0].album, "Album1");
+        assert_eq!(to_upgrade[0].needs_upgrade, 3); // all 3 mp3 files fail the gate
+        assert_eq!(to_upgrade[0].track_count, 3); // the album has 3 files in total
+    }
+
+    #[test]
+    fn test_find_albums_to_upgrade_reports_total_tracks_separately_from_replacements() {
+        // Three files, one of them an MP3: the replacement floor is 1, the album holds 3.
+        // The deletion guard depends on the second number, so they must not collapse.
+        let albums = vec![ScannedAlbum {
+            path: PathBuf::new(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_dirs: ["Album".to_string()].into_iter().collect(),
+            artist_dirs: ["Artist".to_string()].into_iter().collect(),
+            artist_dir: "Artist".into(),
+            track_count: 3,
+            needs_upgrade: 1,
+            min_bitrate: Some(900),
+            max_bitrate: Some(900),
+            formats: vec!["flac".into(), "mp3".into()],
+        }];
+        let config = FilterConfig {
+            allowed_extensions: vec!["flac".into()],
+            min_bit_rate: 0,
+            min_bit_depth: 0,
+            exclude_words: vec![],
+            contiguous_tracks: true,
+            min_tracks: 0,
+            peer_track_count: false,
+            include_locked: false,
+        };
+
+        let to_upgrade = find_albums_to_upgrade(&albums, &config);
+
+        assert_eq!(to_upgrade.len(), 1);
+        assert_eq!(
+            to_upgrade[0].needs_upgrade, 1,
+            "only the mp3 fails the gate"
+        );
+        assert_eq!(
+            to_upgrade[0].track_count, 3,
+            "the album's total file count must be reported separately"
+        );
     }
 
     #[test]
@@ -1167,10 +1311,10 @@ mod tests {
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
         assert_eq!(to_upgrade.len(), 1);
-        assert_eq!(to_upgrade[0].0, "Artist");
-        assert_eq!(to_upgrade[0].1, "Album");
-        assert_eq!(to_upgrade[0].2, 1); // needs_upgrade: single ogg file fails the gate
-        assert_eq!(to_upgrade[0].3, dir.path().to_path_buf()); // library root
+        assert_eq!(to_upgrade[0].artist, "Artist");
+        assert_eq!(to_upgrade[0].album, "Album");
+        assert_eq!(to_upgrade[0].needs_upgrade, 1); // single ogg file fails the gate
+        assert_eq!(to_upgrade[0].location, dir.path().to_path_buf()); // library root
     }
 
     #[test]
@@ -1212,13 +1356,13 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         // Artist and album now come from the two folders above the file, so a
         // nested layout no longer reports the genre as the artist.
-        assert_eq!(to_upgrade[0].0, "Alesha Dixon"); // artist folder, not the genre
-        assert_eq!(to_upgrade[0].1, "The Alesha Show"); // album folder
-        assert_eq!(to_upgrade[0].2, 1); // needs_upgrade: single ogg file fails the gate
-                                        // The upgrade target must be the directory above the artist folder
-                                        // (<root>/Pop), not the library root — this is what preserves the
-                                        // album's real location inside the library.
-        assert_eq!(to_upgrade[0].3, dir.path().join("Pop"));
+        assert_eq!(to_upgrade[0].artist, "Alesha Dixon"); // artist folder, not the genre
+        assert_eq!(to_upgrade[0].album, "The Alesha Show"); // album folder
+        assert_eq!(to_upgrade[0].needs_upgrade, 1); // single ogg file fails the gate
+                                                    // The upgrade target must be the directory above the artist folder
+                                                    // (<root>/Pop), not the library root — this is what preserves the
+                                                    // album's real location inside the library.
+        assert_eq!(to_upgrade[0].location, dir.path().join("Pop"));
     }
 
     #[test]
@@ -1369,8 +1513,8 @@ mod tests {
 
         let to_upgrade = find_albums_to_upgrade(&albums, &config);
         assert_eq!(to_upgrade.len(), 1); // mp3 should trigger upgrade (not flac)
-        assert_eq!(to_upgrade[0].0, "Artist");
-        assert_eq!(to_upgrade[0].2, 2); // needs_upgrade: both mp3 files fail the gate
+        assert_eq!(to_upgrade[0].artist, "Artist");
+        assert_eq!(to_upgrade[0].needs_upgrade, 2); // needs_upgrade: both mp3 files fail the gate
     }
 
     /// Regression (release-review round 2, P1): the upgrade baseline must be
@@ -1426,7 +1570,7 @@ mod tests {
         assert_eq!(to_upgrade.len(), 1);
         // The runner's peer-track-count / completeness gates use this count:
         // a peer offering the 12 replacement FLACs is accepted.
-        assert_eq!(to_upgrade[0].2, 12);
+        assert_eq!(to_upgrade[0].needs_upgrade, 12);
     }
 
     #[test]

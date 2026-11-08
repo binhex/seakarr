@@ -122,35 +122,44 @@ impl RunReport {
         let mut lines = vec!["=== Run summary ===".to_string()];
         if !self.notices.is_empty() {
             lines.push(format!("Notices ({}):", self.notices.len()));
-            lines.extend(self.notices.iter().map(|notice| format!("  {notice}")));
+            lines.extend(
+                self.notices
+                    .iter()
+                    .map(|notice| format!("  {}", crate::formatting::single_line(notice))),
+            );
         }
         if !self.downloaded.is_empty() {
             lines.push(format!("Downloaded ({}):", self.downloaded.len()));
             lines.extend(self.downloaded.iter().map(|entry| {
                 format!(
                     "  {} — {} ({} tracks) -> {}",
-                    entry.artist,
-                    entry.album,
+                    crate::formatting::single_line(&entry.artist),
+                    crate::formatting::single_line(&entry.album),
                     entry.track_count,
-                    entry.destination.render()
+                    crate::formatting::single_line(&entry.destination.render())
                 )
             }));
         }
         if !self.skipped.is_empty() {
             lines.push(format!("Skipped ({}):", self.skipped.len()));
-            lines.extend(
-                self.skipped
-                    .iter()
-                    .map(|(artist, album)| format!("  {artist} — {album}")),
-            );
+            lines.extend(self.skipped.iter().map(|(artist, album)| {
+                format!(
+                    "  {} — {}",
+                    crate::formatting::single_line(artist),
+                    crate::formatting::single_line(album)
+                )
+            }));
         }
         if !self.failed.is_empty() {
             lines.push(format!("Failed ({}):", self.failed.len()));
-            lines.extend(
-                self.failed
-                    .iter()
-                    .map(|(artist, album, reason)| format!("  {artist} — {album} ({reason})")),
-            );
+            lines.extend(self.failed.iter().map(|(artist, album, reason)| {
+                format!(
+                    "  {} — {} ({})",
+                    crate::formatting::single_line(artist),
+                    crate::formatting::single_line(album),
+                    crate::formatting::single_line(reason)
+                )
+            }));
         }
         lines
     }
@@ -180,6 +189,37 @@ impl RunReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_supplied_escape_sequence_cannot_forge_a_summary_line() {
+        // The reason embeds peer-supplied text, and the summary is the run's record. A
+        // control sequence must be neutralised rather than printed raw.
+        let mut report = RunReport::new();
+        report.record(
+            "Artist",
+            "Album",
+            AlbumOutcome::Failed {
+                reason: "transfer failed for 01 - x.flac\u{1b}[2J\nfake: Downloaded (99): \u{202e}"
+                    .into(),
+            },
+        );
+
+        let rendered = report.summary_lines().join("\n");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "an escape sequence must not survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.chars().any(crate::formatting::is_format_character),
+            "a bidi or zero-width character must not survive: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("fake:")),
+            "peer text must not start its own summary line: {rendered:?}"
+        );
+    }
 
     #[test]
     fn test_empty_report_has_no_outcomes() {

@@ -149,6 +149,17 @@ pub fn parse_release_types(values: &[String]) -> Result<Vec<DiscographyReleaseTy
         };
         parsed.push(kind);
     }
+    // Duplicates are accepted but collapsed: `--release-type album,album` means the same as
+    // `album`, and the label selector already refuses a repeated value outright.
+    let mut seen = Vec::with_capacity(parsed.len());
+    parsed.retain(|kind| {
+        if seen.contains(kind) {
+            false
+        } else {
+            seen.push(*kind);
+            true
+        }
+    });
     if parsed.is_empty() {
         return Err(SeakarrError::Config(
             "--release-type needs at least one value".into(),
@@ -324,6 +335,10 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                     return Err(SeakarrError::Config(reason.to_string()));
                 }
                 if input.is_identity() {
+                    // The full check, not just its shape: a code with a bad ISNI check
+                    // character is a configuration error, and `--test` promises to find it
+                    // before a login and a PID lock.
+                    input.validate().map_err(SeakarrError::Config)?;
                     if album.is_some() {
                         return Err(SeakarrError::Config(format!(
                             "{} {artist:?} names a MusicBrainz artist and names no library folder; \
@@ -396,13 +411,8 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                     "--batch-file is incompatible with discover mode; use --mode batch".into(),
                 ));
             }
-            if let Some(reason) = cli.artist.as_deref().and_then(|value| {
-                crate::discography::ArtistInput::parse(value)
-                    .malformed_reason()
-                    .map(str::to_string)
-            }) {
-                return Err(SeakarrError::Config(reason));
-            }
+            // Blank first: a bare discover run processes the whole library, so "you typed
+            // only spaces" deserves its own message rather than the generic blank-name one.
             if cli
                 .artist
                 .as_deref()
@@ -412,6 +422,15 @@ pub fn resolve_execution_plan(config: &Config, cli: &CliOverrides) -> Result<Exe
                     "--artist must not be blank in discover mode; omit it to process the whole library"
                         .into(),
                 ));
+            }
+            if let Some(artist) = cli.artist.as_deref() {
+                let input = crate::discography::ArtistInput::parse(artist);
+                if let Some(reason) = input.malformed_reason() {
+                    return Err(SeakarrError::Config(reason.to_string()));
+                }
+                // A malformed code is a configuration error, not something to discover after
+                // the login; the same check runs for manual mode above.
+                input.validate().map_err(SeakarrError::Config)?;
             }
             let labels = match cli.label.as_deref() {
                 Some(values) if !values.is_empty() => parse_labels(values)?,
@@ -1503,6 +1522,19 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_release_type_is_collapsed() {
+        let types = parse_release_types(&["album".to_string(), "album".to_string()]).unwrap();
+        assert_eq!(types.len(), 1, "a repeated value means the same as one");
+        let types = parse_release_types(&[
+            "ep".to_string(),
+            "studio_album".to_string(),
+            "ep".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(types.len(), 2, "distinct values all survive");
+    }
+
+    #[test]
     fn since_accepts_a_year_month_and_day_and_rejects_anything_else() {
         let config = label_config();
         for value in ["2025", "2025-01", "2025-01-31"] {
@@ -1524,6 +1556,13 @@ mod tests {
         assert_config_error(
             &config,
             &label_cli(&["Hospital Records"], &[], Some("2025-02-30")),
+            "--since",
+        );
+        // A day component of zero is not "the whole month": it is a date that does not
+        // exist, so accepting it would silently widen the bound.
+        assert_config_error(
+            &config,
+            &label_cli(&["Hospital Records"], &[], Some("2025-01-00")),
             "--since",
         );
     }

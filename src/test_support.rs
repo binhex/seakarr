@@ -26,6 +26,30 @@ const TAG_VENDOR: &str = "seakarr test fixture";
 /// FLAC metadata block type for Vorbis comments.
 const VORBIS_COMMENT_BLOCK: u8 = 4;
 
+/// Bitrate and sample rate encoded in every frame of [`write_minimal_mp3`]'s fixture.
+pub const MINIMAL_MP3_BITRATE_KBPS: u32 = 32;
+const MINIMAL_MP3_SAMPLE_RATE: u32 = 44_100;
+
+/// Write an MP3 that `lofty` can parse: repeated MPEG-1 Layer III frame headers with an
+/// empty payload.
+///
+/// The post-download quality gate reads a lossy file's bitrate from the frame header, so
+/// a header-only file exercises the same path a real low-bitrate download does. The
+/// fixture is 32 kbps, deliberately below the 320 kbps default floor.
+pub fn write_minimal_mp3(path: &Path) {
+    // 0xFF 0xFB: MPEG-1, Layer III, no CRC. 0x10: bitrate index 1 (32 kbps), sampling
+    // index 0 (44.1 kHz), no padding. 0xC0: mono.
+    const FRAME_HEADER: [u8; 4] = [0xFF, 0xFB, 0x10, 0xC0];
+    let frame_len =
+        144 * MINIMAL_MP3_BITRATE_KBPS as usize * 1000 / MINIMAL_MP3_SAMPLE_RATE as usize;
+    let mut bytes = Vec::with_capacity(frame_len * 8);
+    for _ in 0..8 {
+        bytes.extend_from_slice(&FRAME_HEADER);
+        bytes.resize(bytes.len() + frame_len - FRAME_HEADER.len(), 0);
+    }
+    fs::write(path, bytes).expect("the MP3 fixture must be writable");
+}
+
 /// A search-result file entry with the given bitrate attribute and size.
 ///
 /// Used by every module that builds `SearchResult` fixtures; it lived in five

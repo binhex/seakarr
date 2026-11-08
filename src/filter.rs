@@ -50,21 +50,9 @@ pub(crate) fn filter_results_with_queue_limit(
     max_queue_length: u32,
     anchor: TrackOneAnchor,
 ) -> Vec<SearchResult> {
-    results
+    let filtered: Vec<SearchResult> = results
         .iter()
         .filter(|r| {
-            // Album-name gate (primary artist+album search tier only): when
-            // the caller knows the album name, reject results whose file
-            // paths do not contain it as a contiguous run of word tokens.
-            // This stops substring false matches like "S Club" matching
-            // "Sgt. Peppers Lonely Hearts **Club** Band". The track-name
-            // fallback tier passes None and is never gated here.
-            if let Some(album_name) = album {
-                if !album_matches_result(r, album_name) {
-                    return false;
-                }
-            }
-
             // Filter: must have free upload slots unless a positive queue
             // cap permits a bounded queue wait (the peer's reported queue
             // position is validated at download time). With the default cap
@@ -97,7 +85,11 @@ pub(crate) fn filter_results_with_queue_limit(
                 if let Some(kind) =
                     incomplete_download(&downloadable_basenames(&passing), config.min_tracks, anchor)
                 {
-                    tracing::debug!("result from {} rejected: {}", r.username, kind.filter_reason());
+                    tracing::debug!(
+                    "result from {} rejected: {}",
+                    crate::formatting::single_line(&r.username),
+                    kind.filter_reason()
+                );
                     return false;
                 }
                 if passing.is_empty() {
@@ -121,7 +113,7 @@ pub(crate) fn filter_results_with_queue_limit(
                     {
                         tracing::debug!(
                             "result from {} rejected: largest album directory has {} tracks < library track count {}",
-                            r.username,
+                            crate::formatting::single_line(&r.username),
                             crate::download::largest_album_group(&passing).len(),
                             lib_count
                         );
@@ -140,7 +132,11 @@ pub(crate) fn filter_results_with_queue_limit(
             if let Some(kind) =
                 incomplete_download(&downloadable_basenames(&passing), config.min_tracks, anchor)
             {
-                tracing::debug!("result from {} rejected: {}", r.username, kind.filter_reason());
+                tracing::debug!(
+                    "result from {} rejected: {}",
+                    crate::formatting::single_line(&r.username),
+                    kind.filter_reason()
+                );
                 return false;
             }
             if passing.is_empty() {
@@ -153,7 +149,7 @@ pub(crate) fn filter_results_with_queue_limit(
                     .any(|f| crate::tracks::track_number_from_filename(&f.name).is_some());
                 tracing::debug!(
                     "result from {} rejected: {}",
-                    r.username,
+                    crate::formatting::single_line(&r.username),
                     if any_numbered {
                         "non-contiguous track numbers in one or more directories"
                     } else {
@@ -179,7 +175,7 @@ pub(crate) fn filter_results_with_queue_limit(
                 {
                     tracing::debug!(
                         "result from {} rejected: largest album directory has {} tracks < library track count {}",
-                        r.username,
+                        crate::formatting::single_line(&r.username),
                         crate::download::largest_album_group(&passing).len(),
                         lib_count
                     );
@@ -195,6 +191,51 @@ pub(crate) fn filter_results_with_queue_limit(
             true
         })
         .cloned()
+        .collect();
+
+    // Album-name gate, applied as a group *selection* rather than a yes/no test.
+    // A peer can share several album directories (the requested album plus a remix or
+    // deluxe companion); every one of them mentions the album name, so "any file
+    // matches" accepts the result and `download_album` then fetches the largest group -
+    // the companion. Narrowing the result to the best-matching group here means the set
+    // that is downloaded is the set that satisfied the gate.
+    let Some(album_name) = album else {
+        return filtered;
+    };
+    filtered
+        .into_iter()
+        .filter_map(|mut result| {
+            let passing: Vec<&FileInfo> = result
+                .files
+                .iter()
+                .filter(|f| {
+                    crate::download::safe_basename(&f.name).is_ok()
+                        && file_passes_filters(f, config)
+                })
+                .collect();
+            // The chosen group must itself satisfy the rules a downloaded album is held
+            // to. Otherwise an exactly named but tiny folder (a single, a partial share)
+            // would outrank the larger edition that actually passed completeness, and the
+            // run would stage or write an incomplete album as a success.
+            let chosen = album_groups_for(&passing, Some(album_name))
+                .into_iter()
+                .find(|group| {
+                    group_satisfies_album_rules(group, config, library_track_count, anchor)
+                })?;
+            let keep: Option<std::collections::HashSet<(String, u64)>> = (chosen.len()
+                < passing.len())
+            .then(|| chosen.iter().map(|f| (f.name.clone(), f.size)).collect());
+            if let Some(keep) = keep {
+                result
+                    .files
+                    .retain(|f| keep.contains(&(f.name.clone(), f.size)));
+                tracing::debug!(
+                    "result from {} narrowed to the album directory that matches {album_name:?}",
+                    result.username
+                );
+            }
+            (!result.files.is_empty()).then_some(result)
+        })
         .collect()
 }
 
@@ -378,9 +419,24 @@ fn files_have_contiguous_tracks_per_directory(files: &[&FileInfo]) -> bool {
         .all(|g| crate::tracks::files_have_contiguous_tracks(g))
 }
 
+/// A remote file name's lowercased extension, or `None` when it has none.
+///
+/// `Path::extension` reports nothing for a name with no dot, so a file called exactly "flac"
+/// has no extension and is not admitted as a FLAC file - it would be written into the
+/// library with no extension at all. The rejection summary uses this same helper, so a
+/// result's `extension_rejected` count cannot disagree with the gate that produced it.
+fn remote_extension(name: &str) -> Option<String> {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_lowercase)
+        .filter(|ext| !ext.is_empty())
+}
+
 pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> bool {
-    // Extension check
-    let ext = file.name.rsplit('.').next().unwrap_or("").to_lowercase();
+    // Extension check.
+    let ext = remote_extension(&file.name);
+    let ext = ext.unwrap_or_default();
     if !config
         .allowed_extensions
         .iter()
@@ -428,9 +484,14 @@ pub(crate) fn file_passes_filters(file: &FileInfo, config: &FilterConfig) -> boo
 ///
 /// `"S Club"` → `["s", "club"]`; `"Sgt. Peppers Lonely Hearts Club Band"`
 /// → `["sgt", "peppers", "lonely", "hearts", "club", "band"]`.
+///
+/// Compatibility decomposition folds accented Latin text to its base letters, and the
+/// combining marks that remain are separators, so `"Café"` yields `["cafe"]`. Scripts
+/// with no such decomposition (Cyrillic, CJK, Arabic and the rest) keep their own
+/// letters: dropping them would leave an album titled in one of them with no tokens at
+/// all, which would disable the album-name gate for exactly those releases.
 fn word_tokens(name: &str) -> Vec<String> {
     name.nfkd()
-        .filter(|c| c.is_ascii())
         .collect::<String>()
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -451,20 +512,192 @@ fn tokens_contain_contiguous(tokens: &[String], needle: &[String]) -> bool {
     tokens.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Whether any of a result's file paths contains the album name as a
-/// contiguous run of word tokens.
-fn album_matches_result(result: &SearchResult, album: &str) -> bool {
-    let album_tokens = word_tokens(album);
-    // An empty token set (punctuation-only album name like "( )", or
-    // whitespace-only) carries no discriminative constraint — skip the
-    // gate so the album can still be processed by other filters.
-    if album_tokens.is_empty() {
+/// True when a candidate album group satisfies the per-album rules the download obeys.
+///
+/// The album gate selects a group on the strength of its name alone, so the rules that
+/// decide whether a group is a complete album must be checked on the same group: otherwise
+/// an exactly named but tiny folder (a single, a partial share) outranks the larger edition
+/// that actually passed completeness, and the run stages or writes an incomplete album as
+/// a success.
+fn group_satisfies_album_rules(
+    group: &[&FileInfo],
+    config: &FilterConfig,
+    library_track_count: Option<usize>,
+    anchor: TrackOneAnchor,
+) -> bool {
+    if group.is_empty() {
+        return false;
+    }
+    if incomplete_download(&downloadable_basenames(group), config.min_tracks, anchor).is_some() {
+        return false;
+    }
+    if config.contiguous_tracks && !files_have_contiguous_tracks_per_directory(group) {
+        return false;
+    }
+    if let Some(lib_count) = library_track_count {
+        if config.peer_track_count && group.len() < lib_count {
+            return false;
+        }
+    }
+    true
+}
+
+/// The album groups a result contributes, best match first, empty when it must be rejected.
+///
+/// The gate is not "does any file mention the album": it selects the one album directory
+/// that best matches the requested name, because `download_album` fetches a single
+/// directory group. Judging every file let a peer through whose directory was a companion
+/// edition (`Gold Remixes` for a requested `Gold`): both matched by token containment, the
+/// larger group won the download, and those files were written into the requested album's
+/// folder and recorded as success.
+///
+/// A share may wrap the album in a container directory (`Gold/FLAC/01.flac`) or carry no
+/// directory at all (`Artist - Gold - 01.flac`): the first names the album one level up,
+/// and the second names it in the filenames. Both are matched; a container is never itself
+/// accepted as the album name, so a companion edition's codec folder cannot rescue it.
+///
+/// Preference order: a group whose album-naming directory is exactly the album's tokens,
+/// then the largest matching group, then the lexicographically largest key for
+/// determinism. `album` is `None` on the track-name fallback tier, which is never gated.
+fn album_groups_for<'a>(passing: &[&'a FileInfo], album: Option<&str>) -> Vec<Vec<&'a FileInfo>> {
+    let Some(album) = album else {
+        // Ungated tier: the whole passing set, so `download_album` still narrows it.
+        return vec![passing.to_vec()];
+    };
+    let tokens = word_tokens(album);
+    if tokens.is_empty() {
+        return vec![passing.to_vec()];
+    }
+
+    let mut groups: std::collections::BTreeMap<String, Vec<&FileInfo>> = Default::default();
+    for file in passing {
+        let parent = parent_dir(&file.name);
+        groups
+            .entry(crate::download::album_group_key(parent))
+            .or_default()
+            .push(file);
+    }
+
+    let mut candidates: Vec<(bool, usize, String, Vec<&FileInfo>)> = Vec::new();
+    for (key, files) in groups {
+        match album_naming(&key, &tokens) {
+            AlbumNaming::Rejected => {}
+            AlbumNaming::Directory { exact } => {
+                let len = files.len();
+                candidates.push((exact, len, key, files));
+            }
+            // No directory names the album: it can only be named by the filenames.
+            // Keep just the files that name it - the rest belong to something else,
+            // and downloading them would write them into the album's folder.
+            AlbumNaming::FilenamesOnly => {
+                let named: Vec<&FileInfo> = files
+                    .into_iter()
+                    .filter(|file| {
+                        tokens_contain_contiguous(&word_tokens(leaf_name(&file.name)), &tokens)
+                    })
+                    .collect();
+                if !named.is_empty() {
+                    let len = named.len();
+                    candidates.push((false, len, key, named));
+                }
+            }
+        }
+    }
+    // Preference: an exactly named directory, then the largest, then the largest key.
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+    });
+    candidates
+        .into_iter()
+        .map(|(_, _, _, files)| files)
+        .collect()
+}
+
+/// The grouping key of a file that carries no directory component.
+const ROOT_GROUP_KEY: &str = "<root>";
+
+/// Directory names that hold an album rather than name one: a codec, a quality tier, or
+/// a media type. A share laid out as `Gold/FLAC/01.flac` names the album one level up, so
+/// the gate looks through these components instead of rejecting the result on the leaf.
+const CONTAINER_DIR_TOKENS: &[&str] = &[
+    "flac", "mp3", "aac", "ogg", "opus", "wav", "wma", "alac", "aiff", "ape", "dsf", "dff", "web",
+    "cd", "vinyl", "lossless", "hires", "hd", "320", "v0", "v2", "16bit", "24bit",
+];
+
+/// The parent directory of a share path, or [`ROOT_GROUP_KEY`] when it has none.
+fn parent_dir(name: &str) -> &str {
+    name.rsplit_once(['/', '\\'])
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or(ROOT_GROUP_KEY)
+}
+
+/// The last component of a path (`01 - Track.flac` for either separator style).
+fn leaf_name(path: &str) -> &str {
+    path.rsplit_once(['/', '\\'])
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(path)
+}
+
+/// How the album-name lookup ended for one directory group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlbumNaming {
+    /// A directory names the album; `exact` is true when it is exactly the album's tokens.
+    Directory { exact: bool },
+    /// Every directory above the files is a container (`FLAC/`) or a disc folder, so no
+    /// directory names the album and only the filenames can.
+    FilenamesOnly,
+    /// A directory that is not a container does not name the album: the group belongs to
+    /// a different release.
+    Rejected,
+}
+
+/// Decide whether a group's directory names the requested album, looked up from the leaf
+/// outwards.
+///
+/// A leaf that matches is the answer. Otherwise a container leaf (`FLAC`, `320`, `CD 01`)
+/// names the transfer rather than the album, so the lookup continues with its parent. The
+/// walk ends in one of three ways: a directory names the album, a directory that is not a
+/// container does not (rejected), or the components run out while every one seen was a
+/// container - a root-level `FLAC/01 - Gold.flac` or `CD 01/01 - Gold.flac` - which leaves
+/// the filenames as the only place the album can be named.
+fn album_naming(key: &str, album_tokens: &[String]) -> AlbumNaming {
+    if key == ROOT_GROUP_KEY || key.is_empty() {
+        // A file with no directory of its own, and the empty key a root-level disc folder
+        // collapses to in `album_group_key`: nothing here can name an album.
+        return AlbumNaming::FilenamesOnly;
+    }
+    let mut current = key;
+    loop {
+        let leaf_tokens = word_tokens(leaf_name(current));
+        if tokens_contain_contiguous(&leaf_tokens, album_tokens) {
+            return AlbumNaming::Directory {
+                exact: leaf_tokens == album_tokens,
+            };
+        }
+        if !is_container_dir(leaf_name(current)) {
+            return AlbumNaming::Rejected;
+        }
+        match current.rsplit_once(['/', '\\']) {
+            Some((parent, _)) if !parent.is_empty() => current = parent,
+            _ => return AlbumNaming::FilenamesOnly,
+        }
+    }
+}
+
+/// True when `leaf` names a container rather than an album: every one of its tokens is a
+/// codec, a quality tier, a media type, or it is a dedicated disc folder (`CD 01`).
+fn is_container_dir(leaf: &str) -> bool {
+    if crate::discs::is_disc_folder(leaf) {
         return true;
     }
-    result.files.iter().any(|f| {
-        let path_tokens = word_tokens(&f.name);
-        tokens_contain_contiguous(&path_tokens, &album_tokens)
-    })
+    let tokens = word_tokens(leaf);
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|t| CONTAINER_DIR_TOKENS.contains(&t.as_str()))
 }
 
 /// Match strength of a result against an album name, for ranking:
@@ -1128,11 +1361,70 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_rejected_result_is_counted_in_the_summary() {
+        // The gate drops a result whose name-matching group fails the per-album rules. The
+        // summary must attribute that rejection: reporting "no rejections" for a result the
+        // gate refused leaves the operator with no explanation at all.
+        let result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                // The exact group is a single track.
+                make_file(r"Music\Artist\Gold\01 - A.flac", 900, 10),
+                // A larger group that does not name the album, so it is not a candidate for
+                // the gate - but it is the largest group, which the pre-download screen
+                // judges and passes.
+                make_file(r"Music\Artist\Silver\01 - C.flac", 900, 10),
+                make_file(r"Music\Artist\Silver\02 - D.flac", 900, 10),
+                make_file(r"Music\Artist\Silver\03 - E.flac", 900, 10),
+            ],
+        );
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results(std::slice::from_ref(&result), &config, None, Some("Gold"));
+        assert!(filtered.is_empty(), "the gate must reject the result");
+
+        let summary = summarize_rejections(&[result], &config, None, Some("Gold"));
+        assert!(
+            summary.has_rejections(),
+            "a gate rejection must appear in the summary, got: {summary:?}"
+        );
+        assert_eq!(
+            summary.below_min_tracks, 1,
+            "the exact group is too short, and that is the bucket to name"
+        );
+    }
+
+    #[test]
+    fn test_a_name_that_is_only_an_extension_has_no_extension() {
+        // "flac" has no dot, so it has no extension: admitting it would download a file the
+        // library writer must then name with its placeholder extension.
+        let cfg = default_filter_config();
+        assert!(!file_passes_filters(
+            &make_file("flac", 900, 30_000_000),
+            &cfg
+        ));
+        assert!(!file_passes_filters(
+            &make_file("Artist\\Album\\mp3", 900, 30_000_000),
+            &cfg
+        ));
+        assert!(file_passes_filters(
+            &make_file("Artist\\Album\\01 - Track.flac", 900, 30_000_000),
+            &cfg
+        ));
+    }
+
+    #[test]
     fn test_filter_contiguity_excludes_unsafe_basenames() {
-        // Tracks 01, 02, 03 where 02 has an unsafe basename (contains
-        // ".."): the contiguity set mirrors what download_album would
-        // really fetch, so 02 is excluded, leaving the gap {1, 3} and the
-        // result must be rejected.
+        // Tracks 01, 02, 03 where 02 has an unsafe basename (a trailing
+        // separator, so its last component is empty): the contiguity set mirrors
+        // what download_album would really fetch, so 02 is excluded, leaving the
+        // gap {1, 3} and the result must be rejected.
         let cfg = FilterConfig {
             contiguous_tracks: true,
             ..default_filter_config()
@@ -1143,7 +1435,7 @@ mod tests {
             1,
             vec![
                 make_file("01 - A.flac", 900, 30_000_000),
-                make_file("02 - B..flac", 900, 30_000_000),
+                make_file("02 - B.flac/", 900, 30_000_000),
                 make_file("03 - C.flac", 900, 30_000_000),
             ],
         )];
@@ -1508,6 +1800,383 @@ mod tests {
         assert!(
             filtered.is_empty(),
             "a gap-free run of 02..06 has no track 1 and is a fragment, so it must not be downloaded"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_narrows_to_the_matching_directory_not_the_largest() {
+        // The peer shares the requested album (2 tracks) and a companion edition with
+        // more tracks. Both mention "Gold", so a yes/no token gate accepts the result and
+        // the download would fetch the larger companion. The gate must narrow the result
+        // to the directory that matches the album name.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\Gold\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\02 - B.flac", 900, 10),
+                make_file(r"Music\Artist\Gold Remixes\01 - C.flac", 900, 10),
+                make_file(r"Music\Artist\Gold Remixes\02 - D.flac", 900, 10),
+                make_file(r"Music\Artist\Gold Remixes\03 - E.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+
+        assert_eq!(filtered.len(), 1, "the result must survive the gate");
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                r"Music\Artist\Gold\01 - A.flac",
+                r"Music\Artist\Gold\02 - B.flac"
+            ],
+            "only the requested album's directory may be downloaded"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_rejects_an_exact_group_below_the_completeness_rule() {
+        // The exact folder holds a single while a larger edition holds the album. The
+        // exact name must not outrank completeness: selecting it would stage a fragment
+        // as a success.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\Gold\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\Gold (Remastered)\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\Gold (Remastered)\02 - B.flac", 900, 10),
+                make_file(r"Music\Artist\Gold (Remastered)\03 - C.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 3,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+        assert_eq!(filtered.len(), 1);
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            3,
+            "the group that satisfies min_tracks must be selected, got {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n.contains("Gold (Remastered)")),
+            "the exact 1-track folder must not win over a complete edition: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_rejects_a_result_without_a_matching_directory() {
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\Gold Remixes\01 - C.flac", 900, 10),
+                make_file(r"Music\Artist\Gold Remixes\02 - D.flac", 900, 10),
+                make_file(r"Music\Artist\Gold Remixes\03 - E.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Silver"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+        assert!(filtered.is_empty(), "an unrelated album must be rejected");
+    }
+
+    #[test]
+    fn test_album_gate_prefers_the_exact_directory_name_over_a_larger_one() {
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\The Gold\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\The Gold\02 - B.flac", 900, 10),
+                make_file(r"Music\Artist\The Gold\03 - C.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\01 - D.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\02 - E.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+        assert_eq!(filtered.len(), 1);
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                r"Music\Artist\Gold\01 - D.flac",
+                r"Music\Artist\Gold\02 - E.flac"
+            ],
+            "an exactly named directory outranks a larger partial match"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_narrows_a_title_with_no_ascii_letters() {
+        // A title written entirely in another script has no ASCII form to fold to. If the
+        // gate treated it as "no discriminative content" it would accept every group and
+        // download the largest, which is the companion-edition bug the gate exists for.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Аквариум\Чёрный альбом\01 - A.flac", 900, 10),
+                make_file(r"Аквариум\Чёрный альбом\02 - B.flac", 900, 10),
+                make_file(r"Аквариум\Чёрный альбом (ремиксы)\01 - C.flac", 900, 10),
+                make_file(r"Аквариум\Чёрный альбом (ремиксы)\02 - D.flac", 900, 10),
+                make_file(r"Аквариум\Чёрный альбом (ремиксы)\03 - E.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Чёрный альбом"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+
+        assert_eq!(filtered.len(), 1, "the result must survive the gate");
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                r"Аквариум\Чёрный альбом\01 - A.flac",
+                r"Аквариум\Чёрный альбом\02 - B.flac"
+            ],
+            "only the album whose name matches may be downloaded"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_accepts_an_album_wrapped_in_a_container_directory() {
+        // A share laid out as `<album>/FLAC/` names the album one level up. Rejecting it
+        // loses a legitimate peer; accepting the container itself as the name would let
+        // a companion edition's codec folder rescue the companion.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\Gold\FLAC\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\FLAC\02 - B.flac", 900, 10),
+                make_file(r"Music\Artist\Silver\FLAC\01 - C.flac", 900, 10),
+                make_file(r"Music\Artist\Silver\FLAC\02 - D.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+
+        assert_eq!(filtered.len(), 1, "the container layout must be accepted");
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                r"Music\Artist\Gold\FLAC\01 - A.flac",
+                r"Music\Artist\Gold\FLAC\02 - B.flac"
+            ],
+            "only the group whose album directory names the album may be downloaded"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_does_not_look_through_a_named_companion() {
+        // The container rule must not become a general ancestor match: "Remixes" is a
+        // different release, and the codec folder below it must not rescue it.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Music\Artist\Gold\Remixes\FLAC\01 - A.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\Remixes\FLAC\02 - B.flac", 900, 10),
+                make_file(r"Music\Artist\Gold\Remixes\FLAC\03 - C.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+
+        assert!(
+            filtered.is_empty(),
+            "a companion edition nested under the album name is not the album"
+        );
+    }
+
+    #[test]
+    fn test_album_gate_accepts_a_share_wrapped_only_in_container_directories() {
+        // A peer whose paths carry no album folder at all - just a codec folder, or a disc
+        // folder, at the top - names the album in the filenames. Rejecting these loses
+        // candidates the download stage would have handled.
+        for paths in [
+            vec![r"FLAC\01 - Gold.flac", r"FLAC\02 - Gold.flac"],
+            vec![r"CD 01\01 - Gold.flac", r"CD 01\02 - Gold.flac"],
+            vec![r"CD 01\FLAC\01 - Gold.flac", r"CD 01\FLAC\02 - Gold.flac"],
+        ] {
+            let mut result = make_result(
+                "peer",
+                1000,
+                2,
+                paths.iter().map(|path| make_file(path, 900, 10)).collect(),
+            );
+            result.slots = 2;
+
+            let config = FilterConfig {
+                min_tracks: 2,
+                contiguous_tracks: false,
+                ..FilterConfig::default()
+            };
+            let filtered = filter_results_with_queue_limit(
+                &[result],
+                &config,
+                None,
+                Some("Gold"),
+                u32::MAX,
+                TrackOneAnchor::NotRequired,
+            );
+
+            assert_eq!(
+                filtered.len(),
+                1,
+                "a container-only layout must be accepted: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_album_gate_accepts_a_root_level_share() {
+        // A peer with no folder structure names the album in the filenames. Only the
+        // files that name it belong to the request; the rest would be written into the
+        // album's folder.
+        let mut result = make_result(
+            "peer",
+            1000,
+            2,
+            vec![
+                make_file(r"Artist - Gold - 01 - A.flac", 900, 10),
+                make_file(r"Artist - Gold - 02 - B.flac", 900, 10),
+                make_file(r"Artist - Silver - 01 - C.flac", 900, 10),
+            ],
+        );
+        result.slots = 2;
+
+        let config = FilterConfig {
+            min_tracks: 2,
+            contiguous_tracks: false,
+            ..FilterConfig::default()
+        };
+
+        let filtered = filter_results_with_queue_limit(
+            &[result],
+            &config,
+            None,
+            Some("Gold"),
+            u32::MAX,
+            TrackOneAnchor::NotRequired,
+        );
+
+        assert_eq!(filtered.len(), 1, "a root-level share must be accepted");
+        let names: Vec<&str> = filtered[0].files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                r"Artist - Gold - 01 - A.flac",
+                r"Artist - Gold - 02 - B.flac"
+            ],
+            "only the files that name the album may be downloaded"
         );
     }
 
@@ -1995,14 +2664,6 @@ pub(crate) fn summarize_rejections_with_queue_limit(
         std::collections::BTreeMap::new();
 
     for r in results {
-        // Album-name gate check
-        if let Some(album_name) = album {
-            if !album_matches_result(r, album_name) {
-                summary.album_mismatch += 1;
-                continue;
-            }
-        }
-
         // Slot check: mirrors filter_results — a positive queue cap keeps a
         // zero-slot result eligible for download-time queue validation, so
         // it is not a free-slot rejection.
@@ -2018,14 +2679,18 @@ pub(crate) fn summarize_rejections_with_queue_limit(
             if crate::download::safe_basename(&f.name).is_err() {
                 continue;
             }
-            let ext = f.name.rsplit('.').next().unwrap_or("").to_lowercase();
-            if !config
-                .allowed_extensions
-                .iter()
-                .any(|e| e.to_lowercase() == ext)
-            {
+            let ext = remote_extension(&f.name);
+            let allowed = ext.as_deref().is_some_and(|ext| {
+                config
+                    .allowed_extensions
+                    .iter()
+                    .any(|allowed| allowed.to_lowercase() == ext)
+            });
+            if !allowed {
                 summary.extension_rejected += 1;
-                *ext_counts.entry(ext.clone()).or_insert(0) += 1;
+                if let Some(ext) = ext {
+                    *ext_counts.entry(ext).or_insert(0) += 1;
+                }
                 continue;
             }
             // Bitrate check (key 0 = bitrate in kbps). Mirrors
@@ -2072,6 +2737,36 @@ pub(crate) fn summarize_rejections_with_queue_limit(
         // is more useful here than reporting a track-count shortfall.
         if passing_files.is_empty() {
             summary.no_usable_files += 1;
+            continue;
+        }
+        // Album-name gate, judged exactly as the gate judges it: does any album group of the
+        // quality-passing files match the requested album, and does at least one of those
+        // groups satisfy the per-album rules? A group that matches but fails the rules is a
+        // rejection the gate makes, so the summary must attribute it rather than reporting no
+        // rejections at all.
+        let groups = album_groups_for(&passing_files, album);
+        if groups.is_empty() {
+            summary.album_mismatch += 1;
+            continue;
+        }
+        if album.is_some()
+            && !groups.iter().any(|group| {
+                group_satisfies_album_rules(group, config, library_track_count, anchor)
+            })
+        {
+            let group = &groups[0];
+            match incomplete_download(&downloadable_basenames(group), config.min_tracks, anchor) {
+                Some(IncompleteDownload::TooShort { .. }) => summary.below_min_tracks += 1,
+                Some(IncompleteDownload::MissingTrackOne { .. }) => {
+                    summary.incomplete_download += 1
+                }
+                None if config.contiguous_tracks
+                    && !files_have_contiguous_tracks_per_directory(group) =>
+                {
+                    summary.non_contiguous += 1;
+                }
+                None => summary.peer_track_count_rejected += 1,
+            }
             continue;
         }
         // Completeness rule, shared with `filter_results` and measured on the

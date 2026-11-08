@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use seakarr::client::SoulseekClient;
@@ -392,8 +392,16 @@ async fn run_with(cli: Cli, client_factory: ClientFactory) -> Result<()> {
             cli.ignore_processed,
         )
         .await;
-        release_pid_lock(&pid_file)?;
-        result
+        // A lock file that cannot be removed must not turn a completed run into a failure:
+        // the run's own outcome is what the operator asked for, and a stale lock is removed
+        // by the next run.
+        match release_pid_lock(&pid_file) {
+            Ok(()) => result,
+            Err(error) => {
+                tracing::warn!("Could not remove the PID file: {error}");
+                result
+            }
+        }
     }
 }
 
@@ -741,18 +749,45 @@ fn parse_batch_line(line: &str) -> std::result::Result<(String, Option<String>),
     Ok((artist, album))
 }
 
-/// Validate every batch line before any of them runs.
+/// Parse every batch line before any of them runs.
 ///
-/// An identifier on a later line must not let the earlier lines download first, so
-/// the whole file is checked up front.
-fn validate_batch_lines(lines: &[&str]) -> std::result::Result<(), String> {
-    for line in lines {
-        parse_batch_line(line)?;
-    }
-    Ok(())
+/// An identifier on a later line must not let the earlier lines download first, so the
+/// whole file is parsed up front, and the run iterates that parsed list. Parsing twice -
+/// once to validate, once to execute - would let a grammar change make the two disagree
+/// about what a line means.
+fn parse_batch_lines(lines: &[&str]) -> std::result::Result<Vec<(String, Option<String>)>, String> {
+    lines.iter().map(|line| parse_batch_line(line)).collect()
 }
 
 /// Batch mode: process a newline-separated list of `artist - album` lines.
+/// Record one batch line's outcome, reporting whether the run must stop.
+///
+/// The operator's own interrupt is not an album failure: it records nothing and stops
+/// the run, through the same predicate the label, discover and upgrade loops use. An
+/// artist-only line stages by rule rather than because a folder is missing, so the "no
+/// library folder found" explanation would be false for it.
+fn record_batch_outcome(
+    artist: &str,
+    album: Option<&str>,
+    outcome: seakarr::report::AlbumOutcome,
+    config: &Config,
+    cancel: &AtomicBool,
+    report: &mut seakarr::report::RunReport,
+    explained: &mut BTreeSet<String>,
+) -> bool {
+    let album_display = album.unwrap_or("(all)");
+    if seakarr::runner::outcome_is_operator_interrupt(&outcome, cancel) {
+        tracing::info!("Batch mode: cancelled during {artist} — {album_display}");
+        report.add_notice("batch: cancelled by user; the run stopped before it finished");
+        return true;
+    }
+    if album.is_some() {
+        seakarr::runner::explain_staging_outcome(artist, config, &outcome, explained);
+    }
+    report.record(artist, album_display, outcome);
+    false
+}
+
 async fn run_batch_mode(
     client: &dyn SoulseekClient,
     batch_path: &str,
@@ -767,10 +802,9 @@ async fn run_batch_mode(
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
-    validate_batch_lines(&lines).map_err(SeakarrError::Config)?;
-
-    let line_word = if lines.len() == 1 { "line" } else { "lines" };
-    tracing::info!("Batch mode: {} {line_word} to process", lines.len());
+    let work = parse_batch_lines(&lines).map_err(SeakarrError::Config)?;
+    let line_word = if work.len() == 1 { "line" } else { "lines" };
+    tracing::info!("Batch mode: {} {line_word} to process", work.len());
     let staging_dir = Path::new(&config.storage.staging_dir);
     seakarr::staging::prepare(staging_dir, &config.library.paths)?;
 
@@ -793,16 +827,20 @@ async fn run_batch_mode(
     let artist_folders = seakarr::discover::ArtistFolderIndex::new(config);
     let mut explained: BTreeSet<String> = BTreeSet::new();
 
-    for line in &lines {
+    for (artist, album) in work {
         // Check cancellation between batch lines — stop processing
         // remaining albums after Ctrl+C.
         if cancel.load(Ordering::SeqCst) {
             tracing::info!("Batch mode: cancelled");
+            report.add_notice("batch: cancelled by user; the run stopped before it finished");
             break;
         }
 
-        let (artist, album) = parse_batch_line(line).map_err(SeakarrError::Config)?;
-        if artist.is_empty() && album.is_none() {
+        // A line that is only the separator (" - ") yields an artist made of dashes, which
+        // would be searched verbatim and recorded as a phantom failure. A real artist name
+        // carries at least one character other than the separator.
+        let separator_only = artist.chars().all(|c| c == '-' || c.is_whitespace());
+        if (artist.is_empty() || separator_only) && album.is_none() {
             tracing::warn!("Batch: skipping line with no artist or album");
             continue;
         }
@@ -832,17 +870,17 @@ async fn run_batch_mode(
         .await
         {
             Ok(outcome) => {
-                // An artist-only line stages by rule rather than because a folder is
-                // missing, so the "no library folder found" explanation would be false.
-                if album.is_some() {
-                    seakarr::runner::explain_staging_outcome(
-                        &artist,
-                        config,
-                        &outcome,
-                        &mut explained,
-                    );
+                if record_batch_outcome(
+                    &artist,
+                    album.as_deref(),
+                    outcome,
+                    config,
+                    &cancel,
+                    &mut report,
+                    &mut explained,
+                ) {
+                    break;
                 }
-                report.record(&artist, album_display, outcome)
             }
             Err(e) => {
                 tracing::error!("Batch: failed {artist} — {album_display}: {e}");
@@ -953,10 +991,10 @@ mod tests {
 
     #[test]
     fn a_malformed_later_batch_line_is_caught_before_any_line_runs() {
-        let error = validate_batch_lines(&["Grafix - Half Light", "000000046659702 - Half Light"])
+        let error = parse_batch_lines(&["Grafix - Half Light", "000000046659702 - Half Light"])
             .unwrap_err();
         assert!(error.contains("15 digits"), "got {error}");
-        assert!(validate_batch_lines(&["Grafix - Half Light"]).is_ok());
+        assert!(parse_batch_lines(&["Grafix - Half Light"]).is_ok());
     }
 
     #[test]
@@ -2163,6 +2201,59 @@ mod tests {
             !dir.path().join("pid").join("seakarr.pid").exists(),
             "a run with a failed album must still release the PID lock"
         );
+    }
+
+    #[test]
+    fn a_cancelled_batch_line_is_not_recorded_as_a_failure() {
+        // Ctrl+C during a batch album is the operator's interrupt, not an album failure.
+        // Recording it would put a phantom failure in the summary and would leave the
+        // run looking as if it had tried and failed.
+        let config = Config::default();
+        let cancel = AtomicBool::new(false);
+        let mut report = seakarr::report::RunReport::new();
+        let mut explained = BTreeSet::new();
+
+        let stop = record_batch_outcome(
+            "Artist",
+            Some("Album"),
+            seakarr::report::AlbumOutcome::Failed {
+                reason: "download error: download cancelled by user".into(),
+            },
+            &config,
+            &cancel,
+            &mut report,
+            &mut explained,
+        );
+
+        assert!(stop, "the run must stop at the interrupt");
+        assert_eq!(
+            report.failed_count(),
+            0,
+            "an interrupt is not a failed album"
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_line_is_recorded_and_the_run_continues() {
+        let config = Config::default();
+        let cancel = AtomicBool::new(false);
+        let mut report = seakarr::report::RunReport::new();
+        let mut explained = BTreeSet::new();
+
+        let stop = record_batch_outcome(
+            "Artist",
+            Some("Album"),
+            seakarr::report::AlbumOutcome::Failed {
+                reason: "no peer accepted the transfer".into(),
+            },
+            &config,
+            &cancel,
+            &mut report,
+            &mut explained,
+        );
+
+        assert!(!stop, "a genuine failure must not stop the run");
+        assert_eq!(report.failed_count(), 1, "the failure must be recorded");
     }
 
     #[tokio::test]

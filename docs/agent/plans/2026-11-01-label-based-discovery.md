@@ -8,9 +8,20 @@
 
 **Architecture:** Two new modules with one job each. `src/discography/label.rs` owns label identity (name-or-MBID parse, search, safe resolution) and the cached release catalogue (browse plus pagination guards). `src/label_discover.rs` owns pure selection: merge labels, filter by type and `--since`, dedupe, order, and split present from missing against `LibraryIndex`. `src/runner.rs` gains one orchestration function that reuses `process_album` with `LibraryTarget::StagingOnly`; the library-derived artist sweep is untouched. Shared cache machinery in `src/discography/mod.rs` is widened to be reusable by both sources.
 
-**Tech Stack:** Rust 2024, `clap` v4 (derive), `rusqlite`, `tokio`, `serde`/`serde_json`, `tracing`, `wiremock` for provider tests, `tempfile` for integration fixtures. No new dependency.
+**Tech Stack:** Rust 2021, `clap` v4 (derive), `rusqlite`, `tokio`, `serde`/`serde_json`, `tracing`, `wiremock` for provider tests, `tempfile` for integration fixtures. No new dependency.
 
 **Spec:** `docs/agent/specs/2026-11-01-label-based-discovery-design.md` (approved, commit `0ba3d99`).
+
+**Status:** implemented and released as `v0.34.0`. The code blocks in the task list below are
+working notes from before implementation; several were superseded during review (the library
+scan failure aborts instead of scanning on, the circuit breaker ignores a fresh cache hit, the
+cache payload carries no `label_name`, and `from_parts` re-parses so a near-miss UUID stays
+malformed). `src/discography/label.rs`, `src/label_discover.rs` and the spec's
+"Corrected during review" block are authoritative; do not re-derive the code from these
+snippets. The task checkboxes below were used as
+working notes and are left unticked; this line is the authoritative status. Released with
+open review residuals recorded in
+`docs/agent/reviews/2026-11-02-label-based-discovery-residuals.md`.
 
 ---
 
@@ -4374,14 +4385,14 @@ cargo fmt --check
 
 Expected: PASS on all three. Fix any clippy complaint properly rather than silencing it, except where the existing file already uses an `#[allow]` for the same reason.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/runner.rs src/main.rs
 git commit -m "feat: sweep a record label and stage the albums the library lacks"
 ```
 
-- [ ] **Step 7: Re-run the CLI and schedule tests, which were blocked in Task 12**
+- [ ] **Step 8: Re-run the CLI and schedule tests, which were blocked in Task 12**
 
 ```bash
 cargo test --lib main::tests 2>&1 | tail -5
