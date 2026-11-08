@@ -1,0 +1,496 @@
+<skill name="release-review" location="/data/plugins/ai/copilot/binhex/skills/build/pi/release-review/SKILL.md">
+References are relative to /data/plugins/ai/copilot/binhex/skills/build/pi/release-review.
+
+# Code Review
+
+## Overview
+
+Automated two-phase review that runs end-to-end:
+
+1. **Full Review** — review-fix-review loop with two reviewer sub-agents,
+   continuing until both return zero issues in the same round (every severity is
+   fixed)
+2. **Code Smell Review** — analyse all files for five categories of code smells; fix every smell found
+
+Progress is narrated throughout. Fully automated — no upfront prompt.
+
+**Core principle:** Full Review eliminates every finding, of every severity,
+before Code Smell Review eliminates structural problems. The loop is driven by
+whether issues remain, not by a round count.
+
+## Prerequisite: Harness and Project Context
+
+Before beginning, ensure both prerequisites are loaded:
+
+1. If `Harness status: loaded.` is not already present as an emitted status line, load and run `harness`, then return here.
+2. If `Project context status: loaded.` is not already present as an emitted status line, load and run `get-context`,
+   then return here.
+
+When invoked from a chain, preserve these status markers and do not repeat either prerequisite.
+
+## Configuration
+
+| Variable | Source | Meaning |
+| ---------- | -------- | --------- |
+| `REVIEWER_A_MODEL` | `harness.model.reviewer_a` | First reviewer model |
+| `REVIEWER_B_MODEL` | `harness.model.reviewer_b` | Second reviewer model |
+
+Set these from harness values after detection (see `harness` "Models by Role"):
+
+```text
+REVIEWER_A_MODEL = harness.model.reviewer_a
+REVIEWER_B_MODEL = harness.model.reviewer_b
+```
+
+Override by editing the skill or setting before invocation.
+
+## Review Gate Status
+
+Immediately emit this standalone line before starting the review:
+
+`REVIEW_GATE_STATUS: RUNNING`
+
+Do not emit `CLEAN` until the final reviewer round reports zero issues, all
+required fixes are applied and verified, the code-smell phase is complete, and
+its full verification passes.
+
+If the circuit breaker trips at `CIRCUIT_BREAKER_ROUNDS` (10), write the residual
+ledger and emit — downstream steps may proceed:
+
+`REVIEW_GATE_STATUS: UNRESOLVED`
+
+If a reviewer fails, or a required phase fails or is interrupted so that no
+usable review result exists, emit — downstream steps must stop:
+
+`REVIEW_GATE_STATUS: BLOCKED`
+
+`UNRESOLVED` means findings were found, fixed and recorded. `BLOCKED` means no
+review result exists. Never substitute one for the other.
+
+## Required-Phase Failure
+
+A **required phase** is any gate or phase this skill must run: the reviewer
+rounds, plus every further phase this skill defines below.
+
+| What happened | Action |
+| -------------- | -------- |
+| A required gate or phase **ran and failed**, and the failure cannot be fixed | Emit `REVIEW_GATE_STATUS: BLOCKED`. Do not claim the review is complete or the code safe to integrate |
+| A required gate or phase could not run because the project has no configured tool | Record it as NOT APPLICABLE with the reason, following `qa-gate`'s Missing-Tool Policy. This does not block `CLEAN` |
+| A configured required gate could not run — missing configured tool or unparsable config | Emit `REVIEW_GATE_STATUS: BLOCKED`. Do not claim the review is complete or the code safe to integrate |
+| A configured required gate could not run, and the user waived it under `qa-gate`'s Pre-commit Tool Flow | Name the waiver in the report; this does not block `CLEAN` |
+| A phase was **interrupted** or returned nothing usable | Emit `REVIEW_GATE_STATUS: BLOCKED` |
+
+`BLOCKED` means no usable review result exists. Never emit `CLEAN` over a phase
+that failed or never finished. Exactly one terminal marker is emitted per run:
+ending with `REVIEW_GATE_STATUS: RUNNING` still current is a violation.
+
+## Round Cap — Hard End at 10
+
+`CIRCUIT_BREAKER_ROUNDS = 10`. Round 10 is the **last** round, whatever it
+reports. At the end of round 10:
+
+| Round 10 reported | Action |
+| ------------------ | -------- |
+| No findings of any severity | Exit on the skill's normal clean path. **No ledger is written.** |
+| Any finding, any severity — HIGH, MEDIUM or LOW | Write the residual ledger, then emit `REVIEW_GATE_STATUS: UNRESOLVED` |
+
+Then stop. **No extra round:** do not start an 11th round, and do not re-review
+round 10's fixes — recording them is what the cap is for. LOW findings are
+recorded like every other severity.
+
+Write the ledger **before** the marker: the marker carries no detail, so a cap
+that ends without a ledger is a set of lost findings.
+
+## Residual Ledger
+
+Written only when round 10 ends the loop with findings. **Do not commit it** —
+the finishing step commits it with the branch.
+
+- **Path:** `docs/agent/reviews/YYYY-MM-DD-<topic>-residuals.md`, following the
+  same `docs/agent/` convention as specs and plans
+
+| Section | Content |
+| -------- | --------- |
+| Header | Branch, commit, round reached, the cap, and both reviewer models |
+| Findings | One row per finding from round 10, every severity: severity, `file:line`, description |
+| Status | `applied, not independently re-reviewed` for a fix made after the last reviewer pass; `not fixed` if it was not applied |
+| Verification gap | State that round 10's fixes were never re-reviewed |
+
+**Lifecycle:** a later fix run may take these findings on. `review-triage` names the ledgers
+it accepts in `REVIEW_TRIAGE_STATUS: PLAY <paths>` and stamps each with a `Triage: PLAY`
+line; `finalising` then deletes a named ledger once every finding in it is verified resolved,
+or shrinks it down to the rows still open. A stamp alone is not consent for a later run.
+
+Record every finding. A finding left out of the ledger is a finding lost.
+
+Only emit `REVIEW_GATE_STATUS: CLEAN` at the final completion gate below. The
+marker must be an actual response line, not text merely quoted from this skill.
+
+---
+
+## Severity Rubric
+
+Both reviewers tag every finding HIGH, MEDIUM, or LOW. You normalise the tags
+after de-duplication; disagreement or uncertainty takes the higher severity.
+
+| Severity | Definition |
+| -------- | ---------- |
+| **HIGH** | Correctness bugs that produce wrong results or crashes; security vulnerabilities (injection, path traversal, auth bypass, secret exposure); data loss or corruption; race conditions and deadlocks; API contract breaks; unhandled failure on a critical path. |
+| **MEDIUM** | Logic errors with limited blast radius; missing edge-case or error handling; resource leaks; performance regressions on realistic input; missing tests for new behaviour; incorrect docs for changed behaviour; fragile assumptions. |
+| **LOW** | Style, naming, formatting, comment/docstring wording, and preference-level refactors with no behavioural impact. |
+
+Every finding gates the Full Review loop, whatever its severity: the loop runs
+until a round reports zero issues from both reviewers. Severity sets the fix
+order (HIGH → MEDIUM → LOW) and how the findings are reported — it never
+decides whether another round is needed.
+
+---
+
+## Phase 1: Full Review
+
+### Full-1: Gather Files
+
+Collect all relevant files from the repository. Exclude build artifacts, dependencies, and generated files.
+
+```bash
+# Code files
+find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.sh" -o -name "*.rb" -o -name "*.php" \) \
+  ! -path "*/node_modules/*" ! -path "*/vendor/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*" ! -path "*/__pycache__/*" ! -path "*/target/*" ! -path "*/.next/*"
+
+# Test files
+find . -type f \( -name "*test*" -o -name "*spec*" \) \
+  ! -path "*/node_modules/*" ! -path "*/vendor/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*"
+
+# Documentation files
+find . -type f \( -name "*.md" -o -name "*.rst" -o -name "*.txt" \) \
+  ! -path "*/node_modules/*" ! -path "*/vendor/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*"
+```
+
+Collect the relative paths of all gathered files into a manifest. Do NOT read file contents — the reviewers will read
+files themselves using the `read` tool. If the repository is very large (100+ files), trim to the most important files
+(entry points, core modules, recent changes) and note that the manifest is a subset. Never summarise or describe file
+contents — pass paths only.
+
+Capture the absolute repo root:
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+```
+
+### Full-2: Run the Loop
+
+Announce: `"🔍 Phase 1: Full Review — starting review-fix-review loop."`
+
+```text
+CIRCUIT_BREAKER_ROUNDS = 10   # safety valve only: any issue gates every round
+current_round = 0
+issues = 1                    # initialise > 0 to force at least one round
+
+WHILE issues > 0:
+
+  current_round += 1
+  Announce: "🔍 Full review — round {current_round}. Dispatching Reviewer A and Reviewer B..."
+
+  1. Dispatch BOTH reviewer sub-agents in **parallel** using the harness workflow
+     form below (fan out one entry per reviewer). Do NOT dispatch them one at a time.
+
+     **Exact call (pi harness) — copy this structure exactly, fill in the prompt.**
+     A dispatch needs **two separate acts** in one reply. (1) Write the block
+     below as the **one** `js workflow` block, opening the fence at the start of
+     a line (no indentation). (2) Invoke the `subagent` tool with
+     `workflow: true` and `async: true` as a **real tool call**.
+
+     Writing `subagent(...)` in a code fence, an inline span, or prose produces
+     documentation only: it starts nothing and returns no workflow ID, while the
+     review step still looks complete. Reproducing the shape of an example is
+     not dispatching.
+
+     ```js workflow
+     const results = await runs.all([
+       {
+         key: "reviewer-a",
+         agent: "reviewer",
+         task: "Review all the provided code files...",  // <-- fill with full prompt
+         model: "${REVIEWER_A_MODEL}"
+       },
+       {
+         key: "reviewer-b",
+         agent: "reviewer",
+         task: "Review all the provided code files...",  // <-- same prompt, full text
+         model: "${REVIEWER_B_MODEL}"
+       }
+     ]);
+     return results;
+     ```
+
+     #### No workflow ID means the dispatch did NOT happen
+
+     The tool returns a workflow ID. Inside this chain step, make `bg_wait` on
+     that exact ID with `stopOnAttention: false` the last action before the turn
+     ends.
+
+     No workflow ID in your turn means nothing launched. Re-invoke the
+     `subagent` tool; never `bg_wait` a placeholder or guessed ID. If repeated
+     invocations return no ID, stop and tell the user the launch failed — never
+     report a review over code that was never reviewed.
+
+     `runs.all` still starts both reviewers in parallel. `async: true` follows
+     the Pi protocol; exact-run `bg_wait` before the turn ends keeps this chain
+     step from ending before both results arrive. **Because this review chain
+     needs the results now, ordinary native-notification waiting does not
+     apply.** Do the independent work that does not need the results, but do not
+     send a progress-only response, invoke another skill, or let the step end
+     between launch and wait.
+
+     **Do NOT use nested `async function`** — use top-level `await` only.
+
+
+     **Structural rules (violating these causes malformed calls):**
+     - `runs.all` must be an array of **exactly two objects** — no bare strings
+     - Each object MUST have ALL four keys: `key`, `agent`, `task`, `model`
+     - The `agent`, `model`, and `context` fields must NOT appear outside the `tasks` array
+     - The two `model` values must be DIFFERENT (`REVIEWER_A_MODEL` vs `REVIEWER_B_MODEL`)
+
+     Each reviewer receives: the repo root path and the file path manifest.
+
+     **Reviewer prompt (identical for both):**
+     "REPO_ROOT: <absolute path>
+
+     FILE MANIFEST (read every file — do NOT skip, summarise, or skim):
+     <one relative path per line>
+
+     Use the read tool to read the FULL contents of every file in the manifest.
+     Then review all code, test files, and documentation for bugs, logic errors,
+     security issues, correctness problems, and maintainability concerns.
+     Be adversarial — assume the code is wrong until proven otherwise.
+     Tag every issue HIGH, MEDIUM, or LOW using the severity rubric; when unsure
+     between two levels, choose the higher. List every issue with its severity
+     and file:line references. Also review tests for coverage gaps and
+     documentation for accuracy and completeness.
+
+     CRITICAL: You MUST read every file. Do NOT summarise, describe, or infer
+     code from filenames or paths. A summary misses bugs. If a file is large,
+     read it in chunks — do not skip it."
+
+     Follow `harness` dispatch behavior for your harness.
+     In Pi, launch this result-dependent loop with `async: true`, capture the
+     exact workflow ID, then make `bg_wait` with `stopOnAttention: false` the
+     last action before the turn ends. Do the independent work that does not
+     need the results, but do not send a progress-only response, invoke
+     tech-debt/QA/finalising, or end the chain step first.
+     After terminal status, collect both results and resume this review loop.
+     Do not de-duplicate, fix, verify, or start dependent work first, and do not
+     end while `REVIEW_GATE_STATUS: RUNNING` remains current.
+     Re-dispatch on `failed`/`cancelled` before de-dup.
+     Only proceed once both results are collected.
+
+  2. Announce findings once both results are collected:
+     "Reviewer A found N issues: [brief list]"
+     "Reviewer B found M issues: [brief list]"
+
+  3. De-duplicate, then normalise every finding's severity against the severity
+     rubric. Disagreement or uncertainty takes the higher severity. Set
+     issues = count of unique issues of ALL severities this round; keep the
+     HIGH/MEDIUM/LOW split for fix order and reporting.
+     Announce: "📋 De-duplicated: H high, M medium, L low — [list]"
+
+  4. IF issues > 0:
+       Fix ALL issues — HIGH first, then MEDIUM, then LOW — announce
+       each: "🔧 Fixing: [issue]"
+       This review step retains ownership; never hand findings to QA,
+       finalising, or another chain step.
+       IF current_round >= CIRCUIT_BREAKER_ROUNDS:
+         # Round 10 is the last round, whatever it reports.
+         Announce: "⛔ Round cap reached: round 10 of CIRCUIT_BREAKER_ROUNDS."
+         Announce: "Findings from round 10: [list]. All were addressed but could not be verified by reviewers."
+         # Write the residual ledger FIRST — the marker itself carries no detail.
+         Write the residual ledger (see "Round Cap — Hard End at 10" above).
+         Announce: "📋 Residuals recorded in <ledger path>. Emitting REVIEW_GATE_STATUS: UNRESOLVED — downstream steps may proceed."
+         Emit standalone: `REVIEW_GATE_STATUS: UNRESOLVED`
+         STOP the loop — the cap is reached. Skip the remaining phases of this
+         skill; the recorded residuals travel with the branch and the chain continues.
+       ELSE:
+         Announce: "✅ Round current_round complete — fixes applied, re-running reviewers..."
+     ELSE:
+       # Zero findings from either reviewer: the loop exits.
+       Announce: "✅ Full review complete — both reviewers returned zero issues."
+```
+
+Do not emit `REVIEW_GATE_STATUS: CLEAN` here. The code-smell phase and final
+verification must pass first.
+
+### Full-3: The Iron Law
+
+```text
+DO NOT STOP THE LOOP WHILE ANY AGENT REPORTS ANY ISSUE
+— unless the 10-round circuit breaker trips (which emits UNRESOLVED, never CLEAN).
+```
+
+**No severity is exempt.** Every LOW, MEDIUM, and HIGH finding forces another
+round until a round returns zero issues from both reviewers. Severity only sets
+the fix order.
+
+**No exceptions:**
+
+- Not for "it's just a style issue", "it's only a variable name", or "it's noise, not signal" — LOW gates the loop too
+- Not for "we're running behind"
+- Not for "I feel like I've done enough rounds" (only a zero-issue round ends the loop)
+- Not for "the circuit breaker is close, I'll call it done" (the breaker emits UNRESOLVED)
+- Not for "round 10 only reported LOW findings, so it counts as clean" (at the
+  cap, LOW findings are recorded like every other severity)
+- Not for "the verification tool is missing, so the phase counts as done" (only a
+  tool the project never configured is NOT APPLICABLE; a configured gate that
+  could not run, or that ran and failed, is `BLOCKED` — unless the user waived a
+  pre-commit gate under `qa-gate`'s Pre-commit Tool Flow and the report names it)
+
+### Full-4: Report
+
+Report findings in chat only:
+
+```text
+## 🔍 Full Review — Round N
+### Reviewer A — N issues
+### Reviewer B — M issues
+### 📋 De-duplicated — K unique issues
+```
+
+---
+
+## Full-5: Rationalizations — STOP
+
+If you catch yourself thinking any of these, stop and re-read the skill:
+
+| Excuse/Red Flag | Reality |
+| -------- | --------- |
+| "This is too much content — let me summarise the codebase instead" | Summaries miss bugs. Pass paths; reviewers read files themselves. Never summarise. |
+| "I'll include the key files' contents and summarise the rest" | Every file must be read in full. Passing some inline and some as paths creates ambiguity about which are complete. |
+| "The reviewers have read tools, so I'll just give them a high-level overview" | Reviewers need the file manifest, not an overview. Descriptions bias reviewers and mask bugs. |
+| "I'll include a brief description of each file so reviewers know what to expect" | File descriptions are summaries. They bias reviewers and hide surprises. Paths only. |
+| "Let me read the files myself first to identify the important areas" | You are the orchestrator, not a reviewer. Reading files yourself wastes time and leads to biased prompts. Send paths. |
+| "The manifest is long — I'll pass a subset manually" / "I'll pick the most relevant files myself" | Run the find command and pass the FULL output. Manual selection introduces bias and skips files. If trimming, use the 100+ rule — not personal judgment. |
+| "The reviewers found 2 MEDIUMs, but the change is small so I'll stop" | Change size never ends the loop. Only a round with zero findings does. |
+| "This MEDIUM is really a LOW" | Severity orders the fixes and the report; every finding gates the loop regardless of label. Normalise anyway — uncertainty takes the higher severity. |
+| "The circuit breaker is close, I'll accept the remaining LOW" | The breaker emits `UNRESOLVED` only after the residual ledger is written. The fix is applied but never re-reviewed, so the LOW is recorded — not clean, and not verified. |
+| "Round 10 reported only LOW findings, so it counts as clean." | At the cap every severity is recorded. A round-10 LOW goes in the ledger like any other finding, so the marker is `UNRESOLVED`, not `CLEAN`. |
+| "UNRESOLVED means the release is reviewed." | `UNRESOLVED` is a completion with residuals. Every round-10 finding gets a ledger row, and round 10's fixes are explicitly unverified. |
+| "The verification stack could not run because the tool is missing, so the review is BLOCKED." | If the project never configured the tool it is NOT APPLICABLE; if it did, it is `BLOCKED`. A configured tool you did not run is never a clean result, unless the user waived a pre-commit gate under `qa-gate`'s Pre-commit Tool Flow and the report names the waiver. |
+| "The code-smell phase finished, so I can emit CLEAN even though 2 tests fail." | `CLEAN` requires the full verification stack to pass. A failed required phase emits `BLOCKED`. |
+| "The cap is close, so I'll emit UNRESOLVED now." | `UNRESOLVED` is valid only once `current_round >= CIRCUIT_BREAKER_ROUNDS`. |
+| "UNRESOLVED and BLOCKED are both terminal, so they are equivalent." | `UNRESOLVED` records findings and continues the chain; `BLOCKED` means no review result exists and the chain stops. |
+| "`UNRESOLVED` still needs a human to re-run the loop until `CLEAN`." | No. `UNRESOLVED` is terminal: the cap ended the loop deliberately. Surface the residuals and continue. |
+| "Only LOW findings remain, so I can exit" | No. Release review loops until a round reports zero issues from both reviewers — fix the LOWs and re-run. |
+| "LOW findings don't matter before a release" | Every severity gates this loop. A LOW is still a defect in shipped code. |
+| "The dispatch is written in my reply, so the review is running" | Reply text is not a tool call. Only a workflow ID returned by the `subagent` tool proves the reviewers launched. |
+| "No workflow ID came back, but the prompts looked right" | No ID means nothing launched. Re-invoke the tool. |
+
+---
+
+## Phase 2: Code Smell Review
+
+### Smell-1: Gather Files
+
+Same file-gathering process as Full-1: collect paths into a manifest, do NOT read contents. Reuse the manifest already
+collected from Full-1 if possible, or re-run the find commands to rebuild it.
+
+### Smell-2: Analyse and Fix
+
+Announce: `"🔍 Phase 2: Code Smell — analysing all files for five categories."`
+
+Scope includes source, tests, scripts, CI/workflow files, configs, and migrations. Exclude only vendored third-party
+code, lockfiles, binaries, and generated artifacts. For monorepos, default to whole repo.
+
+Check each file for all five categories and fix every smell found:
+
+| Category | Smells to detect and fix |
+| ---------- | -------------------------- |
+| **Bloaters** | Long method/function, Large class (God Object), Long parameter list (>3–4 args), Data clumps |
+| **Dispensables** | Duplicate code, Dead code, Commented-out code, Speculative generality (YAGNI) |
+| **OO Abusers** | Primitive obsession, Switch/if-else chains on type, Refused bequest |
+| **Couplers** | Feature envy, Inappropriate intimacy, Message chains, Middle man |
+| **Other** | Magic numbers/strings, Global/mutable data, Poor naming (x, data1, retVal), Comments overload, Ignored/empty catch blocks |
+
+**Tool output alone is not sufficient** — manually review for Feature Envy, Inappropriate Intimacy, Poor Naming, and
+Refused Bequest.
+
+**Do NOT add ignores, suppressions, or exclusions** to work around any code smells. Fix the root cause.
+
+If a file cannot be accessed, stop and report it.
+
+### Smell-3: Run Full Test Suite
+
+Search the codebase for disabled checks (`# type: ignore`, `# noqa`, `@ts-ignore`, etc.). Remove them and fix the
+underlying issues wherever possible.
+
+Run the language-appropriate full verification stack:
+
+| Language | Commands |
+| ---------- | ---------- |
+| **Python** | `ruff check --fix`, `mypy .`, `pytest`, `pre-commit run --all-files` |
+| **JavaScript/TypeScript** | `eslint --fix`, `tsc --noEmit`, `jest` |
+| **Java** | `checkstyle`, `spotbugs`, `mvn test` |
+| **Go** | `go vet ./...`, `staticcheck`, `go test ./...` |
+
+If `pre-commit` is absent, use `qa-gate`'s Fallback: Pre-commit Tool Flow to get
+the user's choice — ephemeral run, install with `uv` or `pipx` only, or a
+recorded waiver — and record which. Never install it here, never into the
+project environment, and never drop the entry silently.
+
+Fix **all** issues revealed. Repeat until the full suite is clean.
+
+**Do NOT** get green by: disabling tests, weakening assertions, adding skip/xfail/noqa/ts-ignore, or relaxing linter rules.
+
+### Smell-4: Report
+
+```text
+## 🔍 Code Smell Review — Results
+
+### Files Analysed: N
+
+### Smells Found and Fixed by Category
+
+#### Bloaters (K fixed)
+- file:line — description
+
+#### Dispensables (L fixed)
+- file:line — description
+
+#### OO Abusers (M fixed)
+- file:line — description
+
+#### Couplers (N fixed)
+- file:line — description
+
+#### Other (P fixed)
+- file:line — description
+
+### Test Suite
+✅ All tests passing / ⚠️ N failures remain
+```
+
+---
+
+## Completion
+
+Before announcing completion, verify that:
+
+- the final full-review round returned zero issues from both reviewers;
+- no finding was left unverified (the circuit breaker did not trip);
+- the code-smell phase finished; and
+- the full verification stack passed, each gate with no configured tool was
+  recorded NOT APPLICABLE with its reason, or a pre-commit gate the user waived
+  under `qa-gate`'s Pre-commit Tool Flow is named in the report.
+
+Only when all four conditions hold, emit this standalone line:
+
+`REVIEW_GATE_STATUS: CLEAN`
+
+If the circuit breaker tripped, emit `REVIEW_GATE_STATUS: UNRESOLVED` instead —
+after writing the residual ledger. For any other required phase, follow
+"Required-Phase Failure" above — a phase that ran and failed or was interrupted
+emits `REVIEW_GATE_STATUS: BLOCKED`, and do not claim that release review is
+complete or safe to integrate.
+
+Then announce: `"✅ Code Review complete — Full Review and Code Smell analysis finished."`
+
+All findings are reported in chat only. No PR comments are posted.
+</skill>

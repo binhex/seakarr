@@ -1,0 +1,76 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M6Y1WQR4H6MZJRCP10M43ZYE",
+  "session_id": "01a198d0-7dec-7383-a777-24ecdc4f11d0",
+  "strategy": "manual-commit",
+  "created_at": "2026-11-08T17:04:45.103066161Z",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "save_step_count": 1,
+  "files_touched": [
+    "README.md",
+    "docs/agent/plans/2026-11-01-label-based-discovery.md",
+    "docs/agent/specs/2026-11-01-label-based-discovery-design.md",
+    "src/discography/musicbrainz.rs",
+    "src/download.rs",
+    "src/filter.rs",
+    "src/label_discover.rs",
+    "src/runner.rs",
+    "src/scanner.rs"
+  ],
+  "agent": "Pi",
+  "model": "deepseek-v4.1-flash",
+  "turn_id": "5e456962aac2",
+  "checkpoint_transcript_start": 1110,
+  "transcript_lines_at_start": 1110,
+  "compact_transcript_start": 502,
+  "token_usage": {
+    "input_tokens": 1423720,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 69597568,
+    "output_tokens": 51770,
+    "api_call_count": 100
+  },
+  "redaction": {
+    "replacements": 30,
+    "layers": {
+      "betterleaks": 26,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 4,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "pi-skill-release-review-2026-11-03T12:06:34.536Z-0",
+      "event_type": "prompt_invocation",
+      "skill": {
+        "name": "release-review"
+      },
+      "source": {
+        "agent": "pi",
+        "signal": "input_slash_command",
+        "confidence": "explicit"
+      },
+      "turn_id": "5e456962aac2",
+      "timestamp": "2026-11-03T12:06:34.536Z",
+      "native": {
+        "command": "/skill:release-review"
+      },
+      "collapse": {
+        "target": "user_message",
+        "label": "/skill:release-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 13
+  }
+}
