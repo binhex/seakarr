@@ -719,7 +719,12 @@ fn forward_transfer_status(
                         }
                     }
                 } else {
-                    tracing::debug!("Bridge status for {safe_filename}: {status:?}");
+                    // A `Failed` status carries a peer-supplied reason verbatim, so the
+                    // Debug rendering is sanitised like every other peer text sink.
+                    tracing::debug!(
+                        "Bridge status for {safe_filename}: {}",
+                        crate::formatting::single_line(&format!("{status:?}"))
+                    );
                 }
                 let mapped = ss_download_status_to_domain(status);
                 let terminal = matches!(
@@ -980,7 +985,11 @@ impl SoulseekClient for RealClient {
         tokio::task::spawn_blocking(move || {
             // Keep the vendor Download alive for the entire bridge lifetime.
             let _keep = &_vendor_download;
-            tracing::debug!("Bridge started for {bridge_filename} from {bridge_username}");
+            tracing::debug!(
+                "Bridge started for {} from {}",
+                crate::formatting::single_line(&bridge_filename),
+                crate::formatting::single_line(&bridge_username)
+            );
             // Evaluate once: isatty is a syscall per call, and the
             // interactive/non-interactive decision does not change mid-transfer.
             let interactive = is_interactive();
@@ -994,7 +1003,9 @@ impl SoulseekClient for RealClient {
                 download_attempt_id,
             );
             tracing::debug!(
-                "Bridge finished for {bridge_filename} from {bridge_username}, cleared attempt {download_attempt_id}"
+                "Bridge finished for {} from {}, cleared attempt {download_attempt_id}",
+                crate::formatting::single_line(&bridge_filename),
+                crate::formatting::single_line(&bridge_username)
             );
         });
 

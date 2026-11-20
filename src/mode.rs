@@ -522,7 +522,8 @@ mod tests {
 
     /// The CLI shape of a label sweep. The multi-label and multi-type spellings
     /// arrive as separate elements: splitting on the comma is clap's job, so this
-    /// constructor hands `mode` what clap would.
+    /// constructor hands `mode` what clap would. It can also pass an unsplit,
+    /// comma-containing element, which a library caller can build without clap.
     fn label_cli(labels: &[&str], release_types: &[&str], since: Option<&str>) -> CliOverrides {
         CliOverrides {
             mode: Some("discover".into()),
@@ -1338,11 +1339,8 @@ mod tests {
     #[test]
     fn a_label_plan_carries_its_labels_types_and_bound() {
         let config = label_config();
-        let plan = resolve_execution_plan(
-            &config,
-            &label_cli(&["Hospital Records,Med School"], &[], None),
-        )
-        .expect("a label sweep is a valid discover plan");
+        let plan = resolve_execution_plan(&config, &label_cli(&["Hospital Records"], &[], None))
+            .expect("a label sweep is a valid discover plan");
         let ExecutionPlan::Discover {
             labels,
             release_types,
@@ -1355,12 +1353,30 @@ mod tests {
         assert_eq!(
             labels.len(),
             1,
-            "the value delimiter is clap's job; mode sees one element here"
+            "a single --label value stays one label on this path"
         );
-        assert_eq!(labels[0].input, "Hospital Records,Med School");
+        assert_eq!(labels[0].input, "Hospital Records");
         assert!(release_types.is_none());
         assert!(since.is_none());
         assert!(artist.is_none());
+    }
+
+    #[test]
+    fn a_comma_is_not_split_by_mode_so_a_library_caller_keeps_its_element() {
+        // Splitting is clap's job (`value_delimiter = ','`). A caller that builds the
+        // arguments itself never passes through clap, so the plan has to preserve the element
+        // verbatim rather than inventing a split of its own.
+        let config = label_config();
+        let plan = resolve_execution_plan(
+            &config,
+            &label_cli(&["Hospital Records,Med School"], &[], None),
+        )
+        .expect("a label sweep is a valid discover plan");
+        let ExecutionPlan::Discover { labels, .. } = plan else {
+            panic!("expected a discover plan");
+        };
+        assert_eq!(labels.len(), 1, "mode must not split a pre-split argument");
+        assert_eq!(labels[0].input, "Hospital Records,Med School");
     }
 
     #[test]

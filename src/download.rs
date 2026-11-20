@@ -141,8 +141,9 @@ pub async fn download_file_for_candidate(
 ) -> Result<(PathBuf, f64)> {
     if config.max_queue_length == 0 && peer_slots == 0 {
         return Err(SeakarrError::QueueTimeout(format!(
-            "{} from {username} requires an advertised free slot when max_queue_length=0",
-            file.name
+            "{} from {} requires an advertised free slot when max_queue_length=0",
+            crate::formatting::single_line(&file.name),
+            crate::formatting::single_line(username)
         )));
     }
 
@@ -205,7 +206,9 @@ pub async fn download_file_for_candidate(
                 return Err(SeakarrError::Download("download cancelled by user".into()));
             }
             tracing::info!(
-                "Retrying download of {basename} from {username} (attempt {attempt}/{})",
+                "Retrying download of {} from {} (attempt {attempt}/{})",
+                crate::formatting::single_line(basename),
+                crate::formatting::single_line(username),
                 config.max_retries
             );
             tokio::time::sleep(Duration::from_secs(config.retry_delay_secs)).await;
@@ -448,7 +451,10 @@ async fn expire_stalled_transfer(
     let error = if cancellation_requested(cancel) {
         SeakarrError::Download("download cancelled by user".into())
     } else {
-        tracing::warn!("Download of {basename} timed out after {timeout_secs}s");
+        tracing::warn!(
+            "Download of {} timed out after {timeout_secs}s",
+            crate::formatting::single_line(basename)
+        );
         SeakarrError::Download("download timed out".into())
     };
     stop_with_error(handle, bar, error).await
@@ -486,7 +492,10 @@ async fn expire_queue_wait(
     let error = if cancellation_requested(cancel) {
         SeakarrError::Download("download cancelled by user".into())
     } else {
-        tracing::warn!("Download queue timeout: {reason}");
+        tracing::warn!(
+            "Download queue timeout: {}",
+            crate::formatting::single_line(&reason)
+        );
         SeakarrError::QueueTimeout(reason)
     };
     stop_with_error(handle, bar, error).await
@@ -505,7 +514,10 @@ async fn reject_queued_attempt(
     let error = if cancellation_requested(cancel) {
         SeakarrError::Download("download cancelled by user".into())
     } else {
-        tracing::warn!("Download queue rejected: {reason}");
+        tracing::warn!(
+            "Download queue rejected: {}",
+            crate::formatting::single_line(&reason)
+        );
         SeakarrError::QueueTimeout(reason)
     };
     stop_with_error(handle, bar, error).await
@@ -518,6 +530,7 @@ async fn reject_queued_attempt(
 /// `None` position means the notice fired on the transfer-start or grace path.
 fn emit_queue_notice(basename: &str, username: &str, position: Option<u32>) {
     let peer = crate::formatting::single_line(username);
+    let basename = crate::formatting::single_line(basename);
     match position {
         Some(position) => {
             tracing::info!("Download queued: {basename} from {peer} - position {position}");
@@ -543,6 +556,7 @@ fn emit_download_started(
     last_position: Option<u32>,
 ) {
     let peer = crate::formatting::single_line(username);
+    let basename = crate::formatting::single_line(basename);
     if last_position.is_none() && wait <= IMMEDIATE_START_WINDOW {
         tracing::info!("Download started: {basename} from {peer} immediately (free slot)");
         return;
@@ -656,13 +670,23 @@ impl QueueWait {
     ) -> Option<String> {
         let position = position.filter(|position| *position > 0)?;
         if let Some(detail) = queue_position_rejection(position, config.max_queue_length) {
-            return Some(format!("{basename} from {username} {detail}"));
+            // The reason is stored on the error and printed in the run summary, so the
+            // peer-supplied parts are sanitised here rather than only at the print sites.
+            return Some(format!(
+                "{} from {} {detail}",
+                crate::formatting::single_line(basename),
+                crate::formatting::single_line(username)
+            ));
         }
         if !self.notice_emitted {
             emit_queue_notice(basename, username, Some(position));
             self.notice_emitted = true;
         } else if self.observed_position != Some(position) {
-            tracing::debug!("Queue position for {basename} from {username}: {position}");
+            tracing::debug!(
+                "Queue position for {} from {}: {position}",
+                crate::formatting::single_line(basename),
+                crate::formatting::single_line(username)
+            );
         }
         if let Some(display) = progress {
             let label = crate::progress::queue_label(basename, username, Some(position));
@@ -1046,7 +1070,11 @@ async fn download_once(
         // enqueue, so this is a refresh; the transfer-started gate is load-bearing
         // because this loop keeps polling for progress after the transfer starts.
         if !transfer.has_started() && queue.position_request_is_due(now) {
-            tracing::debug!("Queue position request for {basename} from {username}");
+            tracing::debug!(
+                "Queue position request for {} from {}",
+                crate::formatting::single_line(basename),
+                crate::formatting::single_line(username)
+            );
             // Best-effort: a peer with no peer actor to ask answers false, and the
             // queue limits still bound the wait.
             let _ = client.request_queue_position(username, &file.name).await;
@@ -1169,7 +1197,14 @@ async fn download_once(
                 queue.release_bar(progress);
                 transfer.complete();
                 let dest = dir.join(basename);
-                tracing::info!("Download staged: {basename} -> {}", dest.display());
+                // `dest` re-renders the peer-chosen basename, so it needs the same treatment
+                // the first interpolation gets: `safe_basename` blocks control characters but
+                // not the bidi/format characters `single_line` removes.
+                tracing::info!(
+                    "Download staged: {} -> {}",
+                    crate::formatting::single_line(basename),
+                    crate::formatting::single_line(&dest.display().to_string())
+                );
 
                 // Post-download quality verification: when min_bit_rate or
                 // min_bit_depth is set and the peer did not provide the
@@ -1179,7 +1214,10 @@ async fn download_once(
                 // caller (download_album) cleans up the staging dir and
                 // tries the next candidate.
                 if let Err(e) = verify_downloaded_quality(&dest, file, filters) {
-                    tracing::warn!("Quality verification failed for {basename}: {e}");
+                    tracing::warn!(
+                        "Quality verification failed for {}: {e}",
+                        crate::formatting::single_line(basename)
+                    );
                     let _ = std::fs::remove_file(&dest);
                     return Err(e);
                 }
@@ -1188,7 +1226,8 @@ async fn download_once(
             }
             Ok(Some(DownloadStatus::Failed { reason })) => {
                 tracing::warn!(
-                    "Download of {basename} failed: {}",
+                    "Download of {} failed: {}",
+                    crate::formatting::single_line(basename),
                     crate::formatting::single_line(&reason)
                 );
                 queue.release_bar(progress);
@@ -1220,7 +1259,10 @@ async fn download_once(
             Ok(Some(DownloadStatus::Paused { .. })) => {}
             Ok(None) => {
                 transfer.clear();
-                tracing::warn!("Download channel closed for {basename}");
+                tracing::warn!(
+                    "Download channel closed for {}",
+                    crate::formatting::single_line(basename)
+                );
                 queue.release_bar(progress);
                 return Err(SeakarrError::Download(
                     "download channel closed unexpectedly".into(),
@@ -1361,6 +1403,22 @@ pub(crate) fn largest_album_group<'a>(files: &[&'a FileInfo]) -> Vec<&'a FileInf
         .max_by(|(ak, av), (bk, bv)| av.len().cmp(&bv.len()).then_with(|| ak.cmp(bk)))
         .map(|(_, v)| v)
         .unwrap_or_default()
+}
+
+/// A short digest of a peer-supplied directory name.
+///
+/// Used only to keep two staging disc directories apart when sanitising their names would
+/// otherwise make them identical. Not a security boundary: the staging name is not secret
+/// and the value is never trusted for anything but uniqueness. Stable within one build, but
+/// not across Rust versions - `DefaultHasher`'s algorithm is unspecified, so a toolchain
+/// upgrade can name the same staging directory differently. That costs one warned-about
+/// duplicate copy, never data: classification peels any 8-hex suffix, so the library write
+/// reads either name.
+fn peer_name_digest(name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
 }
 
 /// Grouping key for a file's parent directory, with trailing disc/CD
@@ -1547,12 +1605,15 @@ pub async fn download_album(
         if all_passed == 0 {
             // Show a sample of what we're rejecting to help debug
             for f in candidate.files.iter().take(3) {
-                let ext = f.name.rsplit('.').next().unwrap_or("<none>");
+                // The peer picks the extension too: it is the tail of its own filename, so
+                // it gets the same treatment as the name beside it.
+                let ext =
+                    crate::formatting::single_line(f.name.rsplit('.').next().unwrap_or("<none>"));
                 let safe = safe_basename(&f.name).is_ok();
                 let passes = filter::file_passes_filters(f, filters);
                 tracing::warn!(
-                    "reject: {:?} ext={ext} safe={safe} passes={passes} bitrate={bitrate:?}",
-                    f.name,
+                    "reject: {} ext={ext} safe={safe} passes={passes} bitrate={bitrate:?}",
+                    crate::formatting::single_line(&f.name),
                     bitrate = f.attribs.get(&0),
                 );
             }
@@ -1602,19 +1663,36 @@ pub async fn download_album(
             // AND album folders with an embedded disc marker ("Gold (Disc
             // 1)" / "Gold (Disc 2)"), matching the album_group_key merge
             // that brings the discs together.
+            // The leaf is the file's deepest parent component: a nested share gives
+            // "CD 01" or "Gold (Disc 1)", and a share rooted at the disc folder gives the
+            // same name as its only component. Taking a second `rsplit_once` alone would
+            // return "" there and stage both discs flat, which is the collision this block
+            // exists to prevent - and it is the layout `album_group_key` explicitly merges
+            // into one album (its `None` arm), so the two halves must agree.
             let disc_leaf = file
                 .name
                 .rsplit_once(['/', '\\'])
-                .and_then(|(parent, _basename)| {
-                    parent.rsplit_once(['/', '\\']).map(|(_, leaf)| leaf)
-                })
+                .map(|(parent, _basename)| parent.rsplit(['/', '\\']).next().unwrap_or(parent))
                 .unwrap_or("");
             // Only create a disc subdirectory when the leaf designates a
             // single disc of a multi-disc album. For albums without disc
             // folders the leaf is the album name and the staging dir is
             // already correct — no extra nesting needed.
+            //
+            // The leaf is a peer-controlled path component (an embedded marker admits any
+            // prefix), so it is sanitised before it becomes a directory: a Windows-reserved
+            // character in it would otherwise make `create_dir_all` fail the whole album, and
+            // the library side already sanitises the same name. When sanitising changes the
+            // leaf, a digest of the peer's own name keeps two leaves that sanitise alike in
+            // separate directories - fusing them would recreate the overwrite this block
+            // exists to prevent.
             let disc_dir = if !disc_leaf.is_empty() && discs::is_disc_designator(disc_leaf) {
-                staging_dir.join(disc_leaf)
+                let safe_leaf = crate::organizer::sanitize_component(disc_leaf);
+                if safe_leaf == disc_leaf {
+                    staging_dir.join(safe_leaf)
+                } else {
+                    staging_dir.join(format!("{safe_leaf} [{}]", peer_name_digest(disc_leaf)))
+                }
             } else {
                 staging_dir.to_path_buf()
             };
@@ -1662,9 +1740,10 @@ pub async fn download_album(
                     // the run summary), so a warning here would multiply one
                     // failure across every peer that was tried.
                     tracing::debug!(
-                        "Download of {} from {} failed after retries: {e}",
-                        file.name,
-                        candidate.username
+                        "Download of {} from {} failed after retries: {}",
+                        crate::formatting::single_line(&file.name),
+                        crate::formatting::single_line(&candidate.username),
+                        crate::formatting::single_line(&e.to_string())
                     );
                     stats.tracks.push(TrackRecord {
                         username: candidate.username.clone(),
@@ -1791,6 +1870,48 @@ mod tests {
             min_tracks: 0,
             ..FilterConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_hostile_extension_cannot_reach_the_reject_log_raw() {
+        // The reject sample prints the peer's extension next to the (sanitised) name. A
+        // filename whose last-dot suffix carries an escape sequence must not repaint the
+        // operator's terminal - the rule every other peer-text sink in this file follows.
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![make_file("Gold\\01 - Track.mp3\u{1b}[31m", 900, 10_000_000)],
+        }];
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+
+        let capture = crate::test_support::LogCapture::start();
+        let _ = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        let captured = capture.text();
+        assert!(
+            captured.contains("reject:"),
+            "the sample line must have been emitted, got: {captured}"
+        );
+        // The capture escapes a raw ESC as the text \x1b, so an escaped control character
+        // appearing there means the message carried a real one.
+        assert!(
+            !captured.contains("\\x1b"),
+            "an escape sequence must not reach the log, got: {captured}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3457,6 +3578,217 @@ mod tests {
                 .iter()
                 .any(|p| p.to_string_lossy().contains("CD 02")),
             "CD 02 files must be in a CD 02 subdirectory, got {downloaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_root_level_disc_folders_stage_into_separate_subdirectories() {
+        // A share rooted at the album itself gives the disc folder as the file's only
+        // parent component. The stager used to require a separator above it, so both discs
+        // staged flat and the second disc's "01 - Track.flac" overwrote the first - the
+        // album then reported every track while holding fewer. `album_group_key` already
+        // merges this layout into one album, so the two halves must agree.
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file("CD 01\\01 - Track.flac", 900, 10_000_000),
+                make_file("CD 01\\02 - Track.flac", 900, 10_000_000),
+                make_file("CD 02\\01 - Track.flac", 900, 10_000_000),
+                make_file("CD 02\\02 - Track.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = result.unwrap();
+        assert_eq!(
+            downloaded.len(),
+            4,
+            "all 4 files from both discs must download (no collision), got {downloaded:?}"
+        );
+        let mut unique: Vec<String> = downloaded
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            4,
+            "every track needs its own path, got {downloaded:?}"
+        );
+        assert!(
+            downloaded
+                .iter()
+                .any(|p| p.to_string_lossy().contains("CD 01")),
+            "CD 01 files must be in a CD 01 subdirectory, got {downloaded:?}"
+        );
+        assert!(
+            downloaded
+                .iter()
+                .any(|p| p.to_string_lossy().contains("CD 02")),
+            "CD 02 files must be in a CD 02 subdirectory, got {downloaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_hostile_disc_folder_still_stages_into_a_safe_directory() {
+        // The disc leaf is a peer-controlled path component, and an embedded marker admits any
+        // prefix. A reserved character in it must not reach the staging path (where
+        // `create_dir_all` would fail the album on Windows), and two leaves that sanitise to
+        // the SAME name must still stay in separate directories - which is what the digest
+        // exists for. Both leaves below are one album (same marker-stripped prefix) and
+        // sanitise to the same name (the trailing space is trimmed), so deleting the digest
+        // makes this test fail: without it the two land in one directory and a track is lost.
+        let client = Arc::new(MockClient::new());
+        let dir = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file("Gold:Vol (Disc 1)\\01 - Track.flac", 900, 10_000_000),
+                make_file("Gold:Vol (Disc 1) \\01 - Track.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let result = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            dir.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "download_album should succeed: {result:?}");
+        let downloaded = result.unwrap();
+        assert_eq!(downloaded.len(), 2, "got {downloaded:?}");
+        // Judge only the staged components: an absolute staging path on Windows starts with a
+        // drive letter and its separator is a colon-free backslash, but the prefix is the temp
+        // directory's, not the peer's.
+        let relative: Vec<String> = downloaded
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir.path())
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            relative.iter().all(|path| !path.contains(':')),
+            "a reserved character must not reach the staging path, got {relative:?}"
+        );
+        assert!(
+            relative
+                .iter()
+                .all(|path| path.contains("GoldVol (Disc 1) [")),
+            "the leaf must be sanitised (colon dropped, trailing space trimmed) and carry a \
+             digest, got {relative:?}"
+        );
+        let parents: std::collections::BTreeSet<_> =
+            downloaded.iter().filter_map(|p| p.parent()).collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "two leaves that sanitise alike must not share a staging directory, got {downloaded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_staged_disc_digest_is_understood_by_the_library_write() {
+        // The stager names a sanitised disc folder with a digest, and the library write parses
+        // that name back to decide the destination. Nothing else binds the emitter's format to
+        // the parser, so this test runs the stager and then the writer on its real output: a
+        // change to the digest format would flatten both discs into the album root, where the
+        // second "01 - Track.flac" overwrites the first.
+        let client = Arc::new(MockClient::new());
+        *client.write_files.lock().unwrap() = true;
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+
+        let candidates = vec![SearchResult {
+            username: "peer".into(),
+            speed: 900,
+            slots: 1,
+            files: vec![
+                make_file("Gold:Vol (Disc 1)\\01 - Track.flac", 900, 10_000_000),
+                make_file("Gold:Vol (Disc 2)\\01 - Track.flac", 900, 10_000_000),
+            ],
+        }];
+
+        let mut config = default_dl_config();
+        config.max_retries = 0;
+        config.retry_delay_secs = 0;
+
+        let downloaded = download_album(
+            client.as_ref() as &dyn SoulseekClient,
+            &candidates,
+            staging.path(),
+            &config,
+            &default_filter_config_test(),
+            None,
+            None,
+            &mut DownloadStats::default(),
+        )
+        .await
+        .expect("the album must stage");
+
+        let written = crate::organizer::copy_to_library(
+            &downloaded,
+            library.path(),
+            "Test Artist",
+            "Test Album",
+        )
+        .expect("the library write succeeds")
+        .written;
+
+        let parents: std::collections::BTreeSet<_> =
+            written.iter().filter_map(|path| path.parent()).collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "each disc needs its own library folder, got {written:?}"
+        );
+        let album_root = library.path().join("Test Artist/Test Album");
+        assert!(
+            parents.iter().all(|parent| parent.starts_with(&album_root)),
+            "a disc folder sits under the album, got {written:?}"
+        );
+        assert!(
+            written
+                .iter()
+                .all(|path| !path.to_string_lossy().contains('[')),
+            "the staging digest must not reach the library, got {written:?}"
         );
     }
 

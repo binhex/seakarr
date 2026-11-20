@@ -256,6 +256,47 @@ pub fn scan_library(
     )
 }
 
+/// Where one scanned file sits in the library: its artist folder, its album folder, and
+/// the directory that holds the artist folder.
+///
+/// The album folder is normally the one holding the files; a dedicated disc folder
+/// ("CD 01", "Disc 2") is stepped over so a multi-disc album resolves to its album
+/// folder, matching the peer-side rule: the folder holding the files is read as a disc
+/// whenever a component above it can serve as the album, so
+/// `<root>/Genre/Artist/CD 01/track.flac` resolves to the artist "Genre" with the album
+/// "Artist". Only at the minimum depth, `<root>/Artist/CD 01/track.flac`, is the
+/// disc-named folder itself read as the album, because peeling there would leave the
+/// artist component with nothing above it to be the artist (the peer-side parser
+/// refuses that shape outright). `None` means the path is not a library album layout.
+///
+/// The returned album folder name is the one on disk, verbatim: stripping an embedded disc
+/// marker here would move the write into a new folder and leave the replaced files behind
+/// in the old one, so the album would be re-upgraded on every run. Merging marker-variant
+/// folders into one album is a presence and identity concern, not a path concern.
+///
+/// The location is the directory above the artist folder — the library root for a
+/// `<root>/Artist/Album` layout, `<root>/Genre` for `<root>/Genre/Artist/Album` — so the
+/// library upgrade copies new files back into the exact directory the album was found in.
+fn album_placement(path: &Path, lib_path: &Path) -> Option<(String, String, PathBuf)> {
+    let relative = path.strip_prefix(lib_path).unwrap_or(path);
+    let components: Vec<&str> = relative.iter().filter_map(|c| c.to_str()).collect();
+    let album_index = match crate::discs::album_index(&components) {
+        Some(index) => index,
+        _ => match components.len().checked_sub(2) {
+            Some(index) if index >= 1 => index,
+            _ => return None,
+        },
+    };
+    let location = components[..album_index - 1]
+        .iter()
+        .fold(lib_path.to_path_buf(), |acc, component| acc.join(component));
+    Some((
+        components[album_index - 1].to_string(),
+        components[album_index].to_string(),
+        location,
+    ))
+}
+
 /// [`scan_library`] with the heartbeat interval injected.
 ///
 /// The interval is a parameter only so the walk's own heartbeat call can be
@@ -403,43 +444,17 @@ fn scan_library_with_heartbeat(
             // one directly above it. For a nested layout such as
             // <root>/Genre/Artist/Album this keeps every component correct
             // instead of naming the genre after the artist.
-            let relative = path.strip_prefix(lib_path).unwrap_or(path);
-            let components: Vec<&str> = relative.iter().filter_map(|c| c.to_str()).collect();
-
-            // A folder named like a disc is stepped over so a multi-disc album
-            // resolves to its album folder, matching the peer-side rule. The
-            // folder holding the files is read as a disc whenever a component
-            // above it can serve as the album, so
-            // <root>/Genre/Artist/CD 01/track.flac resolves to the artist
-            // "Genre" with the album "Artist"; only at the minimum depth,
-            // <root>/Artist/CD 01/track.flac, is the disc-named folder itself
-            // read as the album, because peeling there would leave the artist
-            // component with nothing above it to be the artist (the peer-side
-            // parser refuses that shape outright). Anything with no album
-            // component left at all is not a library album layout and is
-            // skipped.
-            let album_index = match crate::discs::album_index(&components) {
-                Some(index) => index,
-                _ => match components.len().checked_sub(2) {
-                    Some(index) if index >= 1 => index,
-                    _ => continue, // Need at least Artist/Album/file
-                },
-            };
-            let artist_dir = components[album_index - 1].to_string();
-            // The on-disk album folder name, kept verbatim. Stripping an
-            // embedded disc marker here would move the write into a new folder
-            // and leave the replaced files behind in the old one — the album
-            // would then be re-upgraded on every run. Merging marker-variant
-            // folders into one album is a presence and identity concern, not a
-            // path concern.
             //
             // Note that the upgrade-mode destination comes from the album
-            // TAG (`final_album` below), not from this name, so a tag that
-            // differs from the folder already sent that write to a sibling
+            // TAG (`final_album` below), not from the folder name this returns, so a
+            // tag that differs from the folder already sent that write to a sibling
             // folder before the portable-name sanitiser existed. The current
             // sanitiser is a second cause of the same divergence; the
             // `library_upgrade` section of the README documents the consequence.
-            let album_dir = components[album_index].to_string();
+            let Some((artist_dir, album_dir, album_location)) = album_placement(path, lib_path)
+            else {
+                continue; // Need at least Artist/Album/file
+            };
 
             // Read audio tags if available
             let tags = read_audio_tags(path);
@@ -468,16 +483,6 @@ fn scan_library_with_heartbeat(
             let final_album = tag_album.unwrap_or_else(|| album_dir.clone());
 
             let key = (final_artist.clone(), final_album.clone());
-            // The album's real location inside the library: the directory ABOVE
-            // the artist/album folders. For a standard <root>/Artist/Album
-            // layout this is the library root itself; for nested layouts (e.g.
-            // <root>/Genre/Artist/Album) it is <root>/Genre. Threaded to the
-            // runner so the library upgrade copies new files back into the
-            // exact directory the album was found in — not the root of the
-            // library path.
-            let album_location = components[..album_index - 1]
-                .iter()
-                .fold(lib_path.to_path_buf(), |acc, c| acc.join(c));
             // The same artist/album key can appear under several roots, and under
             // one root in several folders. The earliest listed root wins, and
             // inside one root the lexicographically smallest folder wins, so the

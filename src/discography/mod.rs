@@ -465,36 +465,50 @@ fn secondary_category(value: &str) -> Option<DiscographyReleaseType> {
 
 /// Log why a release group was excluded, so a debug run explains a gap.
 ///
-/// Returns nothing on purpose: the caller decides the verdict, which keeps the
-/// rejection path readable instead of hiding a `false` in a boolean-returning
-/// helper.
+/// Returns nothing on purpose: the caller passes the reason and owns the decision to
+/// exclude, so this helper only writes the record.
 fn log_rejected_release(release: &ReleaseGroup, reason: &str) {
     tracing::debug!(
-        release_group_id = %release.id,
-        title = %release.title,
-        reason,
+        release_group_id = %crate::formatting::single_line(&release.id),
+        title = %crate::formatting::single_line(&release.title),
+        reason = %crate::formatting::single_line(reason),
         "excluding MusicBrainz release group"
     );
 }
 
 /// Classify a release group against the configured friendly categories.
+///
 /// Unknown primary or secondary types are rejected; secondary types must all
 /// be allowed; `Album` without secondaries requires `StudioAlbum`.
 pub fn release_allowed(release: &ReleaseGroup, allowed: &[DiscographyReleaseType]) -> bool {
+    release_rejection(release, allowed).is_none()
+}
+
+/// Why [`release_allowed`] refuses this release group, or `None` when it passes.
+///
+/// The reason is returned rather than logged so each caller decides whether its
+/// evaluation is worth a record: a pass that only counts refusals must not repeat the
+/// record the selecting pass writes, or a rejected release is reported twice.
+///
+/// "Once" means once per selecting pass: a label sweep runs `select_albums` once per
+/// artist credit, so a release group listed under two credits is reported for each of
+/// them. Deduplicating those records would need the sweep's cross-credit view, which
+/// this classifier deliberately does not have.
+pub fn release_rejection(
+    release: &ReleaseGroup,
+    allowed: &[DiscographyReleaseType],
+) -> Option<String> {
     let Some(primary) = release.primary_type.as_deref() else {
-        log_rejected_release(release, "missing primary type");
-        return false;
+        return Some("missing primary type".to_string());
     };
     let primary = primary.trim().to_ascii_lowercase();
     if primary != "album" && primary != "ep" && primary != "single" {
-        log_rejected_release(release, &format!("unknown primary type {primary}"));
-        return false;
+        return Some(format!("unknown primary type {primary}"));
     }
     let mut secondaries = Vec::new();
     for value in &release.secondary_types {
         let Some(category) = secondary_category(value) else {
-            log_rejected_release(release, &format!("unknown secondary type {}", value.trim()));
-            return false;
+            return Some(format!("unknown secondary type {}", value.trim()));
         };
         secondaries.push(category);
     }
@@ -520,12 +534,7 @@ pub fn release_allowed(release: &ReleaseGroup, allowed: &[DiscographyReleaseType
         }
         _ => false,
     };
-    if is_allowed {
-        true
-    } else {
-        log_rejected_release(release, "release type is not enabled");
-        false
-    }
+    (!is_allowed).then(|| "release type is not enabled".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -618,13 +627,14 @@ pub fn select_albums(
 
     let mut best: std::collections::BTreeMap<String, Candidate> = std::collections::BTreeMap::new();
     for release in groups {
-        if !release_allowed(release, allowed) {
+        if let Some(reason) = release_rejection(release, allowed) {
+            log_rejected_release(release, &reason);
             continue;
         }
         let title = release.title.trim();
         if title.is_empty() {
             tracing::debug!(
-                release_group_id = %release.id,
+                release_group_id = %crate::formatting::single_line(&release.id),
                 "excluding MusicBrainz release group: empty title"
             );
             continue;
@@ -667,9 +677,9 @@ pub fn select_albums(
                     // dropped; say which one, because otherwise it vanishes from
                     // the run output with nothing to explain why.
                     tracing::debug!(
-                        release_group_id = %candidate.target.release_group_id,
-                        title = %candidate.target.title,
-                        kept_release_group_id = %existing.target.release_group_id,
+                        release_group_id = %crate::formatting::single_line(&candidate.target.release_group_id),
+                        title = %crate::formatting::single_line(&candidate.target.title),
+                        kept_release_group_id = %crate::formatting::single_line(&existing.target.release_group_id),
                         "excluding MusicBrainz release group: shares its album identity with another"
                     );
                 }
@@ -1913,6 +1923,39 @@ mod tests {
             "Artist"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_rejected_release_is_logged_once_by_the_selecting_pass() {
+        // The counting pass calls `release_allowed`; the selecting pass calls `select_albums`,
+        // which logs. Only the latter may write a record, or a label sweep reports a rejected
+        // release twice per credit. The id is unique to this fixture: `LogCapture` is
+        // process-wide, so a shared id could match a concurrent test's record.
+        let capture = crate::test_support::LogCapture::start();
+        let rejected = group(
+            "logged-once-fixture",
+            "Logged Once Fixture",
+            Some("1999"),
+            Some("EP"),
+            &[],
+        );
+        let allowed = [DiscographyReleaseType::StudioAlbum];
+
+        assert!(select_albums(std::slice::from_ref(&rejected), &allowed, "Artist").is_empty());
+        let after_select = capture.text();
+        assert_eq!(
+            after_select.matches("logged-once-fixture").count(),
+            1,
+            "the selecting pass logs one record per rejected group, got: {after_select}"
+        );
+
+        assert!(!release_allowed(&rejected, &allowed));
+        let after_count = capture.text();
+        assert_eq!(
+            after_count.matches("logged-once-fixture").count(),
+            1,
+            "the counting pass must not log a second record, got: {after_count}"
+        );
     }
 
     #[test]

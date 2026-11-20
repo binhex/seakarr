@@ -502,10 +502,17 @@ struct CachedCatalogue {
     incomplete: usize,
 }
 
-/// Read a compatible, well-formed cache row. A row whose key or pinned MBID
+/// Read a compatible, well-formed cache row. A row whose key or expected MBID
 /// does not match is a silent miss; corrupt and wrong-version rows are warned
-/// about, deleted, and treated as a miss, so a cache can never block a lookup it
-/// was not written for.
+/// about, deleted, and treated as a miss, so a rejected row never stands in for
+/// the lookup.
+///
+/// The MBID check needs an expected MBID, which only a pin or an ID input provides. A
+/// *name* with no pin therefore has nothing to compare, so removing a pin can still serve
+/// the previously-pinned label's row for one `cache_days` window, exactly as the artist
+/// name path does. That residual is why the ID form refetches (see
+/// `removing_a_pin_from_an_id_input_refetches_the_requested_label`): do not assume the
+/// name form is covered by the same guard.
 fn load_cached_catalogue(
     db: &Database,
     label_key: &str,

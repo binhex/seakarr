@@ -646,6 +646,28 @@ pub(crate) fn parses_as_audio(path: &Path) -> bool {
         .is_ok()
 }
 
+/// The staging-only digest suffix a peer-named disc directory may carry.
+///
+/// The download stager appends ` [<8 hex>]` when sanitising the peer's disc leaf changed it
+/// (see `download::peer_name_digest`), so two leaves that sanitise alike stay in separate
+/// staging directories. The suffix is not part of the disc designator, so classification has
+/// to peel it. [`disc_subdir`] drops it from the label it returns too: the suffix is the
+/// stager's own, and the library folder is named from the designator alone.
+fn strip_peer_name_digest(name: &str) -> &str {
+    let Some(without_bracket) = name.strip_suffix(']') else {
+        return name;
+    };
+    let Some((kept, digest)) = without_bracket.rsplit_once(" [") else {
+        return name;
+    };
+    let is_digest = digest.len() == 8 && digest.chars().all(|c| c.is_ascii_hexdigit());
+    if is_digest {
+        kept
+    } else {
+        name
+    }
+}
+
 /// Return the disc subdirectory component of a staging source path, if the
 /// file was downloaded into a per-disc folder — either a dedicated disc
 /// folder ("CD 01", "Disc 2") or an album folder carrying an embedded disc
@@ -660,23 +682,31 @@ pub(crate) fn parses_as_audio(path: &Path) -> bool {
 /// when that title itself carries an embedded disc marker, and walking further
 /// up would let an ancestor outside the album be taken for a disc label.
 ///
-/// The returned label is the peer's own folder name, so it is run through
-/// [`sanitize_component`] before it is handed back: it becomes a real path
-/// component in the library, and a peer-supplied name must not reach the
-/// filesystem raw.
+/// The classification peels the stager's digest suffix first (see
+/// [`strip_peer_name_digest`]), so a disc folder the stager had to sanitise
+/// (`CD 01 [1a2b3c4d]`) is still recognised as a disc. The returned label is
+/// that designator with the suffix removed, run through [`sanitize_component`]
+/// before it is handed back: it becomes a real path component in the library,
+/// and a peer-supplied name must not reach the filesystem raw.
 ///
 /// Uses [`crate::discs`] so the destination grouping matches the download
 /// stager exactly.
 fn disc_subdir(src: &Path, album: &str) -> Option<String> {
     let parent = src.parent()?;
     let name = parent.file_name().and_then(|name| name.to_str())?;
-    if name == sanitize_component(album) || !crate::discs::is_disc_designator(name) {
+    if name == sanitize_component(album)
+        || !crate::discs::is_disc_designator(strip_peer_name_digest(name))
+    {
         return None;
     }
     // Only the classification is normalized across marker styles; the label
     // itself is the peer's own, so it goes through the sanitiser before it
-    // becomes a library path component.
-    Some(sanitize_component(name))
+    // becomes a library path component. The staging digest is an implementation
+    // detail of the stager (`download::peer_name_digest`), so it is dropped here:
+    // the operator sees "CD 01", not "CD 01 [1a2b3c4d]". Two sibling disc folders
+    // that sanitise to the same name therefore share one library folder - accepted,
+    // because only a hostile naming choice reaches that.
+    Some(sanitize_component(strip_peer_name_digest(name)))
 }
 
 /// Delete audio files in the album directory that are lower quality than the
@@ -864,18 +894,33 @@ pub fn resume_library_upgrade(
                 // Recurse into the subdirectory, mapping it 1:1 onto the
                 // destination so CD 01/ stays CD 01/. Sanitising the leaf keeps
                 // a disc designator in the same directory the forward copy would
-                // have used. Create the matching destination directory so the
-                // copy has a parent to land in. The lossy conversion cannot
+                // have used. The staging digest has to be peeled for the same
+                // reason: the stager appends it to a disc leaf it had to sanitise
+                // (`CD 01 ` becomes `CD 01 [1a2b3c4d]`), and the forward copy
+                // writes that disc as `CD 01`. Without the peel the recovery writes
+                // a folder the operator never asked for under a name the next scan
+                // reads as an album title. Create the matching destination directory
+                // so the copy has a parent to land in. The lossy conversion cannot
                 // normally fire because the stager derives these names from UTF-8
                 // peer metadata.
-                let leaf = sanitize_component(&entry.file_name().to_string_lossy());
+                let raw_leaf = entry.file_name().to_string_lossy().into_owned();
+                let sanitised_raw = sanitize_component(&raw_leaf);
+                let leaf = sanitize_component(strip_peer_name_digest(&raw_leaf));
                 // The album root is the source root itself, so a subdirectory whose
                 // sanitised name equals the album component is the album root seen
                 // again (an album whose own title is a disc designator). Its files
                 // belong in the album folder, exactly as the forward copy places
                 // them; recursing would add a level the completed write does not
                 // have.
-                if leaf == sanitize_component(album) {
+                //
+                // The guard compares the name as it is on disk, not the peeled one: a
+                // disc leaf that carries the stager's digest is a real disc folder even
+                // when its peeled form equals a designator-shaped album title, and the
+                // forward copy nests it (disc_subdir peels the digest, then sees a disc).
+                // Comparing the peeled name here would flatten that folder while the
+                // forward copy nests it, so a resumed upgrade would produce a different
+                // tree from a completed one.
+                if sanitised_raw == sanitize_component(album) {
                     walk(&src, dest_root, album, copied)?;
                     continue;
                 }
@@ -1577,6 +1622,81 @@ mod tests {
     }
 
     #[test]
+    fn a_disc_folder_with_a_staging_digest_lands_without_it_in_the_library() {
+        // The digest exists only to keep two *staging* disc directories apart. It is an
+        // implementation detail of the stager, so it must not become part of the folder name
+        // the operator sees in their library: a peer folder needing sanitisation otherwise
+        // lands as "CD 01 [1a2b3c4d]" instead of "CD 01".
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("CD 01 [1a2b3c4d]");
+        fs::create_dir_all(&disc).unwrap();
+        let src = disc.join("01 - Track One.flac");
+        fs::write(&src, b"fake flac data").unwrap();
+
+        let dests = copy_to_library(
+            std::slice::from_ref(&src),
+            library.path(),
+            "Test Artist",
+            "Test Album",
+        )
+        .unwrap()
+        .written;
+
+        assert_eq!(
+            dests[0],
+            library
+                .path()
+                .join("Test Artist/Test Album/CD 01/01 - Track One.flac"),
+            "the library folder must not carry the staging digest"
+        );
+    }
+
+    #[test]
+    fn test_copy_to_library_keeps_a_digest_suffixed_disc_folder_apart() {
+        // The stager appends a digest when sanitising the peer's disc leaf changed it, so the
+        // library write must still recognise the directory as a disc: otherwise both discs are
+        // written into the album root and same-named tracks overwrite each other.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let mut sources = Vec::new();
+        for (disc, digest) in [
+            ("GoldVol (Disc 1)", "d1a2b3c4"),
+            ("GoldVol (Disc 2)", "e5f6a7b8"),
+        ] {
+            let dir = staging.path().join(format!("{disc} [{digest}]"));
+            fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("01 - Track One.flac");
+            fs::write(&src, b"fake flac data").unwrap();
+            sources.push(src);
+        }
+
+        let dests = copy_to_library(&sources, library.path(), "Test Artist", "Test Album")
+            .unwrap()
+            .written;
+
+        assert_eq!(dests.len(), 2, "got {dests:?}");
+        let parents: std::collections::BTreeSet<_> =
+            dests.iter().filter_map(|path| path.parent()).collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "each disc needs its own library folder, got {dests:?}"
+        );
+        for parent in parents {
+            assert!(
+                parent.starts_with(library.path().join("Test Artist/Test Album")),
+                "a disc folder sits under the album, got: {parent:?}"
+            );
+            assert_ne!(
+                parent,
+                library.path().join("Test Artist/Test Album"),
+                "a disc must not be flattened into the album root"
+            );
+        }
+    }
+
+    #[test]
     fn test_resume_library_upgrade_sanitises_staging_file_names() {
         // Staging file names are the peer's own basenames, and the forward copy
         // runs them through the same sanitiser. The resume walk must apply it too,
@@ -1611,22 +1731,67 @@ mod tests {
     }
 
     #[test]
+    fn test_resume_library_upgrade_keeps_the_disc_folder_of_an_album_named_like_one() {
+        // An album whose own title is a disc designator ("Gold Disc 1") plus a peer disc leaf
+        // that needed sanitising: the stager nests it (leaf "Gold Disc 1 [1a2b3c4d]") and the
+        // forward copy peels the digest, writing album/Gold Disc 1/track. The recovery must
+        // reach the same tree, so its album-root guard may not run on the peeled name.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let disc = staging.path().join("Gold Disc 1 [1a2b3c4d]");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("01 - Track.flac"), b"content").unwrap();
+
+        let config = Config::default();
+        resume_library_upgrade(
+            &config,
+            staging.path(),
+            library.path(),
+            "Artist",
+            "Gold Disc 1",
+        )
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Artist/Gold Disc 1/Gold Disc 1/01 - Track.flac")
+                .exists(),
+            "the recovery must nest the disc folder the forward copy nests, got: {:?}",
+            fs::read_dir(library.path().join("Artist/Gold Disc 1")).map(|entries| entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
     fn test_resume_library_upgrade_sanitises_staging_subdirectory_names() {
         // Resume re-copies staging 1:1 into the library, so it must apply the
         // same sanitiser as the forward copy or the two disagree on the path.
+        // The stager's digest suffix is part of that contract: the forward copy peels
+        // it, so the recovery must too, or a resumed upgrade writes a folder named
+        // "CD 01 [1a2b3c4d]" that the next scan reads as an album title.
         let staging = TempDir::new().unwrap();
         let library = TempDir::new().unwrap();
-        let disc = staging.path().join("Gold: Disc 1");
+        let disc = staging.path().join("Gold: Disc 1 [1a2b3c4d]");
         fs::create_dir_all(&disc).unwrap();
         fs::write(disc.join("01 - Track.flac"), b"content").unwrap();
 
         let config = Config::default();
         resume_library_upgrade(&config, staging.path(), library.path(), "Artist", "Album").unwrap();
 
-        assert!(library
-            .path()
-            .join("Artist/Album/Gold Disc 1/01 - Track.flac")
-            .exists());
+        assert!(
+            library
+                .path()
+                .join("Artist/Album/Gold Disc 1/01 - Track.flac")
+                .exists(),
+            "the recovery must peel the staging digest, got: {:?}",
+            fs::read_dir(library.path().join("Artist/Album")).map(|entries| entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
     }
 
     // ── Post-download verification helpers ──

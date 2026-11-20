@@ -150,7 +150,7 @@ fn record_track_reputation(db: &Database, stats: &download::DownloadStats) {
         {
             tracing::warn!(
                 "failed to record peer reputation for {}: {e}",
-                track.username
+                crate::formatting::single_line(&track.username)
             );
         }
     }
@@ -166,7 +166,10 @@ fn furthest_peer(stats: &download::DownloadStats) -> Option<&str> {
 /// served an incomplete album or failed the whole album.
 fn record_album_failure(db: &Database, peer: &str) {
     if let Err(e) = db.update_peer_reputation(peer, 0.0, false) {
-        tracing::warn!("failed to record peer reputation for {peer}: {e}");
+        tracing::warn!(
+            "failed to record peer reputation for {}: {e}",
+            crate::formatting::single_line(peer)
+        );
     }
 }
 
@@ -1528,8 +1531,9 @@ async fn download_ranked_candidates(
             // processed-albums table, so an inline warning would repeat the line the
             // summary carries.
             tracing::debug!(
-                "{artist} — {}: download failed ({reason}); {} candidates exhausted",
+                "{artist} — {}: download failed ({}); {} candidates exhausted",
                 album.unwrap_or("(all)"),
+                crate::formatting::single_line(&reason),
                 ranked.len(),
             );
             mark_album_processed_if_identifiable(db, artist, album, "failed")?;
@@ -1730,7 +1734,12 @@ fn record_upgrade_outcomes(
                 report.record(&artist, &album, outcome);
             }
             Err(error) => {
-                tracing::error!("Album processing failed: {artist} — {album}: {error}");
+                tracing::error!(
+                    "Album processing failed: {} — {}: {}",
+                    crate::formatting::single_line(&artist),
+                    crate::formatting::single_line(&album),
+                    crate::formatting::single_line(&error.to_string())
+                );
                 report.record(
                     &artist,
                     &album,
@@ -2180,7 +2189,8 @@ async fn run_artist_only_mode_with_provider(
             } = &provenance
             {
                 tracing::warn!(
-                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache"
+                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({}); using stale cache",
+                    crate::formatting::single_line(refresh_error)
                 );
             }
             // A failing scan must not break artist-only manual mode, which
@@ -2274,7 +2284,8 @@ async fn run_artist_only_mode_with_provider(
             } = &provenance
             {
                 tracing::warn!(
-                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); no eligible authoritative albums"
+                    "{artist}: discography cache is {age_days} day(s) old and refresh failed ({}); no eligible authoritative albums",
+                    crate::formatting::single_line(refresh_error)
                 );
             }
             Ok(ArtistOnlyRun {
@@ -2844,26 +2855,34 @@ async fn run_label_discover_mode_with_provider(
                     discovery.label_mbid.unwrap_or_default(),
                 ));
                 counters.incomplete += incomplete;
+                let aborted =
+                    note_stale_cache_breaker(&provenance, &mut consecutive_provider_failures);
                 if let DiscoveryProvenance::StaleCache {
                     age_days,
                     refresh_error,
                     kind,
                 } = &provenance
                 {
+                    // Phase-neutral on purpose: whether this catalogue is *used* is decided
+                    // once, by `label_notices` reading `selection_ran`. A per-label claim here
+                    // would contradict the summary for any label collected before a later
+                    // abort threw the whole work list away.
                     tracing::warn!(
-                        "{}: label catalogue cache is {age_days} day(s) old and refresh failed ({refresh_error}); using stale cache",
-                        request.input
+                        "{}: label catalogue cache is {age_days} day(s) old and refresh failed ({}); loaded the stale catalogue",
+                        request.input,
+                        crate::formatting::single_line(refresh_error)
                     );
                     // The spec's summary promises the labels whose provider request failed.
-                    // This one was served from a stale row, but the request still failed and
-                    // it still counts towards the breaker, so the operator must see it.
+                    // The entry is recorded either way; `label_notices` chooses "used" or
+                    // "skipped" from `selection_ran`, because only the selection knows whether
+                    // this catalogue reached the work list.
                     if *kind == DiscoveryFailure::Provider {
                         counters
                             .stale_catalogues
                             .push((request.input.clone(), refresh_error.clone()));
                     }
                 }
-                if note_stale_cache_breaker(&provenance, &mut consecutive_provider_failures) {
+                if aborted {
                     return Err(abort_label_run(
                         &mut report,
                         &counters,
@@ -2888,8 +2907,9 @@ async fn run_label_discover_mode_with_provider(
                 match kind {
                     DiscoveryFailure::Unresolved => {
                         tracing::warn!(
-                            "{}: label could not be resolved on MusicBrainz: {reason}",
-                            request.input
+                            "{}: label could not be resolved on MusicBrainz: {}",
+                            request.input,
+                            crate::formatting::single_line(&reason)
                         );
                         counters.unresolved.push(request.input.clone());
                         consecutive_provider_failures = 0;
@@ -2978,17 +2998,18 @@ async fn run_label_discover_mode_with_provider(
     let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
     for target in missing {
         // The interrupt is checked before the budget so an interrupted run reports
-        // "cancelled", never "budget reached". Deliberate divergence from the artist
-        // sweep, which checks the budget first: where both would trip on the same
-        // unit, the two sweeps attribute the stop differently, and this order is the
-        // one that reports an operator's interrupt as an interrupt.
-        if cancel.load(Ordering::SeqCst) {
-            counters.cancelled = true;
-            break;
-        }
-        if budget.exhausted() {
-            counters.budget_reached_at = Some(target.artist.clone());
-            break;
+        // "cancelled", never "budget reached". Both artist-sweep loops and this one ask
+        // `sweep_stop`, so the three sites cannot attribute the same event differently.
+        match sweep_stop(cancel.load(Ordering::SeqCst), budget.exhausted()) {
+            Some(SweepStop::Interrupt) => {
+                counters.cancelled = true;
+                break;
+            }
+            Some(SweepStop::Budget) => {
+                counters.budget_reached_at = Some(target.artist.clone());
+                break;
+            }
+            None => {}
         }
         let result = process_album(
             client,
@@ -3035,9 +3056,10 @@ async fn run_label_discover_mode_with_provider(
             }
             Err(error) => {
                 tracing::error!(
-                    "Album processing failed: {} - {}: {error}",
-                    target.artist,
-                    target.target.title
+                    "Album processing failed: {} - {}: {}",
+                    crate::formatting::single_line(&target.artist),
+                    crate::formatting::single_line(&target.target.title),
+                    crate::formatting::single_line(&error.to_string())
                 );
                 if charges_after_error(&error) {
                     budget.charge();
@@ -3058,17 +3080,24 @@ async fn run_label_discover_mode_with_provider(
     Ok(counters)
 }
 
-/// The tail of the reason the download stage reports for a cancelled transfer.
+/// The whole reason the download stage reports for a cancelled transfer, matched exactly.
 ///
 /// The stage stores `SeakarrError::Download("download cancelled by user")` by its
 /// `Display`, which is `download error: …`; a candidate-exhaustion path may prefix
-/// that with `all candidates exhausted: `. Matching the tail keeps the check immune
-/// to a peer-advertised filename (which is followed by more text, so the reason cannot
-/// end with this) while matching every real cancellation.
+/// that with `all candidates exhausted: `. Both shapes are matched in full: a tail test
+/// is not enough, because a peer controls the crate's `Failed` reason, which is
+/// forwarded verbatim inside `transfer failed: {reason}`, so a hostile peer could end
+/// its reason with this text and fake an operator interrupt.
 const CANCELLED_REASON: &str = "download error: download cancelled by user";
 
-/// The same reason when every candidate was tried first, which is how
-/// `download_ranked_candidates` reports it to the album outcome.
+/// The same reason with the exhaustion prefix.
+///
+/// Not produced today: `runner.rs` composes `all candidates exhausted: {e}` only when the
+/// album was not cancelled, and the only strings that carry `CANCELLED_REASON` are built
+/// behind the cancel flag, which nothing ever clears. It is kept as a backstop so that an
+/// exhausted-then-cancelled path (if one is ever added) is still recognised as the
+/// operator's interrupt, and it is bound by test to the composition above so the two
+/// cannot drift.
 const EXHAUSTED_CANCELLED_REASON: &str =
     "all candidates exhausted: download error: download cancelled by user";
 
@@ -3077,9 +3106,9 @@ const EXHAUSTED_CANCELLED_REASON: &str =
 /// The download stage reports a cancelled transfer as
 /// `AlbumOutcome::Failed { reason }` where `reason` stores
 /// `SeakarrError::Download("download cancelled by user")` by its `Display`, i.e.
-/// `download error: download cancelled by user` (optionally prefixed
-/// `all candidates exhausted: `); the constructor's own string is the bare
-/// `download cancelled by user`. Every other failure is prefixed differently. `SeakarrError::Cancelled` is produced
+/// `download error: download cancelled by user`; the constructor's own string is the bare
+/// `download cancelled by user`. The exhaustion prefix is a backstop, not a live shape (see
+/// [`EXHAUSTED_CANCELLED_REASON`]). Every other failure is prefixed differently. `SeakarrError::Cancelled` is produced
 /// only by the library walk, so this reason is the only evidence a label sweep gets.
 /// The reason is matched rather than the flag, so a genuine failure that happens to
 /// coincide with an interrupt is still counted.
@@ -3212,7 +3241,10 @@ fn note_provider_failure_for(
     consecutive: &mut u32,
 ) -> bool {
     *consecutive += 1;
-    tracing::warn!("{name}: MusicBrainz unavailable ({reason}); {noun} skipped");
+    tracing::warn!(
+        "{name}: MusicBrainz unavailable ({}); {noun} skipped",
+        crate::formatting::single_line(reason)
+    );
     failed.push((name.to_string(), reason.to_string()));
     *consecutive >= DISCOVER_PROVIDER_FAILURE_LIMIT
 }
@@ -3235,7 +3267,8 @@ fn note_stale_cache(
         return note_stale_cache_breaker(provenance, consecutive);
     };
     tracing::warn!(
-        "{artist}: discography cache is {age_days} day(s) old and refresh failed ({refresh_error}); {cache_note}"
+        "{artist}: discography cache is {age_days} day(s) old and refresh failed ({}); {cache_note}",
+        crate::formatting::single_line(refresh_error)
     );
     note_stale_cache_breaker(provenance, consecutive)
 }
@@ -3262,6 +3295,29 @@ fn note_provider_failure(
     )
 }
 
+/// Why a sweep stops before starting its next unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepStop {
+    /// The operator interrupted the run.
+    Interrupt,
+    /// The download budget is spent.
+    Budget,
+}
+
+/// Decide the stop for a sweep that is about to start a unit.
+///
+/// The interrupt wins whenever it is pending, whatever the budget says: a run the operator
+/// stopped must be reported as cancelled, because "budget reached" claims the sweep finished
+/// everything it was allowed to do. The label sweep and both artist-sweep loops ask this, so
+/// the three cannot attribute the same event differently.
+fn sweep_stop(cancelled: bool, budget_exhausted: bool) -> Option<SweepStop> {
+    match (cancelled, budget_exhausted) {
+        (true, _) => Some(SweepStop::Interrupt),
+        (false, true) => Some(SweepStop::Budget),
+        (false, false) => None,
+    }
+}
+
 /// Fill the gaps in one artist's library: process every album the library is
 /// missing, charging the download budget and recording each outcome.
 ///
@@ -3285,18 +3341,24 @@ async fn fill_artist_gap(
     report: &mut RunReport,
 ) -> Result<()> {
     for target in missing {
-        if budget.exhausted() {
-            counters
-                .budget_reached_at
-                .get_or_insert_with(|| artist.name.clone());
-            break;
-        }
-        if cancel.load(Ordering::SeqCst) {
-            // The next album was never searched, queued or attempted, so nothing is
-            // charged or counted as a failure - but the run did stop early, and a
-            // summary that does not say so reads like a completed sweep.
-            counters.cancelled = true;
-            break;
+        // The interrupt wins over a spent budget, via the one decision the artist and label
+        // sweeps share: where both would trip on the same album, an operator's Ctrl+C must be
+        // reported as an interrupt, not as the sweep having used up its allowance.
+        match sweep_stop(cancel.load(Ordering::SeqCst), budget.exhausted()) {
+            Some(SweepStop::Interrupt) => {
+                // The next album was never searched, queued or attempted, so nothing is
+                // charged or counted as a failure - but the run did stop early, and a
+                // summary that does not say so reads like a completed sweep.
+                counters.cancelled = true;
+                break;
+            }
+            Some(SweepStop::Budget) => {
+                counters
+                    .budget_reached_at
+                    .get_or_insert_with(|| artist.name.clone());
+                break;
+            }
+            None => {}
         }
         let result = process_album(
             client,
@@ -3349,9 +3411,10 @@ async fn fill_artist_gap(
                 // Matches upgrade mode: an environment error is recorded and the run
                 // continues to the next album.
                 tracing::error!(
-                    "Album processing failed: {} - {}: {error}",
-                    artist.name,
-                    target.title
+                    "Album processing failed: {} - {}: {}",
+                    crate::formatting::single_line(&artist.name),
+                    crate::formatting::single_line(&target.title),
+                    crate::formatting::single_line(&error.to_string())
                 );
                 // An error can arrive after a completed download, because the
                 // post-download bookkeeping writes can fail. `charges_after_error`
@@ -3545,20 +3608,25 @@ async fn run_discover_mode_with_cancel(
     let mut budget = discover::DownloadBudget::new(config.discover.max_cycle_downloads);
 
     for artist in &selection.artists {
-        if budget.exhausted() {
-            // Only the first write names the artist where the budget ran out;
-            // a later artist was never examined, so it must not rename it.
-            counters
-                .budget_reached_at
-                .get_or_insert_with(|| artist.name.clone());
-            break;
-        }
-        if cancel.load(Ordering::SeqCst) {
-            // Cancellation is not a budget stop. Conflating the two would print
-            // a false "download budget reached" notice for a run the user
-            // interrupted, so the flag is recorded instead of the budget.
-            counters.cancelled = true;
-            break;
+        // Same decision as the per-album and label loops: when both would stop the sweep on
+        // this artist, the operator's interrupt is the true reason.
+        match sweep_stop(cancel.load(Ordering::SeqCst), budget.exhausted()) {
+            Some(SweepStop::Interrupt) => {
+                // Cancellation is not a budget stop. Conflating the two would print
+                // a false "download budget reached" notice for a run the user
+                // interrupted, so the flag is recorded instead of the budget.
+                counters.cancelled = true;
+                break;
+            }
+            Some(SweepStop::Budget) => {
+                // Only the first write names the artist where the budget ran out;
+                // a later artist was never examined, so it must not rename it.
+                counters
+                    .budget_reached_at
+                    .get_or_insert_with(|| artist.name.clone());
+                break;
+            }
+            None => {}
         }
         // Where this artist's completed albums belong: the artist folder the
         // library holds for it, with the folder name that is actually on disk,
@@ -3665,8 +3733,9 @@ async fn run_discover_mode_with_cancel(
                         // provider health: neither increment nor reset the
                         // consecutive-failure counter.
                         tracing::debug!(
-                            "{}: skipped, resolution failure recorded earlier ({reason})",
-                            artist.name
+                            "{}: skipped, resolution failure recorded earlier ({})",
+                            artist.name,
+                            crate::formatting::single_line(&reason)
                         );
                         counters.cached_failures.push(artist.name.clone());
                     } else {
@@ -3675,8 +3744,9 @@ async fn run_discover_mode_with_cancel(
                         // keep the circuit breaker for genuine outages only.
                         consecutive_provider_failures = 0;
                         tracing::warn!(
-                            "{}: artist could not be resolved on MusicBrainz: {reason}",
-                            artist.name
+                            "{}: artist could not be resolved on MusicBrainz: {}",
+                            artist.name,
+                            crate::formatting::single_line(&reason)
                         );
                         counters.unresolved.push(artist.name.clone());
                     }
@@ -6741,6 +6811,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sweep_stop_attributes_an_interrupt_over_a_spent_budget() {
+        // All three sweep loops ask this one function, so pinning it pins every loop - including
+        // the artist-level loop, whose both-trip state (budget spent by the previous artist,
+        // Ctrl+C pending before the next) no integration fixture can reach deterministically.
+        assert_eq!(
+            sweep_stop(true, true),
+            Some(SweepStop::Interrupt),
+            "a raced interrupt must be reported as cancelled, not as a budget stop"
+        );
+        assert_eq!(sweep_stop(true, false), Some(SweepStop::Interrupt));
+        assert_eq!(sweep_stop(false, true), Some(SweepStop::Budget));
+        assert_eq!(sweep_stop(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_wins_when_the_budget_is_also_spent() {
+        // Reaching an album with the budget spent *and* an interrupt pending is the one state
+        // where the two stop reasons compete, and it is the state a raced Ctrl+C produces.
+        // Reporting it as "budget reached" tells the operator the sweep finished all the work
+        // it was allowed, when they stopped it - so the interrupt wins. The label sweep already
+        // reports the same event as "cancelled".
+        let (config, db, staging, _library) = discover_fixture(&[("Artist One", "Present")]);
+        let client = MockClient::new();
+        let artist = discover::SelectedArtist {
+            name: "Artist One".into(),
+            destination: discover::ArtistDestination::Staging,
+        };
+        let missing = vec![crate::discography::AlbumTarget {
+            release_group_id: "missing".into(),
+            title: "Missing".into(),
+        }];
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut budget = discover::DownloadBudget::new(1);
+        // One attempt allowed and already spent: the next album is over the budget.
+        budget.charge();
+        let mut counters = discover::DiscoverCounters::default();
+        let mut report = RunReport::new();
+
+        fill_artist_gap(
+            &client,
+            &config,
+            &db,
+            staging.path(),
+            &artist,
+            &missing,
+            &LibraryTarget::StagingOnly,
+            false,
+            &cancel,
+            None,
+            &mut budget,
+            &mut counters,
+            &mut report,
+        )
+        .await
+        .expect("a stop before the album is not an error");
+
+        assert!(
+            counters.cancelled,
+            "an operator interrupt must be reported as cancelled, got {counters:?}"
+        );
+        assert!(
+            counters.budget_reached_at.is_none(),
+            "a spent budget must not be named as the reason an interrupted sweep stopped, got {:?}",
+            counters.budget_reached_at
+        );
+    }
+
     #[tokio::test]
     async fn artist_only_authoritative_discovery_searches_each_album_oldest_first() {
         let soulseek = MockClient::new();
@@ -7899,11 +8037,21 @@ mod tests {
         // The constant is a copy of the download error's `Display`. Binding it to the real
         // error means a rewording there fails here instead of silently turning every Ctrl+C
         // into a budget-charged failure.
-        assert!(
-            crate::error::SeakarrError::Download("download cancelled by user".into())
-                .to_string()
-                .ends_with(CANCELLED_REASON),
-            "CANCELLED_REASON must stay the tail of the download error's Display"
+        assert_eq!(
+            crate::error::SeakarrError::Download("download cancelled by user".into()).to_string(),
+            CANCELLED_REASON,
+            "CANCELLED_REASON must stay the whole Display, not just its tail"
+        );
+        // The exhausted shape is composed far from the constant, so bind the prefix too: it is a
+        // backstop rather than a live shape, and a rewording must fail here instead of silently
+        // leaving the arm unreachable if a cancelled-and-exhausted path is ever added.
+        assert_eq!(
+            format!(
+                "all candidates exhausted: {}",
+                crate::error::SeakarrError::Download("download cancelled by user".into())
+            ),
+            EXHAUSTED_CANCELLED_REASON,
+            "EXHAUSTED_CANCELLED_REASON must stay the exhausted shape the pipeline builds"
         );
     }
 
@@ -8129,9 +8277,12 @@ mod tests {
     #[test]
     fn the_label_summary_says_a_stale_catalogue_was_used_not_that_the_label_was_skipped() {
         // The albums from a stale catalogue are staged, so the "label skipped" wording would
-        // contradict the staged line printed beside it.
+        // contradict the staged line printed beside it. `selection_ran` is what decides the
+        // wording: it is set once the selection has run, and a run that stops before it
+        // selected nothing.
         let mut counters = label_discover::LabelCounters {
             requested: vec!["Hospital Records".into()],
+            selection_ran: true,
             ..label_discover::LabelCounters::default()
         };
         counters
@@ -8150,6 +8301,22 @@ mod tests {
                 .iter()
                 .any(|notice| notice.contains("label skipped")),
             "a label whose albums were used was not skipped: {notices:?}"
+        );
+
+        // The same counters with no selection are a run that stopped first: nothing was used.
+        counters.selection_ran = false;
+        let stopped = label_discover::label_notices(&counters, "downloads/staging");
+        assert!(
+            stopped
+                .iter()
+                .any(|notice| notice.contains("label skipped")),
+            "a run that selected nothing must not claim the catalogue was used: {stopped:?}"
+        );
+        assert!(
+            !stopped
+                .iter()
+                .any(|notice| notice.contains("its stale catalogue was used")),
+            "no catalogue of a stopped run was used: {stopped:?}"
         );
     }
 
@@ -8388,8 +8555,13 @@ mod tests {
 
         let (mut config, db, staging, _library) = discover_fixture(&[]);
         config.discover.max_cycle_downloads = 10;
+        let capture = crate::test_support::LogCapture::start();
         let stale_at = chrono::Utc::now().timestamp() - 40 * 86_400;
-        let names = ["Hospital Records", "Med School", "Spearhead"];
+        let names = [
+            "Hospital Records Stale Fixture",
+            "Med School Stale Fixture",
+            "Spearhead Stale Fixture",
+        ];
         for name in names {
             let key = LabelInput::parse(name).cache_key();
             db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
@@ -8435,6 +8607,138 @@ mod tests {
                 .to_string()
                 .contains("3 consecutive MusicBrainz failures"),
             "got {error}"
+        );
+        // Nothing was selected, so no stale catalogue on this run may be reported as used:
+        // the ids above are unique to this fixture because `LogCapture` is process-wide and a
+        // sibling test sweeps the same labels, which would otherwise satisfy these guards
+        // with its own record.
+        let captured = capture.text();
+        let spearhead = captured
+            .lines()
+            .find(|line| line.contains("provider failed for Spearhead Stale Fixture"))
+            .unwrap_or_else(|| panic!("no notice for the aborting label, got:\n{captured}"));
+        assert!(
+            spearhead.contains("label skipped"),
+            "the aborting label must be reported as skipped, got: {spearhead}"
+        );
+        // Scoped to this fixture: `LogCapture` is process-wide, so a global negative could be
+        // met - or broken - by a concurrent test's record.
+        assert!(
+            !captured.lines().any(|line| line.contains("Stale Fixture")
+                && line.contains("its stale catalogue was used")),
+            "no fixture label of an aborted run may be reported as used, got:\n{captured}"
+        );
+        let stale_warn = captured.lines().find(|line| {
+            line.contains("Spearhead Stale Fixture") && line.contains("label catalogue cache is")
+        });
+        let stale_warn =
+            stale_warn.unwrap_or_else(|| panic!("no stale-catalogue warn, got:\n{captured}"));
+        assert!(
+            stale_warn.contains("loaded the stale catalogue"),
+            "the warn must be phase-neutral, got: {stale_warn}"
+        );
+        assert!(
+            !stale_warn.contains("using stale cache"),
+            "the warn must not claim the cache was used, got: {stale_warn}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_label_catalogue_that_is_used_is_reported_as_used_and_not_as_skipped() {
+        use crate::discography::label::{
+            LabelCacheEntry, LabelInput, LabelRelease, LABEL_CACHE_VERSION,
+        };
+
+        let (mut config, db, staging, _library) = discover_fixture(&[]);
+        config.filters.min_tracks = 0;
+        config.discover.max_cycle_downloads = 10;
+        let client = MockClient::new();
+        *client.search_results.lock().unwrap() = vec![SearchResult {
+            username: "peer".into(),
+            speed: 1000,
+            slots: 2,
+            files: vec![
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\01 - Bare Liars.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+                FileInfo {
+                    name: r"London Elektricity\Syncopated City\02 - Guess Who.flac".into(),
+                    size: 20_000_000,
+                    attribs: std::collections::HashMap::from([(0u32, 900u32)]),
+                },
+            ],
+        }];
+
+        // One stale row whose refresh fails: the catalogue is served from the row, and a
+        // single failure is below the breaker, so the run continues and stages the album.
+        // This is the arm a future misroute would turn into a false "label skipped".
+        let name = "Hospital Records Stale Use Fixture";
+        let stale_at = chrono::Utc::now().timestamp() - 40 * 86_400;
+        db.upsert_discography_cache(&crate::db::DiscographyCacheEntry {
+            artist_key: LabelInput::parse(name).cache_key(),
+            artist_mbid: "8562598d-60d1-4bd6-8b85-4d709e951770".to_string(),
+            canonical_artist: name.to_string(),
+            fetched_at: stale_at,
+            release_groups_json: serde_json::to_string(&LabelCacheEntry {
+                version: LABEL_CACHE_VERSION,
+                releases: vec![LabelRelease {
+                    release_id: "release-0".into(),
+                    release_group: ReleaseGroup {
+                        id: "group-stale-use".into(),
+                        title: "Syncopated City".into(),
+                        first_release_date: Some("2008-06-02".into()),
+                        primary_type: Some("Album".into()),
+                        secondary_types: Vec::new(),
+                    },
+                    artist_credit: "London Elektricity".into(),
+                }],
+                incomplete: 0,
+            })
+            .unwrap(),
+        })
+        .unwrap();
+
+        let capture = crate::test_support::LogCapture::start();
+        let provider = FakeLabelProvider::failing("MusicBrainz returned HTTP 503");
+        run_label_discover_mode_with_provider(
+            &client,
+            &config,
+            &db,
+            &[label_request(name)],
+            None,
+            None,
+            false,
+            staging.path(),
+            &provider,
+            &active_cancel(),
+        )
+        .await
+        .unwrap();
+
+        let captured = capture.text();
+        // Scoped to this fixture: `LogCapture` is process-wide, so an unscoped positive could be
+        // met by a concurrent test's identical notice.
+        assert!(
+            captured
+                .lines()
+                .any(|line| line.contains(name) && line.contains("its stale catalogue was used")),
+            "a served stale catalogue must be reported as used, got:\n{captured}"
+        );
+        assert!(
+            !captured
+                .lines()
+                .any(|line| line.contains(name) && line.contains("label skipped")),
+            "a used catalogue was not skipped, got:\n{captured}"
+        );
+        assert!(
+            staging
+                .path()
+                .join("London Elektricity")
+                .join("Syncopated City")
+                .is_dir(),
+            "the stale catalogue's album must still be staged"
         );
     }
 

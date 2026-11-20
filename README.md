@@ -41,8 +41,10 @@ Automated Soulseek music downloader with library quality upgrading.
   guessed; `discography.label_mbids` pins a name to an ID when the same label is
   swept repeatedly. `--release-type` overrides `discography.allowed_types` for that
   run (`album` is accepted as another word for `studio_album`), and
-  `--since YYYY[-MM[-DD]]` bounds the sweep by first-release-date; an undated
-  release group cannot satisfy a lower bound and is excluded. Albums already in
+  `--since YYYY[-MM[-DD]]` bounds the sweep by first-release-date; a release group
+  with no first-release date cannot satisfy a lower bound, and neither can one whose
+  date cannot be parsed (for example a month or day of `00`), so both are excluded
+  and counted as undated or unparseable. Albums already in
   the library are skipped and every other eligible album is downloaded into
   `storage.staging_dir` under `<artist>/<album>/` — a label sweep never writes
   into your library. An album a run already downloaded and left in staging counts as
@@ -57,7 +59,9 @@ Automated Soulseek music downloader with library quality upgrading.
   because what is left depends on the budget as well as on those counts. A release is searched and matched under its full MusicBrainz
   credit, and a candidate's folder must match that credit exactly, so a collaboration
   the library files under the lead artist alone usually yields no candidate at all
-  rather than a second copy. A label's catalogue is cached for `discography.cache_days`,
+  rather than a second copy. The same rule decides "already present", so an album the
+  library holds under the lead artist's folder is staged again when the catalogue credits
+  a collaboration. A label's catalogue is cached for `discography.cache_days`,
   so a brand-new release can take up to that long to appear.
 
   A sweep shares the discover budget: `discover.max_cycle_downloads` bounds the whole run,
@@ -244,7 +248,7 @@ All options are optional overrides. When an option is omitted, the value from `s
 | `--batch-file <path>` | Batch selector; surrounding whitespace is ignored; cannot be combined with artist or album selectors. | *(from config)* |
 | `--label <name[,name...]>` | Discover-mode selector; sweeps one or more record labels instead of the library-derived artist list. Each value is a label name or a MusicBrainz label ID, and a comma separates several. A name is resolved on MusicBrainz with the same exact-match and score-dominance rules as an artist, so an ambiguous name is refused with its candidates listed rather than guessed, and `discography.label_mbids` pins a name to an ID. A blank value, a value hyphenated like a MusicBrainz ID that is not one (four hyphens separating five hexadecimal groups, within two characters of a UUID's 32 digits), and the same value given twice are configuration errors. Naming one label both by name and by its MusicBrainz ID resolves it twice, so it is counted twice in the summary while the work list still downloads each album once. A label sweep needs `discography.enabled: true` and at least one `library.paths` entry, and `discover.exclude_artists` applies to the artist credits it finds. Discover only: it is mutually exclusive with `--artist`, and discover mode already refuses `--album` and `--batch-file`, so it cannot be combined with them.  A name that contains a comma cannot be expressed this way: the value splits into two requested labels, so the second half is swept as a name the operator never typed. Pass the label's MusicBrainz ID instead. | — |
 | `--release-type <type[,type...]>` | Release types wanted in a label sweep, comma-delimited; overrides `discography.allowed_types` for that run. `album` is accepted as another word for `studio_album`, and the other values are those `discography.allowed_types` accepts. An unknown value is a configuration error naming the accepted set. Requires `--label`, because no other mode selects releases by type. `filters.min_tracks` still applies: with its default of 3, a one- or two-track single or EP never passes, so lower it (0 or 1) when you ask for those types. | *(from config)* |
-| `--since <date>` | Lower bound on a release group's first-release date in a label sweep: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`. A release group without a first-release date cannot satisfy a lower bound and is excluded. Any other shape, or a date that does not exist such as `2025-02-30`, is a configuration error. Requires `--label`. | — |
+| `--since <date>` | Lower bound on a release group's first-release date in a label sweep: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`. A release group without a first-release date cannot satisfy a lower bound and is excluded, and so is one whose date cannot be parsed (for example a month or day of `00`); the two are counted as undated or unparseable. Any other shape, or a date that does not exist such as `2025-02-30`, is a configuration error. Requires `--label`. | — |
 | `--schedule` | Run immediately, then repeat the same validated upgrade, manual, batch, or discover operation after each interval. | `false` |
 | `--ignore-processed` | Reprocess a successful album once. | `false` |
 
@@ -479,7 +483,7 @@ Controls which Soulseek search results pass the quality gate.
 | `exclude_words` | Reject files whose names contain any of these keywords (case-insensitive). | `[]` |
 | `include_locked` | Include locked (private) files in search results. *(Reserved for future use — not yet enforced.)* | `false` |
 | `contiguous_tracks` | Reject results with gaps in their track numbers; duplicates permitted. Numberless filenames (e.g. `track01.flac`, bare `Title.flac`) count as unnumbered — set `false` for unnumbered collections. Each disc of a multi-disc album is validated independently, so multi-disc collections keep this on. This toggle governs the gap check only; the track-1 half of the completeness rule is part of `min_tracks` and is disabled only by `min_tracks: 0`. | `true` |
-| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule runs in two stages. The pre-download screen judges the largest album group in a result (the set `download_album` would fetch when no name narrows it), which is a deliberately conservative first cut. The album gate then chooses the group whose directory matches the requested name, and that group must itself pass the same rule before it can be chosen — so an exactly named fragment cannot outrank a complete edition. A result whose largest group fails the screen is rejected even when a smaller name-matching group would pass; another peer can still supply the album. Its two halves are that the group must reach `min_tracks`, and (for a new album) that its numbered files, when every name parses with at least two distinct values, include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement path as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later upgrade run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
+| `min_tracks` | Minimum number of downloadable tracks a share must contain for its files to be considered. Rejects incomplete shares (e.g. a single track of a 16-track album). The rule runs in two stages. The rule is judged on the group that will actually be fetched, never on the whole result. When no album name narrows the search, that group is the largest album group, and a result whose largest group fails is rejected even when some smaller group would pass; another peer can still supply the album. When an album name does narrow the search, the pre-download screen is not applied at all: the album gate chooses the group whose directory matches the requested name, and that group must itself pass the same rule before it can be chosen — so an exactly named fragment cannot outrank a complete edition, and an exactly named complete folder is not refused because a gapped companion folder beside it is larger. Once a folder names the album exactly, only exactly named folders are eligible: a companion that merely contains the album's words (a remix or deluxe edition beside a fragment) is not chosen in its place, and a result whose exact folders all fail the rule is refused outright, because filing another release's tracks under this album's name would record the wrong content as a success. Its two halves are that the group must reach `min_tracks`, and (for a new album) that its numbered files, when every name parses with at least two distinct values, include track 1. A library-upgrade candidate is exempt from that second half, because the library holds its own track 1 and the upgrade only replaces the files that failed the quality gate. Set `0` to disable both halves. The same rule is enforced **after** download on the placement path as a backstop, where a refused set has its staged files removed and the album is recorded failed rather than written into the library. One corner is exempt: a manual album whose destination folder already exists returns from the existence check before the backstop, so its staged files are kept and the album is recorded as a success, because nothing is written into the library. That staging copy carries a normal success record, so a later upgrade run with `library_upgrade.enabled: true` can adopt it into `library.paths[0]` through its interrupted-upgrade recovery, replacing files whose contents differ; keeping gate-skipped albums out of that recovery is a separate change. See [Incomplete downloads are not written to the library](#incomplete-downloads-are-not-written-to-the-library). | `3` |
 | `peer_track_count` | In upgrade mode, reject search results whose usable track count is below the number of library files that fail the quality gate for the same album — the album's `needs_upgrade` count, not its total track count, so a mixed-format album is compared only against the files that actually need replacing, and a fully conforming album is never flagged. Prevents silent downgrades when the library already has a more complete copy. In manual mode, when the album is already present in the library, the compared count is the number of audio files held directly by the album folder, including files that already conform, so a hand-run upgrade of a mixed-format album can be rejected by a peer that upgrade mode would accept; the gate is skipped entirely when that count is zero, which is the case for an album whose tracks live in per-disc sub-folders such as `CD 01/`, and for an artist folder that is not directly under a library path (a nested layout such as `<root>/Genre/Artist/Album`, where the lookup finds no tracks). Batch and discover runs have no library track count at all. Note: with the default `min_tracks: 3`, albums with 1-2 tracks (EPs, singles) are rejected by `min_tracks` before this check runs — set `min_tracks: 0` or `1` to apply the library check to EPs. | `true` |
 
 ### `download`
@@ -676,8 +680,10 @@ Two conditions make up the rule. The anchor is part of it rather than part of th
 disable the anchor — and only `min_tracks: 0` disables both halves. The anchor is skipped for
 library-upgrade candidates, which only have to deliver the files the library needs replaced.
 
-- **the set is shorter than `min_tracks`** — measured on the largest album group, the set that will
-  actually be downloaded, and applied in every mode; and
+- **the set is shorter than `min_tracks`** — measured on the set that will
+  actually be downloaded (the largest album group when no album name narrows the search,
+  otherwise the group the album gate chose, which must be exactly named once an exactly
+  named folder exists at all), and applied in every mode; and
 - **its numbered files, if any, do not include track 1** — a set of tracks nine and ten is a
   fragment however contiguous it looks. This half applies to new albums; an upgrade candidate is
   exempt, because the library keeps its own track 1.
@@ -771,10 +777,11 @@ Seakarr has four operating modes:
    whose queue position is validated during download. When
    `filters.contiguous_tracks` is enabled, results whose downloadable track
    numbers have gaps (or none at all) are rejected before ranking. The
-   completeness rule (`filters.min_tracks`) also runs here, in every mode: the
-   pre-download screen judges the largest album group, and the album gate then
-   requires the group it selects to pass the same rule, so a result that could
-   never be placed is rejected before the transfer rather than after it.
+   completeness rule (`filters.min_tracks`) also runs here, in every mode: when
+   no album name narrows the search the pre-download screen judges the largest
+   album group, and in either case the album gate requires the group it selects
+   to pass the same rule, so a result that could never be placed is rejected
+   before the transfer rather than after it.
    Ranks candidates by `speed × slot_bonus × bitrate_bonus × album_bonus × reliability_factor` (reliability and
    measured-speed reputation adjust the advertised speed; `album_bonus` is 1.5 when the peer's folder matches the
    album name, 1.1 when the name appears elsewhere in the path, 1.0 otherwise).

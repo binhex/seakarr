@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::DiscographyReleaseType;
-use crate::discography::label::LabelRelease;
+use crate::discography::label::{LabelInput, LabelRelease};
 use crate::discography::{
     normalize_catalog_key, parse_partial_date, release_allowed, select_albums, AlbumTarget,
     PartialDate, ReleaseGroup,
@@ -133,7 +133,7 @@ pub fn label_targets(
             // must not be reported as one - but it must still be reported.
             counts.undescribed_credits += 1;
             tracing::debug!(
-                release_id = %release.release_id,
+                release_id = %crate::formatting::single_line(&release.release_id),
                 "skipping a release whose artist credit folds away"
             );
             continue;
@@ -278,16 +278,22 @@ pub struct LabelCounters {
     /// Labels whose request failed, with the reason.
     pub provider_failed: Vec<(String, String)>,
     /// Labels served from a stale catalogue because the refresh failed. Kept apart from
-    /// `provider_failed`: the label was *not* skipped - its albums were selected - so the
-    /// "label skipped" wording would contradict the staged line in the same summary.
+    /// `provider_failed` because the wording differs: a catalogue that reached the work list
+    /// was used, and one collected by a run that stopped before selection (the breaker
+    /// aborting, an operator interrupt) was skipped. `label_notices` reads `selection_ran`
+    /// to choose between the two, so no caller has to rewrite these entries on the way out.
     pub stale_catalogues: Vec<(String, String)>,
     /// Labels actually examined before the run stopped.
     pub labels_examined: usize,
     /// What the selection filters removed and kept.
     pub selection: SelectionCounts,
-    /// True once the selection has run. A run that stops before it (the breaker
-    /// tripped) has no selection to report, so the eligible/staged notices are
-    /// withheld rather than printed as zero.
+    /// Whether the selection ran, which is what decides the stale-catalogue wording.
+    ///
+    /// A run that stops before selection (the breaker aborting, an operator interrupt) never
+    /// produces a work list, so `label_notices` reports those labels as skipped; a run that
+    /// selected keeps "was used" even if it then stopped. A run that never selected also has
+    /// no selection to report, so the eligible and staged notices are withheld rather than
+    /// printed as zero.
     pub selection_ran: bool,
     /// True when the run stopped because the operator cancelled it - before a label,
     /// before an album, or during an album. A cancelled run would otherwise report
@@ -375,11 +381,19 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
         ));
         // One refusal is answered by its own candidate list; several mean the
         // operator needs the deterministic escape hatch, which the refusal path
-        // and the README both name.
-        if counters.unresolved.len() > 1 {
+        // and the README both name. Only names can be pinned: a `--label` that was
+        // given as an ID has nothing to map, so it is excluded from the count. The
+        // advice says "pin or correct" because a name whose own pin already exists
+        // and no longer resolves needs the pin fixed, not a second one - and this
+        // notice cannot see the configured pins to tell the two apart.
+        let pinnable = counters
+            .unresolved
+            .iter()
+            .filter(|value| LabelInput::parse(value).mbid().is_none())
+            .count();
+        if counters.unresolved.len() > 1 && pinnable > 0 {
             notices.push(format!(
-                "label: pin {} unresolved name(s) with discography.label_mbids to resolve them deterministically",
-                counters.unresolved.len()
+                "label: pin or correct {pinnable} unresolved name(s) in discography.label_mbids to resolve them deterministically"
             ));
         }
     }
@@ -403,8 +417,16 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
         ));
     }
     for (label, reason) in &counters.stale_catalogues {
+        // "was used" is a claim about this run's work list, and only the selection decides
+        // it. A run that stops before selection - the breaker aborting on this label, or an
+        // operator Ctrl+C before the next one - selected nothing, so the label was skipped.
+        let wording = if counters.selection_ran {
+            "its stale catalogue was used"
+        } else {
+            "label skipped"
+        };
         notices.push(format!(
-            "label: provider failed for {label} ({reason}); its stale catalogue was used"
+            "label: provider failed for {label} ({reason}); {wording}"
         ));
     }
     if counters.selection.releases_examined > 0 {
@@ -430,8 +452,13 @@ pub fn label_notices(counters: &LabelCounters, staging_dir: &str) -> Vec<String>
         // usable date - so the first number is their total and the parenthetical breaks it
         // down. Reporting only the dated count beside the undated count read as if the
         // undated ones were a subset of it.
+        //
+        // The dated half includes a date given only to a coarser precision than the bound: a
+        // release group dated `2019` is below `--since 2019-06-01`, and no smaller bound
+        // inside 2019 will admit it. The wording says so, because "below the bound" alone
+        // invites the operator to lower the bound and wait for a result that never comes.
         notices.push(format!(
-            "label: {} release(s) excluded by --since ({} below the bound, {} undated or unparseable)",
+            "label: {} release(s) excluded by --since ({} dated before the bound, including dates coarser than the bound; {} undated or unparseable)",
             counters.selection.since_skipped + counters.selection.undated_skipped,
             counters.selection.since_skipped,
             counters.selection.undated_skipped
@@ -997,7 +1024,7 @@ mod tests {
         );
         assert!(
             notices.iter().any(|notice| notice
-                == "label: 8 release(s) excluded by --since (5 below the bound, 3 undated or unparseable)"),
+                == "label: 8 release(s) excluded by --since (5 dated before the bound, including dates coarser than the bound; 3 undated or unparseable)"),
             "the total, not the dated subset, is the exclusion count: {notices:?}"
         );
         assert!(
@@ -1092,7 +1119,7 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|notice| notice.contains("pin 2 unresolved name(s)")),
+                .any(|notice| notice.contains("pin or correct 2 unresolved name(s)")),
             "got {notices:?}"
         );
 
@@ -1103,6 +1130,25 @@ mod tests {
                 .iter()
                 .any(|notice| notice.contains("pin ")),
             "one refusal is answered by its own candidate list"
+        );
+    }
+
+    #[test]
+    fn the_pin_advice_counts_only_the_names_that_can_be_pinned() {
+        // A `--label` given as a MusicBrainz ID has no name to map, so counting it would tell
+        // the operator to pin a value the setting cannot accept.
+        let mut run = counters();
+        run.unresolved.extend([
+            "Hospital Records".to_string(),
+            "8562598d-60d1-4bd6-8b85-4d709e951770".to_string(),
+        ]);
+
+        let notices = label_notices(&run, "downloads/staging");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("pin or correct 1 unresolved name(s)")),
+            "only the name entry is pinnable: {notices:?}"
         );
     }
 
