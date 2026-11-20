@@ -1757,11 +1757,7 @@ mod tests {
                 .path()
                 .join("Artist/Gold Disc 1/Gold Disc 1/01 - Track.flac")
                 .exists(),
-            "the recovery must nest the disc folder the forward copy nests, got: {:?}",
-            fs::read_dir(library.path().join("Artist/Gold Disc 1")).map(|entries| entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name())
-                .collect::<Vec<_>>())
+            "the recovery must nest the disc folder the forward copy nests"
         );
     }
 
@@ -1786,15 +1782,170 @@ mod tests {
                 .path()
                 .join("Artist/Album/Gold Disc 1/01 - Track.flac")
                 .exists(),
-            "the recovery must peel the staging digest, got: {:?}",
-            fs::read_dir(library.path().join("Artist/Album")).map(|entries| entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name())
-                .collect::<Vec<_>>())
+            "the recovery must peel the staging digest"
         );
     }
 
     // ── Post-download verification helpers ──
+
+    // ── Tech-debt coverage: the branches below were never executed ──
+
+    #[test]
+    fn a_bracket_suffix_that_is_not_the_stager_digest_is_kept() {
+        // The digest peel must not misfire on a peer's own bracketed suffix, or a disc folder
+        // named "Gold (Disc 1) [live]" would be classified and renamed from text that is not
+        // ours. Only an 8-hex suffix that the stager wrote may be removed.
+        assert_eq!(
+            strip_peer_name_digest("Gold (Disc 1) [live]"),
+            "Gold (Disc 1) [live]",
+            "a suffix that is not 8 hex characters is the peer's"
+        );
+        assert_eq!(
+            strip_peer_name_digest("Gold (Disc 1) [zzzzzzzz]"),
+            "Gold (Disc 1) [zzzzzzzz]",
+            "eight characters that are not hex are not a digest"
+        );
+        assert_eq!(
+            strip_peer_name_digest("Album]"),
+            "Album]",
+            "a name with no space-bracket split has no digest to peel"
+        );
+        assert_eq!(
+            strip_peer_name_digest("Gold (Disc 1) [1a2b3c4d]"),
+            "Gold (Disc 1)",
+            "the stager's own suffix is removed"
+        );
+    }
+
+    #[test]
+    fn a_stem_with_no_leading_track_token_is_returned_unchanged() {
+        // Two shapes reach the early returns: a stem with no alphanumeric character at all,
+        // and a stem that is nothing but a track token. Stripping either would leave an empty
+        // title, so both come back as they went in.
+        assert_eq!(strip_leading_track_token("---"), "---");
+        assert_eq!(strip_leading_track_token("01"), "01");
+        assert_eq!(strip_leading_track_token("01 - Song"), "Song");
+    }
+
+    #[test]
+    fn residue_clearance_removes_debris_and_keeps_everything_else() {
+        // The residue pass exists to delete only what a download left behind. A cover image
+        // the operator added, and a directory holding one, must survive - deleting them would
+        // destroy library content that no run staged.
+        let dir = TempDir::new().unwrap();
+        let album = dir.path().join("Album");
+        fs::create_dir_all(album.join("CD 01")).unwrap();
+        fs::create_dir_all(album.join("extras")).unwrap();
+        write_minimal_flac(&album.join("01 - A.flac")); // audio: residue
+        fs::write(album.join("02 - B.flac.part"), b"partial").unwrap(); // residue
+        fs::write(album.join("cover.jpg"), b"image").unwrap(); // operator content
+        write_minimal_flac(&album.join("CD 01/01 - C.flac")); // residue in a subdirectory
+        fs::write(album.join("extras/notes.txt"), b"notes").unwrap(); // operator content
+
+        assert!(
+            clear_download_residue(&album),
+            "audio and partial files are residue and must be reported as removed"
+        );
+        assert!(
+            !album.join("01 - A.flac").exists(),
+            "audio residue is removed"
+        );
+        assert!(
+            !album.join("02 - B.flac.part").exists(),
+            "a partial file is residue"
+        );
+        assert!(
+            !album.join("CD 01").exists(),
+            "a subdirectory emptied of residue is removed with it"
+        );
+        assert!(
+            album.join("cover.jpg").exists(),
+            "an operator's image is not residue"
+        );
+        assert!(
+            album.join("extras/notes.txt").exists(),
+            "a directory holding no residue is left in place"
+        );
+    }
+
+    #[test]
+    fn residue_detection_ignores_content_a_download_did_not_write() {
+        // Residue detection gates deletion, so it must answer false for a folder that holds
+        // only an operator's files - and true for one that holds anything a transfer wrote,
+        // however deeply nested.
+        let dir = TempDir::new().unwrap();
+        let clean = dir.path().join("Clean");
+        fs::create_dir_all(clean.join("scans")).unwrap();
+        fs::write(clean.join("cover.jpg"), b"image").unwrap();
+        fs::write(clean.join("scans/back.jpg"), b"image").unwrap();
+        assert!(
+            !holds_download_residue(&clean),
+            "images and text are not download debris"
+        );
+
+        let dirty = dir.path().join("Dirty");
+        fs::create_dir_all(dirty.join("CD 02")).unwrap();
+        fs::write(dirty.join("cover.jpg"), b"image").unwrap();
+        fs::write(dirty.join("CD 02/01 - A.tmp"), b"partial").unwrap();
+        assert!(
+            holds_download_residue(&dirty),
+            "a nested partial file is debris"
+        );
+    }
+
+    #[test]
+    fn lossy_quality_helpers_report_bitrate_and_no_bitdepth() {
+        // The lossy arm of the post-download verification: a lossy file has a bitrate and no
+        // bit depth, so the two helpers must not swap answers.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.mp3");
+        crate::test_support::write_minimal_mp3(&path);
+
+        assert_eq!(
+            extract_bitrate(&path),
+            Some(crate::test_support::MINIMAL_MP3_BITRATE_KBPS),
+            "a lossy file reports its bitrate"
+        );
+        assert_eq!(
+            extract_bitdepth(&path),
+            None,
+            "bit depth is not meaningful for a lossy file"
+        );
+        assert!(
+            file_quality_score(&path).is_some(),
+            "a lossy file is scored by bitrate"
+        );
+    }
+
+    #[test]
+    fn a_staging_subdirectory_named_like_the_album_writes_into_the_album_root() {
+        // The album root appears again as a subdirectory when the album's own title is a disc
+        // designator. Its files belong in the album folder; recursing would add a level the
+        // forward copy does not have.
+        let staging = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let album_dir = staging.path().join("Gold Disc 1");
+        fs::create_dir_all(&album_dir).unwrap();
+        fs::write(album_dir.join("01 - Track.flac"), b"content").unwrap();
+
+        let config = Config::default();
+        resume_library_upgrade(
+            &config,
+            staging.path(),
+            library.path(),
+            "Artist",
+            "Gold Disc 1",
+        )
+        .unwrap();
+
+        assert!(
+            library
+                .path()
+                .join("Artist/Gold Disc 1/01 - Track.flac")
+                .exists(),
+            "a subdirectory that is the album root again must not nest a second level"
+        );
+    }
 
     #[test]
     fn test_extract_bitdepth_from_lossless_file() {
